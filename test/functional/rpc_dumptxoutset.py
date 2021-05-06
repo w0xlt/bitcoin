@@ -68,11 +68,12 @@ class DumptxoutsetTest(BitcoinTestFramework):
         if params.get('format') == ():
             with open(expected_path, 'r', encoding='utf-8') as f:
                 content = f.readlines()
+                sep = params.get('separator', ',')
                 if params.get('show_header', True):
                     assert_equal(content.pop(0).rstrip(),
-                        "#(blockhash 6fd417acba2a8738b06fee43330c50d58e6a725046c3d843c8dd7e51d46d1ed6 ) txid,vout,value,coinbase,height,scriptPubKey")
+                        "#(blockhash 6fd417acba2a8738b06fee43330c50d58e6a725046c3d843c8dd7e51d46d1ed6 ) txid{s}vout{s}value{s}coinbase{s}height{s}scriptPubKey".format(s=sep))
                 assert_equal(content[0].rstrip(),
-                    "213ecbdfe837a2c8ffc0812da62d4de94efce8894c67e22ff658517ecf104e03,0,5000000000,1,81,76a9142b4569203694fc997e13f2c0a1383b9e16c77a0d88ac")
+                    "213ecbdfe837a2c8ffc0812da62d4de94efce8894c67e22ff658517ecf104e03{s}0{s}5000000000{s}1{s}81{s}76a9142b4569203694fc997e13f2c0a1383b9e16c77a0d88ac".format(s=sep))
 
     def run_test(self):
         """Test a trivial usage of the dumptxoutset RPC command."""
@@ -93,6 +94,10 @@ class DumptxoutsetTest(BitcoinTestFramework):
                             '0eb83a3bf6a7580333fdaf7fd6cebebe93096e032d49049229124ca699222919')
         self.test_dump_file('no_header',           {'format': (), 'show_header': False},
                             'ba85c1db5df6de80c783f2c9a617de4bd7e0e92125a0d318532218eaaed28bfa')
+        self.test_dump_file('separator',           {'format': (), 'separator': ':'},
+                            '3352b4db7a9f63629cf255c1a805241f1bee2b557e5f113993669cd3085e9b0f')
+        self.test_dump_file('all_options',         {'format': (), 'show_header': False, 'separator': ':'},
+                            '7df9588375f8bd01d0b6f902a55e086c2d0549c3f08f389baa28b398e987f8a2')
 
         # Other failing tests
         assert_raises_rpc_error(

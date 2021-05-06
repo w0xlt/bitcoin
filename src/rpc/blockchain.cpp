@@ -2727,6 +2727,7 @@ static RPCHelpMan dumptxoutset()
                                         "available below are written in ASCII format (if an empty array is provided, all items are written in ASCII).",
                                         ascii_args, "format"},
             {"show_header", RPCArg::Type::BOOL, RPCArg::Default{true}, "Whether to include the header line in non-serialized (ASCII) mode"},
+            {"separator", RPCArg::Type::STR, RPCArg::Default{","}, "Field separator to use in non-serialized (ASCII) mode"},
         },
         RPCResult{
             RPCResult::Type::OBJ, "", "",
@@ -2742,13 +2743,14 @@ static RPCHelpMan dumptxoutset()
         RPCExamples{
             HelpExampleCli("dumptxoutset", "utxo.dat") +
             HelpExampleCli("dumptxoutset", "utxo.dat '[]'") +
-            HelpExampleCli("dumptxoutset", "utxo.dat '[\"txid\", \"vout\"]' false")
+            HelpExampleCli("dumptxoutset", "utxo.dat '[\"txid\", \"vout\"]' false ':'")
         },
         [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
 {
     // handle optional ASCII parameters
     const bool is_human_readable = !request.params[1].isNull();
     const bool show_header = request.params[2].isNull() || request.params[2].get_bool();
+    const std::string separator = request.params[3].isNull() ? "," : request.params[3].get_str();
     std::vector<std::pair<std::string, coinascii_cb_t>> requested;
     if (is_human_readable) {
         const auto& arr = request.params[1].get_array();
@@ -2784,7 +2786,7 @@ static RPCHelpMan dumptxoutset()
     NodeContext& node = EnsureAnyNodeContext(request.context);
     UniValue result = CreateUTXOSnapshot(
         is_human_readable,
-        show_header, requested,
+        show_header, separator, requested,
         node,
         node.chainman->ActiveChainstate(),
         afile,
@@ -2801,6 +2803,7 @@ static RPCHelpMan dumptxoutset()
 UniValue CreateUTXOSnapshot(
     const bool is_human_readable,
     const bool show_header,
+    const std::string& separator,
     const std::vector<std::pair<std::string, coinascii_cb_t>>& requested,
     NodeContext& node,
     CChainState& chainstate,
@@ -2811,9 +2814,6 @@ UniValue CreateUTXOSnapshot(
     std::unique_ptr<CCoinsViewCursor> pcursor;
     CCoinsStats stats{CoinStatsHashType::HASH_SERIALIZED};
     CBlockIndex* tip;
-
-    // used when human readable format is requested
-    const std::string& separator{","};
 
     {
         // We need to lock cs_main to ensure that the coinsdb isn't written to
