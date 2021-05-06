@@ -10,6 +10,7 @@
 #include <fs.h>
 #include <streams.h>
 #include <sync.h>
+#include <coins.h>
 
 #include <any>
 #include <stdint.h>
@@ -27,6 +28,7 @@ struct NodeContext;
 } // namespace node
 
 static constexpr int NUM_GETBLOCKSTATS_PERCENTILES = 5;
+using coinascii_cb_t = std::function<std::string(const COutPoint&, const Coin&)>;
 
 /**
  * Get the difficulty of the net wrt to the given block index.
@@ -60,6 +62,7 @@ void CalculatePercentilesByWeight(CAmount result[NUM_GETBLOCKSTATS_PERCENTILES],
  */
 UniValue CreateUTXOSnapshot(
     const bool is_human_readable,
+    const std::vector<std::pair<std::string, coinascii_cb_t>>& requested,
     node::NodeContext& node,
     CChainState& chainstate,
     CAutoFile& afile,

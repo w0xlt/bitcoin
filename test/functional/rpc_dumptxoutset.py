@@ -34,11 +34,15 @@ class DumptxoutsetTest(BitcoinTestFramework):
             # UTXO snapshot hash should be deterministic based on mocked time.
             assert_equal(digest, expected_digest)
 
-    def test_dump_file(self, filename, is_human_readable, expected_digest):
+    def test_dump_file(self, testname, params, expected_digest):
 
         node = self.nodes[0]
 
-        out = node.dumptxoutset(filename, is_human_readable)
+        self.log.info(testname)
+        filename = testname + '_txoutset.dat'
+        is_human_readable = not params.get('format') is None
+
+        out = node.dumptxoutset(path=filename, **params)
         expected_path = Path(node.datadir) / self.chain / filename
 
         assert expected_path.is_file()
@@ -61,7 +65,7 @@ class DumptxoutsetTest(BitcoinTestFramework):
         assert_raises_rpc_error(
             -8, '{} already exists'.format(filename),  node.dumptxoutset, filename)
 
-        if (is_human_readable):
+        if params.get('format') == ():
             with open(expected_path, 'r', encoding='utf-8') as f:
                 content = f.readlines()
                 assert_equal(content[0].rstrip(),
@@ -76,8 +80,20 @@ class DumptxoutsetTest(BitcoinTestFramework):
         node.setmocktime(mocktime)
         self.generate(node, COINBASE_MATURITY)
 
-        self.test_dump_file('txoutset.dat', False, '7ae82c986fa5445678d2a21453bb1c86d39e47af13da137640c2b1cf8093691c')
-        self.test_dump_file('txoutset.txt', True, '5554c7d08c2f9aaacbbc66617eb59f13aab4b8c0574f4d8b12f728c60dc7d287')
+        self.test_dump_file('no_option',           {},
+                            '7ae82c986fa5445678d2a21453bb1c86d39e47af13da137640c2b1cf8093691c')
+        self.test_dump_file('all_data',            {'format': ()},
+                            '5554c7d08c2f9aaacbbc66617eb59f13aab4b8c0574f4d8b12f728c60dc7d287')
+        self.test_dump_file('partial_data_1',      {'format': ('txid',)},
+                            'eaec3b56b285dcae610be0975d494befa5a6a130211dda0e1ec1ef2c4afa4389')
+        self.test_dump_file('partial_data_order',  {'format': ('height', 'vout')},
+                            '3e5d6d1cb44595eb7c9d13b3370d14b8826c0d81798c29339794623d4ab6091c')
+        self.test_dump_file('partial_data_double', {'format': ('scriptPubKey', 'scriptPubKey')},
+                            '0eb83a3bf6a7580333fdaf7fd6cebebe93096e032d49049229124ca699222919')
+
+        # Other failing tests
+        assert_raises_rpc_error(
+            -8, 'unable to find item \'sample\'',  node.dumptxoutset, path='xxx', format=['sample'])
 
 if __name__ == '__main__':
     DumptxoutsetTest().main()
