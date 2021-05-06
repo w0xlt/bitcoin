@@ -68,9 +68,10 @@ class DumptxoutsetTest(BitcoinTestFramework):
         if params.get('format') == ():
             with open(expected_path, 'r', encoding='utf-8') as f:
                 content = f.readlines()
+                if params.get('show_header', True):
+                    assert_equal(content.pop(0).rstrip(),
+                        "#(blockhash 6fd417acba2a8738b06fee43330c50d58e6a725046c3d843c8dd7e51d46d1ed6 ) txid,vout,value,coinbase,height,scriptPubKey")
                 assert_equal(content[0].rstrip(),
-                    "#(blockhash 6fd417acba2a8738b06fee43330c50d58e6a725046c3d843c8dd7e51d46d1ed6 ) txid,vout,value,coinbase,height,scriptPubKey")
-                assert_equal(content[1].rstrip(),
                     "213ecbdfe837a2c8ffc0812da62d4de94efce8894c67e22ff658517ecf104e03,0,5000000000,1,81,76a9142b4569203694fc997e13f2c0a1383b9e16c77a0d88ac")
 
     def run_test(self):
@@ -90,6 +91,8 @@ class DumptxoutsetTest(BitcoinTestFramework):
                             '3e5d6d1cb44595eb7c9d13b3370d14b8826c0d81798c29339794623d4ab6091c')
         self.test_dump_file('partial_data_double', {'format': ('scriptPubKey', 'scriptPubKey')},
                             '0eb83a3bf6a7580333fdaf7fd6cebebe93096e032d49049229124ca699222919')
+        self.test_dump_file('no_header',           {'format': (), 'show_header': False},
+                            'ba85c1db5df6de80c783f2c9a617de4bd7e0e92125a0d318532218eaaed28bfa')
 
         # Other failing tests
         assert_raises_rpc_error(

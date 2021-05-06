@@ -2726,6 +2726,7 @@ static RPCHelpMan dumptxoutset()
                                         "If no argument is provided, a compact binary serialized format is used; otherwise only requested items "
                                         "available below are written in ASCII format (if an empty array is provided, all items are written in ASCII).",
                                         ascii_args, "format"},
+            {"show_header", RPCArg::Type::BOOL, RPCArg::Default{true}, "Whether to include the header line in non-serialized (ASCII) mode"},
         },
         RPCResult{
             RPCResult::Type::OBJ, "", "",
@@ -2741,12 +2742,13 @@ static RPCHelpMan dumptxoutset()
         RPCExamples{
             HelpExampleCli("dumptxoutset", "utxo.dat") +
             HelpExampleCli("dumptxoutset", "utxo.dat '[]'") +
-            HelpExampleCli("dumptxoutset", "utxo.dat '[\"txid\", \"vout\"]'")
+            HelpExampleCli("dumptxoutset", "utxo.dat '[\"txid\", \"vout\"]' false")
         },
         [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
 {
     // handle optional ASCII parameters
     const bool is_human_readable = !request.params[1].isNull();
+    const bool show_header = request.params[2].isNull() || request.params[2].get_bool();
     std::vector<std::pair<std::string, coinascii_cb_t>> requested;
     if (is_human_readable) {
         const auto& arr = request.params[1].get_array();
@@ -2782,7 +2784,7 @@ static RPCHelpMan dumptxoutset()
     NodeContext& node = EnsureAnyNodeContext(request.context);
     UniValue result = CreateUTXOSnapshot(
         is_human_readable,
-        requested,
+        show_header, requested,
         node,
         node.chainman->ActiveChainstate(),
         afile,
@@ -2798,6 +2800,7 @@ static RPCHelpMan dumptxoutset()
 
 UniValue CreateUTXOSnapshot(
     const bool is_human_readable,
+    const bool show_header,
     const std::vector<std::pair<std::string, coinascii_cb_t>>& requested,
     NodeContext& node,
     CChainState& chainstate,
@@ -2845,7 +2848,7 @@ UniValue CreateUTXOSnapshot(
     if (!is_human_readable) {
         SnapshotMetadata metadata{tip->GetBlockHash(), stats.coins_count, tip->nChainTx};
         afile << metadata;
-    } else {
+    } else if (show_header) {
         afile.write("#(blockhash " + tip->GetBlockHash().ToString() + " ) ");
         for (auto it = std::begin(requested); it != std::end(requested); ++it) {
             if (it != std::begin(requested)) {
