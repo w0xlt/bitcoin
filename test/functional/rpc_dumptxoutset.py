@@ -65,7 +65,7 @@ class DumptxoutsetTest(BitcoinTestFramework):
             with open(expected_path, 'r', encoding='utf-8') as f:
                 content = f.readlines()
                 assert_equal(content[0].rstrip(),
-                    "#(blockhash 6fd417acba2a8738b06fee43330c50d58e6a725046c3d843c8dd7e51d46d1ed6),txid,vout,value,coinbase,height,scriptPubKey")
+                    "#(blockhash 6fd417acba2a8738b06fee43330c50d58e6a725046c3d843c8dd7e51d46d1ed6 ) txid,vout,value,coinbase,height,scriptPubKey")
                 assert_equal(content[1].rstrip(),
                     "213ecbdfe837a2c8ffc0812da62d4de94efce8894c67e22ff658517ecf104e03,0,5000000000,1,81,76a9142b4569203694fc997e13f2c0a1383b9e16c77a0d88ac")
 
@@ -77,7 +77,7 @@ class DumptxoutsetTest(BitcoinTestFramework):
         self.generate(node, COINBASE_MATURITY)
 
         self.test_dump_file('txoutset.dat', False, '7ae82c986fa5445678d2a21453bb1c86d39e47af13da137640c2b1cf8093691c')
-        self.test_dump_file('txoutset.txt', True, '5bc8a9c14d1f6d89833342dcd6014bdf9ddb5f19e3741760da6d6d666971df41')
+        self.test_dump_file('txoutset.txt', True, '5554c7d08c2f9aaacbbc66617eb59f13aab4b8c0574f4d8b12f728c60dc7d287')
 
 if __name__ == '__main__':
     DumptxoutsetTest().main()

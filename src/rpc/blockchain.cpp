@@ -2808,10 +2808,12 @@ UniValue CreateUTXOSnapshot(
         SnapshotMetadata metadata{tip->GetBlockHash(), stats.coins_count, tip->nChainTx};
         afile << metadata;
     } else {
-        afile.write("#(blockhash " + tip->GetBlockHash().ToString() + ")");
+        afile.write("#(blockhash " + tip->GetBlockHash().ToString() + " ) ");
 
         for(const auto& text : { "txid", "vout", "value", "coinbase", "height", "scriptPubKey" }) {
-            afile.write(separator);
+            if (text != "txid") {
+                afile.write(separator);
+            }
             afile.write(text);
         }
         afile.write("\n");
