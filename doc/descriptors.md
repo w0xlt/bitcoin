@@ -77,6 +77,7 @@ Descriptors consist of several types of expressions. The top level expression is
 - `tr(KEY)` or `tr(KEY,TREE)` (top level only): P2TR output with the specified key as internal key, and optionally a tree of script paths.
 - `addr(ADDR)` (top level only): the script which ADDR expands to.
 - `raw(HEX)` (top level only): the script whose hex encoding is HEX.
+- `rawtr(KEY)` (top level only): P2TR output with the specified key as output key.
 
 `KEY` expressions:
 - Optionally, key origin information, consisting of:
