@@ -2705,9 +2705,10 @@ static RPCHelpMan dumptxoutset()
 {
     return RPCHelpMan{
         "dumptxoutset",
-        "Write the serialized UTXO set to disk.",
+        "Write the UTXO set to disk.",
         {
             {"path", RPCArg::Type::STR, RPCArg::Optional::NO, "Path to the output file. If relative, will be prefixed by datadir."},
+            {"human_readable", RPCArg::Type::BOOL, RPCArg::Default{false}, "Dump file is created in human-readable format"}
         },
         RPCResult{
             RPCResult::Type::OBJ, "", "",
@@ -2721,10 +2722,12 @@ static RPCHelpMan dumptxoutset()
                 }
         },
         RPCExamples{
-            HelpExampleCli("dumptxoutset", "utxo.dat")
+            HelpExampleCli("dumptxoutset", "utxo.dat") +
+            HelpExampleCli("dumptxoutset", "utxo.dat true")
         },
         [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
 {
+    const bool is_human_readable{request.params[1].isNull() ? false : request.params[1].get_bool()};
     const ArgsManager& args{EnsureAnyArgsman(request.context)};
     const fs::path path = fsbridge::AbsPathJoin(args.GetDataDirNet(), fs::u8path(request.params[0].get_str()));
     // Write to a temporary path and then move into `path` on completion
@@ -2738,11 +2741,16 @@ static RPCHelpMan dumptxoutset()
             "move it out of the way first");
     }
 
-    FILE* file{fsbridge::fopen(temppath, "wb")};
+    FILE* file{fsbridge::fopen(temppath, !is_human_readable ? "wb" : "w")};
     CAutoFile afile{file, SER_DISK, CLIENT_VERSION};
     NodeContext& node = EnsureAnyNodeContext(request.context);
     UniValue result = CreateUTXOSnapshot(
-        node, node.chainman->ActiveChainstate(), afile, path, temppath);
+        is_human_readable,
+        node,
+        node.chainman->ActiveChainstate(),
+        afile,
+        path,
+        temppath);
     fs::rename(temppath, path);
 
     result.pushKV("path", path.u8string());
@@ -2752,6 +2760,7 @@ static RPCHelpMan dumptxoutset()
 }
 
 UniValue CreateUTXOSnapshot(
+    const bool is_human_readable,
     NodeContext& node,
     CChainState& chainstate,
     CAutoFile& afile,
@@ -2761,6 +2770,9 @@ UniValue CreateUTXOSnapshot(
     std::unique_ptr<CCoinsViewCursor> pcursor;
     CCoinsStats stats{CoinStatsHashType::HASH_SERIALIZED};
     CBlockIndex* tip;
+
+    // used when human readable format is requested
+    const std::string& separator{","};
 
     {
         // We need to lock cs_main to ensure that the coinsdb isn't written to
@@ -2792,9 +2804,18 @@ UniValue CreateUTXOSnapshot(
         tip->nHeight, tip->GetBlockHash().ToString(),
         fs::PathToString(path), fs::PathToString(temppath)));
 
-    SnapshotMetadata metadata{tip->GetBlockHash(), stats.coins_count, tip->nChainTx};
+    if (!is_human_readable) {
+        SnapshotMetadata metadata{tip->GetBlockHash(), stats.coins_count, tip->nChainTx};
+        afile << metadata;
+    } else {
+        afile.write("#(blockhash " + tip->GetBlockHash().ToString() + ")");
 
-    afile << metadata;
+        for(const auto& text : { "txid", "vout", "value", "coinbase", "height", "scriptPubKey" }) {
+            afile.write(separator);
+            afile.write(text);
+        }
+        afile.write("\n");
+    }
 
     COutPoint key;
     Coin coin;
@@ -2804,8 +2825,23 @@ UniValue CreateUTXOSnapshot(
         if (iter % 5000 == 0) node.rpc_interruption_point();
         ++iter;
         if (pcursor->GetKey(key) && pcursor->GetValue(coin)) {
-            afile << key;
-            afile << coin;
+            if (!is_human_readable) {
+                afile << key;
+                afile << coin;
+            } else {
+                afile.write(key.hash.GetHex()); // txid
+                afile.write(separator);
+                afile.write(ToString(static_cast<int32_t>(key.n))); // vout
+                afile.write(separator);
+                afile.write(ToString(coin.out.nValue)); // value
+                afile.write(separator);
+                afile.write(ToString(coin.fCoinBase)); // coinbase
+                afile.write(separator);
+                afile.write(ToString(static_cast<uint32_t>(coin.nHeight))); // height
+                afile.write(separator);
+                afile.write(HexStr(coin.out.scriptPubKey)); // scriptPubKey
+                afile.write("\n");
+            }
         }
 
         pcursor->Next();
