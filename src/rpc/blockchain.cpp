@@ -2787,11 +2787,7 @@ static RPCHelpMan dumptxoutset()
     UniValue result = CreateUTXOSnapshot(
         is_human_readable,
         show_header, separator, requested,
-        node,
-        node.chainman->ActiveChainstate(),
-        afile,
-        path,
-        temppath);
+        node, node.chainman->ActiveChainstate(), afile, path, temppath);
     fs::rename(temppath, path);
 
     result.pushKV("path", path.u8string());
@@ -2849,8 +2845,9 @@ UniValue CreateUTXOSnapshot(
         fs::PathToString(path), fs::PathToString(temppath)));
 
     if (!is_human_readable) {
-        SnapshotMetadata metadata{tip->GetBlockHash(), stats.coins_count, tip->nChainTx};
-        afile << metadata;
+    SnapshotMetadata metadata{tip->GetBlockHash(), stats.coins_count, tip->nChainTx};
+
+    afile << metadata;
     } else if (show_header) {
         afile.write(MakeByteSpan("#(blockhash " + tip->GetBlockHash().ToString() + " ) "));
         for (auto it = std::begin(requested); it != std::end(requested); ++it) {
@@ -2871,8 +2868,8 @@ UniValue CreateUTXOSnapshot(
         ++iter;
         if (pcursor->GetKey(key) && pcursor->GetValue(coin)) {
             if (!is_human_readable) {
-                afile << key;
-                afile << coin;
+            afile << key;
+            afile << coin;
             } else {
                 for (auto it = std::begin(requested); it != std::end(requested); ++it) {
                     if (it != std::begin(requested))
