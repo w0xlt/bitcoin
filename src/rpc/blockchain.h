@@ -59,6 +59,7 @@ void CalculatePercentilesByWeight(CAmount result[NUM_GETBLOCKSTATS_PERCENTILES],
  * @return a UniValue map containing metadata about the snapshot.
  */
 UniValue CreateUTXOSnapshot(
+    const bool is_human_readable,
     node::NodeContext& node,
     CChainState& chainstate,
     CAutoFile& afile,
