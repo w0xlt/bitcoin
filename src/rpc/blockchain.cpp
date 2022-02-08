@@ -2750,7 +2750,7 @@ static RPCHelpMan dumptxoutset()
     // handle optional ASCII parameters
     const bool is_human_readable = !request.params[1].isNull();
     const bool show_header = request.params[2].isNull() || request.params[2].get_bool();
-    const std::string separator = request.params[3].isNull() ? "," : request.params[3].get_str();
+    const auto separator = request.params[3].isNull() ? MakeByteSpan(",").first(1) : MakeByteSpan(request.params[3].get_str());
     std::vector<std::pair<std::string, coinascii_cb_t>> requested;
     if (is_human_readable) {
         const auto& arr = request.params[1].get_array();
@@ -2803,7 +2803,7 @@ static RPCHelpMan dumptxoutset()
 UniValue CreateUTXOSnapshot(
     const bool is_human_readable,
     const bool show_header,
-    const std::string& separator,
+    const Span<const std::byte>& separator,
     const std::vector<std::pair<std::string, coinascii_cb_t>>& requested,
     NodeContext& node,
     CChainState& chainstate,
@@ -2814,6 +2814,9 @@ UniValue CreateUTXOSnapshot(
     std::unique_ptr<CCoinsViewCursor> pcursor;
     CCoinsStats stats{CoinStatsHashType::HASH_SERIALIZED};
     CBlockIndex* tip;
+
+    // used when human readable format is requested
+    const auto line_separator = MakeByteSpan("\n").first(1);
 
     {
         // We need to lock cs_main to ensure that the coinsdb isn't written to
@@ -2849,14 +2852,14 @@ UniValue CreateUTXOSnapshot(
         SnapshotMetadata metadata{tip->GetBlockHash(), stats.coins_count, tip->nChainTx};
         afile << metadata;
     } else if (show_header) {
-        afile.write("#(blockhash " + tip->GetBlockHash().ToString() + " ) ");
+        afile.write(MakeByteSpan("#(blockhash " + tip->GetBlockHash().ToString() + " ) "));
         for (auto it = std::begin(requested); it != std::end(requested); ++it) {
             if (it != std::begin(requested)) {
                 afile.write(separator);
             }
-            afile.write(it->first);
+            afile.write(MakeByteSpan(it->first));
         }
-        afile.write("\n");
+        afile.write(line_separator);
     }
 
     COutPoint key;
@@ -2874,9 +2877,9 @@ UniValue CreateUTXOSnapshot(
                 for (auto it = std::begin(requested); it != std::end(requested); ++it) {
                     if (it != std::begin(requested))
                         afile.write(separator);
-                    afile.write(it->second(key, coin));
+                    afile.write(MakeByteSpan(it->second(key, coin)));
                 }
-                afile.write("\n");
+                afile.write(line_separator);
             }
         }
 

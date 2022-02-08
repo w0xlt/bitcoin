@@ -626,11 +626,6 @@ public:
         }
     }
 
-    void write(const std::string& s)
-    {
-        write(MakeByteSpan(s));
-    }
-
     template<typename T>
     CAutoFile& operator<<(const T& obj)
     {

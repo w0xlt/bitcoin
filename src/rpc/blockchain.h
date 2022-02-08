@@ -8,6 +8,7 @@
 #include <consensus/amount.h>
 #include <core_io.h>
 #include <fs.h>
+#include <span.h>
 #include <streams.h>
 #include <sync.h>
 #include <coins.h>
@@ -63,7 +64,7 @@ void CalculatePercentilesByWeight(CAmount result[NUM_GETBLOCKSTATS_PERCENTILES],
 UniValue CreateUTXOSnapshot(
     const bool is_human_readable,
     const bool show_header,
-    const std::string& separator,
+    const Span<const std::byte>& separator,
     const std::vector<std::pair<std::string, coinascii_cb_t>>& requested,
     node::NodeContext& node,
     CChainState& chainstate,
