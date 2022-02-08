@@ -19,6 +19,21 @@ class DumptxoutsetTest(BitcoinTestFramework):
         self.setup_clean_chain = True
         self.num_nodes = 1
 
+    @staticmethod
+    def check_output_file(path, is_human_readable, expected_digest):
+        with open(str(path), 'rb') as f:
+            content = f.read()
+
+            if is_human_readable:
+                # Normalise platform EOL to \n, while making sure any stray \n becomes a literal backslash+n to avoid a false positive
+                # This ensures the platform EOL and only the platform EOL produces the expected hash
+                linesep = os.linesep.encode('utf8')
+                content = b'\n'.join(line.replace(b'\n', b'\\n') for line in content.split(linesep))
+
+            digest = hashlib.sha256(content).hexdigest()
+            # UTXO snapshot hash should be deterministic based on mocked time.
+            assert_equal(digest, expected_digest)
+
     def test_dump_file(self, filename, is_human_readable, expected_digest):
 
         node = self.nodes[0]
@@ -36,10 +51,7 @@ class DumptxoutsetTest(BitcoinTestFramework):
             out['base_hash'],
             '6fd417acba2a8738b06fee43330c50d58e6a725046c3d843c8dd7e51d46d1ed6')
 
-        with open(str(expected_path), 'rb') as f:
-            digest = hashlib.sha256(f.read()).hexdigest()
-            # UTXO snapshot hash should be deterministic based on mocked time.
-            assert_equal(digest, expected_digest)
+        self.check_output_file(expected_path, is_human_readable, expected_digest)
 
         assert_equal(
             out['txoutset_hash'], 'd4b614f476b99a6e569973bf1c0120d88b1a168076f8ce25691fb41dd1cef149')
@@ -64,13 +76,8 @@ class DumptxoutsetTest(BitcoinTestFramework):
         node.setmocktime(mocktime)
         self.generate(node, COINBASE_MATURITY)
 
-        txt_file_digest = '5bc8a9c14d1f6d89833342dcd6014bdf9ddb5f19e3741760da6d6d666971df41'
-
-        if os.name == 'nt':
-            txt_file_digest = 'dff298e77a80bb6e292526c0729d78fdef68a537c372563b5f5dbfadddabc780'
-
         self.test_dump_file('txoutset.dat', False, '7ae82c986fa5445678d2a21453bb1c86d39e47af13da137640c2b1cf8093691c')
-        self.test_dump_file('txoutset.txt', True, txt_file_digest)
+        self.test_dump_file('txoutset.txt', True, '5bc8a9c14d1f6d89833342dcd6014bdf9ddb5f19e3741760da6d6d666971df41')
 
 if __name__ == '__main__':
     DumptxoutsetTest().main()
