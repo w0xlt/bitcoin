@@ -7,6 +7,7 @@
 
 #include <core_io.h>
 #include <fs.h>
+#include <index/txospenderindex.h>
 #include <policy/rbf.h>
 #include <primitives/transaction.h>
 #include <rpc/server.h>
@@ -647,6 +648,8 @@ static RPCHelpMan gettxspendingprevout()
                 prevouts.emplace_back(txid, nOutput);
             }
 
+            bool f_txospenderindex_ready = g_txospenderindex ? g_txospenderindex->BlockUntilSyncedToCurrentChain() : false;
+
             const CTxMemPool& mempool = EnsureAnyMemPool(request.context);
             LOCK(mempool.cs);
 
@@ -660,6 +663,14 @@ static RPCHelpMan gettxspendingprevout()
                 const CTransaction* spendingTx = mempool.GetConflictTx(prevout);
                 if (spendingTx != nullptr) {
                     o.pushKV("spendingtxid", spendingTx->GetHash().ToString());
+                } else if (g_txospenderindex) {
+                    // no spending tx in mempool, query txospender index
+                    uint256 spendingtxid;
+                    if(g_txospenderindex->FindSpender(prevout, spendingtxid)) {
+                        o.pushKV("spendingtxid", spendingtxid.GetHex());
+                    } else if (!f_txospenderindex_ready) {
+                        throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "No spending tx for the provided outpoint. Transactions spenders are still in the process of being indexed ");
+                    }
                 }
 
                 result.push_back(o);
