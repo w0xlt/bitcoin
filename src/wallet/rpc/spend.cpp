@@ -489,7 +489,7 @@ static std::vector<RPCArg> FundTxDoc(bool solving_data = true)
     return args;
 }
 
-void FundTransaction(CWallet& wallet, CMutableTransaction& tx, CAmount& fee_out, int& change_position, const UniValue& options, CCoinControl& coinControl, bool override_min_fee)
+void FundTransaction(CWallet& wallet, CMutableTransaction& tx, CAmount& fee_out, int& change_position, const UniValue& options, CCoinControl& coinControl, bool override_min_fee, bool silent_payment = false)
 {
     // Make sure the results are valid at least up to the most recent block
     // the user could have gotten from another RPC command prior to now
@@ -526,6 +526,7 @@ void FundTransaction(CWallet& wallet, CMutableTransaction& tx, CAmount& fee_out,
                 {"fee_rate", UniValueType()}, // will be checked by AmountFromValue() in SetFeeEstimateMode()
                 {"feeRate", UniValueType()}, // will be checked by AmountFromValue() below
                 {"psbt", UniValueType(UniValue::VBOOL)},
+                {"silent_payment", UniValueType(UniValue::VBOOL)},
                 {"solving_data", UniValueType(UniValue::VOBJ)},
                 {"subtractFeeFromOutputs", UniValueType(UniValue::VARR)},
                 {"subtract_fee_from_outputs", UniValueType(UniValue::VARR)},
@@ -715,7 +716,7 @@ void FundTransaction(CWallet& wallet, CMutableTransaction& tx, CAmount& fee_out,
 
     bilingual_str error;
 
-    if (!FundTransaction(wallet, tx, fee_out, change_position, error, lockUnspents, setSubtractFeeFromOutputs, coinControl)) {
+    if (!FundTransaction(wallet, tx, fee_out, change_position, error, lockUnspents, setSubtractFeeFromOutputs, coinControl, silent_payment)) {
         throw JSONRPCError(RPC_WALLET_ERROR, error.original);
     }
 }
@@ -1188,6 +1189,7 @@ RPCHelpMan send()
                             {"vout_index", RPCArg::Type::NUM, RPCArg::Optional::OMITTED, "The zero-based output index, before a change output is added."},
                         },
                     },
+                    {"silent_payment", RPCArg::Type::BOOL, RPCArg::Default{false}, "Use the silent payment protocol to tweak the recipient addresses. All recipients must use Taproot addresses."},
                 },
                 FundTxDoc()),
                 "options"},
@@ -1231,6 +1233,7 @@ RPCHelpMan send()
             InterpretFeeEstimationInstructions(/*conf_target=*/request.params[1], /*estimate_mode=*/request.params[2], /*fee_rate=*/request.params[3], options);
             PreventOutdatedOptions(options);
 
+            bool silent_payment{options.exists("silent_payment") ? options["silent_payment"].get_bool() : false};
 
             CAmount fee;
             int change_position;
@@ -1241,7 +1244,7 @@ RPCHelpMan send()
             // be overridden by options.add_inputs.
             coin_control.m_add_inputs = rawTx.vin.size() == 0;
             SetOptionsInputWeights(options["inputs"], options);
-            FundTransaction(*pwallet, rawTx, fee, change_position, options, coin_control, /* override_min_fee */ false);
+            FundTransaction(*pwallet, rawTx, fee, change_position, options, coin_control, /* override_min_fee */ false, silent_payment);
 
             return FinishTransaction(pwallet, options, rawTx);
         }

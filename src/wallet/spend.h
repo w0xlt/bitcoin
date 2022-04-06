@@ -87,13 +87,16 @@ std::optional<SelectionResult> SelectCoins(const CWallet& wallet, const std::vec
  * selected by SelectCoins(); Also create the change output, when needed
  * @note passing nChangePosInOut as -1 will result in setting a random position
  */
-bool CreateTransaction(CWallet& wallet, const std::vector<CRecipient>& vecSend, CTransactionRef& tx, CAmount& nFeeRet, int& nChangePosInOut, bilingual_str& error, const CCoinControl& coin_control, FeeCalculation& fee_calc_out, bool sign = true);
+bool CreateTransaction(CWallet& wallet, const std::vector<CRecipient>& vecSend, CTransactionRef& tx, CAmount& nFeeRet, int& nChangePosInOut, bilingual_str& error, const CCoinControl& coin_control, FeeCalculation& fee_calc_out, bool sign = true, bool silent_payment = false);
 
 /**
  * Insert additional inputs into the transaction by
  * calling CreateTransaction();
  */
-bool FundTransaction(CWallet& wallet, CMutableTransaction& tx, CAmount& nFeeRet, int& nChangePosInOut, bilingual_str& error, bool lockUnspents, const std::set<int>& setSubtractFeeFromOutputs, CCoinControl);
+bool FundTransaction(CWallet& wallet, CMutableTransaction& tx, CAmount& nFeeRet, int& nChangePosInOut, bilingual_str& error, bool lockUnspents, const std::set<int>& setSubtractFeeFromOutputs, CCoinControl, bool silent_payment = false);
+
+
+bool CreateSilentTransaction( const CWallet& wallet, const std::vector<COutput>& selected_coins, CMutableTransaction& txNew, bilingual_str& error);
 } // namespace wallet
 
 #endif // BITCOIN_WALLET_SPEND_H

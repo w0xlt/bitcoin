@@ -19,6 +19,9 @@
 #include <wallet/transaction.h>
 #include <wallet/wallet.h>
 
+// It can be removed later
+#include <key_io.h>
+
 #include <cmath>
 
 using interfaces::FoundBlock;
@@ -660,7 +663,8 @@ static bool CreateTransactionInternal(
         bilingual_str& error,
         const CCoinControl& coin_control,
         FeeCalculation& fee_calc_out,
-        bool sign) EXCLUSIVE_LOCKS_REQUIRED(wallet.cs_wallet)
+        bool sign,
+        bool silent_payment=false) EXCLUSIVE_LOCKS_REQUIRED(wallet.cs_wallet)
 {
     AssertLockHeld(wallet.cs_wallet);
 
@@ -805,11 +809,18 @@ static bool CreateTransactionInternal(
         return false;
     }
 
-    assert(nChangePosInOut != -1);
-    auto change_position = txNew.vout.insert(txNew.vout.begin() + nChangePosInOut, newTxOut);
-
     // Shuffle selected coins and fill in final vin
     std::vector<COutput> selected_coins = result->GetShuffledInputVector();
+
+    if (silent_payment) {
+        if (!CreateSilentTransaction(wallet, selected_coins, txNew, error)) {
+            return false;
+        }
+    }
+
+    // the vout related to the change is inserted after the silent transcation is created
+    assert(nChangePosInOut != -1);
+    auto change_position = txNew.vout.insert(txNew.vout.begin() + nChangePosInOut, newTxOut);
 
     // The sequence number is set to non-maxint so that DiscourageFeeSniping
     // works.
@@ -961,7 +972,8 @@ bool CreateTransaction(
         bilingual_str& error,
         const CCoinControl& coin_control,
         FeeCalculation& fee_calc_out,
-        bool sign)
+        bool sign,
+        bool silent_payment)
 {
     if (vecSend.empty()) {
         error = _("Transaction must have at least one recipient");
@@ -977,7 +989,7 @@ bool CreateTransaction(
 
     int nChangePosIn = nChangePosInOut;
     Assert(!tx); // tx is an out-param. TODO change the return type from bool to tx (or nullptr)
-    bool res = CreateTransactionInternal(wallet, vecSend, tx, nFeeRet, nChangePosInOut, error, coin_control, fee_calc_out, sign);
+    bool res = CreateTransactionInternal(wallet, vecSend, tx, nFeeRet, nChangePosInOut, error, coin_control, fee_calc_out, sign, silent_payment);
     // try with avoidpartialspends unless it's enabled already
     if (res && nFeeRet > 0 /* 0 means non-functional fee rate estimation */ && wallet.m_max_aps_fee > -1 && !coin_control.m_avoid_partial_spends) {
         CCoinControl tmp_cc = coin_control;
@@ -986,7 +998,7 @@ bool CreateTransaction(
         CTransactionRef tx2;
         int nChangePosInOut2 = nChangePosIn;
         bilingual_str error2; // fired and forgotten; if an error occurs, we discard the results
-        if (CreateTransactionInternal(wallet, vecSend, tx2, nFeeRet2, nChangePosInOut2, error2, tmp_cc, fee_calc_out, sign)) {
+        if (CreateTransactionInternal(wallet, vecSend, tx2, nFeeRet2, nChangePosInOut2, error2, tmp_cc, fee_calc_out, sign, silent_payment)) {
             // if fee of this alternative one is within the range of the max fee, we use this one
             const bool use_aps = nFeeRet2 <= nFeeRet + wallet.m_max_aps_fee;
             wallet.WalletLogPrintf("Fee non-grouped = %lld, grouped = %lld, using %s\n", nFeeRet, nFeeRet2, use_aps ? "grouped" : "non-grouped");
@@ -1000,7 +1012,7 @@ bool CreateTransaction(
     return res;
 }
 
-bool FundTransaction(CWallet& wallet, CMutableTransaction& tx, CAmount& nFeeRet, int& nChangePosInOut, bilingual_str& error, bool lockUnspents, const std::set<int>& setSubtractFeeFromOutputs, CCoinControl coinControl)
+bool FundTransaction(CWallet& wallet, CMutableTransaction& tx, CAmount& nFeeRet, int& nChangePosInOut, bilingual_str& error, bool lockUnspents, const std::set<int>& setSubtractFeeFromOutputs, CCoinControl coinControl, bool silent_payment)
 {
     std::vector<CRecipient> vecSend;
 
@@ -1023,7 +1035,7 @@ bool FundTransaction(CWallet& wallet, CMutableTransaction& tx, CAmount& nFeeRet,
 
     CTransactionRef tx_new;
     FeeCalculation fee_calc_out;
-    if (!CreateTransaction(wallet, vecSend, tx_new, nFeeRet, nChangePosInOut, error, coinControl, fee_calc_out, false)) {
+    if (!CreateTransaction(wallet, vecSend, tx_new, nFeeRet, nChangePosInOut, error, coinControl, fee_calc_out, false, silent_payment)) {
         return false;
     }
 
@@ -1033,8 +1045,11 @@ bool FundTransaction(CWallet& wallet, CMutableTransaction& tx, CAmount& nFeeRet,
 
     // Copy output sizes from new transaction; they may have had the fee
     // subtracted from them.
+    // Also copy the scriptPubKeys as they may have been tweaked if silent payment
+    // is enabled
     for (unsigned int idx = 0; idx < tx.vout.size(); idx++) {
         tx.vout[idx].nValue = tx_new->vout[idx].nValue;
+        tx.vout[idx].scriptPubKey = tx_new->vout[idx].scriptPubKey;
     }
 
     // Add new txins while keeping original txin scriptSig/order.
@@ -1051,4 +1066,53 @@ bool FundTransaction(CWallet& wallet, CMutableTransaction& tx, CAmount& nFeeRet,
 
     return true;
 }
+
+bool CreateSilentTransaction(
+    const CWallet& wallet,
+    const std::vector<COutput>& selected_coins,
+    CMutableTransaction& txNew,
+    bilingual_str& error)
+{
+    auto firstCoin = selected_coins.at(0);
+
+    const auto& spk_managers = wallet.GetScriptPubKeyMans(firstCoin.txout.scriptPubKey);
+
+    if (spk_managers.size() != 1) {
+        error = _("Only one ScriptPubKeyManager was expected for the input.");
+        return false;
+    }
+
+    DescriptorScriptPubKeyMan* spk_manager = dynamic_cast<DescriptorScriptPubKeyMan*>(*spk_managers.begin());
+
+    for (auto& vout : txNew.vout) {
+
+        std::vector<std::vector<unsigned char>> solutions;
+        TxoutType whichType = Solver(vout.scriptPubKey, solutions);
+
+        if (whichType != TxoutType::WITNESS_V1_TAPROOT) {
+            error = _("Silent Payments require that the recipients use Taproot address.");
+            return false;
+        }
+
+        auto recipientPubKey = XOnlyPubKey(solutions[0]);
+
+        assert(recipientPubKey.IsFullyValid());
+
+        XOnlyPubKey tweakedKey;
+
+        if (!spk_manager->SilentPaymentAddress(firstCoin.txout.scriptPubKey, recipientPubKey, tweakedKey)) {
+            error = _("Unexpected error when tweaking address.");
+            return false;
+        }
+
+        auto tap = WitnessV1Taproot(tweakedKey);
+
+        CScript tweakedScriptPubKey =  GetScriptForDestination(tap);
+
+        vout = CTxOut(vout.nValue, tweakedScriptPubKey);
+    }
+
+    return true;
+}
+
 } // namespace wallet

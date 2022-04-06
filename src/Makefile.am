@@ -299,6 +299,7 @@ BITCOIN_CORE_H = \
   wallet/rpc/wallet.h \
   wallet/salvage.h \
   wallet/scriptpubkeyman.h \
+  wallet/silentpayment.h \
   wallet/spend.h \
   wallet/sqlite.h \
   wallet/transaction.h \

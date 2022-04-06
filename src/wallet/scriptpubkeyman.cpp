@@ -14,6 +14,10 @@
 #include <util/time.h>
 #include <util/translation.h>
 #include <wallet/scriptpubkeyman.h>
+#include <wallet/silentpayment.h>
+
+// should be removed. Used only for de
+#include <base58.h>
 
 #include <optional>
 
@@ -2112,6 +2116,24 @@ bool DescriptorScriptPubKeyMan::SignTransaction(CMutableTransaction& tx, const s
     }
 
     return ::SignTransaction(tx, keys.get(), coins, sighash, input_errors);
+}
+
+bool DescriptorScriptPubKeyMan::SilentPaymentAddress(const CScript scriptPubKey, const XOnlyPubKey recipientPubKey, XOnlyPubKey& tweakedKey) {
+
+    std::unique_ptr<FlatSigningProvider> coin_keys = GetSigningProvider(scriptPubKey, true);
+    if (!coin_keys) {
+        return false;
+    }
+
+    if (coin_keys->keys.size() != 1) {
+        return false;
+    }
+
+    auto& key = *coin_keys->keys.begin();
+
+    tweakedKey = silentpaymet::GenerateSilentAddress(key.second, recipientPubKey);
+
+    return true;
 }
 
 SigningResult DescriptorScriptPubKeyMan::SignMessage(const std::string& message, const PKHash& pkhash, std::string& str_sig) const
