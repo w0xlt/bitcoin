@@ -59,6 +59,7 @@ static RPCHelpMan getwalletinfo()
                         }, /*skip_type_check=*/true},
                         {RPCResult::Type::BOOL, "descriptors", "whether this wallet uses descriptors for scriptPubKey management"},
                         {RPCResult::Type::BOOL, "external_signer", "whether this wallet is configured to use an external signer such as a hardware wallet"},
+                        {RPCResult::Type::BOOL, "silent_payment", "whether this supports silent payments"},
                     }},
                 },
                 RPCExamples{
@@ -120,6 +121,7 @@ static RPCHelpMan getwalletinfo()
     }
     obj.pushKV("descriptors", pwallet->IsWalletFlagSet(WALLET_FLAG_DESCRIPTORS));
     obj.pushKV("external_signer", pwallet->IsWalletFlagSet(WALLET_FLAG_EXTERNAL_SIGNER));
+    obj.pushKV("silent_payment", pwallet->IsWalletFlagSet(WALLET_FLAG_SILENT_PAYMENT));
     return obj;
 },
     };
@@ -322,6 +324,7 @@ static RPCHelpMan createwallet()
                                                                        " support for creating and opening legacy wallets will be removed in the future."},
             {"load_on_startup", RPCArg::Type::BOOL, RPCArg::Optional::OMITTED_NAMED_ARG, "Save wallet name to persistent settings and load on startup. True to add wallet to startup list, false to remove, null to leave unchanged."},
             {"external_signer", RPCArg::Type::BOOL, RPCArg::Default{false}, "Use an external signer such as a hardware wallet. Requires -signer to be configured. Wallet creation will fail if keys cannot be fetched. Requires disable_private_keys and descriptors set to true."},
+            {"silent_payment", RPCArg::Type::BOOL, RPCArg::Default{false}, "Experimental. Indicates that the wallet supports Silent Payments. This means a more complex scanning logic"},
         },
         RPCResult{
             RPCResult::Type::OBJ, "", "",
@@ -380,6 +383,10 @@ static RPCHelpMan createwallet()
         throw JSONRPCError(RPC_WALLET_ERROR, "Compiled without bdb support (required for legacy wallets)");
     }
 #endif
+
+    if (!request.params[8].isNull() && request.params[8].get_bool()) {
+        flags |= WALLET_FLAG_SILENT_PAYMENT;
+    }
 
     DatabaseOptions options;
     DatabaseStatus status;
