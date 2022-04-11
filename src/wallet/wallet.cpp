@@ -46,6 +46,9 @@
 
 #include <boost/algorithm/string/replace.hpp>
 
+// should be removed. Used only for de
+#include <base58.h>
+
 using interfaces::FoundBlock;
 
 namespace wallet {
@@ -1137,9 +1140,152 @@ bool CWallet::AddToWalletIfInvolvingMe(const CTransactionRef& ptx, const SyncTxS
             // which means user may have to call abandontransaction again
             TxState tx_state = std::visit([](auto&& s) -> TxState { return s; }, state);
             return AddToWallet(MakeTransactionRef(tx), tx_state, /*update_wtx=*/nullptr, /*fFlushOnClose=*/false, rescanning_old_block);
+
+        } else if (IsWalletFlagSet(WALLET_FLAG_SILENT_PAYMENT)) {
+            bool result = VerifySilentPayment(tx);
         }
     }
     return false;
+}
+
+bool CWallet::ExtractPubkeyFromInput(const CTxIn& txin, XOnlyPubKey& senderPubKey)
+{
+    // Find the UTXO being spent in UTXO Set to learn the transaction type
+    std::map<COutPoint, Coin> coins;
+    coins[txin.prevout];
+    chain().findCoins(coins);
+
+    auto pos = coins.find(txin.prevout);
+
+    if (pos == coins.end()) return false;
+
+    Coin coin = pos->second;
+
+    assert( ++pos == coins.end() );
+
+    // scriptPubKey being spent by this input
+    CScript scriptPubKey = coin.out.scriptPubKey;
+
+    // Vector of parsed pubkeys and hashes
+    std::vector<std::vector<unsigned char>> solutions;
+
+    TxoutType whichType = Solver(scriptPubKey, solutions);
+
+    if (whichType == TxoutType::NONSTANDARD ||
+    whichType == TxoutType::MULTISIG ||
+    whichType == TxoutType::WITNESS_UNKNOWN ) {
+        return false;
+    }
+
+    const CScript scriptSig = txin.scriptSig;
+    const CScriptWitness scriptWitness = txin.scriptWitness;
+
+    assert(senderPubKey.IsNull());
+
+    // TODO: Condition not tested
+    if (whichType == TxoutType::PUBKEY) {
+
+        CPubKey pubkey = CPubKey(solutions[0]);
+        assert(pubkey.IsFullyValid());
+        senderPubKey = XOnlyPubKey(pubkey);
+
+    }
+
+    else if (whichType == TxoutType::PUBKEYHASH) {
+
+        int sigSize = static_cast<int>(scriptSig[0]);
+        int pubKeySize = static_cast<int>(scriptSig[sigSize + 1]);
+        auto serializedPubKey = std::vector<unsigned char>(scriptSig.begin() + sigSize + 2, scriptSig.end());
+        assert(serializedPubKey.size() == pubKeySize);
+
+        CPubKey pubkey = CPubKey(serializedPubKey);
+        assert(pubkey.IsFullyValid());
+
+        senderPubKey = XOnlyPubKey(pubkey);
+
+    }
+
+    else if (whichType == TxoutType::WITNESS_V0_KEYHASH || scriptPubKey.IsPayToScriptHash()) {
+        if (scriptWitness.stack.size() != 2) return false;
+        assert(scriptWitness.stack.at(1).size() == 33);
+
+        CPubKey pubkey = CPubKey(scriptWitness.stack.at(1));
+        assert(pubkey.IsFullyValid());
+
+        senderPubKey = XOnlyPubKey(pubkey);
+    }
+
+    else if (whichType == TxoutType::WITNESS_V1_TAPROOT) {
+
+        senderPubKey = XOnlyPubKey(solutions[0]);
+        assert(senderPubKey.IsFullyValid());
+    }
+
+    CTxDestination address;
+    ExtractDestination(scriptPubKey, address);
+
+    return true;
+}
+
+bool CWallet::VerifySilentPayment(const CTransaction& tx)
+{
+    AssertLockHeld(cs_wallet);
+
+    if (tx.IsCoinBase() || tx.vin.empty()) return false;
+
+    if (!IsWalletFlagSet(WALLET_FLAG_DESCRIPTORS)) return false;
+
+    std::vector<XOnlyPubKey> outputPubKeys;
+
+    for (auto& vout : tx.vout) {
+
+        std::vector<std::vector<unsigned char>> solutions;
+        TxoutType whichType = Solver(vout.scriptPubKey, solutions);
+
+        // Silent Payments require that the recipients use Taproot address
+        if (whichType != TxoutType::WITNESS_V1_TAPROOT) {
+            return false;
+        }
+
+        auto xOnlyPubKey = XOnlyPubKey(solutions[0]);
+
+        assert(xOnlyPubKey.IsFullyValid());
+
+        outputPubKeys.push_back(xOnlyPubKey);
+    }
+
+    const CTxIn& txin = tx.vin.at(0);
+
+    auto senderPubKey = XOnlyPubKey();
+
+    if (!ExtractPubkeyFromInput(txin, senderPubKey)) {
+        return false;
+    }
+
+
+
+
+    assert(senderPubKey.IsFullyValid());
+
+    for (ScriptPubKeyMan* spkm : GetAllScriptPubKeyMans()) {
+        DescriptorScriptPubKeyMan* desc_spkm = dynamic_cast<DescriptorScriptPubKeyMan*>(spkm);
+
+        std::string desc_str;
+        bool res_get_desc = desc_spkm->GetDescriptorString(desc_str, false);
+
+        // Since silent payments only work with P2TR, we skip non-Taproot descriptors
+        if (res_get_desc && desc_str.rfind("tr(", 0) != 0) {
+            continue;
+        }
+
+        desc_spkm->VerifySilentPaymentAddress(outputPubKeys, senderPubKey);
+    }
+
+
+    // TODO
+
+    return false;
+
 }
 
 bool CWallet::TransactionCanBeAbandoned(const uint256& hashTx) const

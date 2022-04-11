@@ -1096,11 +1096,15 @@ bool CreateSilentTransaction(
 
         auto recipientPubKey = XOnlyPubKey(solutions[0]);
 
+        auto destScriptPubKey = GetScriptForDestination(WitnessV1Taproot(recipientPubKey));
+        CTxDestination address2;
+        ExtractDestination(destScriptPubKey, address2);
+
         assert(recipientPubKey.IsFullyValid());
 
         XOnlyPubKey tweakedKey;
 
-        if (!spk_manager->SilentPaymentAddress(firstCoin.txout.scriptPubKey, recipientPubKey, tweakedKey)) {
+        if (!spk_manager->CreateSilentPaymentAddress(firstCoin.txout.scriptPubKey, recipientPubKey, tweakedKey)) {
             error = _("Unexpected error when tweaking address.");
             return false;
         }

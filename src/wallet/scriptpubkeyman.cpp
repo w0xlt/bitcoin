@@ -2118,9 +2118,13 @@ bool DescriptorScriptPubKeyMan::SignTransaction(CMutableTransaction& tx, const s
     return ::SignTransaction(tx, keys.get(), coins, sighash, input_errors);
 }
 
-bool DescriptorScriptPubKeyMan::SilentPaymentAddress(const CScript scriptPubKey, const XOnlyPubKey recipientPubKey, XOnlyPubKey& tweakedKey) {
+bool DescriptorScriptPubKeyMan::CreateSilentPaymentAddress(const CScript inputScriptPubKey, const XOnlyPubKey recipientPubKey, XOnlyPubKey& tweakedKey)
+{
+    std::vector<std::vector<unsigned char>> solutions;
+    TxoutType whichType = Solver(inputScriptPubKey, solutions);
 
-    std::unique_ptr<FlatSigningProvider> coin_keys = GetSigningProvider(scriptPubKey, true);
+    // Change it to a method to get private key. Code duplicated in VerifySilentPaymentAddress()
+    std::unique_ptr<FlatSigningProvider> coin_keys = GetSigningProvider(inputScriptPubKey, true);
     if (!coin_keys) {
         return false;
     }
@@ -2131,9 +2135,73 @@ bool DescriptorScriptPubKeyMan::SilentPaymentAddress(const CScript scriptPubKey,
 
     auto& key = *coin_keys->keys.begin();
 
-    tweakedKey = silentpaymet::GenerateSilentAddress(key.second, recipientPubKey);
+    CKey sender_secret_key;
+
+    // Tweak the input private key as GetSigningProvider returns
+    // the original key
+    if (whichType == TxoutType::WITNESS_V1_TAPROOT) {
+        auto pubKeyFromScriptPubKey = XOnlyPubKey(solutions[0]);
+
+        TaprootSpendData spenddata;
+        coin_keys->GetTaprootSpendData(pubKeyFromScriptPubKey, spenddata);
+
+        if(!key.second.TweakCKey(&spenddata.merkle_root, sender_secret_key)) return false;
+    } else {
+        sender_secret_key = key.second;
+    }
+
+    CTxDestination address;
+    ExtractDestination(inputScriptPubKey, address);
+
+    tweakedKey = silentpaymet::Sender::CreateSilentAddress(sender_secret_key, recipientPubKey);
 
     return true;
+}
+
+bool DescriptorScriptPubKeyMan::VerifySilentPaymentAddress(std::vector<XOnlyPubKey>& txOutputPubKeys, XOnlyPubKey& senderPubKey)
+{
+    LOCK(cs_desc_man);
+
+    for (auto const& [scriptPubKey, _] : m_map_script_pub_keys)
+    {
+        std::vector<std::vector<unsigned char>> solutions;
+        TxoutType whichType = Solver(scriptPubKey, solutions);
+
+        // Confirm the scriptPubKey is WITNESS_V1_TAPROOT
+        if (whichType != TxoutType::WITNESS_V1_TAPROOT) {
+            return false;
+        }
+
+        // get the tweaked pubkey
+        auto pubKeyFromScriptPubKey = XOnlyPubKey(solutions[0]);
+
+        std::unique_ptr<FlatSigningProvider> coin_keys = GetSigningProvider(scriptPubKey, true);
+
+        if (!coin_keys || coin_keys->keys.size() != 1) {
+            return false;
+        }
+
+        TaprootSpendData spenddata;
+        coin_keys->GetTaprootSpendData(pubKeyFromScriptPubKey, spenddata);
+
+        auto& recipientPrivKey = coin_keys->keys.begin()->second;
+
+        auto tweakedPrivKey = CKey();
+
+        recipientPrivKey.TweakCKey(&spenddata.merkle_root, tweakedPrivKey);
+
+        assert(XOnlyPubKey(tweakedPrivKey.GetPubKey()) ==  pubKeyFromScriptPubKey);
+
+        for(auto& outputPubKeys : txOutputPubKeys) {
+
+            CKey silKey = silentpaymet::Recipient::CreateSilentAddress(tweakedPrivKey, senderPubKey);
+            XOnlyPubKey silPubKey = XOnlyPubKey(silKey.GetPubKey());
+            if (silPubKey == outputPubKeys) {
+                // TODO: Handle silent tx
+            }
+        }
+    }
+    return false;
 }
 
 SigningResult DescriptorScriptPubKeyMan::SignMessage(const std::string& message, const PKHash& pkhash, std::string& str_sig) const

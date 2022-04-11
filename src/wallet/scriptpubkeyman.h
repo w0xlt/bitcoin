@@ -613,7 +613,9 @@ public:
     SigningResult SignMessage(const std::string& message, const PKHash& pkhash, std::string& str_sig) const override;
     TransactionError FillPSBT(PartiallySignedTransaction& psbt, const PrecomputedTransactionData& txdata, int sighash_type = SIGHASH_DEFAULT, bool sign = true, bool bip32derivs = false, int* n_signed = nullptr, bool finalize = true) const override;
 
-    bool SilentPaymentAddress(CScript scriptPubKey, XOnlyPubKey recipientPubKey, XOnlyPubKey& tweakedKey);
+    bool CreateSilentPaymentAddress(CScript scriptPubKey, XOnlyPubKey recipientPubKey, XOnlyPubKey& tweakedKey);
+
+    bool VerifySilentPaymentAddress(std::vector<XOnlyPubKey>& txOutputPubKeys, XOnlyPubKey& senderPubKey);
 
     uint256 GetID() const override;
 
