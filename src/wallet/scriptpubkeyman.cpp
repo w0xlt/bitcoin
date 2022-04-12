@@ -14,7 +14,6 @@
 #include <util/time.h>
 #include <util/translation.h>
 #include <wallet/scriptpubkeyman.h>
-#include <wallet/silentpayment.h>
 
 // should be removed. Used only for de
 #include <base58.h>
@@ -1709,7 +1708,7 @@ bool DescriptorScriptPubKeyMan::GetNewDestination(const OutputType type, CTxDest
 isminetype DescriptorScriptPubKeyMan::IsMine(const CScript& script) const
 {
     LOCK(cs_desc_man);
-    if (m_map_script_pub_keys.count(script) > 0) {
+    if (m_map_script_pub_keys.count(script) > 0 || m_map_silent_transactions.count(script) > 0) {
         return ISMINE_SPENDABLE;
     }
     return ISMINE_NO;
@@ -2153,12 +2152,12 @@ bool DescriptorScriptPubKeyMan::CreateSilentPaymentAddress(const CScript inputSc
     CTxDestination address;
     ExtractDestination(inputScriptPubKey, address);
 
-    tweakedKey = silentpaymet::Sender::CreateSilentAddress(sender_secret_key, recipientPubKey);
+    tweakedKey = silentpayment::Sender::CreateSilentAddress(sender_secret_key, recipientPubKey);
 
     return true;
 }
 
-bool DescriptorScriptPubKeyMan::VerifySilentPaymentAddress(std::vector<XOnlyPubKey>& txOutputPubKeys, XOnlyPubKey& senderPubKey)
+bool DescriptorScriptPubKeyMan::VerifySilentPaymentAddress(std::vector<std::tuple<CScript, XOnlyPubKey>>& txOutputPubKeys, XOnlyPubKey& senderPubKey)
 {
     LOCK(cs_desc_man);
 
@@ -2192,15 +2191,29 @@ bool DescriptorScriptPubKeyMan::VerifySilentPaymentAddress(std::vector<XOnlyPubK
 
         assert(XOnlyPubKey(tweakedPrivKey.GetPubKey()) ==  pubKeyFromScriptPubKey);
 
-        for(auto& outputPubKeys : txOutputPubKeys) {
+        for(auto& pubKeyItems : txOutputPubKeys) {
 
-            CKey silKey = silentpaymet::Recipient::CreateSilentAddress(tweakedPrivKey, senderPubKey);
+            CScript& tweakedScriptPubKey = std::get<0>(pubKeyItems);
+            XOnlyPubKey& outputPubKey = std::get<1>(pubKeyItems);
+
+            CKey silKey = silentpayment::Recipient::CreateSilentAddress(tweakedPrivKey, senderPubKey);
             XOnlyPubKey silPubKey = XOnlyPubKey(silKey.GetPubKey());
-            if (silPubKey == outputPubKeys) {
+            if (silPubKey == outputPubKey) {
                 // TODO: Handle silent tx
+                auto silTxData = silentpayment::SilentTransactionData(
+                    scriptPubKey,
+                    recipientPrivKey,
+                    tweakedScriptPubKey,
+                    tweakedPrivKey);
+
+                m_map_silent_transactions.insert(
+                    std::pair<CScript, silentpayment::SilentTransactionData>(scriptPubKey, silTxData)
+                );
+                continue;
             }
         }
     }
+
     return false;
 }
 

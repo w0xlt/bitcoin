@@ -1141,8 +1141,9 @@ bool CWallet::AddToWalletIfInvolvingMe(const CTransactionRef& ptx, const SyncTxS
             TxState tx_state = std::visit([](auto&& s) -> TxState { return s; }, state);
             return AddToWallet(MakeTransactionRef(tx), tx_state, /*update_wtx=*/nullptr, /*fFlushOnClose=*/false, rescanning_old_block);
 
-        } else if (IsWalletFlagSet(WALLET_FLAG_SILENT_PAYMENT)) {
-            bool result = VerifySilentPayment(tx);
+        } else if (IsWalletFlagSet(WALLET_FLAG_SILENT_PAYMENT) && VerifySilentPayment(tx)) {
+            TxState tx_state = std::visit([](auto&& s) -> TxState { return s; }, state);
+            return AddToWallet(MakeTransactionRef(tx), tx_state, /*update_wtx=*/nullptr, /*fFlushOnClose=*/false, rescanning_old_block);
         }
     }
     return false;
@@ -1235,7 +1236,9 @@ bool CWallet::VerifySilentPayment(const CTransaction& tx)
 
     if (!IsWalletFlagSet(WALLET_FLAG_DESCRIPTORS)) return false;
 
-    std::vector<XOnlyPubKey> outputPubKeys;
+    //std::vector<XOnlyPubKey> outputPubKeys;
+
+    std::vector<std::tuple<CScript, XOnlyPubKey>> outputPubKeys;
 
     for (auto& vout : tx.vout) {
 
@@ -1251,7 +1254,7 @@ bool CWallet::VerifySilentPayment(const CTransaction& tx)
 
         assert(xOnlyPubKey.IsFullyValid());
 
-        outputPubKeys.push_back(xOnlyPubKey);
+        outputPubKeys.emplace_back(vout.scriptPubKey, xOnlyPubKey);
     }
 
     const CTxIn& txin = tx.vin.at(0);
@@ -1278,11 +1281,10 @@ bool CWallet::VerifySilentPayment(const CTransaction& tx)
             continue;
         }
 
-        desc_spkm->VerifySilentPaymentAddress(outputPubKeys, senderPubKey);
+        if (desc_spkm->VerifySilentPaymentAddress(outputPubKeys, senderPubKey)) {
+            return true;
+        }
     }
-
-
-    // TODO
 
     return false;
 

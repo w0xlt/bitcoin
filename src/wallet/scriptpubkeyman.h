@@ -14,6 +14,7 @@
 #include <util/time.h>
 #include <wallet/crypter.h>
 #include <wallet/ismine.h>
+#include <wallet/silentpayment.h>
 #include <wallet/walletdb.h>
 #include <wallet/walletutil.h>
 
@@ -532,12 +533,17 @@ private:
     using CryptedKeyMap = std::map<CKeyID, std::pair<CPubKey, std::vector<unsigned char>>>;
     using KeyMap = std::map<CKeyID, CKey>;
 
+    /* Map of tweaked scriptPubKey and the relevant transaction data. */
+    using SilentTransactionMap = std::map<CScript, silentpayment::SilentTransactionData>;
+
     ScriptPubKeyMap m_map_script_pub_keys GUARDED_BY(cs_desc_man);
     PubKeyMap m_map_pubkeys GUARDED_BY(cs_desc_man);
     int32_t m_max_cached_index = -1;
 
     KeyMap m_map_keys GUARDED_BY(cs_desc_man);
     CryptedKeyMap m_map_crypted_keys GUARDED_BY(cs_desc_man);
+
+    SilentTransactionMap m_map_silent_transactions GUARDED_BY(cs_desc_man);
 
     //! keeps track of whether Unlock has run a thorough check before
     bool m_decryption_thoroughly_checked = false;
@@ -615,7 +621,7 @@ public:
 
     bool CreateSilentPaymentAddress(CScript scriptPubKey, XOnlyPubKey recipientPubKey, XOnlyPubKey& tweakedKey);
 
-    bool VerifySilentPaymentAddress(std::vector<XOnlyPubKey>& txOutputPubKeys, XOnlyPubKey& senderPubKey);
+    bool VerifySilentPaymentAddress(std::vector<std::tuple<CScript, XOnlyPubKey>>& txOutputPubKeys, XOnlyPubKey& senderPubKey);
 
     uint256 GetID() const override;
 

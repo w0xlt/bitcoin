@@ -398,6 +398,8 @@ public:
      * interested in, including received and sent transactions. */
     std::map<uint256, CWalletTx> mapWallet GUARDED_BY(cs_wallet);
 
+    std::set<CScript> silent_outputs;
+
     typedef std::multimap<int64_t, CWalletTx*> TxItems;
     TxItems wtxOrdered;
 

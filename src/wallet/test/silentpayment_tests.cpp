@@ -20,9 +20,9 @@ BOOST_AUTO_TEST_CASE(silent_addresses)
     XOnlyPubKey recipientPubkey = XOnlyPubKey(recipientkey.GetPubKey());
     BOOST_CHECK(recipientPubkey.IsFullyValid());
 
-    XOnlyPubKey senderTweakedPubKey = silentpaymet::Sender::CreateSilentAddress(senderkey,recipientPubkey);
+    XOnlyPubKey senderTweakedPubKey = silentpayment::Sender::CreateSilentAddress(senderkey,recipientPubkey);
 
-    CKey ckey = silentpaymet::Recipient::CreateSilentAddress(recipientkey, senderPubkey);
+    CKey ckey = silentpayment::Recipient::CreateSilentAddress(recipientkey, senderPubkey);
 
     BOOST_CHECK(senderTweakedPubKey == XOnlyPubKey(ckey.GetPubKey()));
 

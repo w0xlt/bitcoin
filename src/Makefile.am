@@ -445,6 +445,7 @@ libbitcoin_wallet_a_SOURCES = \
   wallet/walletdb.cpp \
   wallet/walletutil.cpp \
   wallet/coinselection.cpp \
+  wallet/silentpayment.cpp \
   $(BITCOIN_CORE_H)
 
 if USE_SQLITE
