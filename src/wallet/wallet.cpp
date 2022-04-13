@@ -53,6 +53,11 @@ const std::map<uint64_t,std::string> WALLET_FLAG_CAVEATS{
         "destinations in the past. Until this is done, some destinations may "
         "be considered unused, even if the opposite is the case."
     },
+    {WALLET_FLAG_SILENT_PAYMENT,
+        "By enabling this flag, the wallet will start to check for silent transactions. "
+        "For previous transactions, a rescan is required."
+        "This flag significantly increases scan and verification time."
+    }
 };
 
 bool AddWalletSetting(interfaces::Chain& chain, const std::string& wallet_name)
@@ -303,6 +308,32 @@ std::shared_ptr<CWallet> CreateWallet(WalletContext& context, const std::string&
         status = DatabaseStatus::FAILED_CREATE;
         return nullptr;
     }
+
+    // silent payment validations
+    if ((wallet_creation_flags & WALLET_FLAG_DISABLE_PRIVATE_KEYS) && (wallet_creation_flags & WALLET_FLAG_SILENT_PAYMENT)) {
+        error = Untranslated("Silent payments require the ability to store private keys.") + error;
+        status = DatabaseStatus::FAILED_VERIFY;
+        return nullptr;
+    }
+
+    if ((wallet_creation_flags & WALLET_FLAG_SILENT_PAYMENT) && !(wallet_creation_flags & WALLET_FLAG_DESCRIPTORS)) {
+        error = Untranslated("Only descriptor wallets support silent payments.") + error;
+        status = DatabaseStatus::FAILED_VERIFY;
+        return nullptr;
+    }
+
+    if (!passphrase.empty() && (wallet_creation_flags & WALLET_FLAG_SILENT_PAYMENT)) {
+        error = Untranslated("Silent payment verification requires access to private keys. Cannot be used with encrypted wallets.")  + error;
+        status = DatabaseStatus::FAILED_VERIFY;
+        return nullptr;
+    }
+
+    if((wallet_creation_flags & WALLET_FLAG_SILENT_PAYMENT) && !context.chain->isSilentPaymentIndexActivatedAndSynced()) {
+        error = Untranslated("Silent payment index is required to verify silent transactions. It must be activated and synced before creating a wallet with this option.") + error;
+        status = DatabaseStatus::FAILED_VERIFY;
+        return nullptr;
+    }
+    // end - silent payment validations
 
     // Wallet::Verify will check if we're trying to create a wallet with a duplicate name.
     std::unique_ptr<WalletDatabase> database = MakeWalletDatabase(name, options, status, error);
