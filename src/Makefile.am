@@ -318,6 +318,7 @@ BITCOIN_CORE_H = \
   wallet/rpc/wallet.h \
   wallet/salvage.h \
   wallet/scriptpubkeyman.h \
+  wallet/silentpayment.h \
   wallet/spend.h \
   wallet/sqlite.h \
   wallet/transaction.h \
@@ -476,6 +477,7 @@ libbitcoin_wallet_a_SOURCES = \
   wallet/walletdb.cpp \
   wallet/walletutil.cpp \
   wallet/coinselection.cpp \
+  wallet/silentpayment.cpp \
   $(BITCOIN_CORE_H)
 
 if USE_SQLITE
