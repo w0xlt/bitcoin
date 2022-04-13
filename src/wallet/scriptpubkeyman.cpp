@@ -2187,6 +2187,43 @@ bool DescriptorScriptPubKeyMan::CreateSilentPaymentAddress(const CScript inputSc
     return true;
 }
 
+void DescriptorScriptPubKeyMan::VerifySilentPaymentAddress(
+    std::vector<std::tuple<CScript, XOnlyPubKey>>& txOutputPubKeys,
+    XOnlyPubKey& senderPubKey,
+    std::vector<CKey>& rawTrKeys)
+{
+    LOCK(cs_desc_man);
+
+    std::vector<CKey> silentOutputCKeys;
+
+    for (auto const& [scriptPubKey, _] : m_map_script_pub_keys)
+    {
+        CKey tweakedPrivKey;
+        GetPrivKeyForSilentPayment(scriptPubKey, /*privKey=*/tweakedPrivKey,  /*onlyTaproot=*/true);
+
+        for(auto& pubKeyItems : txOutputPubKeys) {
+
+            CScript& outputScriptPubKey = std::get<0>(pubKeyItems);
+            XOnlyPubKey& outputPubKey = std::get<1>(pubKeyItems);
+
+            CKey silKey = silentpayment::Recipient::CreateSilentPaymentAddress(tweakedPrivKey, senderPubKey);
+            XOnlyPubKey silPubKey = XOnlyPubKey(silKey.GetPubKey());
+
+            if (silPubKey == outputPubKey) {
+                silentOutputCKeys.push_back(silKey);
+
+                WalletLogPrintf("Silent scriptPubKey identified: %s\n", HexStr(outputScriptPubKey));
+            }
+        }
+
+        if (silentOutputCKeys.size() == txOutputPubKeys.size()) {
+            break;
+        }
+    }
+
+    rawTrKeys.insert(rawTrKeys.end(), silentOutputCKeys.begin(), silentOutputCKeys.end());
+}
+
 TransactionError DescriptorScriptPubKeyMan::FillPSBT(PartiallySignedTransaction& psbtx, const PrecomputedTransactionData& txdata, int sighash_type, bool sign, bool bip32derivs, int* n_signed, bool finalize) const
 {
     if (n_signed) {
