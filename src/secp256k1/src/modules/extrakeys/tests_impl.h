@@ -579,6 +579,65 @@ void test_keypair_add(void) {
     secp256k1_context_destroy(verify);
 }
 
+void test_xonly_ecdh(void) {
+#ifdef ENABLE_MODULE_ECDH
+    unsigned char sk1[32], sk2[32];
+    secp256k1_keypair keypair1, keypair2;
+    secp256k1_xonly_pubkey xpubkey1, xpubkey2;
+    secp256k1_pubkey pubkey1;
+    unsigned char output1[32], output2[32], output3[32];
+
+    /* Create random points */
+    secp256k1_testrand256(sk1);
+    secp256k1_testrand256(sk2);
+    CHECK(secp256k1_keypair_create(ctx, &keypair1, sk1) == 1);
+    CHECK(secp256k1_keypair_create(ctx, &keypair2, sk2) == 1);
+    CHECK(secp256k1_keypair_xonly_pub(ctx, &xpubkey1, NULL, &keypair1) == 1);
+    CHECK(secp256k1_keypair_xonly_pub(ctx, &xpubkey2, NULL, &keypair2) == 1);
+
+    /* They should get the same shared secret. */
+    CHECK(secp256k1_ecdh_xonly(ctx, output1, &xpubkey1, sk2, NULL, NULL) == 1);
+    CHECK(secp256k1_ecdh_xonly(ctx, output2, &xpubkey2, sk1, NULL, NULL) == 1);
+    CHECK(memcmp(output1, output2, sizeof(output1)) == 0);
+
+    /* We can also do ECDH via normal compressed pubkey functions, if we
+     * use the same hashfn */
+    CHECK(secp256k1_keypair_pub(ctx, &pubkey1, &keypair1) == 1);
+    CHECK(secp256k1_ecdh(ctx, output3, &pubkey1, sk2, secp256k1_ecdh_hash_function_xonly_sha256, NULL) == 1);
+    CHECK(memcmp(output1, output3, sizeof(output1)) == 0);
+#endif /* ENABLE_MODULE_ECDH */
+}
+
+void test_xonly_pubkey_to_pubkey(void) {
+    unsigned char sk1[32];
+    secp256k1_keypair keypair1;
+    secp256k1_xonly_pubkey xpubkey1;
+    secp256k1_pubkey pubkey1;
+    secp256k1_pubkey result_pubkey;
+    unsigned char compressed_pubkey1[33];
+    size_t len;
+
+    /* Create random points */
+    secp256k1_testrand256(sk1);
+    CHECK(secp256k1_keypair_create(ctx, &keypair1, sk1) == 1);
+    CHECK(secp256k1_keypair_xonly_pub(ctx, &xpubkey1, NULL, &keypair1) == 1);
+    CHECK(secp256k1_keypair_pub(ctx, &pubkey1, &keypair1) == 1);
+
+    /* If the compressed public key has the prefix 03, negate it */
+    len = sizeof(compressed_pubkey1);
+    CHECK(secp256k1_ec_pubkey_serialize(ctx, compressed_pubkey1, &len, &pubkey1, SECP256K1_EC_COMPRESSED));
+    CHECK(len == sizeof(compressed_pubkey1));
+
+    if (compressed_pubkey1[0] == 3) {
+        CHECK(secp256k1_ec_pubkey_negate(ctx, &pubkey1));
+    }
+
+    /* Convert the secp256k1_xonly_pubkey to secp256k1_pubkey and compare the result with the
+     * original public key */
+    CHECK(secp256k1_xonly_pubkey_to_pubkey(ctx, &result_pubkey, &xpubkey1));
+    CHECK(secp256k1_ec_pubkey_cmp(ctx, &pubkey1, &result_pubkey) == 0);
+}
+
 void run_extrakeys_tests(void) {
     /* xonly key test cases */
     test_xonly_pubkey();
@@ -586,6 +645,8 @@ void run_extrakeys_tests(void) {
     test_xonly_pubkey_tweak_check();
     test_xonly_pubkey_tweak_recursive();
     test_xonly_pubkey_comparison();
+    test_xonly_ecdh();
+    test_xonly_pubkey_to_pubkey();
 
     /* keypair tests */
     test_keypair();
