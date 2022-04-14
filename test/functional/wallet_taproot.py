@@ -9,6 +9,7 @@ import random
 from decimal import Decimal
 from test_framework.address import output_key_to_p2tr
 from test_framework.key import H_POINT
+from test_framework.segwit_addr import encode_segwit_address
 from test_framework.test_framework import BitcoinTestFramework
 from test_framework.util import assert_equal
 from test_framework.descriptors import descsum_create
