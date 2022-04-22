@@ -168,6 +168,9 @@ static const CRPCConvertParam vRPCConvertParams[] =
     { "estimaterawfee", 1, "threshold" },
     { "prioritisetransaction", 1, "dummy" },
     { "prioritisetransaction", 2, "fee_delta" },
+
+    { "scantxoutset", 2, "silent_payment" },
+
     { "setban", 2, "bantime" },
     { "setban", 3, "absolute" },
     { "setnetworkactive", 0, "state" },

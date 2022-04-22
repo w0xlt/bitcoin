@@ -425,6 +425,7 @@ libbitcoin_node_a_SOURCES = \
   validation.cpp \
   validationinterface.cpp \
   versionbits.cpp \
+  wallet/silentpayment.cpp \
   $(BITCOIN_CORE_H)
 
 if ENABLE_WALLET

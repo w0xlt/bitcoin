@@ -5,6 +5,7 @@
 
 #include <rpc/blockchain.h>
 
+#include <assert.h>
 #include <blockfilter.h>
 #include <chain.h>
 #include <chainparams.h>
@@ -20,11 +21,13 @@
 #include <index/blockfilterindex.h>
 #include <index/coinstatsindex.h>
 #include <kernel/coinstats.h>
+#include <index/silentpaymentindex.h>
 #include <logging/timer.h>
 #include <net.h>
 #include <net_processing.h>
 #include <node/blockstorage.h>
 #include <node/context.h>
+#include <node/transaction.h>
 #include <node/utxo_snapshot.h>
 #include <primitives/transaction.h>
 #include <rpc/server.h>
@@ -44,6 +47,7 @@
 #include <validation.h>
 #include <validationinterface.h>
 #include <versionbits.h>
+#include <wallet/silentpayment.h>
 #include <warnings.h>
 
 #include <stdint.h>
@@ -1959,9 +1963,109 @@ static RPCHelpMan getblockstats()
 }
 
 namespace {
-//! Search for a given set of pubkey scripts
-bool FindScriptPubKey(std::atomic<int>& scan_progress, const std::atomic<bool>& should_abort, int64_t& count, CCoinsViewCursor* cursor, const std::set<CScript>& needles, std::map<COutPoint, Coin>& out_results, std::function<void()>& interruption_point)
+
+bool CheckSilentPayment(
+    uint256& txhash,
+    const CScript& outScriptPubKey,
+    std::vector<std::tuple<FlatSigningProvider, CScript>>& providers,
+    NodeContext& node,
+    std::vector<uint256>& verified_txs,
+    std::vector<XOnlyPubKey>& silPubKeys,
+    std::map<CScript, std::string>& silDesc)
 {
+
+    bool f_silentpaymentindex_ready = g_silentpaymentindex ? g_silentpaymentindex->BlockUntilSyncedToCurrentChain() : false;
+    if (!f_silentpaymentindex_ready) {
+        throw JSONRPCError(RPC_VERIFY_ERROR, "The silent payment index is either disabled or not yet synced.");
+    }
+
+    std::vector<std::vector<unsigned char>> solutions;
+    TxoutType whichType = Solver(outScriptPubKey, solutions);
+
+    if (whichType != TxoutType::WITNESS_V1_TAPROOT) {
+        return false;
+    }
+
+    auto outputPubKey = XOnlyPubKey(solutions[0]);
+
+    // verify if the tx has already been checked
+    if (std::count(verified_txs.begin(), verified_txs.end(), txhash)) {
+        // verify if the silent pubkey vector contains the output
+        if (std::find(silPubKeys.begin(), silPubKeys.end(), outputPubKey) != silPubKeys.end()) {
+            return true;
+        }
+        return false;
+    }
+
+    auto firstInputPubKey = XOnlyPubKey();
+
+    if(!g_silentpaymentindex->FindSilentPayment(txhash, firstInputPubKey)) {
+        return false;
+    }
+
+    for (auto& provider : providers) {
+
+        FlatSigningProvider descProvider = std::get<0>(provider);
+        CScript descScriptPub = std::get<1>(provider);
+
+        // Should FlatSigningProvider only have a single key for silent payments?
+        for (auto& [_, descPrivKey] : descProvider.keys) {
+
+            CKey privKey;
+
+            std::vector<std::vector<unsigned char>> solutions;
+            TxoutType whichType = Solver(descScriptPub, solutions);
+
+            if (whichType != TxoutType::WITNESS_V1_TAPROOT) {
+                throw JSONRPCError(RPC_INVALID_PARAMETER, "Only taproot descriptors can be used with silent payment options.");
+            }
+
+            auto pubKeyFromScriptPubKey = XOnlyPubKey(solutions[0]);
+
+            // this means it is a "rawtr" output
+            if (XOnlyPubKey(descPrivKey.GetPubKey()) == pubKeyFromScriptPubKey) {
+                privKey = descPrivKey;
+            }
+            else {
+                TaprootSpendData spenddata;
+                descProvider.GetTaprootSpendData(pubKeyFromScriptPubKey, spenddata);
+
+                if(!descPrivKey.TweakCKey(&spenddata.merkle_root, privKey)) {
+                    throw JSONRPCError(RPC_MISC_ERROR, "Unexpected error when tweaking the key.");
+                }
+            }
+
+            CKey silKey = silentpayment::Recipient::CreateSilentPaymentAddress(privKey, firstInputPubKey);
+            XOnlyPubKey silPubKey = XOnlyPubKey(silKey.GetPubKey());
+            silPubKeys.push_back(silPubKey);
+
+            std::string inferred = InferDescriptor(outScriptPubKey, descProvider)->ToString();
+            silDesc[outScriptPubKey] = inferred;
+        }
+    }
+
+    verified_txs.push_back(txhash);
+
+    return std::find(silPubKeys.begin(), silPubKeys.end(), outputPubKey) != silPubKeys.end();
+
+}
+
+//! Search for a given set of pubkey scripts
+bool FindScriptPubKey(
+    std::atomic<int>& scan_progress,
+    const std::atomic<bool>& should_abort,
+    int64_t& count, CCoinsViewCursor* cursor,
+    const std::set<CScript>& needles,
+    std::map<COutPoint, Coin>& out_results,
+    std::function<void()>& interruption_point,
+    bool silent_payment,
+    std::vector<std::tuple<FlatSigningProvider, CScript>>& providers,
+    std::map<CScript, std::string>& silDesc,
+    NodeContext& node)
+{
+    std::vector<uint256> verified_txs;
+    std::vector<XOnlyPubKey> silPubKeys;
+
     scan_progress = 0;
     count = 0;
     while (cursor->Valid()) {
@@ -1980,7 +2084,8 @@ bool FindScriptPubKey(std::atomic<int>& scan_progress, const std::atomic<bool>& 
             uint32_t high = 0x100 * *key.hash.begin() + *(key.hash.begin() + 1);
             scan_progress = (int)(high * 100.0 / 65536.0 + 0.5);
         }
-        if (needles.count(coin.out.scriptPubKey)) {
+        if (needles.count(coin.out.scriptPubKey) ||
+            (silent_payment && CheckSilentPayment(key.hash, coin.out.scriptPubKey, providers, node, verified_txs, silPubKeys, silDesc))) {
             out_results.emplace(key, coin);
         }
         cursor->Next();
@@ -2044,15 +2149,16 @@ static RPCHelpMan scantxoutset()
                 "\"status\" for progress report (in %) of the current scan"},
             {"scanobjects", RPCArg::Type::ARR, RPCArg::Optional::OMITTED, "Array of scan objects. Required for \"start\" action\n"
                 "Every scan object is either a string descriptor or an object:",
-            {
-                {"descriptor", RPCArg::Type::STR, RPCArg::Optional::OMITTED, "An output descriptor"},
-                {"", RPCArg::Type::OBJ, RPCArg::Optional::OMITTED, "An object with output descriptor and metadata",
                 {
-                    {"desc", RPCArg::Type::STR, RPCArg::Optional::NO, "An output descriptor"},
-                    {"range", RPCArg::Type::RANGE, RPCArg::Default{1000}, "The range of HD chain indexes to explore (either end or [begin,end])"},
-                }},
-            },
-                        "[scanobjects,...]"},
+                    {"descriptor", RPCArg::Type::STR, RPCArg::Optional::OMITTED, "An output descriptor"},
+                    {"", RPCArg::Type::OBJ, RPCArg::Optional::OMITTED, "An object with output descriptor and metadata",
+                    {
+                        {"desc", RPCArg::Type::STR, RPCArg::Optional::NO, "An output descriptor"},
+                        {"range", RPCArg::Type::RANGE, RPCArg::Default{1000}, "The range of HD chain indexes to explore (either end or [begin,end])"},
+                    }},
+                },
+            "[scanobjects,...]"},
+            {"silent_payment", RPCArg::Type::BOOL, RPCArg::Default{false}, "Use the silent payment protocol to tweak the recipient addresses. All recipients must use Taproot addresses."},
         },
         {
             RPCResult{"when action=='start'; only returns after scan completes", RPCResult::Type::OBJ, "", "", {
@@ -2073,6 +2179,7 @@ static RPCHelpMan scantxoutset()
                     }},
                 }},
                 {RPCResult::Type::STR_AMOUNT, "total_amount", "The total amount of all found unspent outputs in " + CURRENCY_UNIT},
+                {RPCResult::Type::BOOL, "silent_payment", "Whether it is scanning silent payments"},
             }},
             RPCResult{"when action=='abort'", RPCResult::Type::BOOL, "success", "True if scan will be aborted (not necessarily before this RPC returns), or false if there is no scan to abort"},
             RPCResult{"when action=='status' and a scan is currently in progress", RPCResult::Type::OBJ, "", "",
@@ -2125,15 +2232,37 @@ static RPCHelpMan scantxoutset()
         std::map<CScript, std::string> descriptors;
         CAmount total_in = 0;
 
+        std::vector<std::tuple<FlatSigningProvider, CScript>> providers;
+
+        bool silent_payment{!request.params[2].isNull() && request.params[2].get_bool()};
+
+        if (silent_payment) {
+            bool f_silentpaymentindex_ready = g_silentpaymentindex ? g_silentpaymentindex->BlockUntilSyncedToCurrentChain() : false;
+            if (!f_silentpaymentindex_ready) {
+                throw JSONRPCError(RPC_VERIFY_ERROR, "The silent payment index is either disabled or not yet synced.");
+            }
+        }
+
         // loop through the scan objects
         for (const UniValue& scanobject : request.params[1].get_array().getValues()) {
             FlatSigningProvider provider;
-            auto scripts = EvalDescriptorStringOrObject(scanobject, provider);
+            FlatSigningProvider out_keys;
+
+            auto scripts = (silent_payment) ?
+                EvalDescriptorStringOrObject(scanobject, provider, &out_keys) :
+                EvalDescriptorStringOrObject(scanobject, provider);
+
             for (const auto& script : scripts) {
                 std::string inferred = InferDescriptor(script, provider)->ToString();
                 needles.emplace(script);
                 descriptors.emplace(std::move(script), std::move(inferred));
+
+                if (silent_payment) providers.push_back(std::tuple<FlatSigningProvider, CScript>(out_keys, script));
             }
+        }
+
+        if (silent_payment && !providers.size()) {
+            throw JSONRPCError(RPC_INVALID_PARAMETER, "Scanning silent payments require access to private keys. The descriptors must contain private keys.");
         }
 
         // Scan the unspent transaction output set for inputs
@@ -2153,7 +2282,12 @@ static RPCHelpMan scantxoutset()
             pcursor = CHECK_NONFATAL(active_chainstate.CoinsDB().Cursor());
             tip = CHECK_NONFATAL(active_chainstate.m_chain.Tip());
         }
-        bool res = FindScriptPubKey(g_scan_progress, g_should_abort_scan, count, pcursor.get(), needles, coins, node.rpc_interruption_point);
+
+        std::map<CScript, std::string> silDesc;
+
+
+        FlatSigningProvider provider;
+        bool res = FindScriptPubKey(g_scan_progress, g_should_abort_scan, count, pcursor.get(), needles, coins, node.rpc_interruption_point, silent_payment, providers, silDesc, node);
         result.pushKV("success", res);
         result.pushKV("txouts", count);
         result.pushKV("height", tip->nHeight);
@@ -2166,11 +2300,17 @@ static RPCHelpMan scantxoutset()
             input_txos.push_back(txo);
             total_in += txo.nValue;
 
+            std::string desc = descriptors[txo.scriptPubKey];
+
+            if (desc.empty()) {
+                desc = silDesc[txo.scriptPubKey];
+            }
+
             UniValue unspent(UniValue::VOBJ);
             unspent.pushKV("txid", outpoint.hash.GetHex());
             unspent.pushKV("vout", (int32_t)outpoint.n);
             unspent.pushKV("scriptPubKey", HexStr(txo.scriptPubKey));
-            unspent.pushKV("desc", descriptors[txo.scriptPubKey]);
+            unspent.pushKV("desc", desc);
             unspent.pushKV("amount", ValueFromAmount(txo.nValue));
             unspent.pushKV("height", (int32_t)coin.nHeight);
 
@@ -2178,6 +2318,7 @@ static RPCHelpMan scantxoutset()
         }
         result.pushKV("unspents", unspents);
         result.pushKV("total_amount", ValueFromAmount(total_in));
+        result.pushKV("silent_payment", silent_payment);
     } else {
         throw JSONRPCError(RPC_INVALID_PARAMETER, "Invalid command");
     }
