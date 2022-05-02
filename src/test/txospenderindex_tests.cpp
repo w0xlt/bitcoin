@@ -43,7 +43,7 @@ BOOST_FIXTURE_TEST_CASE(txospenderindex_initial_sync, TestChain100Setup)
     }
 
     CreateAndProcessBlock(spender, this->m_coinbase_txns[0]->vout[0].scriptPubKey);
-    uint256 txid;
+    std::pair<uint256, int> txid;
 
     // Transaction should not be found in the index before it is started.
     for (const auto& outpoint : spent) {
@@ -64,7 +64,7 @@ BOOST_FIXTURE_TEST_CASE(txospenderindex_initial_sync, TestChain100Setup)
         UninterruptibleSleep(std::chrono::milliseconds{100});
     }
     for (size_t i = 0; i < spent.size(); i++) {
-        BOOST_CHECK(txospenderindex.FindSpender(spent[i], txid) && txid == spender[i].GetHash());
+        BOOST_CHECK(txospenderindex.FindSpender(spent[i], txid) && txid.first == spender[i].GetHash());
     }
 
     // shutdown sequence (c.f. Shutdown() in init.cpp)

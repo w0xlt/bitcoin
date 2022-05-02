@@ -36,7 +36,7 @@ public:
     // Destructor is declared because this class contains a unique_ptr to an incomplete type.
     virtual ~TxoSpenderIndex() override;
 
-    bool FindSpender(const COutPoint& txo, uint256& tx_hash) const;
+    bool FindSpender(const COutPoint& txo, std::pair<uint256, int>& tx_hash) const;
 };
 
 /// The global txo spender index. May be null.

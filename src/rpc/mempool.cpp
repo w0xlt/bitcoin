@@ -611,7 +611,9 @@ static RPCHelpMan gettxspendingprevout()
                 {
                     {RPCResult::Type::STR_HEX, "txid", "the transaction id of the spent output"},
                     {RPCResult::Type::NUM, "vout", "the vout value of the spent output"},
-                    {RPCResult::Type::STR_HEX, "spendingtxid", /*optional=*/true, "the transaction id of the mempool transaction spending this output (omitted if unspent)"},
+                    {RPCResult::Type::STR_HEX, "spendingtxid", "the id of the transaction that spends the output"},
+                    {RPCResult::Type::BOOL, "in_mempool", "whether the transaction is in mempool or not"},
+                    {RPCResult::Type::NUM, "block_height", /*optional=*/true, "the block height of the transaction if it is not in mempools"},
                 }},
             }
         },
@@ -663,11 +665,14 @@ static RPCHelpMan gettxspendingprevout()
                 const CTransaction* spendingTx = mempool.GetConflictTx(prevout);
                 if (spendingTx != nullptr) {
                     o.pushKV("spendingtxid", spendingTx->GetHash().ToString());
+                    o.pushKV("in_mempool", true);
                 } else if (g_txospenderindex) {
                     // no spending tx in mempool, query txospender index
-                    uint256 spendingtxid;
+                    std::pair<uint256, int> spendingtxid;
                     if(g_txospenderindex->FindSpender(prevout, spendingtxid)) {
-                        o.pushKV("spendingtxid", spendingtxid.GetHex());
+                        o.pushKV("spendingtxid", spendingtxid.first.GetHex());
+                        o.pushKV("in_mempool", false);
+                        o.pushKV("block_height", spendingtxid.second);
                     } else if (!f_txospenderindex_ready) {
                         throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "No spending tx for the provided outpoint. Transactions spenders are still in the process of being indexed ");
                     }

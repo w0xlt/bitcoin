@@ -15,7 +15,7 @@ class TxoSpenderIndex::DB : public BaseIndex::DB
 public:
     explicit DB(size_t n_cache_size, bool f_memory = false, bool f_wipe = false);
 
-    bool WriteSpenderInfos(const std::vector<std::pair<COutPoint, uint256>>& items);
+    bool WriteSpenderInfos(const std::vector<std::pair<COutPoint, uint256>>& items, int block_height);
 };
 
 TxoSpenderIndex::DB::DB(size_t n_cache_size, bool f_memory, bool f_wipe) :
@@ -28,11 +28,12 @@ TxoSpenderIndex::TxoSpenderIndex(size_t n_cache_size, bool f_memory, bool f_wipe
 
 TxoSpenderIndex::~TxoSpenderIndex() {}
 
-bool TxoSpenderIndex::DB::WriteSpenderInfos(const std::vector<std::pair<COutPoint, uint256>>& items)
+bool TxoSpenderIndex::DB::WriteSpenderInfos(const std::vector<std::pair<COutPoint, uint256>>& items, int block_height)
 {
     CDBBatch batch(*this);
     for (const auto& tuple : items) {
-        batch.Write(std::make_pair(DB_TXOSPENDERINDEX, tuple.first), tuple.second);
+        batch.Write(std::make_pair(DB_TXOSPENDERINDEX, tuple.first),
+            std::make_pair(tuple.second, block_height));
     }
     return WriteBatch(batch);
 }
@@ -47,10 +48,10 @@ bool TxoSpenderIndex::WriteBlock(const CBlock& block, const CBlockIndex* pindex)
             items.emplace_back(input.prevout, tx->GetHash());
         }
     }
-    return m_db->WriteSpenderInfos(items);
+    return m_db->WriteSpenderInfos(items, pindex->nHeight);
 }
 
-bool TxoSpenderIndex::FindSpender(const COutPoint& txo, uint256& tx_hash) const
+bool TxoSpenderIndex::FindSpender(const COutPoint& txo, std::pair<uint256, int>& tx_hash) const
 {
     return m_db->Read(std::make_pair(DB_TXOSPENDERINDEX, txo), tx_hash);
 }
