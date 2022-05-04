@@ -27,6 +27,7 @@
 #include <index/blockfilterindex.h>
 #include <index/coinstatsindex.h>
 #include <index/txindex.h>
+#include <index/silentpaymentindex.h>
 #include <init/common.h>
 #include <interfaces/chain.h>
 #include <interfaces/init.h>
@@ -202,6 +203,9 @@ void Interrupt(NodeContext& node)
     if (g_txindex) {
         g_txindex->Interrupt();
     }
+    if (g_silentpaymentindex) {
+        g_silentpaymentindex->Interrupt();
+    }
     ForEachBlockFilterIndex([](BlockFilterIndex& index) { index.Interrupt(); });
     if (g_coin_stats_index) {
         g_coin_stats_index->Interrupt();
@@ -278,6 +282,10 @@ void Shutdown(NodeContext& node)
     if (g_txindex) {
         g_txindex->Stop();
         g_txindex.reset();
+    }
+    if (g_silentpaymentindex) {
+        g_silentpaymentindex->Stop();
+        g_silentpaymentindex.reset();
     }
     if (g_coin_stats_index) {
         g_coin_stats_index->Stop();
@@ -446,6 +454,7 @@ void SetupServerArgs(ArgsManager& argsman)
     hidden_args.emplace_back("-sysperms");
 #endif
     argsman.AddArg("-txindex", strprintf("Maintain a full transaction index, used by the getrawtransaction rpc call (default: %u)", DEFAULT_TXINDEX), ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
+    argsman.AddArg("-silentpaymentindex", strprintf("Maintain an index of the public keys of the first input of each transaction that has all outputs as Taproot. It is used to speed up the identification of silent payments on the blockchain (default: %u)", DEFAULT_SILENTPAYMENTINDEX), ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
     argsman.AddArg("-blockfilterindex=<type>",
                  strprintf("Maintain an index of compact filters by block (default: %s, values: %s).", DEFAULT_BLOCKFILTERINDEX, ListBlockFilterTypes()) +
                  " If <type> is not supplied or if <type> = 1, indexes for all known types are enabled.",
@@ -881,6 +890,8 @@ bool AppInitParameterInteraction(const ArgsManager& args, bool use_syscall_sandb
     if (args.GetIntArg("-prune", 0)) {
         if (args.GetBoolArg("-txindex", DEFAULT_TXINDEX))
             return InitError(_("Prune mode is incompatible with -txindex."));
+        if (args.GetBoolArg("-silentpaymentindex", DEFAULT_SILENTPAYMENTINDEX))
+            return InitError(_("Prune mode is incompatible with -txospenderindex."));
         if (args.GetBoolArg("-reindex-chainstate", false)) {
             return InitError(_("Prune mode is incompatible with -reindex-chainstate. Use full -reindex instead."));
         }
@@ -1397,6 +1408,9 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
     if (args.GetBoolArg("-txindex", DEFAULT_TXINDEX)) {
         LogPrintf("* Using %.1f MiB for transaction index database\n", cache_sizes.tx_index * (1.0 / 1024 / 1024));
     }
+    if (args.GetBoolArg("-silentpaymentindex", DEFAULT_SILENTPAYMENTINDEX)) {
+        LogPrintf("* Using %.1f MiB for silent payment index database\n", cache_sizes.silentpayment_index * (1.0 / 1024 / 1024));
+    }
     for (BlockFilterType filter_type : g_enabled_filter_types) {
         LogPrintf("* Using %.1f MiB for %s block filter index database\n",
                   cache_sizes.filter_index * (1.0 / 1024 / 1024), BlockFilterTypeName(filter_type));
@@ -1516,6 +1530,13 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
 
         g_txindex = std::make_unique<TxIndex>(interfaces::MakeChain(node), cache_sizes.tx_index, false, fReindex);
         if (!g_txindex->Start()) {
+            return false;
+        }
+    }
+
+    if (args.GetBoolArg("-silentpaymentindex", DEFAULT_SILENTPAYMENTINDEX)) {
+        g_silentpaymentindex = std::make_unique<SilentPaymentIndex>(interfaces::MakeChain(node), cache_sizes.tx_index, false, fReindex);
+        if (!g_silentpaymentindex->Start()) {
             return false;
         }
     }
