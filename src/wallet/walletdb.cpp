@@ -171,7 +171,10 @@ bool WalletBatch::EraseWatchOnly(const CScript &dest)
 
 bool WalletBatch::WriteBestBlock(const CBlockLocator& locator)
 {
-    WriteIC(DBKeys::BESTBLOCK, CBlockLocator()); // Write empty block locator so versions that require a merkle branch automatically rescan
+    // Write empty block locator so versions that require a merkle branch automatically rescan
+    if (!WriteIC(DBKeys::BESTBLOCK, CBlockLocator())) {
+        return false;
+    }
     return WriteIC(DBKeys::BESTBLOCK_NOMERKLE, locator);
 }
 
