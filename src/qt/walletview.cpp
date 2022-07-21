@@ -72,6 +72,7 @@ WalletView::WalletView(WalletModel* wallet_model, const PlatformStyle* _platform
 
     addWidget(overviewPage);
     addWidget(transactionsPage);
+    addWidget(m_address_page);
     addWidget(receiveCoinsPage);
     addWidget(sendCoinsPage);
 
