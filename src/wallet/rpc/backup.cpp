@@ -1490,8 +1490,12 @@ static UniValue ProcessDescriptorImport(CWallet& wallet, const UniValue& data, c
             }
         }
 
+        // Can only have sp at top level
+        // TODO: Move logic to `DescImpl`
+        bool isSP = (descriptor.rfind("sp(", 0) == 0);
+
         // Active descriptors must be ranged
-        if (active && !parsed_desc->IsRange()) {
+        if (active && !parsed_desc->IsRange() && !isSP) {
             throw JSONRPCError(RPC_INVALID_PARAMETER, "Active descriptors must be ranged");
         }
 

@@ -2016,6 +2016,10 @@ bool DescriptorScriptPubKeyMan::CanGetAddresses(bool internal) const
     // We can only give out addresses from descriptors that are single type (not combo), ranged,
     // and either have cached keys or can generate more keys (ignoring encryption)
     LOCK(cs_desc_man);
+
+    if (m_wallet_descriptor.descriptor->GetOutputType() == OutputType::SILENT_PAYMENT)
+        return true;
+
     return m_wallet_descriptor.descriptor->IsSingleType() &&
            m_wallet_descriptor.descriptor->IsRange() &&
            (HavePrivateKeys() || m_wallet_descriptor.next_index < m_wallet_descriptor.range_end);

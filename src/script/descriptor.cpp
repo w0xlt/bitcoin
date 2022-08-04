@@ -1504,7 +1504,12 @@ std::unique_ptr<DescriptorImpl> ParseScript(uint32_t& key_exp_index, Span<const 
         auto internal_key = ParsePubkey(key_exp_index, arg, ParseScriptContext::P2TR, out, error);
         if (!internal_key) return nullptr;
         ++key_exp_index;
-        return std::make_unique<SPDescriptor>(std::move(internal_key));
+        auto sp_desc = std::make_unique<SPDescriptor>(std::move(internal_key));
+        if (sp_desc->IsRange()) {
+            error = "Silent Payment descriptors cannot be ranged.";
+            return nullptr;
+        }
+        return sp_desc;
     } else if (Func("sp", expr)) {
         error = "Can only have sp at top level";
         return nullptr;
