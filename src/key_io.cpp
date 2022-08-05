@@ -20,9 +20,12 @@ class DestinationEncoder
 {
 private:
     const CChainParams& m_params;
+    const bool m_silent_payment{false};
 
 public:
     explicit DestinationEncoder(const CChainParams& params) : m_params(params) {}
+    explicit DestinationEncoder(const CChainParams& params, const bool silent_payment) : m_params(params), m_silent_payment{silent_payment} {}
+
 
     std::string operator()(const PKHash& id) const
     {
@@ -59,7 +62,10 @@ public:
         std::vector<unsigned char> data = {1};
         data.reserve(53);
         ConvertBits<8, 5, true>([&](unsigned char c) { data.push_back(c); }, tap.begin(), tap.end());
-        return bech32::Encode(bech32::Encoding::BECH32M, m_params.Bech32HRP(), data);
+
+        const std::string hrp = m_silent_payment ? m_params.SilentPaymentHRP() : m_params.Bech32HRP();
+
+        return bech32::Encode(bech32::Encoding::BECH32M, hrp, data);
     }
 
     std::string operator()(const WitnessUnknown& id) const
@@ -273,9 +279,9 @@ std::string EncodeExtKey(const CExtKey& key)
     return ret;
 }
 
-std::string EncodeDestination(const CTxDestination& dest)
+std::string EncodeDestination(const CTxDestination& dest, const bool silent_payment)
 {
-    return std::visit(DestinationEncoder(Params()), dest);
+    return std::visit(DestinationEncoder(Params(), silent_payment), dest);
 }
 
 CTxDestination DecodeDestination(const std::string& str, std::string& error_msg, std::vector<int>* error_locations)

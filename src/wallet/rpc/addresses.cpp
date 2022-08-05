@@ -42,6 +42,8 @@ RPCHelpMan getnewaddress()
         throw JSONRPCError(RPC_WALLET_ERROR, "Error: This wallet has no available keys");
     }
 
+    bool silent_payment = false;
+
     // Parse the label first so we don't generate a key if there's an error
     std::string label;
     if (!request.params[0].isNull())
@@ -56,6 +58,7 @@ RPCHelpMan getnewaddress()
             throw JSONRPCError(RPC_INVALID_PARAMETER, "Legacy wallets cannot provide bech32m addresses");
         }
         output_type = parsed.value();
+        silent_payment = output_type == OutputType::SILENT_PAYMENT;
     }
 
     auto op_dest = pwallet->GetNewDestination(output_type, label);
@@ -63,7 +66,9 @@ RPCHelpMan getnewaddress()
         throw JSONRPCError(RPC_WALLET_KEYPOOL_RAN_OUT, op_dest.GetError().original);
     }
 
-    return EncodeDestination(op_dest.GetObj());
+
+
+    return EncodeDestination(op_dest.GetObj(), silent_payment);
 },
     };
 }
