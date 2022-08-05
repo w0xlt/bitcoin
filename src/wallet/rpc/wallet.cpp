@@ -384,7 +384,9 @@ static RPCHelpMan createwallet()
     }
 #endif
 
-    if (!request.params[8].isNull() && request.params[8].get_bool()) {
+    bool silent_payment = !request.params[8].isNull() && request.params[8].get_bool();
+
+    if (silent_payment) {
         flags |= WALLET_FLAG_SILENT_PAYMENT;
     }
 
@@ -396,7 +398,7 @@ static RPCHelpMan createwallet()
     options.create_passphrase = passphrase;
     bilingual_str error;
     std::optional<bool> load_on_start = request.params[6].isNull() ? std::nullopt : std::optional<bool>(request.params[6].get_bool());
-    const std::shared_ptr<CWallet> wallet = CreateWallet(context, request.params[0].get_str(), load_on_start, options, status, error, warnings);
+    const std::shared_ptr<CWallet> wallet = CreateWallet(context, request.params[0].get_str(), load_on_start, options, status, error, warnings, silent_payment);
     if (!wallet) {
         RPCErrorCode code = status == DatabaseStatus::FAILED_ENCRYPT ? RPC_WALLET_ENCRYPTION_FAILED : RPC_WALLET_ERROR;
         throw JSONRPCError(code, error.original);
