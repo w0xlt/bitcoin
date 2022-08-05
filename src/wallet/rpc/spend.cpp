@@ -1232,10 +1232,15 @@ RPCHelpMan send()
                 EnsureWalletIsUnlocked(*pwallet);
             }
 
+            std::vector<CTxOut> silent_payment_vouts;
+
             CAmount fee;
             int change_position;
             bool rbf{options.exists("replaceable") ? options["replaceable"].get_bool() : pwallet->m_signal_rbf};
-            CMutableTransaction rawTx = ConstructTransaction(options["inputs"], request.params[0], options["locktime"], rbf);
+            CMutableTransaction rawTx = ConstructTransaction(options["inputs"], request.params[0], options["locktime"], rbf, &silent_payment_vouts);
+
+            std::cout << "---> silent_payment_vouts.size: " << silent_payment_vouts.size() << std::endl;
+
             CCoinControl coin_control;
             // Automatically select coins, unless at least one is manually selected. Can
             // be overridden by options.add_inputs.

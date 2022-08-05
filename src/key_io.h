@@ -23,6 +23,7 @@ std::string EncodeExtPubKey(const CExtPubKey& extpubkey);
 
 std::string EncodeDestination(const CTxDestination& dest, const bool silent_payment = false);
 CTxDestination DecodeDestination(const std::string& str);
+CTxDestination DecodeDestination(const std::string& str, bool* silent_payment);
 CTxDestination DecodeDestination(const std::string& str, std::string& error_msg, std::vector<int>* error_locations = nullptr);
 bool IsValidDestinationString(const std::string& str);
 bool IsValidDestinationString(const std::string& str, const CChainParams& params);
