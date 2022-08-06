@@ -486,7 +486,7 @@ static std::vector<RPCArg> FundTxDoc(bool solving_data = true)
     return args;
 }
 
-void FundTransaction(CWallet& wallet, CMutableTransaction& tx, CAmount& fee_out, int& change_position, const UniValue& options, CCoinControl& coinControl, bool override_min_fee, bool silent_payment = false)
+void FundTransaction(CWallet& wallet, CMutableTransaction& tx, CAmount& fee_out, int& change_position, const UniValue& options, CCoinControl& coinControl, bool override_min_fee, const std::vector<CTxOut>* silent_payment_vouts = nullptr)
 {
     // Make sure the results are valid at least up to the most recent block
     // the user could have gotten from another RPC command prior to now
@@ -700,7 +700,7 @@ void FundTransaction(CWallet& wallet, CMutableTransaction& tx, CAmount& fee_out,
 
     bilingual_str error;
 
-    if (!FundTransaction(wallet, tx, fee_out, change_position, error, lockUnspents, setSubtractFeeFromOutputs, coinControl, silent_payment)) {
+    if (!FundTransaction(wallet, tx, fee_out, change_position, error, lockUnspents, setSubtractFeeFromOutputs, coinControl, silent_payment_vouts)) {
         throw JSONRPCError(RPC_WALLET_ERROR, error.original);
     }
 }
@@ -1217,20 +1217,20 @@ RPCHelpMan send()
             InterpretFeeEstimationInstructions(/*conf_target=*/request.params[1], /*estimate_mode=*/request.params[2], /*fee_rate=*/request.params[3], options);
             PreventOutdatedOptions(options);
 
-            bool silent_payment{options.exists("silent_payment") ? options["silent_payment"].get_bool() : false};
+            // bool silent_payment{options.exists("silent_payment") ? options["silent_payment"].get_bool() : false};
 
-            if (!pwallet->IsWalletFlagSet(WALLET_FLAG_DESCRIPTORS) && silent_payment) {
-                throw JSONRPCError(RPC_WALLET_ERROR, "Only descriptor wallets support silent payments.");
-            }
+            // if (!pwallet->IsWalletFlagSet(WALLET_FLAG_DESCRIPTORS) && silent_payment) {
+            //     throw JSONRPCError(RPC_WALLET_ERROR, "Only descriptor wallets support silent payments.");
+            // }
 
-            if (silent_payment) {
+            // if (silent_payment) {
 
-                if (pwallet->IsWalletFlagSet(WALLET_FLAG_DISABLE_PRIVATE_KEYS) || pwallet->IsWalletFlagSet(WALLET_FLAG_EXTERNAL_SIGNER) ) {
-                    throw JSONRPCError(RPC_WALLET_ERROR, "Silent payments require access to private keys to build transactions.");
-                }
+            //     if (pwallet->IsWalletFlagSet(WALLET_FLAG_DISABLE_PRIVATE_KEYS) || pwallet->IsWalletFlagSet(WALLET_FLAG_EXTERNAL_SIGNER) ) {
+            //         throw JSONRPCError(RPC_WALLET_ERROR, "Silent payments require access to private keys to build transactions.");
+            //     }
 
-                EnsureWalletIsUnlocked(*pwallet);
-            }
+            //     EnsureWalletIsUnlocked(*pwallet);
+            // }
 
             std::vector<CTxOut> silent_payment_vouts;
 
@@ -1246,7 +1246,7 @@ RPCHelpMan send()
             // be overridden by options.add_inputs.
             coin_control.m_allow_other_inputs = rawTx.vin.size() == 0;
             SetOptionsInputWeights(options["inputs"], options);
-            FundTransaction(*pwallet, rawTx, fee, change_position, options, coin_control, /*override_min_fee=*/false, silent_payment);
+            FundTransaction(*pwallet, rawTx, fee, change_position, options, coin_control, /*override_min_fee=*/false, &silent_payment_vouts);
 
             return FinishTransaction(pwallet, options, rawTx);
         }

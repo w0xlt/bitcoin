@@ -762,8 +762,11 @@ bool CreateSilentTransaction(
     const CWallet& wallet,
     const std::vector<COutput>& selected_coins,
     CMutableTransaction& txNew,
+    const std::vector<CTxOut>* silent_payment_vouts,
     bilingual_str& error)
 {
+    assert(silent_payment_vouts != nullptr);
+
     auto firstCoin = selected_coins.at(0);
 
     const auto& spk_managers = wallet.GetScriptPubKeyMans(firstCoin.txout.scriptPubKey);
@@ -777,13 +780,22 @@ bool CreateSilentTransaction(
 
     for (auto& vout : txNew.vout) {
 
+        // std::vector<std::vector<unsigned char>> solutions;
+        // TxoutType whichType = Solver(vout.scriptPubKey, solutions);
+
+        // if (whichType != TxoutType::WITNESS_V1_TAPROOT) {
+        //     error = _("Silent Payments require that the recipients use Taproot address.");
+        //     return false;
+        // }
+
+        if (std::find(silent_payment_vouts->begin(), silent_payment_vouts->end(), vout) == silent_payment_vouts->end()) {
+            continue;
+        }
+
         std::vector<std::vector<unsigned char>> solutions;
         TxoutType whichType = Solver(vout.scriptPubKey, solutions);
 
-        if (whichType != TxoutType::WITNESS_V1_TAPROOT) {
-            error = _("Silent Payments require that the recipients use Taproot address.");
-            return false;
-        }
+        assert(whichType == TxoutType::WITNESS_V1_TAPROOT);
 
         auto recipientPubKey = XOnlyPubKey(solutions[0]);
 
@@ -814,7 +826,7 @@ static BResult<CreatedTransactionResult> CreateTransactionInternal(
         int change_pos,
         const CCoinControl& coin_control,
         bool sign,
-        bool silent_payment=false) EXCLUSIVE_LOCKS_REQUIRED(wallet.cs_wallet)
+        const std::vector<CTxOut>* silent_payment_vouts = nullptr) EXCLUSIVE_LOCKS_REQUIRED(wallet.cs_wallet)
 {
     AssertLockHeld(wallet.cs_wallet);
 
@@ -832,6 +844,8 @@ static BResult<CreatedTransactionResult> CreateTransactionInternal(
     coin_selection_params.m_long_term_feerate = wallet.m_consolidate_feerate;
 
     CAmount recipients_sum = 0;
+
+    bool silent_payment = (silent_payment_vouts != nullptr && silent_payment_vouts->size() > 1);
 
     // Silent Payment requires Taproot change address. If the wallet has no bech32m addresses available, this will fail later.
     const OutputType change_type = silent_payment ? OutputType::BECH32M :
@@ -971,7 +985,7 @@ static BResult<CreatedTransactionResult> CreateTransactionInternal(
     std::vector<COutput> selected_coins = result->GetShuffledInputVector();
 
     if (silent_payment) {
-        if (!CreateSilentTransaction(wallet, selected_coins, txNew, error)) {
+        if (!CreateSilentTransaction(wallet, selected_coins, txNew, silent_payment_vouts, error)) {
             return _("Unable to create silent transaction");
         }
     }
@@ -1119,7 +1133,7 @@ BResult<CreatedTransactionResult> CreateTransaction(
         int change_pos,
         const CCoinControl& coin_control,
         bool sign,
-        bool silent_payment)
+        const std::vector<CTxOut>* silent_payment_vouts)
 {
     if (vecSend.empty()) {
         return _("Transaction must have at least one recipient");
@@ -1131,7 +1145,7 @@ BResult<CreatedTransactionResult> CreateTransaction(
 
     LOCK(wallet.cs_wallet);
 
-    auto res = CreateTransactionInternal(wallet, vecSend, change_pos, coin_control, sign, silent_payment);
+    auto res = CreateTransactionInternal(wallet, vecSend, change_pos, coin_control, sign, silent_payment_vouts);
     TRACE4(coin_selection, normal_create_tx_internal, wallet.GetName().c_str(), res.HasRes(),
            res ? res.GetObj().fee : 0, res ? res.GetObj().change_pos : 0);
     if (!res) return res;
@@ -1141,7 +1155,7 @@ BResult<CreatedTransactionResult> CreateTransaction(
         TRACE1(coin_selection, attempting_aps_create_tx, wallet.GetName().c_str());
         CCoinControl tmp_cc = coin_control;
         tmp_cc.m_avoid_partial_spends = true;
-        auto res_tx_grouped = CreateTransactionInternal(wallet, vecSend, change_pos, tmp_cc, sign, silent_payment);
+        auto res_tx_grouped = CreateTransactionInternal(wallet, vecSend, change_pos, tmp_cc, sign, silent_payment_vouts);
         // Helper optional class for now
         std::optional<CreatedTransactionResult> txr_grouped{res_tx_grouped.HasRes() ? std::make_optional(res_tx_grouped.GetObj()) : std::nullopt};
         // if fee of this alternative one is within the range of the max fee, we use this one
@@ -1157,7 +1171,15 @@ BResult<CreatedTransactionResult> CreateTransaction(
     return res;
 }
 
-bool FundTransaction(CWallet& wallet, CMutableTransaction& tx, CAmount& nFeeRet, int& nChangePosInOut, bilingual_str& error, bool lockUnspents, const std::set<int>& setSubtractFeeFromOutputs, CCoinControl coinControl, bool silent_payment)
+bool FundTransaction(CWallet& wallet,
+    CMutableTransaction& tx,
+    CAmount& nFeeRet,
+    int& nChangePosInOut,
+    bilingual_str& error,
+    bool lockUnspents,
+    const std::set<int>& setSubtractFeeFromOutputs,
+    CCoinControl coinControl,
+    const std::vector<CTxOut>* silent_payment_vouts)
 {
     std::vector<CRecipient> vecSend;
 
@@ -1190,7 +1212,7 @@ bool FundTransaction(CWallet& wallet, CMutableTransaction& tx, CAmount& nFeeRet,
         }
     }
 
-    auto res = CreateTransaction(wallet, vecSend, nChangePosInOut, coinControl, false, silent_payment);
+    auto res = CreateTransaction(wallet, vecSend, nChangePosInOut, coinControl, false, silent_payment_vouts);
     if (!res) {
         error = res.GetError();
         return false;
