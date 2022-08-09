@@ -523,7 +523,6 @@ void FundTransaction(CWallet& wallet, CMutableTransaction& tx, CAmount& fee_out,
                 {"fee_rate", UniValueType()}, // will be checked by AmountFromValue() in SetFeeEstimateMode()
                 {"feeRate", UniValueType()}, // will be checked by AmountFromValue() below
                 {"psbt", UniValueType(UniValue::VBOOL)},
-                {"silent_payment", UniValueType(UniValue::VBOOL)},
                 {"solving_data", UniValueType(UniValue::VOBJ)},
                 {"subtractFeeFromOutputs", UniValueType(UniValue::VARR)},
                 {"subtract_fee_from_outputs", UniValueType(UniValue::VARR)},
@@ -1173,7 +1172,6 @@ RPCHelpMan send()
                             {"vout_index", RPCArg::Type::NUM, RPCArg::Optional::OMITTED, "The zero-based output index, before a change output is added."},
                         },
                     },
-                    {"silent_payment", RPCArg::Type::BOOL, RPCArg::Default{false}, "Use the silent payment protocol to tweak the recipient addresses. All recipients must use Taproot addresses."},
                 },
                 FundTxDoc()),
                 "options"},
@@ -1217,29 +1215,12 @@ RPCHelpMan send()
             InterpretFeeEstimationInstructions(/*conf_target=*/request.params[1], /*estimate_mode=*/request.params[2], /*fee_rate=*/request.params[3], options);
             PreventOutdatedOptions(options);
 
-            // bool silent_payment{options.exists("silent_payment") ? options["silent_payment"].get_bool() : false};
-
-            // if (!pwallet->IsWalletFlagSet(WALLET_FLAG_DESCRIPTORS) && silent_payment) {
-            //     throw JSONRPCError(RPC_WALLET_ERROR, "Only descriptor wallets support silent payments.");
-            // }
-
-            // if (silent_payment) {
-
-            //     if (pwallet->IsWalletFlagSet(WALLET_FLAG_DISABLE_PRIVATE_KEYS) || pwallet->IsWalletFlagSet(WALLET_FLAG_EXTERNAL_SIGNER) ) {
-            //         throw JSONRPCError(RPC_WALLET_ERROR, "Silent payments require access to private keys to build transactions.");
-            //     }
-
-            //     EnsureWalletIsUnlocked(*pwallet);
-            // }
-
             std::vector<CTxOut> silent_payment_vouts;
 
             CAmount fee;
             int change_position;
             bool rbf{options.exists("replaceable") ? options["replaceable"].get_bool() : pwallet->m_signal_rbf};
             CMutableTransaction rawTx = ConstructTransaction(options["inputs"], request.params[0], options["locktime"], rbf, &silent_payment_vouts);
-
-            std::cout << "---> silent_payment_vouts.size: " << silent_payment_vouts.size() << std::endl;
 
             CCoinControl coin_control;
             // Automatically select coins, unless at least one is manually selected. Can
