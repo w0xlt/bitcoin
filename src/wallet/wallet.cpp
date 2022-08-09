@@ -1358,14 +1358,14 @@ bool CWallet::VerifySilentPayment(const CTransaction& tx, std::vector<CKey>& raw
 
     assert(senderPubKey.IsFullyValid());
 
-    for (ScriptPubKeyMan* spkm : GetAllScriptPubKeyMans()) {
+    for (ScriptPubKeyMan* spkm : GetActiveScriptPubKeyMans()) {
         DescriptorScriptPubKeyMan* desc_spkm = dynamic_cast<DescriptorScriptPubKeyMan*>(spkm);
 
         std::string desc_str;
         bool res_get_desc = desc_spkm->GetDescriptorString(desc_str, false);
 
-        // Since silent payments only work with P2TR, we skip non-Taproot descriptors
-        if (res_get_desc && desc_str.rfind("tr(", 0) != 0) {
+        // There must be only one SP descriptor
+        if (res_get_desc && desc_str.rfind("sp(", 0) != 0) {
             continue;
         }
 
