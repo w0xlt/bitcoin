@@ -232,6 +232,56 @@ class SilentTransactioTest(BitcoinTestFramework):
             assert(silent_tx['address'] != recv_addr_05)
             assert(silent_tx['desc'].startswith('rawtr('))
 
+    def test_big_transaction_multiple_wallets(self):
+        self.nodes[0].createwallet(wallet_name='mw_01', descriptors=True)
+        mw_01 = self.nodes[0].get_wallet_rpc('mw_01')
+
+        self.nodes[1].createwallet(wallet_name='mw_02', descriptors=True, silent_payment=True)
+        mw_02 = self.nodes[1].get_wallet_rpc('mw_02')
+
+        self.nodes[1].createwallet(wallet_name='mw_03', descriptors=True, silent_payment=True)
+        mw_03 = self.nodes[1].get_wallet_rpc('mw_03')
+
+        self.nodes[1].createwallet(wallet_name='mw_04', descriptors=True)
+        mw_04 = self.nodes[1].get_wallet_rpc('mw_04')
+
+        self.nodes[1].createwallet(wallet_name='mw_05', descriptors=True, silent_payment=True)
+        mw_05 = self.nodes[1].get_wallet_rpc('mw_05')
+
+        self.generatetoaddress(self.nodes[0], COINBASE_MATURITY + 15, mw_01.getnewaddress())
+
+        recv_addr_01 = mw_02.getnewaddress('', 'silent-payment')
+        recv_addr_02 = mw_02.getnewaddress('', 'bech32m')
+        recv_addr_03 = mw_02.getnewaddress('', 'bech32')
+
+        recv_addr_04 = mw_03.getnewaddress('', 'silent-payment')
+        recv_addr_05 = mw_03.getnewaddress('', 'legacy')
+
+        recv_addr_06 = mw_04.getnewaddress('', 'legacy')
+        recv_addr_07 = mw_04.getnewaddress('', 'bech32m')
+        recv_addr_08 = mw_04.getnewaddress('', 'p2sh-segwit')
+
+        recv_addr_09 = mw_05.getnewaddress('', 'silent-payment')
+        recv_addr_10 = mw_05.getnewaddress('', 'p2sh-segwit')
+        recv_addr_11 = mw_05.getnewaddress('', 'bech32m')
+        recv_addr_12 = mw_05.getnewaddress('', 'bech32')
+        recv_addr_13 = mw_05.getnewaddress('', 'legacy')
+
+        outputs = [{recv_addr_01: 2}, {recv_addr_02: 3}, {recv_addr_03: 1}, {recv_addr_04: 2}, {recv_addr_05: 1},
+            {recv_addr_06: 4}, {recv_addr_07: 3}, {recv_addr_08: 2}, {recv_addr_09: 5}, {recv_addr_10: 4},
+            {recv_addr_11: 2}, {recv_addr_12: 1}, {recv_addr_13: 2}]
+
+        ret = mw_01.send(outputs)
+
+        assert(ret['complete'])
+
+        self.sync_mempools()
+
+        assert_equal(len(mw_02.listunspent(0)), 3)
+        assert_equal(len(mw_03.listunspent(0)), 2)
+        assert_equal(len(mw_04.listunspent(0)), 3)
+        assert_equal(len(mw_05.listunspent(0)), 5)
+
     def test_scantxoutset(self):
         self.nodes[0].createwallet(wallet_name='sender_wallet_02', descriptors=True)
         sender_wallet_02 = self.nodes[0].get_wallet_rpc('sender_wallet_02')
@@ -334,17 +384,18 @@ class SilentTransactioTest(BitcoinTestFramework):
         self.encrypted_wallet_send()
         self.test_sp_descriptor()
         self.test_transactions()
+        self.test_big_transaction_multiple_wallets()
         # self.test_scantxoutset()
         # self.test_load_silent_wallet()
 
         # new tests:
 
-        # 1. create really a big transaction to multiple wallets
-
         # 2. wallet sends to itself in an sp address
 
         # 3. backup SP desc via importdesc should work. Currently it won't work because it must add the SP flag
         # to fetch SP transactions
+
+        # after the tests have been finished, revert change outpu type selection to the default behavior
 
 if __name__ == '__main__':
     SilentTransactioTest().main()
