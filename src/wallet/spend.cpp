@@ -848,8 +848,7 @@ static BResult<CreatedTransactionResult> CreateTransactionInternal(
     bool silent_payment = (silent_payment_vouts != nullptr && silent_payment_vouts->size() > 1);
 
     // Silent Payment requires Taproot change address. If the wallet has no bech32m addresses available, this will fail later.
-    const OutputType change_type = silent_payment ? OutputType::BECH32M :
-        wallet.TransactionChangeType(coin_control.m_change_type ? *coin_control.m_change_type : wallet.m_default_change_type, vecSend);
+    const OutputType change_type = wallet.TransactionChangeType(coin_control.m_change_type ? *coin_control.m_change_type : wallet.m_default_change_type, vecSend);
     ReserveDestination reservedest(&wallet, change_type);
     unsigned int outputs_to_subtract_fee_from = 0; // The number of outputs which we are subtracting the fee from
     for (const auto& recipient : vecSend) {

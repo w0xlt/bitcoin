@@ -1584,6 +1584,10 @@ static UniValue ProcessDescriptorImport(CWallet& wallet, const UniValue& data, c
             }
         }
 
+        if (isSP && !wallet.IsWalletFlagSet(WALLET_FLAG_SILENT_PAYMENT)) {
+            wallet.SetWalletFlag(WALLET_FLAG_SILENT_PAYMENT);
+        }
+
         result.pushKV("success", UniValue(true));
     } catch (const UniValue& e) {
         result.pushKV("success", UniValue(false));

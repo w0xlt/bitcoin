@@ -282,6 +282,56 @@ class SilentTransactioTest(BitcoinTestFramework):
         assert_equal(len(mw_04.listunspent(0)), 3)
         assert_equal(len(mw_05.listunspent(0)), 5)
 
+    def test_backup_sp_descriptor(self):
+        self.nodes[0].createwallet(wallet_name='sender_bk_01', descriptors=True)
+        sender_bk_01 = self.nodes[0].get_wallet_rpc('sender_bk_01')
+
+        self.nodes[1].createwallet(wallet_name='receiver_bk_01', descriptors=True, silent_payment=True)
+        receiver_bk_01 = self.nodes[1].get_wallet_rpc('receiver_bk_01')
+
+        assert(receiver_bk_01.getwalletinfo()['silent_payment'])
+
+        receiver_sp_address = receiver_bk_01.getnewaddress('', 'silent-payment')
+
+        self.generatetoaddress(self.nodes[0], COINBASE_MATURITY + 10, sender_bk_01.getnewaddress())
+
+        ret1 = sender_bk_01.send({receiver_sp_address: 2})
+        assert(ret1['complete'])
+
+        ret2 = sender_bk_01.send({receiver_sp_address: 3})
+        assert(ret2['complete'])
+
+        ret3 = sender_bk_01.send({receiver_sp_address: 5})
+        assert(ret3['complete'])
+
+        self.generate(self.nodes[0], 7)
+
+        self.sync_all()
+
+        assert_equal(len(receiver_bk_01.listunspent()), 3)
+
+        for utxo in receiver_bk_01.listunspent(0):
+            assert(utxo['desc'].startswith('rawtr('))
+
+        sp_xpriv = ''
+
+        for desc in receiver_bk_01.listdescriptors(True)['descriptors']:
+            if "sp(tprv" in desc['desc']:
+                sp_xpriv = desc['desc']
+
+        assert(sp_xpriv != '')
+
+        self.nodes[1].createwallet(wallet_name='receiver_bk_02', descriptors=True, blank=True)
+        receiver_bk_02 = self.nodes[1].get_wallet_rpc('receiver_bk_02')
+
+        ret = receiver_bk_02.importdescriptors([{'desc': sp_xpriv, 'timestamp': 0}])
+
+        assert(ret[0]['success'])
+        assert(receiver_bk_02.getwalletinfo()['silent_payment'])
+
+        assert_equal(len(receiver_bk_02.listunspent()), 3)
+
+
     def test_scantxoutset(self):
         self.nodes[0].createwallet(wallet_name='sender_wallet_02', descriptors=True)
         sender_wallet_02 = self.nodes[0].get_wallet_rpc('sender_wallet_02')
@@ -341,42 +391,58 @@ class SilentTransactioTest(BitcoinTestFramework):
             assert(len([x for x in utxos if x['txid'] == scan_tx['txid']]) == 1)
 
     def test_load_silent_wallet(self):
-        self.nodes[0].createwallet(wallet_name='sender_wallet_03', descriptors=True)
-        sender_wallet_03 = self.nodes[0].get_wallet_rpc('sender_wallet_03')
+        self.nodes[0].createwallet(wallet_name='load_sender_wallet_01', descriptors=True)
+        load_sender_wallet_01 = self.nodes[0].get_wallet_rpc('load_sender_wallet_01')
 
-        self.nodes[1].createwallet(wallet_name='recipient_wallet_04', descriptors=True, silent_payment=True)
-        recipient_wallet_04 = self.nodes[1].get_wallet_rpc('recipient_wallet_04')
+        self.nodes[1].createwallet(wallet_name='load_recipient_wallet_01', descriptors=True, silent_payment=True)
+        load_recipient_wallet_01 = self.nodes[1].get_wallet_rpc('load_recipient_wallet_01')
 
-        self.generatetoaddress(self.nodes[0], COINBASE_MATURITY + 10, sender_wallet_03.getnewaddress())
+        self.generatetoaddress(self.nodes[0], COINBASE_MATURITY + 25, load_sender_wallet_01.getnewaddress())
 
-        recv_addr_list = []
+        sp_recv_addr = load_recipient_wallet_01.getnewaddress('', 'silent-payment')
 
-        for _ in range(5):
-            recv_addr_list.append(recipient_wallet_04.getnewaddress('', 'bech32m'))
-
-        self.nodes[1].unloadwallet('recipient_wallet_04')
+        self.nodes[1].unloadwallet('load_recipient_wallet_01')
 
         silent_tx_ids = []
 
-        for recv_addr in recv_addr_list:
+        for _ in range(1,5):
 
-            outputs = [{recv_addr: 13.12}]
-            options= {"silent_payment": True  }
+            outputs = [{sp_recv_addr: 5}]
 
-            silent_tx_ids.append(sender_wallet_03.send(outputs=outputs, options=options)['txid'])
+            silent_tx_ids.append(load_sender_wallet_01.send(outputs=outputs)['txid'])
 
             self.generate(self.nodes[0], 1)
 
         self.sync_all()
 
-        self.nodes[1].loadwallet('recipient_wallet_04')
+        self.nodes[1].loadwallet('load_recipient_wallet_01')
 
-        listunspent = [u['txid'] for u in recipient_wallet_04.listunspent(0)]
+        listunspent = [u['txid'] for u in load_recipient_wallet_01.listunspent(0)]
 
         assert(len(listunspent) == len(silent_tx_ids))
 
         for txid in silent_tx_ids:
             assert(txid in listunspent)
+
+    # it makes no sense for users to send themselves silent payments, but that should work anyway.
+    def test_self_sp_transfer(self):
+        self.nodes[1].createwallet(wallet_name='self_sender_wallet_01', descriptors=True, silent_payment=True)
+        self_sender_wallet_01 = self.nodes[1].get_wallet_rpc('self_sender_wallet_01')
+
+        self.generatetoaddress(self.nodes[1], 1, self_sender_wallet_01.getnewaddress())
+
+        self.generate(self.nodes[1], COINBASE_MATURITY + 1)
+
+        sp_recv_addr = self_sender_wallet_01.getnewaddress('', 'silent-payment')
+
+        print(self_sender_wallet_01.getbalance())
+
+        ret = self_sender_wallet_01.send([{sp_recv_addr: 0.2}])
+
+        assert(ret['complete'])
+
+        assert_equal(len(self_sender_wallet_01.listunspent(0)), 2)
+
 
     def run_test(self):
         self.invalid_create_wallet()
@@ -385,16 +451,15 @@ class SilentTransactioTest(BitcoinTestFramework):
         self.test_sp_descriptor()
         self.test_transactions()
         self.test_big_transaction_multiple_wallets()
+        self.test_backup_sp_descriptor()
+        self.test_load_silent_wallet()
+        self.test_self_sp_transfer()
+
         # self.test_scantxoutset()
-        # self.test_load_silent_wallet()
+
+
 
         # new tests:
-
-        # 2. wallet sends to itself in an sp address
-
-        # 3. backup SP desc via importdesc should work. Currently it won't work because it must add the SP flag
-        # to fetch SP transactions
-
         # after the tests have been finished, revert change outpu type selection to the default behavior
 
 if __name__ == '__main__':
