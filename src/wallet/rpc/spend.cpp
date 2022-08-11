@@ -1222,6 +1222,22 @@ RPCHelpMan send()
             bool rbf{options.exists("replaceable") ? options["replaceable"].get_bool() : pwallet->m_signal_rbf};
             CMutableTransaction rawTx = ConstructTransaction(options["inputs"], request.params[0], options["locktime"], rbf, &silent_payment_vouts);
 
+
+            bool silent_payment{silent_payment_vouts.size() > 0};
+
+            if (!pwallet->IsWalletFlagSet(WALLET_FLAG_DESCRIPTORS) && silent_payment) {
+                throw JSONRPCError(RPC_WALLET_ERROR, "Only descriptor wallets support silent payments.");
+            }
+
+            if (silent_payment) {
+
+                if (pwallet->IsWalletFlagSet(WALLET_FLAG_DISABLE_PRIVATE_KEYS) || pwallet->IsWalletFlagSet(WALLET_FLAG_EXTERNAL_SIGNER) ) {
+                    throw JSONRPCError(RPC_WALLET_ERROR, "Silent payments require access to private keys to build transactions.");
+                }
+
+                EnsureWalletIsUnlocked(*pwallet);
+            }
+
             CCoinControl coin_control;
             // Automatically select coins, unless at least one is manually selected. Can
             // be overridden by options.add_inputs.

@@ -1539,6 +1539,13 @@ static UniValue ProcessDescriptorImport(CWallet& wallet, const UniValue& data, c
         }
 
         // If private keys are enabled, check some things.
+        if (isSP) {
+           if (keys.keys.empty() || !have_all_privkeys) {
+                throw JSONRPCError(RPC_WALLET_ERROR, "Cannot import Silent Payment descriptor without private keys provided.");
+           }
+        }
+
+        // If private keys are enabled, check some things.
         if (!wallet.IsWalletFlagSet(WALLET_FLAG_DISABLE_PRIVATE_KEYS)) {
            if (keys.keys.empty()) {
                 throw JSONRPCError(RPC_WALLET_ERROR, "Cannot import descriptor without private keys to a wallet with private keys enabled");

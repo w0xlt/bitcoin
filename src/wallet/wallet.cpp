@@ -1218,14 +1218,20 @@ bool CWallet::AddToWalletIfInvolvingMe(const CTransactionRef& ptx, const SyncTxS
 
         bool fExisted = mapWallet.count(tx.GetHash()) != 0;
         if (fExisted && !fUpdate) return false;
+
+        bool ret = false;
+
         if (fExisted || IsMine(tx) || IsFromMe(tx))
         {
-            return HandleNewTxBelongingToMe(tx, state, rescanning_old_block);
+            ret = HandleNewTxBelongingToMe(tx, state, rescanning_old_block);
         }
-        else if (IsWalletFlagSet(WALLET_FLAG_SILENT_PAYMENT) && VerifySilentPayment(tx, rawTrKeys))
+
+        if (IsWalletFlagSet(WALLET_FLAG_SILENT_PAYMENT) && VerifySilentPayment(tx, rawTrKeys))
         {
-            return AddSilentScriptKeyMan(tx, state, rescanning_old_block, rawTrKeys);
+            ret = AddSilentScriptKeyMan(tx, state, rescanning_old_block, rawTrKeys) || ret;
         }
+
+        return ret;
     }
     return false;
 }
@@ -1331,12 +1337,16 @@ bool CWallet::VerifySilentPayment(const CTransaction& tx, std::vector<CKey>& raw
 
     for (auto& vout : tx.vout) {
 
+        if (IsMine(vout)) {
+            continue;
+        }
+
         std::vector<std::vector<unsigned char>> solutions;
         TxoutType whichType = Solver(vout.scriptPubKey, solutions);
 
         // Silent Payments require that the recipients use Taproot address
         if (whichType != TxoutType::WITNESS_V1_TAPROOT) {
-            return false;
+            continue;
         }
 
         auto xOnlyPubKey = XOnlyPubKey(solutions[0]);
