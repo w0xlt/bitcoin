@@ -137,7 +137,7 @@ CTxDestination DecodeDestination(const std::string& str, const CChainParams& par
             error_str = "Invalid prefix for Bech32 address";
             return CNoDestination();
         }
-        if (dec.hrp == params.SilentPaymentHRP()) {
+        if (silent_payment != nullptr && dec.hrp == params.SilentPaymentHRP()) {
             *silent_payment = true;
         }
         int version = dec.data[0]; // The first 5 bit symbol is the witness version (0-16)
@@ -302,6 +302,11 @@ CTxDestination DecodeDestination(const std::string& str)
 CTxDestination DecodeDestination(const std::string& str, bool* silent_payment)
 {
     std::string error_msg;
+    return DecodeDestination(str, Params(), error_msg, nullptr, silent_payment);
+}
+
+CTxDestination DecodeDestination(const std::string& str, std::string& error_msg, bool* silent_payment)
+{
     return DecodeDestination(str, Params(), error_msg, nullptr, silent_payment);
 }
 

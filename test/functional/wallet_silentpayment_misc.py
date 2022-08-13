@@ -42,6 +42,8 @@ class SilentTransactioTest(BitcoinTestFramework):
             self.nodes[0].createwallet, wallet_name='invalid_wallet', descriptors=True, silent_payment=True)
 
     def watch_only_wallet_send(self):
+        self.log.info("Testing if a watch only wallet is not able to send silent transaction")
+
         self.nodes[0].createwallet(wallet_name='watch_only_wallet', descriptors=True, disable_private_keys=True, blank=True)
         watch_only_wallet = self.nodes[0].get_wallet_rpc('watch_only_wallet')
 
@@ -66,6 +68,8 @@ class SilentTransactioTest(BitcoinTestFramework):
             watch_only_wallet.send, outputs=outputs)
 
     def encrypted_wallet_send(self):
+        self.log.info("Testing if encrypted SP wallet")
+
         self.nodes[0].createwallet(wallet_name='encrypted_wallet', descriptors=True, passphrase='passphrase')
         encrypted_wallet = self.nodes[0].get_wallet_rpc('encrypted_wallet')
 
@@ -89,16 +93,18 @@ class SilentTransactioTest(BitcoinTestFramework):
         assert(tx['complete'])
 
     def test_sp_descriptor(self):
+        self.log.info("Testing if SP descriptor works as expected")
+
         self.nodes[1].createwallet(wallet_name='sp_wallet_01', descriptors=True, silent_payment=True)
         sp_wallet_01 = self.nodes[1].get_wallet_rpc('sp_wallet_01')
 
         wallet_has_sp_desc = False
 
-        sp_xpub = ''
+        sp_pub = ''
 
         for desc in sp_wallet_01.listdescriptors()['descriptors']:
-            if "sp(tpub" in desc['desc']:
-                sp_xpub = desc['desc']
+            if "sp(" in desc['desc']:
+                sp_pub = desc['desc']
                 wallet_has_sp_desc = True
 
         assert(wallet_has_sp_desc)
@@ -106,7 +112,7 @@ class SilentTransactioTest(BitcoinTestFramework):
         self.nodes[1].createwallet(wallet_name='sp_wallet_02', descriptors=True, blank=True)
         sp_wallet_02 = self.nodes[1].get_wallet_rpc('sp_wallet_02')
 
-        result = sp_wallet_02.importdescriptors([{"desc": sp_xpub, "timestamp": "now"}])
+        result = sp_wallet_02.importdescriptors([{"desc": sp_pub, "timestamp": "now"}])
         assert_equal(result[0]['success'], False)
         assert_equal(result[0]['error']['code'], -4)
         assert_equal(result[0]['error']['message'], "Cannot import Silent Payment descriptor without private keys provided.")
@@ -118,14 +124,14 @@ class SilentTransactioTest(BitcoinTestFramework):
         assert_equal(result[0]['error']['code'], -5)
         assert_equal(result[0]['error']['message'], "Silent Payment descriptors cannot be ranged.")
 
-        xpriv = "sp(tprv8ZgxMBicQKsPerCR9hYaUEDjrfKRwJW75hADM1yQ95vi6opzZ4yDZkvKM56NvpGMMeFT7SR5TA2MY1GQT32T6k57ctZmiAUk314waQccNew)#v6xt9uhq"
+        xpriv = "sp(cMcfPtLYsvQAUrP1Xw3uWYvtnNH1pSJ1jWbgTxL5yqwkgfbmaSkx)#vutc4cze"
 
         result = sp_wallet_02.importdescriptors([{"desc": xpriv, "timestamp": "now"}])
         assert_equal(result[0]['success'], True)
 
-        xpriv1 = "sp(tprv8ZgxMBicQKsPefef2Doobbq3xTCaVTHcDn6me82KSXY1vY9AJAWD5u7SDM4XGLfc4EoXRMFrJKpp6HNmQWA3FTMRQeEmMJYJ9RPqe9ne2hU)#tuc04tp4"
-        xpriv2 = "sp(tprv8ZgxMBicQKsPezQ2KGArMRovTEbCGxaLgBgaVcTvEx8mby8ogX2bgC4HBapH4yMwrz2FpoCuA17eocuUVMgEP6fnm83YpwSDTFrumw42bny)#y8twsgwk"
-        xpriv3 = "sp(tprv8ZgxMBicQKsPeWFyDrRjkcsrC5W85R9CCoMoLUBt4KScPgcMrPHLGrWKsLpPco47NAAdQb2VJYYpeQCZvTU35w88hzivf83ZWSK7CUanNx6)#wax7cnpl"
+        xpriv1 = "sp(cNSWZfhJWf1uYcsMKZxN94SgNiM8xQPhGyGaEkyCSR1GtSweLkdr)#vs4h975j"
+        xpriv2 = "sp(cS1NMRiK87hdpzzNJgiYcdABjCPGxbBAdCrHoosqzjfeQY4z85rn)#dh4rsd8m"
+        xpriv3 = "sp(cQUVgcphF27yReKMNduhr9ig24uJj6jC1BxEXNSUZYxNTbG3cCka)#8uvrehfs"
 
         result = sp_wallet_02.importdescriptors([
             {"desc": xpriv1, "timestamp": "now", "active": True},
@@ -142,97 +148,15 @@ class SilentTransactioTest(BitcoinTestFramework):
             else:
                 assert(not desc['active'])
 
-    def test_transactions(self):
-        for input_type in ['bech32m', 'bech32', 'p2sh-segwit', 'legacy']:
-
-            self.nodes[0].createwallet(wallet_name=f'sender_wallet_{input_type}', descriptors=True)
-            sender_wallet = self.nodes[0].get_wallet_rpc(f'sender_wallet_{input_type}')
-
-            self.generatetoaddress(self.nodes[0], COINBASE_MATURITY + 10, sender_wallet.getnewaddress())
-
-            self.nodes[1].createwallet(wallet_name=f'recipient_wallet_01_{input_type}', descriptors=True, silent_payment=True)
-            recipient_wallet_01 = self.nodes[1].get_wallet_rpc(f'recipient_wallet_01_{input_type}')
-
-            self.nodes[2].createwallet(wallet_name=f'recipient_wallet_02_{input_type}', descriptors=True, silent_payment=True)
-            recipient_wallet_02 = self.nodes[2].get_wallet_rpc(f'recipient_wallet_02_{input_type}')
-
-            # sender wallet sends coins to itself using input_type address
-            # The goal is to use the output of this tx as silent transaction inputs
-            sen_addr_02 = sender_wallet.getnewaddress('', input_type)
-            tx_id_01 = sender_wallet.send({sen_addr_02: 50})['txid']
-
-            self.generate(self.nodes[0], 7)
-
-            tx_01 = [x for x in sender_wallet.listunspent(0) if x['txid'] == tx_id_01]
-            input_data = [x for x in tx_01 if x['address'] == sen_addr_02][0]
-
-            # use two addresses so that one can be spent on a normal tx and the other on a normal transaction
-            recv_addr_01 = recipient_wallet_01.getnewaddress('', 'silent-payment')
-            recv_addr_02 = recipient_wallet_01.getnewaddress('', input_type)
-            recv_addr_03 = recipient_wallet_02.getnewaddress('', 'silent-payment')
-
-            self.log.info("[%s] create silent transaction", input_type)
-            inputs = [{"txid": input_data["txid"], "vout":input_data["vout"]}]
-            outputs = [{recv_addr_01: 15}, {recv_addr_02: 15}, {recv_addr_03: 15}]
-            options= {"inputs": inputs }
-
-            silent_tx_ret = sender_wallet.send(outputs=outputs, options=options)
-
-            self.sync_mempools()
-
-            wallet_01_utxos = [x for x in recipient_wallet_01.listunspent(0) if x['txid'] == silent_tx_ret['txid']]
-
-            print(len(recipient_wallet_01.listunspent(0)))
-
-            silent_txid = ''
-            silent_vout = ''
-
-            self.log.info("[%s] confirm that transaction has a different address than the original", input_type)
-            assert_equal(len(wallet_01_utxos), 2)
-            for utxo in wallet_01_utxos:
-                if utxo['desc'].startswith('rawtr('):
-                    silent_txid = utxo["txid"]
-                    silent_vout = utxo["vout"]
-                    assert(utxo['address'] != recv_addr_01)
-                else:
-                    assert(utxo['address'] == recv_addr_02)
-
-            recv_addr_04 = recipient_wallet_02.getnewaddress('', input_type)
-
-            self.log.info("[%s] spend the silent output to a normal address", input_type)
-            normal_inputs = [{"txid": silent_txid, "vout":silent_vout}]
-            normal_outputs = [{recv_addr_04: 10}]
-            normal_options = {"inputs": normal_inputs}
-
-            normal_tx_ret = recipient_wallet_01.send(outputs=normal_outputs, options=normal_options)
-
-            self.log.info("[%s] spend the silent output to another", input_type)
-            wallet_02_utxos = [x for x in recipient_wallet_02.listunspent(0) if x['txid'] == silent_tx_ret['txid']]
-            assert_equal(len(wallet_02_utxos), 1)
-            assert(wallet_02_utxos[0]['desc'].startswith('rawtr('))
-            assert(wallet_02_utxos[0]['address'] != recv_addr_03)
-
-            recv_addr_05 = recipient_wallet_01.getnewaddress('', 'silent-payment')
-            assert_equal(recv_addr_01, recv_addr_05)
-
-            silent_inputs = [{"txid": wallet_02_utxos[0]["txid"], "vout":wallet_02_utxos[0]["vout"]}]
-            silent_outputs = [{recv_addr_05: 10}]
-            silent_options = {"inputs": silent_inputs}
-
-            silent_tx_ret = recipient_wallet_02.send(outputs=silent_outputs, options=silent_options)
-
-            self.sync_mempools()
-
-            normal_tx = [x for x in recipient_wallet_02.listunspent(0) if x['txid'] == normal_tx_ret['txid']][0]
-            silent_tx = [x for x in recipient_wallet_01.listunspent(0) if x['txid'] == silent_tx_ret['txid']][0]
-
-            self.log.info("[%s] confirm the silent output was spent correctly", input_type)
-            assert(normal_tx['address'] == recv_addr_04)
-
-            assert(silent_tx['address'] != recv_addr_05)
-            assert(silent_tx['desc'].startswith('rawtr('))
+        sp_addr = sp_wallet_02.getnewaddress('', 'silent-payment')
+        addr_info = sp_wallet_02.getaddressinfo(sp_addr)
+        assert_equal(addr_info['address'], sp_addr)
+        assert addr_info['parent_desc'], xpriv3
+        assert addr_info['desc'].startswith('rawtr(')
 
     def test_big_transaction_multiple_wallets(self):
+        self.log.info("Testing a big transaction to SP wallet")
+
         self.nodes[0].createwallet(wallet_name='mw_01', descriptors=True)
         mw_01 = self.nodes[0].get_wallet_rpc('mw_01')
 
@@ -283,6 +207,8 @@ class SilentTransactioTest(BitcoinTestFramework):
         assert_equal(len(mw_05.listunspent(0)), 5)
 
     def test_backup_sp_descriptor(self):
+        self.log.info("Testing SP descriptor backup")
+
         self.nodes[0].createwallet(wallet_name='sender_bk_01', descriptors=True)
         sender_bk_01 = self.nodes[0].get_wallet_rpc('sender_bk_01')
 
@@ -293,7 +219,8 @@ class SilentTransactioTest(BitcoinTestFramework):
 
         receiver_sp_address = receiver_bk_01.getnewaddress('', 'silent-payment')
 
-        self.generatetoaddress(self.nodes[0], COINBASE_MATURITY + 10, sender_bk_01.getnewaddress())
+        self.generatetoaddress(self.nodes[0], COINBASE_MATURITY, sender_bk_01.getnewaddress())
+        self.generate(self.nodes[0], COINBASE_MATURITY)
 
         ret1 = sender_bk_01.send({receiver_sp_address: 2})
         assert(ret1['complete'])
@@ -313,84 +240,27 @@ class SilentTransactioTest(BitcoinTestFramework):
         for utxo in receiver_bk_01.listunspent(0):
             assert(utxo['desc'].startswith('rawtr('))
 
-        sp_xpriv = ''
+        sp_priv = ''
 
         for desc in receiver_bk_01.listdescriptors(True)['descriptors']:
-            if "sp(tprv" in desc['desc']:
-                sp_xpriv = desc['desc']
+            if "sp(" in desc['desc']:
+                sp_priv = desc['desc']
 
-        assert(sp_xpriv != '')
+        assert(sp_priv != '')
 
         self.nodes[1].createwallet(wallet_name='receiver_bk_02', descriptors=True, blank=True)
         receiver_bk_02 = self.nodes[1].get_wallet_rpc('receiver_bk_02')
 
-        ret = receiver_bk_02.importdescriptors([{'desc': sp_xpriv, 'timestamp': 0}])
+        ret = receiver_bk_02.importdescriptors([{'desc': sp_priv, 'timestamp': 0, 'active': True}])
 
         assert(ret[0]['success'])
         assert(receiver_bk_02.getwalletinfo()['silent_payment'])
 
         assert_equal(len(receiver_bk_02.listunspent()), 3)
 
-
-    def test_scantxoutset(self):
-        self.nodes[0].createwallet(wallet_name='sender_wallet_02', descriptors=True)
-        sender_wallet_02 = self.nodes[0].get_wallet_rpc('sender_wallet_02')
-
-        self.generatetoaddress(self.nodes[0], COINBASE_MATURITY + 10, sender_wallet_02.getnewaddress())
-
-        self.nodes[2].createwallet(wallet_name='recipient_wallet_03', descriptors=True, silent_payment=True, blank=True)
-        recipient_wallet_03 = self.nodes[2].get_wallet_rpc('recipient_wallet_03')
-
-        desc_import = [{
-            "desc": descsum_create("tr(tprv8ZgxMBicQKsPe4mDP1295ti2BqcgFzPWkKnvsGyKVerGqf9tDif6yR4yLcK6Pf49tQ1HRQK2vjXrAVqxVUJCtXWn3AAiacXnXhUf6nxBJAp/86'/1'/0'/0/*)"),
-            "timestamp": "now",
-            "internal": False,
-            "active": True,
-            "range": [0, 3]
-        },
-        {
-            "desc": descsum_create("tr(tprv8ZgxMBicQKsPe4mDP1295ti2BqcgFzPWkKnvsGyKVerGqf9tDif6yR4yLcK6Pf49tQ1HRQK2vjXrAVqxVUJCtXWn3AAiacXnXhUf6nxBJAp/86'/1'/0'/1/*)"),
-            "timestamp": "now",
-            "internal": True,
-            "active": True,
-            "range": [0, 3]
-        }]
-
-        self.log.info("send multiple silent transactions to test scantxoutset")
-        for amount in [12.75, 11.98, 21.30]:
-
-            recipient_wallet_03.importdescriptors(desc_import)
-
-            recv_addr_03 = recipient_wallet_03.getnewaddress('', 'bech32m')
-
-            outputs = [{recv_addr_03: amount}]
-            options= {"silent_payment": True }
-
-            silent_tx_ret = sender_wallet_02.send(outputs=outputs, options=options)
-
-            self.sync_mempools()
-
-            silent_utxo = [x for x in recipient_wallet_03.listunspent(0) if x['txid'] == silent_tx_ret['txid']][0]
-
-            assert(silent_utxo['address'] != recv_addr_03)
-
-            self.generate(self.nodes[0], 7)
-
-            self.sync_all()
-
-        self.wait_until(lambda: all(i["synced"] for i in self.nodes[0].getindexinfo().values()))
-
-        utxos = recipient_wallet_03.listunspent()
-
-        scan_result = self.nodes[1].scantxoutset("start", [{"desc": desc_import[0]["desc"], "range": [0, 3]}], True)
-
-        self.log.info("check if silent scantxoutset and listunspent have the same result for the same descriptor")
-        assert(len(scan_result["unspents"]) == len(utxos))
-
-        for scan_tx in scan_result["unspents"]:
-            assert(len([x for x in utxos if x['txid'] == scan_tx['txid']]) == 1)
-
     def test_load_silent_wallet(self):
+        self.log.info("Testing wallet loading after receveing transactions")
+
         self.nodes[0].createwallet(wallet_name='load_sender_wallet_01', descriptors=True)
         load_sender_wallet_01 = self.nodes[0].get_wallet_rpc('load_sender_wallet_01')
 
@@ -426,16 +296,17 @@ class SilentTransactioTest(BitcoinTestFramework):
 
     # it makes no sense for users to send themselves silent payments, but that should work anyway.
     def test_self_sp_transfer(self):
+
+        self.log.info("Testing self transfer")
+
         self.nodes[1].createwallet(wallet_name='self_sender_wallet_01', descriptors=True, silent_payment=True)
         self_sender_wallet_01 = self.nodes[1].get_wallet_rpc('self_sender_wallet_01')
 
         self.generatetoaddress(self.nodes[1], 1, self_sender_wallet_01.getnewaddress())
 
-        self.generate(self.nodes[1], COINBASE_MATURITY + 1)
+        self.generate(self.nodes[1], COINBASE_MATURITY)
 
         sp_recv_addr = self_sender_wallet_01.getnewaddress('', 'silent-payment')
-
-        print(self_sender_wallet_01.getbalance())
 
         ret = self_sender_wallet_01.send([{sp_recv_addr: 0.2}])
 
@@ -443,19 +314,67 @@ class SilentTransactioTest(BitcoinTestFramework):
 
         assert_equal(len(self_sender_wallet_01.listunspent(0)), 2)
 
+    def test_scantxoutset(self):
+        self.log.info("Testing  SP scantxoutset")
+        self.nodes[0].createwallet(wallet_name='scan_sender_wallet_02', descriptors=True)
+        scan_sender_wallet_02 = self.nodes[0].get_wallet_rpc('scan_sender_wallet_02')
+
+        self.generatetoaddress(self.nodes[0], COINBASE_MATURITY + 10, scan_sender_wallet_02.getnewaddress())
+
+        self.nodes[2].createwallet(wallet_name='recipient_wallet_03', descriptors=True, silent_payment=True, blank=True)
+        recipient_wallet_03 = self.nodes[2].get_wallet_rpc('recipient_wallet_03')
+
+        desc_import = [{
+            "desc": "sp(cQq73sG9nQN1bUNneZHKiYV3jhnED7Y3oNUdLHoHrpZdJD51uaRD)#9llg6xjm",
+            "timestamp": "now",
+            "internal": False,
+            "active": True,
+        }]
+
+        self.log.info("send multiple silent transactions to test scantxoutset")
+        for amount in [2.75, 3.98, 2.30]:
+
+            recipient_wallet_03.importdescriptors(desc_import)
+
+            recv_addr_03 = recipient_wallet_03.getnewaddress('', 'silent-payment')
+
+            outputs = [{recv_addr_03: amount}]
+
+            silent_tx_ret = scan_sender_wallet_02.send(outputs=outputs)
+
+            self.sync_mempools()
+
+            silent_utxo = [x for x in recipient_wallet_03.listunspent(0) if x['txid'] == silent_tx_ret['txid']][0]
+
+            assert(silent_utxo['address'] != recv_addr_03)
+
+            self.generate(self.nodes[0], 7)
+
+            self.sync_all()
+
+        self.wait_until(lambda: all(i["synced"] for i in self.nodes[0].getindexinfo().values()))
+
+        utxos = recipient_wallet_03.listunspent()
+
+        scan_result = self.nodes[1].scantxoutset("start", [desc_import[0]["desc"]])
+
+        self.log.info("check if silent scantxoutset and listunspent have the same result for the same descriptor")
+        assert(len(scan_result["unspents"]) == len(utxos))
+
+        for scan_tx in scan_result["unspents"]:
+            assert(len([x for x in utxos if x['txid'] == scan_tx['txid']]) == 1)
+
 
     def run_test(self):
         self.invalid_create_wallet()
         self.watch_only_wallet_send()
         self.encrypted_wallet_send()
+        self.test_self_sp_transfer()
         self.test_sp_descriptor()
-        self.test_transactions()
         self.test_big_transaction_multiple_wallets()
         self.test_backup_sp_descriptor()
         self.test_load_silent_wallet()
-        self.test_self_sp_transfer()
-
-        # self.test_scantxoutset()
+        self.test_scantxoutset()
 
 
 

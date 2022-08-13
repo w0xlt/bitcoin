@@ -1501,6 +1501,10 @@ std::unique_ptr<DescriptorImpl> ParseScript(uint32_t& key_exp_index, Span<const 
     }
     if (ctx == ParseScriptContext::TOP && Func("sp", expr)) {
         auto arg = Expr(expr);
+        if (expr.size()) {
+            error = strprintf("sp(): only one key expected.");
+            return nullptr;
+        }
         auto internal_key = ParsePubkey(key_exp_index, arg, ParseScriptContext::P2TR, out, error);
         if (!internal_key) return nullptr;
         ++key_exp_index;

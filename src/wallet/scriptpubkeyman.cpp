@@ -1967,7 +1967,7 @@ bool DescriptorScriptPubKeyMan::SetupDescriptorGeneration(const CExtKey& master_
         break;
     }
     case OutputType::SILENT_PAYMENT: {
-        desc_prefix = "sp(" + xpub  + ")";
+        desc_prefix = "sp(" + EncodeSecret(master_key.key)  + ")";
         break;
     }
     } // no default case, so the compiler can warn about missing cases
@@ -2201,41 +2201,39 @@ bool DescriptorScriptPubKeyMan::CreateSilentPaymentAddress(const CScript inputSc
     return true;
 }
 
-void DescriptorScriptPubKeyMan::VerifySilentPaymentAddress(
-    std::vector<std::tuple<CScript, XOnlyPubKey>>& txOutputPubKeys,
-    XOnlyPubKey& senderPubKey,
-    std::vector<CKey>& rawTrKeys)
+std::vector<CKey> DescriptorScriptPubKeyMan::VerifySilentPaymentAddress(
+    std::vector<std::tuple<CScript, XOnlyPubKey>>& tx_output_pub_keys,
+    XOnlyPubKey& sender_pub_key)
 {
     LOCK(cs_desc_man);
 
-    std::vector<CKey> silentOutputCKeys;
+    std::vector<CKey> raw_tr_keys;
 
-    for (auto const& [scriptPubKey, _] : m_map_script_pub_keys)
-    {
-        CKey tweakedPrivKey;
-        GetPrivKeyForSilentPayment(scriptPubKey, /*privKey=*/tweakedPrivKey,  /*onlyTaproot=*/true);
+    std::vector<CKey> priv_keys;
 
-        for(auto& pubKeyItems : txOutputPubKeys) {
+    for (auto& [_, priv_key] : m_map_keys) {
+        priv_keys.push_back(priv_key);
+    }
 
-            CScript& outputScriptPubKey = std::get<0>(pubKeyItems);
-            XOnlyPubKey& outputPubKey = std::get<1>(pubKeyItems);
+    assert(priv_keys.size() == 1);
 
-            CKey silKey = silentpayment::Recipient::CreateSilentPaymentAddress(tweakedPrivKey, senderPubKey);
-            XOnlyPubKey silPubKey = XOnlyPubKey(silKey.GetPubKey());
+    CKey priv_key = priv_keys.at(0);
 
-            if (silPubKey == outputPubKey) {
-                silentOutputCKeys.push_back(silKey);
+    for(auto& pub_key_items : tx_output_pub_keys) {
 
-                WalletLogPrintf("Silent scriptPubKey identified: %s\n", HexStr(outputScriptPubKey));
-            }
-        }
+        CScript& outputScriptPubKey = std::get<0>(pub_key_items);
+        XOnlyPubKey& outputPubKey = std::get<1>(pub_key_items);
 
-        if (silentOutputCKeys.size() == txOutputPubKeys.size()) {
-            break;
+        CKey silKey = silentpayment::Recipient::CreateSilentPaymentAddress(priv_key, sender_pub_key);
+        XOnlyPubKey silPubKey = XOnlyPubKey(silKey.GetPubKey());
+
+        if (silPubKey == outputPubKey) {
+            raw_tr_keys.push_back(silKey);
+            WalletLogPrintf("Silent scriptPubKey identified: %s\n", HexStr(outputScriptPubKey));
         }
     }
 
-    rawTrKeys.insert(rawTrKeys.end(), silentOutputCKeys.begin(), silentOutputCKeys.end());
+    return raw_tr_keys;
 }
 
 TransactionError DescriptorScriptPubKeyMan::FillPSBT(PartiallySignedTransaction& psbtx, const PrecomputedTransactionData& txdata, int sighash_type, bool sign, bool bip32derivs, int* n_signed, bool finalize) const

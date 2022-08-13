@@ -558,7 +558,8 @@ RPCHelpMan getaddressinfo()
     LOCK(pwallet->cs_wallet);
 
     std::string error_msg;
-    CTxDestination dest = DecodeDestination(request.params[0].get_str(), error_msg);
+    bool silent_payment = false;
+    CTxDestination dest = DecodeDestination(request.params[0].get_str(), error_msg, &silent_payment);
 
     // Make sure the destination is valid
     if (!IsValidDestination(dest)) {
@@ -570,7 +571,7 @@ RPCHelpMan getaddressinfo()
 
     UniValue ret(UniValue::VOBJ);
 
-    std::string currentAddress = EncodeDestination(dest);
+    std::string currentAddress = EncodeDestination(dest, silent_payment);
     ret.pushKV("address", currentAddress);
 
     CScript scriptPubKey = GetScriptForDestination(dest);

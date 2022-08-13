@@ -1331,8 +1331,6 @@ bool CWallet::VerifySilentPayment(const CTransaction& tx, std::vector<CKey>& raw
 
     if (!IsWalletFlagSet(WALLET_FLAG_DESCRIPTORS)) return false;
 
-    //std::vector<XOnlyPubKey> outputPubKeys;
-
     std::vector<std::tuple<CScript, XOnlyPubKey>> outputPubKeys;
 
     for (auto& vout : tx.vout) {
@@ -1354,6 +1352,10 @@ bool CWallet::VerifySilentPayment(const CTransaction& tx, std::vector<CKey>& raw
         assert(xOnlyPubKey.IsFullyValid());
 
         outputPubKeys.emplace_back(vout.scriptPubKey, xOnlyPubKey);
+    }
+
+    if (outputPubKeys.empty()) {
+        return false;
     }
 
     const CTxIn& txin = tx.vin.at(0);
@@ -1379,7 +1381,7 @@ bool CWallet::VerifySilentPayment(const CTransaction& tx, std::vector<CKey>& raw
             continue;
         }
 
-        desc_spkm->VerifySilentPaymentAddress(outputPubKeys, senderPubKey, rawTrKeys);
+        rawTrKeys = desc_spkm->VerifySilentPaymentAddress(outputPubKeys, senderPubKey);
     }
 
     return rawTrKeys.size() > 0;
