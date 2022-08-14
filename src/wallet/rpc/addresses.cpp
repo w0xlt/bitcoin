@@ -22,7 +22,7 @@ RPCHelpMan getnewaddress()
                 "so payments received with the address will be associated with 'label'.\n",
                 {
                     {"label", RPCArg::Type::STR, RPCArg::Default{""}, "The label name for the address to be linked to. It can also be set to the empty string \"\" to represent the default label. The label does not need to exist, it will be created if there is no label by the given name."},
-                    {"address_type", RPCArg::Type::STR, RPCArg::DefaultHint{"set by -addresstype"}, "The address type to use. Options are \"legacy\", \"p2sh-segwit\", \"bech32\", and \"bech32m\"."},
+                    {"address_type", RPCArg::Type::STR, RPCArg::DefaultHint{"set by -addresstype"}, "The address type to use. Options are \"legacy\", \"p2sh-segwit\", \"bech32\", \"bech32m\" and \"silent-payment\"."},
                 },
                 RPCResult{
                     RPCResult::Type::STR, "address", "The new bitcoin address"
@@ -42,6 +42,8 @@ RPCHelpMan getnewaddress()
         throw JSONRPCError(RPC_WALLET_ERROR, "Error: This wallet has no available keys");
     }
 
+    bool silent_payment{false};
+
     // Parse the label first so we don't generate a key if there's an error
     std::string label;
     if (!request.params[0].isNull())
@@ -56,6 +58,15 @@ RPCHelpMan getnewaddress()
             throw JSONRPCError(RPC_INVALID_PARAMETER, "Legacy wallets cannot provide bech32m addresses");
         }
         output_type = parsed.value();
+        silent_payment = output_type == OutputType::SILENT_PAYMENT;
+    }
+
+    int32_t current_index{0};
+
+    if (silent_payment) {
+        auto wallet_descriptor = pwallet->GetWalletDescriptor(output_type, /*internal=*/false);
+
+        current_index = wallet_descriptor->next_index;
     }
 
     auto op_dest = pwallet->GetNewDestination(output_type, label);
@@ -63,7 +74,7 @@ RPCHelpMan getnewaddress()
         throw JSONRPCError(RPC_WALLET_KEYPOOL_RAN_OUT, util::ErrorString(op_dest).original);
     }
 
-    return EncodeDestination(*op_dest);
+    return EncodeDestination(*op_dest, silent_payment, current_index);
 },
     };
 }
@@ -509,6 +520,7 @@ RPCHelpMan getaddressinfo()
                         {RPCResult::Type::BOOL, "solvable", "If we know how to spend coins sent to this address, ignoring the possible lack of private keys."},
                         {RPCResult::Type::STR, "desc", /*optional=*/true, "A descriptor for spending coins sent to this address (only when solvable)."},
                         {RPCResult::Type::STR, "parent_desc", /*optional=*/true, "The descriptor used to derive this address if this is a descriptor wallet"},
+                        {RPCResult::Type::NUM, "silent_payment_identifier", /*optional=*/true, "The identifier used by the silent payment address"},
                         {RPCResult::Type::BOOL, "isscript", "If the key is a script."},
                         {RPCResult::Type::BOOL, "ischange", "If the address was used for change output."},
                         {RPCResult::Type::BOOL, "iswitness", "If the address is a witness address."},
@@ -553,7 +565,11 @@ RPCHelpMan getaddressinfo()
     LOCK(pwallet->cs_wallet);
 
     std::string error_msg;
-    CTxDestination dest = DecodeDestination(request.params[0].get_str(), error_msg);
+
+    auto decoded = DecodeDestinationIndicatingSP(request.params[0].get_str(), error_msg);
+    CTxDestination dest{std::get<0>(decoded)};
+    bool silent_payment{std::get<1>(decoded)};
+    int32_t silent_payment_index{std::get<2>(decoded)};
 
     // Make sure the destination is valid
     if (!IsValidDestination(dest)) {
@@ -565,7 +581,7 @@ RPCHelpMan getaddressinfo()
 
     UniValue ret(UniValue::VOBJ);
 
-    std::string currentAddress = EncodeDestination(dest);
+    std::string currentAddress = EncodeDestination(dest, silent_payment, silent_payment_index);
     ret.pushKV("address", currentAddress);
 
     CScript scriptPubKey = GetScriptForDestination(dest);
@@ -598,6 +614,10 @@ RPCHelpMan getaddressinfo()
         if (desc_spk_man->GetDescriptorString(desc_str, /*priv=*/false)) {
             ret.pushKV("parent_desc", desc_str);
         }
+    }
+
+    if (silent_payment) {
+        ret.pushKV("silent_payment_identifier", silent_payment_index);
     }
 
     ret.pushKV("iswatchonly", bool(mine & ISMINE_WATCH_ONLY));
