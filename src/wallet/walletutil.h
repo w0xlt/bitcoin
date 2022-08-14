@@ -11,6 +11,7 @@
 #include <vector>
 
 namespace wallet {
+
 /** (client) version numbers for particular wallet features */
 enum WalletFeature
 {
