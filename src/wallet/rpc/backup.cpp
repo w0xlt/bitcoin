@@ -1495,6 +1495,11 @@ static UniValue ProcessDescriptorImport(CWallet& wallet, const UniValue& data, c
             throw JSONRPCError(RPC_INVALID_PARAMETER, "Active descriptors must be ranged");
         }
 
+        if (isSP && data.exists("next_index"))
+        {
+            next_index = data["next_index"].getInt<int64_t>();
+        }
+
         // Ranged descriptors should not have a label
         if (data.exists("range") && data.exists("label")) {
             throw JSONRPCError(RPC_INVALID_PARAMETER, "Ranged descriptors should not have a label");
@@ -1836,6 +1841,9 @@ RPCHelpMan listdescriptors()
             range.push_back(info.range->first);
             range.push_back(info.range->second - 1);
             spk.pushKV("range", range);
+            spk.pushKV("next", info.next_index);
+        }
+        if (info.descriptor.rfind("sp(", 0) == 0) {
             spk.pushKV("next", info.next_index);
         }
         descriptors.push_back(spk);
