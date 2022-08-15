@@ -12,8 +12,6 @@
 
 namespace wallet {
 
-const int16_t SILENT_ADDRESS_MAXIMUM_IDENTIFIER = 99;
-
 /** (client) version numbers for particular wallet features */
 enum WalletFeature
 {
