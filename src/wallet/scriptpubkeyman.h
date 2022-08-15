@@ -15,6 +15,7 @@
 #include <util/time.h>
 #include <wallet/crypter.h>
 #include <wallet/ismine.h>
+#include <silentpayment.h>
 #include <wallet/walletdb.h>
 #include <wallet/walletutil.h>
 
@@ -634,6 +635,9 @@ public:
 
     bool AddKey(const CKeyID& key_id, const CKey& key);
     bool AddCryptedKey(const CKeyID& key_id, const CPubKey& pubkey, const std::vector<unsigned char>& crypted_key);
+
+    bool GetPrivKeyForSilentPayment(const CScript& scriptPubKey, CKey& privKey, bool onlyTaproot) const;
+    std::vector<std::tuple<CKey, int32_t>> VerifySilentPaymentAddress(std::vector<std::tuple<CScript, XOnlyPubKey>>& txOutputPubKeys, XOnlyPubKey& senderPubKey);
 
     bool HasWalletDescriptor(const WalletDescriptor& desc) const;
     void UpdateWalletDescriptor(WalletDescriptor& descriptor);
