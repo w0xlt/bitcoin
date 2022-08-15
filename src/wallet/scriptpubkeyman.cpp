@@ -2640,6 +2640,86 @@ bool DescriptorScriptPubKeyMan::AddCryptedKey(const CKeyID& key_id, const CPubKe
     return true;
 }
 
+bool DescriptorScriptPubKeyMan::GetPrivKeyForSilentPayment(const CScript& scriptPubKey, CKey& privKey, bool onlyTaproot)
+{
+    std::vector<std::vector<unsigned char>> solutions;
+    TxoutType whichType = Solver(scriptPubKey, solutions);
+
+    std::unique_ptr<FlatSigningProvider> coin_keys = GetSigningProvider(scriptPubKey, true);
+    if (!coin_keys || coin_keys->keys.size() != 1) {
+        return false;
+    }
+
+    auto& key = *coin_keys->keys.begin();
+
+    // Tweak the private key as GetSigningProvider returns the original key.
+    // Taproot addresses / scriptPubKeys use tweaked public key, not the original key.
+    if (whichType == TxoutType::WITNESS_V1_TAPROOT) {
+        auto pubKeyFromScriptPubKey = XOnlyPubKey(solutions[0]);
+
+        // this means it is a "rawtr" output
+        if (XOnlyPubKey(key.second.GetPubKey()) == pubKeyFromScriptPubKey) {
+            privKey = key.second;
+            return true;
+        }
+
+        TaprootSpendData spenddata;
+        coin_keys->GetTaprootSpendData(pubKeyFromScriptPubKey, spenddata);
+
+        if(!key.second.TweakCKey(&spenddata.merkle_root, privKey)) return false;
+
+        assert(XOnlyPubKey(privKey.GetPubKey()) ==  pubKeyFromScriptPubKey);
+    } else if (onlyTaproot) {
+        return false;
+    } else if (whichType == TxoutType::NONSTANDARD || whichType == TxoutType::MULTISIG || whichType == TxoutType::WITNESS_UNKNOWN ) {
+        return false;
+    } else {
+        privKey = key.second;
+    }
+
+    return true;
+}
+
+std::vector<std::tuple<CKey, int32_t>> DescriptorScriptPubKeyMan::VerifySilentPaymentAddress(
+    std::vector<std::tuple<CScript, XOnlyPubKey>>& tx_output_pub_keys,
+    XOnlyPubKey& sender_pub_key)
+{
+    LOCK(cs_desc_man);
+
+    std::vector<std::tuple<CKey, int32_t>> raw_tr_keys;
+
+    std::vector<CKey> priv_keys;
+
+    for (auto& [_, priv_key] : m_map_keys) {
+        priv_keys.push_back(priv_key);
+    }
+
+    assert(priv_keys.size() == 1);
+
+    CKey priv_key = priv_keys.at(0);
+
+    for(auto& pub_key_items : tx_output_pub_keys) {
+
+        const auto& [outputScriptPubKey, outputPubKey] = pub_key_items;
+
+        silentpayment::Recipient silent_sender{silentpayment::Recipient(priv_key, sender_pub_key)};
+
+        for (int32_t identifier = 0; identifier <= m_wallet_descriptor.next_index; identifier++) {
+            CKey silKey = silent_sender.Tweak(identifier);
+            XOnlyPubKey silPubKey{silKey.GetPubKey()};
+
+            if (silPubKey == outputPubKey) {
+                raw_tr_keys.emplace_back(silKey, identifier);
+                WalletLogPrintf("Silent scriptPubKey identified: %s\n", HexStr(outputScriptPubKey));
+                break;
+            }
+        }
+
+    }
+
+    return raw_tr_keys;
+}
+
 bool DescriptorScriptPubKeyMan::HasWalletDescriptor(const WalletDescriptor& desc) const
 {
     LOCK(cs_desc_man);
