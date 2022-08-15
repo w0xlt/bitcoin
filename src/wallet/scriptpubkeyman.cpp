@@ -2691,8 +2691,8 @@ bool DescriptorScriptPubKeyMan::CreateSilentPaymentAddress(const CScript inputSc
     CTxDestination address;
     ExtractDestination(inputScriptPubKey, address);
 
-    auto newKey{silentpayment::Sender::CreateSilentPaymentAddress(sender_secret_key, recipientPubKey)};
-    tweakedKey = silentpayment::AddIdentifierToSilentPaymentAddress(newKey, (uint8_t) identifier);
+    silentpayment::Sender silent_sender{silentpayment::Sender(sender_secret_key, recipientPubKey)};
+    tweakedKey = silent_sender.Tweak(identifier);
 
     return true;
 }
