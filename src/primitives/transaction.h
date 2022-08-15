@@ -158,6 +158,7 @@ class CTxOut
 public:
     CAmount nValue;
     CScript scriptPubKey;
+    bool m_silentpayment{false};
 
     CTxOut()
     {
@@ -166,12 +167,15 @@ public:
 
     CTxOut(const CAmount& nValueIn, CScript scriptPubKeyIn);
 
+    CTxOut(const CAmount& nValueIn, CScript scriptPubKeyIn, bool silentpayment);
+
     SERIALIZE_METHODS(CTxOut, obj) { READWRITE(obj.nValue, obj.scriptPubKey); }
 
     void SetNull()
     {
         nValue = -1;
         scriptPubKey.clear();
+        m_silentpayment = false;
     }
 
     bool IsNull() const
@@ -191,6 +195,12 @@ public:
     }
 
     std::string ToString() const;
+};
+
+struct SilentTxOut
+{
+    CTxOut tx_out;
+    int32_t identifier;
 };
 
 struct CMutableTransaction;
