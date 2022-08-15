@@ -2289,20 +2289,27 @@ bool DescriptorScriptPubKeyMan::SetupDescriptorGeneration(const CExtKey& master_
         assert(false);
     }
     case OutputType::SILENT_PAYMENT: {
-        return false;
+        desc_prefix = "sp(" + EncodeSecret(master_key.key)  + ")";
+        break;
     }
     } // no default case, so the compiler can warn about missing cases
     assert(!desc_prefix.empty());
 
-    // Mainnet derives at 0', testnet and regtest derive at 1'
-    if (Params().IsTestChain()) {
-        desc_prefix += "/1'";
-    } else {
-        desc_prefix += "/0'";
-    }
+    std::string desc_str;
 
-    std::string internal_path = internal ? "/1" : "/0";
-    std::string desc_str = desc_prefix + "/0'" + internal_path + desc_suffix;
+    if (addr_type != OutputType::SILENT_PAYMENT) {
+        // Mainnet derives at 0', testnet and regtest derive at 1'
+        if (Params().IsTestChain()) {
+            desc_prefix += "/1'";
+        } else {
+            desc_prefix += "/0'";
+        }
+
+        std::string internal_path = internal ? "/1" : "/0";
+        desc_str = desc_prefix + "/0'" + internal_path + desc_suffix;
+    } else {
+        desc_str = desc_prefix;
+    }
 
     // Make the descriptor
     FlatSigningProvider keys;

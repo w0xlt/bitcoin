@@ -67,7 +67,7 @@ std::vector<std::shared_ptr<CWallet>> GetWallets(WalletContext& context);
 std::shared_ptr<CWallet> GetDefaultWallet(WalletContext& context, size_t& count);
 std::shared_ptr<CWallet> GetWallet(WalletContext& context, const std::string& name);
 std::shared_ptr<CWallet> LoadWallet(WalletContext& context, const std::string& name, std::optional<bool> load_on_start, const DatabaseOptions& options, DatabaseStatus& status, bilingual_str& error, std::vector<bilingual_str>& warnings);
-std::shared_ptr<CWallet> CreateWallet(WalletContext& context, const std::string& name, std::optional<bool> load_on_start, DatabaseOptions& options, DatabaseStatus& status, bilingual_str& error, std::vector<bilingual_str>& warnings);
+std::shared_ptr<CWallet> CreateWallet(WalletContext& context, const std::string& name, std::optional<bool> load_on_start, DatabaseOptions& options, DatabaseStatus& status, bilingual_str& error, std::vector<bilingual_str>& warnings, const bool silent_payment = false);
 std::shared_ptr<CWallet> RestoreWallet(WalletContext& context, const fs::path& backup_file, const std::string& wallet_name, std::optional<bool> load_on_start, DatabaseStatus& status, bilingual_str& error, std::vector<bilingual_str>& warnings);
 std::unique_ptr<interfaces::Handler> HandleLoadWallet(WalletContext& context, LoadWalletFn load_wallet);
 void NotifyWalletLoaded(WalletContext& context, const std::shared_ptr<CWallet>& wallet);
@@ -222,6 +222,12 @@ public:
         m_change = false;
         m_label = label;
     }
+};
+
+struct SilentAddressBookEntry
+{
+    std::string m_label;
+    std::string m_address;
 };
 
 struct CRecipient
@@ -405,6 +411,7 @@ public:
     uint64_t nAccountingEntryNumber = 0;
 
     std::map<CTxDestination, CAddressBookData> m_address_book GUARDED_BY(cs_wallet);
+    std::map<int32_t, SilentAddressBookEntry> m_silent_address_book GUARDED_BY(cs_wallet);
     const CAddressBookData* FindAddressBookEntry(const CTxDestination&, bool allow_change = false) const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
 
     /** Set of Coins owned by this wallet that we won't try to spend from. A
@@ -675,7 +682,7 @@ public:
      */
     void MarkDestinationsDirty(const std::set<CTxDestination>& destinations) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
 
-    util::Result<CTxDestination> GetNewDestination(const OutputType type, const std::string label);
+    util::Result<CTxDestination> GetNewDestination(const OutputType type, const std::string label, const bool silent_payment = false, const int32_t current_index = 0);
     util::Result<CTxDestination> GetNewChangeDestination(const OutputType type);
 
     isminetype IsMine(const CTxDestination& dest) const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
@@ -697,6 +704,8 @@ public:
     DBErrors ZapSelectTx(std::vector<uint256>& vHashIn, std::vector<uint256>& vHashOut) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
 
     bool SetAddressBook(const CTxDestination& address, const std::string& strName, const std::string& purpose);
+
+    bool SetSilentAddressBook(int32_t identifier, const std::string& silent_address, const std::string& label) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
 
     bool DelAddressBook(const CTxDestination& address);
 
@@ -774,7 +783,7 @@ public:
     bool MarkReplaced(const uint256& originalHash, const uint256& newHash);
 
     /* Initializes the wallet, returns a new CWallet instance or a null pointer in case of an error */
-    static std::shared_ptr<CWallet> Create(WalletContext& context, const std::string& name, std::unique_ptr<WalletDatabase> database, uint64_t wallet_creation_flags, bilingual_str& error, std::vector<bilingual_str>& warnings);
+    static std::shared_ptr<CWallet> Create(WalletContext& context, const std::string& name, std::unique_ptr<WalletDatabase> database, uint64_t wallet_creation_flags, bilingual_str& error, std::vector<bilingual_str>& warnings, const bool silent_payment = false);
 
     /**
      * Wallet post-init setup
@@ -912,8 +921,8 @@ public:
     void DeactivateScriptPubKeyMan(uint256 id, OutputType type, bool internal);
 
     //! Create new DescriptorScriptPubKeyMans and add them to the wallet
-    void SetupDescriptorScriptPubKeyMans(const CExtKey& master_key) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
-    void SetupDescriptorScriptPubKeyMans() EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+    void SetupDescriptorScriptPubKeyMans(const CExtKey& master_key, bool silent_payment = false) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+    void SetupDescriptorScriptPubKeyMans(bool silent_payment = false) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
 
     //! Return the DescriptorScriptPubKeyMan for a WalletDescriptor if it is already in the wallet
     DescriptorScriptPubKeyMan* GetDescriptorScriptPubKeyMan(const WalletDescriptor& desc) const;
