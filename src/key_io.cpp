@@ -7,7 +7,6 @@
 #include <base58.h>
 #include <bech32.h>
 #include <util/strencodings.h>
-#include <wallet/walletutil.h>
 
 #include <algorithm>
 #include <assert.h>
@@ -207,9 +206,9 @@ std::tuple<CTxDestination,bool,int32_t> DecodeDestination(const std::string& str
                         return {CNoDestination(), false, 0};
                     }
 
-                    if (hrp_index > wallet::SILENT_ADDRESS_MAXIMUM_IDENTIFIER) {
+                    if (hrp_index > SILENT_ADDRESS_MAXIMUM_IDENTIFIER) {
                         std::stringstream ss;
-                        ss << wallet::SILENT_ADDRESS_MAXIMUM_IDENTIFIER;
+                        ss << SILENT_ADDRESS_MAXIMUM_IDENTIFIER;
 
                         error_str = "Silent Payment identifier must have a maximum value of " + ss.str();
                         return {CNoDestination(), false, 0};

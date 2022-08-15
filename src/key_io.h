@@ -13,6 +13,8 @@
 
 #include <string>
 
+const int16_t SILENT_ADDRESS_MAXIMUM_IDENTIFIER = 99;
+
 CKey DecodeSecret(const std::string& str);
 std::string EncodeSecret(const CKey& key);
 

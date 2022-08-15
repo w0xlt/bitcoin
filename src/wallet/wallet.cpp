@@ -252,6 +252,12 @@ std::shared_ptr<CWallet> LoadWalletInternal(WalletContext& context, const std::s
             return nullptr;
         }
 
+        if (wallet->IsWalletFlagSet(WALLET_FLAG_SILENT_PAYMENT) &&  !wallet->chain().isSilentPaymentIndexActivatedAndSynced()) {
+            error = Untranslated("Wallet loading failed. Wallets enabled for silent payments require the silent payment index enabled and synchronized.") + Untranslated(" ") + error;
+            status = DatabaseStatus::FAILED_LOAD;
+            return nullptr;
+        }
+
         NotifyWalletLoaded(context, wallet);
         AddWallet(context, wallet);
         wallet->postInitProcess();
@@ -281,7 +287,7 @@ std::shared_ptr<CWallet> LoadWallet(WalletContext& context, const std::string& n
     return wallet;
 }
 
-std::shared_ptr<CWallet> CreateWallet(WalletContext& context, const std::string& name, std::optional<bool> load_on_start, DatabaseOptions& options, DatabaseStatus& status, bilingual_str& error, std::vector<bilingual_str>& warnings)
+std::shared_ptr<CWallet> CreateWallet(WalletContext& context, const std::string& name, std::optional<bool> load_on_start, DatabaseOptions& options, DatabaseStatus& status, bilingual_str& error, std::vector<bilingual_str>& warnings, const bool silent_payment)
 {
     uint64_t wallet_creation_flags = options.create_flags;
     const SecureString& passphrase = options.create_passphrase;
@@ -317,6 +323,32 @@ std::shared_ptr<CWallet> CreateWallet(WalletContext& context, const std::string&
         return nullptr;
     }
 
+    // silent payment validations
+    if ((wallet_creation_flags & WALLET_FLAG_DISABLE_PRIVATE_KEYS) && (wallet_creation_flags & WALLET_FLAG_SILENT_PAYMENT)) {
+        error = Untranslated("Silent payments require the ability to store private keys.") + error;
+        status = DatabaseStatus::FAILED_VERIFY;
+        return nullptr;
+    }
+
+    if ((wallet_creation_flags & WALLET_FLAG_SILENT_PAYMENT) && !(wallet_creation_flags & WALLET_FLAG_DESCRIPTORS)) {
+        error = Untranslated("Only descriptor wallets support silent payments.") + error;
+        status = DatabaseStatus::FAILED_VERIFY;
+        return nullptr;
+    }
+
+    if (!passphrase.empty() && (wallet_creation_flags & WALLET_FLAG_SILENT_PAYMENT)) {
+        error = Untranslated("Silent payment verification requires access to private keys. Cannot be used with encrypted wallets.")  + error;
+        status = DatabaseStatus::FAILED_VERIFY;
+        return nullptr;
+    }
+
+    if((wallet_creation_flags & WALLET_FLAG_SILENT_PAYMENT) && !context.chain->isSilentPaymentIndexActivatedAndSynced()) {
+        error = Untranslated("Silent payment index is required to verify silent transactions. It must be activated and synced before creating a wallet with this option.") + error;
+        status = DatabaseStatus::FAILED_VERIFY;
+        return nullptr;
+    }
+    // end - silent payment validations
+
     // Wallet::Verify will check if we're trying to create a wallet with a duplicate name.
     std::unique_ptr<WalletDatabase> database = MakeWalletDatabase(name, options, status, error);
     if (!database) {
@@ -327,7 +359,7 @@ std::shared_ptr<CWallet> CreateWallet(WalletContext& context, const std::string&
 
     // Make the wallet
     context.chain->initMessage(_("Loading wallet…").translated);
-    const std::shared_ptr<CWallet> wallet = CWallet::Create(context, name, std::move(database), wallet_creation_flags, error, warnings);
+    const std::shared_ptr<CWallet> wallet = CWallet::Create(context, name, std::move(database), wallet_creation_flags, error, warnings, silent_payment);
     if (!wallet) {
         error = Untranslated("Wallet creation failed.") + Untranslated(" ") + error;
         status = DatabaseStatus::FAILED_CREATE;
@@ -2316,6 +2348,15 @@ bool CWallet::SetAddressBook(const CTxDestination& address, const std::string& s
     return SetAddressBookWithDB(batch, address, strName, strPurpose);
 }
 
+bool CWallet::SetSilentAddressBook(int32_t identifier, const std::string& silent_address, const std::string& label)
+{
+    AssertLockHeld(cs_wallet);
+    WalletBatch batch(GetDatabase());
+    m_silent_address_book[identifier].m_label = label;
+    m_silent_address_book[identifier].m_address = silent_address;
+    return batch.WriteSilentIdentifier(identifier, label, silent_address);
+}
+
 bool CWallet::DelAddressBook(const CTxDestination& address)
 {
     bool is_mine;
@@ -2383,7 +2424,7 @@ bool CWallet::TopUpKeyPool(unsigned int kpSize)
     return res;
 }
 
-util::Result<CTxDestination> CWallet::GetNewDestination(const OutputType type, const std::string label)
+util::Result<CTxDestination> CWallet::GetNewDestination(const OutputType& type, const std::string& label, const bool silent_payment, const int32_t current_index)
 {
     LOCK(cs_wallet);
     auto spk_man = GetScriptPubKeyMan(type, false /* internal */);
@@ -2391,9 +2432,23 @@ util::Result<CTxDestination> CWallet::GetNewDestination(const OutputType type, c
         return util::Error{strprintf(_("Error: No %s addresses available."), FormatOutputType(type))};
     }
 
+    if (silent_payment) {
+        for (auto const& [key, val] : m_silent_address_book)
+        {
+            if (val.m_label == label) {
+                return util::Error{strprintf(_("Label %s is already assigned to a silent payment address."), label)};
+            }
+        }
+    }
+
     auto op_dest = spk_man->GetNewDestination(type);
     if (op_dest) {
-        SetAddressBook(*op_dest, label, "receive");
+        if (silent_payment) {
+            auto silent_address = EncodeDestination(*op_dest, silent_payment, current_index);
+            SetSilentAddressBook(current_index, silent_address, label);
+        } else {
+            SetAddressBook(*op_dest, label, "receive");
+        }
     }
 
     return op_dest;
@@ -2798,7 +2853,7 @@ std::unique_ptr<WalletDatabase> MakeWalletDatabase(const std::string& name, cons
     return MakeDatabase(wallet_path, options, status, error_string);
 }
 
-std::shared_ptr<CWallet> CWallet::Create(WalletContext& context, const std::string& name, std::unique_ptr<WalletDatabase> database, uint64_t wallet_creation_flags, bilingual_str& error, std::vector<bilingual_str>& warnings)
+std::shared_ptr<CWallet> CWallet::Create(WalletContext& context, const std::string& name, std::unique_ptr<WalletDatabase> database, uint64_t wallet_creation_flags, bilingual_str& error, std::vector<bilingual_str>& warnings, const bool silent_payment)
 {
     interfaces::Chain* chain = context.chain;
     ArgsManager& args = *Assert(context.args);
@@ -2867,7 +2922,7 @@ std::shared_ptr<CWallet> CWallet::Create(WalletContext& context, const std::stri
         if ((wallet_creation_flags & WALLET_FLAG_EXTERNAL_SIGNER) || !(wallet_creation_flags & (WALLET_FLAG_DISABLE_PRIVATE_KEYS | WALLET_FLAG_BLANK_WALLET))) {
             LOCK(walletInstance->cs_wallet);
             if (walletInstance->IsWalletFlagSet(WALLET_FLAG_DESCRIPTORS)) {
-                walletInstance->SetupDescriptorScriptPubKeyMans();
+                walletInstance->SetupDescriptorScriptPubKeyMans(silent_payment);
                 // SetupDescriptorScriptPubKeyMans already calls SetupGeneration for us so we don't need to call SetupGeneration separately
             } else {
                 // Legacy wallets need SetupGeneration here.
@@ -3040,6 +3095,9 @@ std::shared_ptr<CWallet> CWallet::Create(WalletContext& context, const std::stri
         walletInstance->WalletLogPrintf("setKeyPool.size() = %u\n",      walletInstance->GetKeyPoolSize());
         walletInstance->WalletLogPrintf("mapWallet.size() = %u\n",       walletInstance->mapWallet.size());
         walletInstance->WalletLogPrintf("m_address_book.size() = %u\n",  walletInstance->m_address_book.size());
+        if (walletInstance->IsWalletFlagSet(WALLET_FLAG_SILENT_PAYMENT)) {
+            walletInstance->WalletLogPrintf("m_silent_address_book.size() = %u\n",  walletInstance->m_silent_address_book.size());
+        }
     }
 
     return walletInstance;
@@ -3473,13 +3531,13 @@ void CWallet::LoadDescriptorScriptPubKeyMan(uint256 id, WalletDescriptor& desc)
     }
 }
 
-void CWallet::SetupDescriptorScriptPubKeyMans(const CExtKey& master_key)
+void CWallet::SetupDescriptorScriptPubKeyMans(const CExtKey& master_key, bool silent_payment)
 {
     AssertLockHeld(cs_wallet);
 
     for (bool internal : {false, true}) {
         for (OutputType t : OUTPUT_TYPES) {
-            if (t == OutputType::SILENT_PAYMENT) continue;
+            if (t == OutputType::SILENT_PAYMENT && (!silent_payment || IsCrypted() || internal)) continue;
             auto spk_manager = std::unique_ptr<DescriptorScriptPubKeyMan>(new DescriptorScriptPubKeyMan(*this));
             if (IsCrypted()) {
                 if (IsLocked()) {
@@ -3497,7 +3555,7 @@ void CWallet::SetupDescriptorScriptPubKeyMans(const CExtKey& master_key)
     }
 }
 
-void CWallet::SetupDescriptorScriptPubKeyMans()
+void CWallet::SetupDescriptorScriptPubKeyMans(bool silent_payment)
 {
     AssertLockHeld(cs_wallet);
 
@@ -3512,7 +3570,7 @@ void CWallet::SetupDescriptorScriptPubKeyMans()
         CExtKey master_key;
         master_key.SetSeed(seed_key);
 
-        SetupDescriptorScriptPubKeyMans(master_key);
+        SetupDescriptorScriptPubKeyMans(master_key, silent_payment);
     } else {
         ExternalSigner signer = ExternalSignerScriptPubKeyMan::GetExternalSigner();
 
