@@ -2640,6 +2640,63 @@ bool DescriptorScriptPubKeyMan::AddCryptedKey(const CKeyID& key_id, const CPubKe
     return true;
 }
 
+bool DescriptorScriptPubKeyMan::GetPrivKeyForSilentPayment(const CScript scriptPubKey, CKey& privKey, bool onlyTaproot)
+{
+    std::vector<std::vector<unsigned char>> solutions;
+    TxoutType whichType = Solver(scriptPubKey, solutions);
+
+    std::unique_ptr<FlatSigningProvider> coin_keys = GetSigningProvider(scriptPubKey, true);
+    if (!coin_keys || coin_keys->keys.size() != 1) {
+        return false;
+    }
+
+    auto& key = *coin_keys->keys.begin();
+
+    // Tweak the private key as GetSigningProvider returns the original key.
+    // Taproot addresses / scriptPubKeys use tweaked public key, not the original key.
+    if (whichType == TxoutType::WITNESS_V1_TAPROOT) {
+        auto pubKeyFromScriptPubKey = XOnlyPubKey(solutions[0]);
+
+        // this means it is a "rawtr" output
+        if (XOnlyPubKey(key.second.GetPubKey()) == pubKeyFromScriptPubKey) {
+            privKey = key.second;
+            return true;
+        }
+
+        TaprootSpendData spenddata;
+        coin_keys->GetTaprootSpendData(pubKeyFromScriptPubKey, spenddata);
+
+        if(!key.second.TweakCKey(&spenddata.merkle_root, privKey)) return false;
+
+        assert(XOnlyPubKey(privKey.GetPubKey()) ==  pubKeyFromScriptPubKey);
+    } else if (onlyTaproot) {
+        return false;
+    } else if (whichType == TxoutType::NONSTANDARD || whichType == TxoutType::MULTISIG || whichType == TxoutType::WITNESS_UNKNOWN ) {
+        return false;
+    } else {
+        privKey = key.second;
+    }
+
+    return true;
+}
+
+bool DescriptorScriptPubKeyMan::CreateSilentPaymentAddress(const CScript inputScriptPubKey, const XOnlyPubKey recipientPubKey, const int32_t identifier, XOnlyPubKey& tweakedKey)
+{
+
+    CKey sender_secret_key;
+    bool privKeyRet = GetPrivKeyForSilentPayment(inputScriptPubKey, /*privKey=*/ sender_secret_key, /*onlyTaproot=*/ false);
+
+    if (!privKeyRet) return false;
+
+    CTxDestination address;
+    ExtractDestination(inputScriptPubKey, address);
+
+    auto newKey{silentpayment::Sender::CreateSilentPaymentAddress(sender_secret_key, recipientPubKey)};
+    tweakedKey = silentpayment::AddIdentifierToSilentPaymentAddress(newKey, (uint8_t) identifier);
+
+    return true;
+}
+
 bool DescriptorScriptPubKeyMan::HasWalletDescriptor(const WalletDescriptor& desc) const
 {
     LOCK(cs_desc_man);
