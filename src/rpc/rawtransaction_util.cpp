@@ -105,6 +105,8 @@ CMutableTransaction ConstructTransaction(const UniValue& inputs_in, const UniVal
     std::set<CTxDestination> destinations;
     bool has_data{false};
 
+    std::set<std::vector<unsigned char>> silent_data;
+
     for (const std::string& name_ : outputs.getKeys()) {
         if (name_ == "data") {
             if (has_data) {
@@ -116,19 +118,41 @@ CMutableTransaction ConstructTransaction(const UniValue& inputs_in, const UniVal
             CTxOut out(0, CScript() << OP_RETURN << data);
             rawTx.vout.push_back(out);
         } else {
-            CTxDestination destination = DecodeDestination(name_);
-            if (!IsValidDestination(destination)) {
-                throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, std::string("Invalid Bitcoin address: ") + name_);
+
+            CScript scriptPubKey;
+
+            auto data = DecodeSilentAddress(name_);
+            auto [scan_pubkey, spend_pubkey] = DecodeSilentData(data);
+
+            CTxOut out;
+
+            if (scan_pubkey.IsFullyValid() && spend_pubkey.IsFullyValid()) {
+
+                if (!silent_data.insert(data).second) {
+                    throw JSONRPCError(RPC_INVALID_PARAMETER, std::string("Invalid parameter, duplicated address: ") + name_);
+                }
+                // this scriptPubKey is the identifier + pubkey
+                // This is not a valid pubkey but will be changed to a P2TR when creating the transaction
+                CScript scriptPubKey = CScript(std::begin(data), std::end(data));
+                CAmount nAmount = AmountFromValue(outputs[name_]);
+                out = {nAmount, scriptPubKey, true};
+            }
+            else {
+                CTxDestination destination = DecodeDestination(name_);
+
+                if (!IsValidDestination(destination)) {
+                    throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, std::string("Invalid Bitcoin address: ") + name_);
+                }
+
+                if (!destinations.insert(destination).second) {
+                    throw JSONRPCError(RPC_INVALID_PARAMETER, std::string("Invalid parameter, duplicated address: ") + name_);
+                }
+
+                CScript scriptPubKey = GetScriptForDestination(destination);
+                CAmount nAmount = AmountFromValue(outputs[name_]);
+                out = {nAmount, scriptPubKey};
             }
 
-            if (!destinations.insert(destination).second) {
-                throw JSONRPCError(RPC_INVALID_PARAMETER, std::string("Invalid parameter, duplicated address: ") + name_);
-            }
-
-            CScript scriptPubKey = GetScriptForDestination(destination);
-            CAmount nAmount = AmountFromValue(outputs[name_]);
-
-            CTxOut out(nAmount, scriptPubKey);
             rawTx.vout.push_back(out);
         }
     }
