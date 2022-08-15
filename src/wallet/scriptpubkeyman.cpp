@@ -2684,6 +2684,48 @@ bool DescriptorScriptPubKeyMan::AddCryptedKey(const CKeyID& key_id, const CPubKe
     return true;
 }
 
+std::tuple<CKey,bool> DescriptorScriptPubKeyMan::GetPrivKeyForSilentPayment(const CScript& scriptPubKey, const bool onlyTaproot) const
+{
+    std::vector<std::vector<unsigned char>> solutions;
+    TxoutType whichType = Solver(scriptPubKey, solutions);
+
+    std::unique_ptr<FlatSigningProvider> coin_keys = GetSigningProvider(scriptPubKey, true);
+    if (!coin_keys || coin_keys->keys.size() != 1) {
+        return {}; // returns an invalid private key
+    }
+
+    auto& key = *coin_keys->keys.begin();
+
+    // Tweak the private key as GetSigningProvider returns the original key.
+    // Taproot addresses / scriptPubKeys use tweaked public key, not the original key.
+    if (whichType == TxoutType::WITNESS_V1_TAPROOT) {
+
+
+        auto pubKeyFromScriptPubKey = XOnlyPubKey(solutions[0]);
+
+        // this means it is a "rawtr" output
+        if (XOnlyPubKey(key.second.GetPubKey()) == pubKeyFromScriptPubKey) {
+            return {key.second, true};
+        }
+
+        TaprootSpendData spenddata;
+        coin_keys->GetTaprootSpendData(pubKeyFromScriptPubKey, spenddata);
+
+        CKey priv_key;
+        if(!key.second.TweakCKey(&spenddata.merkle_root, priv_key)) return {};
+
+        assert(XOnlyPubKey(priv_key.GetPubKey()) ==  pubKeyFromScriptPubKey);
+
+        return {priv_key, true};
+    } else if (onlyTaproot) {
+        return {}; // returns an invalid private key
+    } else if (whichType == TxoutType::NONSTANDARD || whichType == TxoutType::MULTISIG || whichType == TxoutType::WITNESS_UNKNOWN ) {
+        return {}; // returns an invalid private key
+    } else {
+        return {key.second, false};
+    }
+}
+
 bool DescriptorScriptPubKeyMan::HasWalletDescriptor(const WalletDescriptor& desc) const
 {
     LOCK(cs_desc_man);
