@@ -21,7 +21,7 @@
 #include <util/strencodings.h>
 #include <util/translation.h>
 
-CMutableTransaction ConstructTransaction(const UniValue& inputs_in, const UniValue& outputs_in, const UniValue& locktime, std::optional<bool> rbf)
+CMutableTransaction ConstructTransaction(const UniValue& inputs_in, const UniValue& outputs_in, const UniValue& locktime, std::optional<bool> rbf, std::vector<CTxOut>* silent_payment_vouts)
 {
     if (outputs_in.isNull()) {
         throw JSONRPCError(RPC_INVALID_PARAMETER, "Invalid parameter, output argument must be non-null");
@@ -116,7 +116,11 @@ CMutableTransaction ConstructTransaction(const UniValue& inputs_in, const UniVal
             CTxOut out(0, CScript() << OP_RETURN << data);
             rawTx.vout.push_back(out);
         } else {
-            CTxDestination destination = DecodeDestination(name_);
+            ;
+            auto decoded = DecodeDestinationIndicatingSP(name_);
+            CTxDestination destination{std::get<0>(decoded)};
+            bool silent_payment{std::get<1>(decoded)};
+
             if (!IsValidDestination(destination)) {
                 throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, std::string("Invalid Bitcoin address: ") + name_);
             }
@@ -130,6 +134,10 @@ CMutableTransaction ConstructTransaction(const UniValue& inputs_in, const UniVal
 
             CTxOut out(nAmount, scriptPubKey);
             rawTx.vout.push_back(out);
+
+            if (silent_payment && silent_payment_vouts != nullptr) {
+                silent_payment_vouts->push_back(out);
+            }
         }
     }
 
