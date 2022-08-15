@@ -278,6 +278,13 @@ private:
     void AddToSpends(const COutPoint& outpoint, const uint256& wtxid, WalletBatch* batch = nullptr) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
     void AddToSpends(const CWalletTx& wtx, WalletBatch* batch = nullptr) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
 
+    bool HandleNewTxBelongingToMe(const CTransaction& tx , const SyncTxState& state, bool rescanning_old_block) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+
+    bool AddSilentScriptKeyMan(const CTransaction& tx, const SyncTxState& state, bool rescanning_old_block, const std::vector<std::tuple<CKey, int32_t>>& rawTrKeys) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+
+    /** Detect if a transaction is a silent payment that belongs to wallet and in that case add it **/
+    bool VerifySilentPayment(const CTransaction& tx, std::vector<std::tuple<CKey, int32_t>>& rawTrKeys) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+
     /**
      * Add a transaction to the wallet, or update it.  confirm.block_* should
      * be set when the transaction was known to be included in a block.  When
@@ -295,6 +302,8 @@ private:
      * not discovered in real time, but during a rescan of old blocks.
      */
     bool AddToWalletIfInvolvingMe(const CTransactionRef& tx, const SyncTxState& state, bool fUpdate, bool rescanning_old_block) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+
+    Coin FindPreviousCoin(const CTxIn& txin) const;
 
     /** Mark a transaction (and its in-wallet descendants) as conflicting with a particular block. */
     void MarkConflicted(const uint256& hashBlock, int conflicting_height, const uint256& hashTx);
