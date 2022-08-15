@@ -1259,6 +1259,93 @@ bool CWallet::AddToWalletIfInvolvingMe(const CTransactionRef& ptx, const SyncTxS
     return false;
 }
 
+bool CWallet::ExtractPubkeyFromInput(const CTxIn& txin, XOnlyPubKey& senderPubKey)
+{
+    // Find the UTXO being spent in UTXO Set to learn the transaction type
+    std::map<COutPoint, Coin> coins;
+    coins[txin.prevout];
+    chain().findCoins(coins);
+
+    auto pos = coins.find(txin.prevout);
+
+    Coin coin = pos->second;
+
+    // TODO: can more than one txin.prevout be in the mempool (RBF) ?
+    pos++;
+    assert( pos == coins.end() );
+
+    if (coin.out.IsNull()) {
+        return false;
+    }
+
+    // scriptPubKey being spent by this input
+    CScript scriptPubKey = coin.out.scriptPubKey;
+
+    if (scriptPubKey.IsPayToWitnessScriptHash()) {
+        return false;
+    }
+
+    // Vector of parsed pubkeys and hashes
+    std::vector<std::vector<unsigned char>> solutions;
+
+    TxoutType whichType = Solver(scriptPubKey, solutions);
+
+    if (whichType == TxoutType::NONSTANDARD ||
+    whichType == TxoutType::MULTISIG ||
+    whichType == TxoutType::WITNESS_UNKNOWN ) {
+        return false;
+    }
+
+    const CScript scriptSig = txin.scriptSig;
+    const CScriptWitness scriptWitness = txin.scriptWitness;
+
+    assert(senderPubKey.IsNull());
+
+    // TODO: Condition not tested
+    if (whichType == TxoutType::PUBKEY) {
+
+        CPubKey pubkey = CPubKey(solutions[0]);
+        assert(pubkey.IsFullyValid());
+        senderPubKey = XOnlyPubKey(pubkey);
+
+    }
+
+    else if (whichType == TxoutType::PUBKEYHASH) {
+
+        int sigSize = static_cast<int>(scriptSig[0]);
+        int pubKeySize = static_cast<int>(scriptSig[sigSize + 1]);
+        auto serializedPubKey = std::vector<unsigned char>(scriptSig.begin() + sigSize + 2, scriptSig.end());
+        assert(serializedPubKey.size() == (size_t) pubKeySize);
+
+        CPubKey pubkey = CPubKey(serializedPubKey);
+        assert(pubkey.IsFullyValid());
+
+        senderPubKey = XOnlyPubKey(pubkey);
+
+    }
+
+    else if (whichType == TxoutType::WITNESS_V0_KEYHASH || scriptPubKey.IsPayToScriptHash()) {
+        if (scriptWitness.stack.size() != 2) return false;
+        assert(scriptWitness.stack.at(1).size() == 33);
+
+        CPubKey pubkey = CPubKey(scriptWitness.stack.at(1));
+        assert(pubkey.IsFullyValid());
+
+        senderPubKey = XOnlyPubKey(pubkey);
+    }
+
+    else if (whichType == TxoutType::WITNESS_V1_TAPROOT) {
+
+        senderPubKey = XOnlyPubKey(solutions[0]);
+        assert(senderPubKey.IsFullyValid());
+    }
+
+    CTxDestination address;
+    ExtractDestination(scriptPubKey, address);
+
+    return true;
+}
+
 bool CWallet::TransactionCanBeAbandoned(const uint256& hashTx) const
 {
     LOCK(cs_wallet);

@@ -296,6 +296,9 @@ private:
      */
     bool AddToWalletIfInvolvingMe(const CTransactionRef& tx, const SyncTxState& state, bool fUpdate, bool rescanning_old_block) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
 
+    /** Extract Pubkey from an input according to the transaction type **/
+    bool ExtractPubkeyFromInput(const CTxIn& txin, XOnlyPubKey& senderPubKey);
+
     /** Mark a transaction (and its in-wallet descendants) as conflicting with a particular block. */
     void MarkConflicted(const uint256& hashBlock, int conflicting_height, const uint256& hashTx);
 
