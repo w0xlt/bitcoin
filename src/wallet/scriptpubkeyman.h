@@ -553,6 +553,8 @@ private:
     KeyMap m_map_keys GUARDED_BY(cs_desc_man);
     CryptedKeyMap m_map_crypted_keys GUARDED_BY(cs_desc_man);
 
+    std::unique_ptr<silentpayment::Recipient> m_silent_recipient{nullptr};
+
     //! keeps track of whether Unlock has run a thorough check before
     bool m_decryption_thoroughly_checked = false;
 
@@ -637,7 +639,9 @@ public:
     bool AddKey(const CKeyID& key_id, const CKey& key);
     bool AddCryptedKey(const CKeyID& key_id, const CPubKey& pubkey, const std::vector<unsigned char>& crypted_key);
 
+    void LoadSilentRecipient();
     std::tuple<CKey,bool> GetPrivKeyForSilentPayment(const CScript& scriptPubKey, const bool onlyTaproot) const;
+    std::vector<std::tuple<CKey, int32_t>> VerifySilentPaymentAddress(std::vector<std::tuple<CScript, XOnlyPubKey>>& txOutputPubKeys, CPubKey& senderPubKey);
 
     bool HasWalletDescriptor(const WalletDescriptor& desc) const;
     void UpdateWalletDescriptor(WalletDescriptor& descriptor);
