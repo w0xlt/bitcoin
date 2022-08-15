@@ -341,6 +341,11 @@ public:
      */
     CAmount GetChange(const CAmount min_viable_change, const CAmount change_fee) const;
 
+    std::vector<COutput> GetSelectedInputs() const {
+        std::vector<COutput> inputs(m_selected_inputs.begin(), m_selected_inputs.end());
+        return inputs;
+    }
+
     CAmount GetTarget() const { return m_target; }
 
     SelectionAlgorithm GetAlgo() const { return m_algo; }
