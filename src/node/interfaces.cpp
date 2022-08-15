@@ -11,6 +11,7 @@
 #include <external_signer.h>
 #include <index/blockfilterindex.h>
 #include <init.h>
+#include <index/silentpaymentindex.h>
 #include <interfaces/chain.h>
 #include <interfaces/handler.h>
 #include <interfaces/node.h>
@@ -597,6 +598,10 @@ public:
                int{FillBlock(block2, block2_out, lock, active)};
     }
     void findCoins(std::map<COutPoint, Coin>& coins) override { return FindCoins(m_node, coins); }
+    bool isSilentPaymentIndexActivatedAndSynced() override
+    {
+        return g_silentpaymentindex ? g_silentpaymentindex->BlockUntilSyncedToCurrentChain() : false;
+    }
     double guessVerificationProgress(const uint256& block_hash) override
     {
         LOCK(::cs_main);
