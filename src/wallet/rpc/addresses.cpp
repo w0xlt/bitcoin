@@ -61,7 +61,7 @@ RPCHelpMan getnewaddress()
         silent_payment = output_type == OutputType::SILENT_PAYMENT;
     }
 
-    auto op_dest = pwallet->GetNewDestination(output_type, label);
+    auto op_dest = pwallet->GetNewDestination(output_type, label, !silent_payment);
     if (!op_dest) {
         throw JSONRPCError(RPC_WALLET_KEYPOOL_RAN_OUT, util::ErrorString(op_dest).original);
     }
