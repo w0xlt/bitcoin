@@ -35,6 +35,7 @@
 #include <policy/settings.h>
 #include <primitives/block.h>
 #include <primitives/transaction.h>
+#include <pubkey.h>
 #include <rpc/protocol.h>
 #include <rpc/server.h>
 #include <shutdown.h>
@@ -602,6 +603,10 @@ public:
     bool isSilentPaymentIndexActivatedAndSynced() override
     {
         return g_silentpaymentindex ? g_silentpaymentindex->BlockUntilSyncedToCurrentChain() : false;
+    }
+    bool getSilentTransactionPubKey(const uint256& txhash, CPubKey& sum_all_inputs_pubkey) override
+    {
+        return g_silentpaymentindex->FindSilentPayment(txhash, sum_all_inputs_pubkey);
     }
     double guessVerificationProgress(const uint256& block_hash) override
     {
