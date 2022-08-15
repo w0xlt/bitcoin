@@ -1092,6 +1092,72 @@ std::vector<CScript> EvalDescriptorStringOrObject(const UniValue& scanobject, Fl
     return ret;
 }
 
+std::tuple<std::string, std::pair<int64_t, int64_t>> EvalDescriptorStringOrObject(const UniValue& scanobject)
+{
+    std::string desc_str;
+    std::pair<int64_t, int64_t> range = {0, 1000};
+    if (scanobject.isStr()) {
+        desc_str = scanobject.get_str();
+    } else if (scanobject.isObject()) {
+        UniValue desc_uni = find_value(scanobject, "desc");
+        if (desc_uni.isNull()) throw JSONRPCError(RPC_INVALID_PARAMETER, "Descriptor needs to be provided in scan object");
+        desc_str = desc_uni.get_str();
+        UniValue range_uni = find_value(scanobject, "range");
+        if (!range_uni.isNull()) {
+            range = ParseDescriptorRange(range_uni);
+        }
+    } else {
+        throw JSONRPCError(RPC_INVALID_PARAMETER, "Scan object needs to be either a string or an object");
+    }
+
+    return {desc_str, range};
+}
+
+std::vector<CScript> DescriptorToScripts(std::string desc_str, std::pair<int64_t, int64_t> range, FlatSigningProvider& provider)
+{
+    std::string error;
+    auto desc = Parse(desc_str, provider, error);
+    if (!desc) {
+        throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, error);
+    }
+    if (!desc->IsRange()) {
+        range.first = 0;
+        range.second = 0;
+    }
+    std::vector<CScript> ret;
+    for (int i = range.first; i <= range.second; ++i) {
+        std::vector<CScript> scripts;
+        if (!desc->Expand(i, provider, scripts, provider)) {
+            throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, strprintf("Cannot derive script without private keys: '%s'", desc_str));
+        }
+        std::move(scripts.begin(), scripts.end(), std::back_inserter(ret));
+    }
+    return ret;
+}
+
+std::vector<CKey> DescriptorToKeys(std::string desc_str, std::pair<int64_t, int64_t> range, FlatSigningProvider& provider)
+{
+    std::string error;
+    auto desc = Parse(desc_str, provider, error);
+    if (!desc) {
+        throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, error);
+    }
+    if (!desc->IsRange()) {
+        range.first = 0;
+        range.second = 0;
+    }
+    std::vector<CKey> ret;
+    for (int i = range.first; i <= range.second; ++i) {
+        FlatSigningProvider out;
+        desc->ExpandPrivate(i, provider, out);
+        //std::move(out.keys.begin(), out.keys.end(), std::back_inserter(ret));
+        for (auto& [_, privKey] : out.keys) {
+            ret.push_back(privKey);
+        }
+    }
+    return ret;
+}
+
 UniValue GetServicesNames(ServiceFlags services)
 {
     UniValue servicesNames(UniValue::VARR);

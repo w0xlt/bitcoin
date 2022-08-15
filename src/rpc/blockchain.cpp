@@ -20,6 +20,7 @@
 #include <index/blockfilterindex.h>
 #include <index/coinstatsindex.h>
 #include <kernel/coinstats.h>
+#include <index/silentpaymentindex.h>
 #include <logging/timer.h>
 #include <net.h>
 #include <net_processing.h>
@@ -44,6 +45,7 @@
 #include <validation.h>
 #include <validationinterface.h>
 #include <versionbits.h>
+#include <wallet/silentpayment.h>
 #include <warnings.h>
 
 #include <stdint.h>
@@ -1959,8 +1961,42 @@ static RPCHelpMan getblockstats()
 }
 
 namespace {
+bool CheckSilentPayment(const uint256& txhash, const CScript& outScriptPubKey, CKey privKey)
+{
+    std::vector<std::vector<unsigned char>> solutions;
+    TxoutType whichType = Solver(outScriptPubKey, solutions);
+
+    if (whichType != TxoutType::WITNESS_V1_TAPROOT) {
+        return false;
+    }
+
+    // public key of the output
+    auto outputPubKey = XOnlyPubKey(solutions[0]);
+
+    auto firstInputPubKey = XOnlyPubKey();
+
+    if(!g_silentpaymentindex->FindSilentPayment(txhash, firstInputPubKey)) {
+        return false;
+    }
+
+    auto currentScriptPubKey = HexStr( ToByteVector(outScriptPubKey) );
+
+    CKey silKey = silentpayment::Recipient::CreateSilentPaymentAddress(privKey, firstInputPubKey);
+    XOnlyPubKey silPubKey = XOnlyPubKey(silKey.GetPubKey());
+
+    return outputPubKey == silPubKey;
+}
+
 //! Search for a given set of pubkey scripts
-bool FindScriptPubKey(std::atomic<int>& scan_progress, const std::atomic<bool>& should_abort, int64_t& count, CCoinsViewCursor* cursor, const std::set<CScript>& needles, std::map<COutPoint, Coin>& out_results, std::function<void()>& interruption_point)
+bool FindScriptPubKey(
+    std::atomic<int>& scan_progress,
+    const std::atomic<bool>& should_abort,
+    int64_t& count,
+    CCoinsViewCursor* cursor,
+    const std::set<CScript>& needles,
+    std::map<COutPoint, Coin>& out_results,
+    std::function<void()>& interruption_point,
+    const std::vector<CKey>& sp_keys)
 {
     scan_progress = 0;
     count = 0;
@@ -1982,6 +2018,11 @@ bool FindScriptPubKey(std::atomic<int>& scan_progress, const std::atomic<bool>& 
         }
         if (needles.count(coin.out.scriptPubKey)) {
             out_results.emplace(key, coin);
+        }
+        for(const auto& sp_key: sp_keys) {
+            if(CheckSilentPayment(key.hash, coin.out.scriptPubKey, sp_key)) {
+                out_results.emplace(key, coin);
+            }
         }
         cursor->Next();
     }
@@ -2122,17 +2163,41 @@ static RPCHelpMan scantxoutset()
         }
 
         std::set<CScript> needles;
+        std::vector<CKey> sp_keys;
         std::map<CScript, std::string> descriptors;
         CAmount total_in = 0;
 
         // loop through the scan objects
         for (const UniValue& scanobject : request.params[1].get_array().getValues()) {
             FlatSigningProvider provider;
-            auto scripts = EvalDescriptorStringOrObject(scanobject, provider);
-            for (CScript& script : scripts) {
-                std::string inferred = InferDescriptor(script, provider)->ToString();
-                needles.emplace(script);
-                descriptors.emplace(std::move(script), std::move(inferred));
+            // auto scripts = EvalDescriptorStringOrObject(scanobject, provider);
+            auto ret = EvalDescriptorStringOrObject(scanobject);
+            auto desc_str = std::get<0>(ret);
+            auto range = std::get<1>(ret);
+
+            bool is_sp_desc = (desc_str.rfind("sp(", 0) == 0);
+
+            if (is_sp_desc) {
+                auto keys = DescriptorToKeys(desc_str, range, provider);
+
+                if (keys.empty()) {
+                    throw JSONRPCError(RPC_INVALID_PARAMETER, "Scanning silent payment descriptors requires private keys.");
+                }
+
+                assert(keys.size() == 1);
+
+                auto privKey = keys.at(0);
+
+                if (std::find(sp_keys.begin(), sp_keys.end(), privKey) == sp_keys.end()) {
+                    sp_keys.push_back(privKey);
+                }
+            } else {
+                auto scripts = DescriptorToScripts(desc_str, range, provider);
+                for (const auto& script : scripts) {
+                    std::string inferred = InferDescriptor(script, provider)->ToString();
+                    needles.emplace(script);
+                    descriptors.emplace(script, std::move(inferred));
+                }
             }
         }
 
@@ -2153,7 +2218,8 @@ static RPCHelpMan scantxoutset()
             pcursor = CHECK_NONFATAL(active_chainstate.CoinsDB().Cursor());
             tip = CHECK_NONFATAL(active_chainstate.m_chain.Tip());
         }
-        bool res = FindScriptPubKey(g_scan_progress, g_should_abort_scan, count, pcursor.get(), needles, coins, node.rpc_interruption_point);
+
+        bool res = FindScriptPubKey(g_scan_progress, g_should_abort_scan, count, pcursor.get(), needles, coins, node.rpc_interruption_point, sp_keys);
         result.pushKV("success", res);
         result.pushKV("txouts", count);
         result.pushKV("height", tip->nHeight);
@@ -2165,6 +2231,12 @@ static RPCHelpMan scantxoutset()
             const CTxOut& txo = coin.out;
             input_txos.push_back(txo);
             total_in += txo.nValue;
+
+            if (descriptors.find(txo.scriptPubKey) == descriptors.end()) {
+                FlatSigningProvider provider;
+                std::string inferred = InferDescriptor(txo.scriptPubKey, provider)->ToString();
+                descriptors.emplace(txo.scriptPubKey, std::move(inferred));
+            }
 
             UniValue unspent(UniValue::VOBJ);
             unspent.pushKV("txid", outpoint.hash.GetHex());
