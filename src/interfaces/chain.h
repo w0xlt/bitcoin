@@ -184,6 +184,9 @@ public:
     //! populates the values.
     virtual void findCoins(std::map<COutPoint, Coin>& coins) = 0;
 
+    //! Verify if silent payment index is enabled and synced
+    virtual bool isSilentPaymentIndexActivatedAndSynced() = 0;
+
     //! Estimate fraction of total transactions verified if blocks up to
     //! the specified block hash are verified.
     virtual double guessVerificationProgress(const uint256& block_hash) = 0;
