@@ -641,6 +641,7 @@ public:
 
     void LoadSilentRecipient();
     std::tuple<CKey,bool> GetPrivKeyForSilentPayment(const CScript& scriptPubKey, const bool onlyTaproot) const;
+    std::vector<std::tuple<CKey, int32_t>> VerifySilentPaymentAddress(const std::vector<std::tuple<CScript, XOnlyPubKey>>& txOutputPubKeys, const CPubKey& senderPubKey);
     int32_t RetrieveSilentIdentifier(XOnlyPubKey spend_key);
 
     bool HasWalletDescriptor(const WalletDescriptor& desc) const;
