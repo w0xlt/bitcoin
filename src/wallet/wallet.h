@@ -276,6 +276,13 @@ private:
     void AddToSpends(const COutPoint& outpoint, const uint256& wtxid, WalletBatch* batch = nullptr) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
     void AddToSpends(const CWalletTx& wtx, WalletBatch* batch = nullptr) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
 
+    bool HandleNewTxBelongingToMe(const CTransaction& tx , const SyncTxState& state, bool rescanning_old_block) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+
+    bool AddSilentScriptKeyMan(const CTransaction& tx, const SyncTxState& state, bool rescanning_old_block, const std::vector<std::tuple<CKey, int32_t>>& rawTrKeys) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+
+    /** Detect if a transaction is a silent payment that belongs to wallet and in that case add it **/
+    bool VerifySilentPayment(const CTransaction& tx, std::vector<std::tuple<CKey, int32_t>>& rawTrKeys) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+
     /**
      * Add a transaction to the wallet, or update it.  confirm.block_* should
      * be set when the transaction was known to be included in a block.  When
