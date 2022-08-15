@@ -1133,70 +1133,133 @@ bool CWallet::LoadToWallet(const uint256& hash, const UpdateWalletTxFn& fill_wtx
     return true;
 }
 
+bool CWallet::HandleNewTxBelongingToMe(const CTransaction& tx, const SyncTxState& state, bool rescanning_old_block)
+{
+    AssertLockHeld(cs_wallet);
+
+    /* Check if any keys in the wallet keypool that were supposed to be unused
+        * have appeared in a new transaction. If so, remove those keys from the keypool.
+        * This can happen when restoring an old wallet backup that does not contain
+        * the mostly recently created transactions from newer versions of the wallet.
+        */
+
+    // loop though all outputs
+    for (const CTxOut& txout: tx.vout) {
+        for (const auto& spk_man : GetScriptPubKeyMans(txout.scriptPubKey)) {
+            for (auto &dest : spk_man->MarkUnusedAddresses(txout.scriptPubKey)) {
+                // If internal flag is not defined try to infer it from the ScriptPubKeyMan
+                if (!dest.internal.has_value()) {
+                    dest.internal = IsInternalScriptPubKeyMan(spk_man);
+                }
+
+                // skip if can't determine whether it's a receiving address or not
+                if (!dest.internal.has_value()) continue;
+
+                // If this is a receiving address and it's not in the address book yet
+                // (e.g. it wasn't generated on this node or we're restoring from backup)
+                // add it to the address book for proper transaction accounting
+                if (!*dest.internal && !FindAddressBookEntry(dest.dest, /* allow_change= */ false)) {
+                    SetAddressBook(dest.dest, "", "receive");
+                }
+            }
+        }
+    }
+
+    // Block disconnection override an abandoned tx as unconfirmed
+    // which means user may have to call abandontransaction again
+    TxState tx_state = std::visit([](auto&& s) -> TxState { return s; }, state);
+    CWalletTx* wtx = AddToWallet(MakeTransactionRef(tx), tx_state, /*update_wtx=*/nullptr, /*fFlushOnClose=*/false, rescanning_old_block);
+    if (!wtx) {
+        // Can only be nullptr if there was a db write error (missing db, read-only db or a db engine internal writing error).
+        // As we only store arriving transaction in this process, and we don't want an inconsistent state, let's throw an error.
+        throw std::runtime_error("DB error adding transaction to wallet, write failed");
+    }
+    return true;
+}
+
+bool CWallet::AddSilentScriptKeyMan(
+    const CTransaction& tx, const SyncTxState& state, bool rescanning_old_block, const std::vector<std::tuple<CKey, int32_t>>& rawTrKeys)
+{
+    WalletLogPrintf("Silent Transaction identified: %s.\n", tx.GetHash().ToString());
+
+    for(auto& identifier_key: rawTrKeys) {
+
+        CKey key = std::get<0>(identifier_key);
+        int32_t identifier = std::get<1>(identifier_key);
+
+        std::string desc = "rawtr(" + EncodeSecret(key) + ")";
+        std::string checksum = GetDescriptorChecksum(desc);
+
+        auto timestamp = std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+
+        std::string desc_check = desc + "#" + checksum;
+
+        FlatSigningProvider keys;
+        std::string error;
+        auto parsed_desc = Parse(desc_check, keys, error, /* require_checksum = */ true);
+        assert(parsed_desc);
+
+        int64_t range_start = 0, range_end = 1, next_index = 0;
+
+        // Need to ExpandPrivate to check if private keys are available for all pubkeys
+        FlatSigningProvider expand_keys;
+        std::vector<CScript> scripts;
+        assert(parsed_desc->Expand(0, keys, scripts, expand_keys));
+        parsed_desc->ExpandPrivate(0, keys, expand_keys);
+
+        WalletDescriptor w_desc(std::move(parsed_desc), timestamp, range_start, range_end, next_index);
+
+        std::string label;
+
+        if (m_silent_address_book.count(identifier)) {
+            auto entry = m_silent_address_book[identifier];
+            label = entry.m_label;
+        } else {
+            std::stringstream ss;
+            ss << identifier;
+            label = ss.str();
+        }
+
+        auto existing_spk_manager = GetDescriptorScriptPubKeyMan(w_desc);
+        if (!existing_spk_manager) {
+            auto spk_manager = AddWalletDescriptor(w_desc, keys, label, false);
+            assert(spk_manager != nullptr);
+        }
+    }
+
+    return HandleNewTxBelongingToMe(tx, state, rescanning_old_block);
+}
+
 bool CWallet::AddToWalletIfInvolvingMe(const CTransactionRef& ptx, const SyncTxState& state, bool fUpdate, bool rescanning_old_block)
 {
     const CTransaction& tx = *ptx;
-    {
-        AssertLockHeld(cs_wallet);
 
-        if (auto* conf = std::get_if<TxStateConfirmed>(&state)) {
-            for (const CTxIn& txin : tx.vin) {
-                std::pair<TxSpends::const_iterator, TxSpends::const_iterator> range = mapTxSpends.equal_range(txin.prevout);
-                while (range.first != range.second) {
-                    if (range.first->second != tx.GetHash()) {
-                        WalletLogPrintf("Transaction %s (in block %s) conflicts with wallet transaction %s (both spend %s:%i)\n", tx.GetHash().ToString(), conf->confirmed_block_hash.ToString(), range.first->second.ToString(), range.first->first.hash.ToString(), range.first->first.n);
-                        MarkConflicted(conf->confirmed_block_hash, conf->confirmed_block_height, range.first->second);
-                    }
-                    range.first++;
+    AssertLockHeld(cs_wallet);
+
+    std::vector<std::tuple<CKey, int32_t>> rawTrKeys;
+
+    if (auto* conf = std::get_if<TxStateConfirmed>(&state)) {
+        for (const CTxIn& txin : tx.vin) {
+            std::pair<TxSpends::const_iterator, TxSpends::const_iterator> range = mapTxSpends.equal_range(txin.prevout);
+            while (range.first != range.second) {
+                if (range.first->second != tx.GetHash()) {
+                    WalletLogPrintf("Transaction %s (in block %s) conflicts with wallet transaction %s (both spend %s:%i)\n", tx.GetHash().ToString(), conf->confirmed_block_hash.ToString(), range.first->second.ToString(), range.first->first.hash.ToString(), range.first->first.n);
+                    MarkConflicted(conf->confirmed_block_hash, conf->confirmed_block_height, range.first->second);
                 }
+                range.first++;
             }
-        }
-
-        bool fExisted = mapWallet.count(tx.GetHash()) != 0;
-        if (fExisted && !fUpdate) return false;
-        if (fExisted || IsMine(tx) || IsFromMe(tx))
-        {
-            /* Check if any keys in the wallet keypool that were supposed to be unused
-             * have appeared in a new transaction. If so, remove those keys from the keypool.
-             * This can happen when restoring an old wallet backup that does not contain
-             * the mostly recently created transactions from newer versions of the wallet.
-             */
-
-            // loop though all outputs
-            for (const CTxOut& txout: tx.vout) {
-                for (const auto& spk_man : GetScriptPubKeyMans(txout.scriptPubKey)) {
-                    for (auto &dest : spk_man->MarkUnusedAddresses(txout.scriptPubKey)) {
-                        // If internal flag is not defined try to infer it from the ScriptPubKeyMan
-                        if (!dest.internal.has_value()) {
-                            dest.internal = IsInternalScriptPubKeyMan(spk_man);
-                        }
-
-                        // skip if can't determine whether it's a receiving address or not
-                        if (!dest.internal.has_value()) continue;
-
-                        // If this is a receiving address and it's not in the address book yet
-                        // (e.g. it wasn't generated on this node or we're restoring from backup)
-                        // add it to the address book for proper transaction accounting
-                        if (!*dest.internal && !FindAddressBookEntry(dest.dest, /* allow_change= */ false)) {
-                            SetAddressBook(dest.dest, "", "receive");
-                        }
-                    }
-                }
-            }
-
-            // Block disconnection override an abandoned tx as unconfirmed
-            // which means user may have to call abandontransaction again
-            TxState tx_state = std::visit([](auto&& s) -> TxState { return s; }, state);
-            CWalletTx* wtx = AddToWallet(MakeTransactionRef(tx), tx_state, /*update_wtx=*/nullptr, /*fFlushOnClose=*/false, rescanning_old_block);
-            if (!wtx) {
-                // Can only be nullptr if there was a db write error (missing db, read-only db or a db engine internal writing error).
-                // As we only store arriving transaction in this process, and we don't want an inconsistent state, let's throw an error.
-                throw std::runtime_error("DB error adding transaction to wallet, write failed");
-            }
-            return true;
         }
     }
-    return false;
+
+    bool fExisted = mapWallet.count(tx.GetHash()) != 0;
+    if (fExisted && !fUpdate) return false;
+
+    bool ret = (fExisted || IsMine(tx) || IsFromMe(tx)) ? HandleNewTxBelongingToMe(tx, state, rescanning_old_block) : false;
+    if (IsWalletFlagSet(WALLET_FLAG_SILENT_PAYMENT) && VerifySilentPayment(tx, rawTrKeys)) {
+        ret = AddSilentScriptKeyMan(tx, state, rescanning_old_block, rawTrKeys) || ret;
+    }
+    return ret;
 }
 
 bool CWallet::ExtractPubkeyFromInput(const CTxIn& txin, XOnlyPubKey& senderPubKey)
@@ -1284,6 +1347,70 @@ bool CWallet::ExtractPubkeyFromInput(const CTxIn& txin, XOnlyPubKey& senderPubKe
     ExtractDestination(scriptPubKey, address);
 
     return true;
+}
+
+bool CWallet::VerifySilentPayment(const CTransaction& tx, std::vector<std::tuple<CKey, int32_t>>& rawTrKeys)
+{
+    AssertLockHeld(cs_wallet);
+
+    if (tx.IsCoinBase() || tx.vin.empty()) return false;
+
+    if (!IsWalletFlagSet(WALLET_FLAG_DESCRIPTORS)) return false;
+
+    std::vector<std::tuple<CScript, XOnlyPubKey>> outputPubKeys;
+
+    for (auto& vout : tx.vout) {
+
+        if (IsMine(vout)) {
+            continue;
+        }
+
+        std::vector<std::vector<unsigned char>> solutions;
+        TxoutType whichType = Solver(vout.scriptPubKey, solutions);
+
+        // Silent Payments require that the recipients use Taproot address
+        if (whichType != TxoutType::WITNESS_V1_TAPROOT) {
+            continue;
+        }
+
+        auto xOnlyPubKey = XOnlyPubKey(solutions[0]);
+
+        assert(xOnlyPubKey.IsFullyValid());
+
+        outputPubKeys.emplace_back(vout.scriptPubKey, xOnlyPubKey);
+    }
+
+    if (outputPubKeys.empty()) {
+        return false;
+    }
+
+    const CTxIn& txin = tx.vin.at(0);
+
+    auto senderPubKey = XOnlyPubKey();
+
+    if (!ExtractPubkeyFromInput(txin, senderPubKey)) {
+        if (!m_chain->getSilentTransactionFirstInputPubKey(tx.GetHash(), senderPubKey)) {
+            return false;
+        }
+    }
+
+    assert(senderPubKey.IsFullyValid());
+
+    for (ScriptPubKeyMan* spkm : GetActiveScriptPubKeyMans()) {
+        DescriptorScriptPubKeyMan* desc_spkm = dynamic_cast<DescriptorScriptPubKeyMan*>(spkm);
+
+        std::string desc_str;
+        bool res_get_desc = desc_spkm->GetDescriptorString(desc_str, false);
+
+        // There must be only one SP descriptor
+        if (res_get_desc && desc_str.rfind("sp(", 0) != 0) {
+            continue;
+        }
+
+        rawTrKeys = desc_spkm->VerifySilentPaymentAddress(outputPubKeys, senderPubKey);
+    }
+
+    return rawTrKeys.size() > 0;
 }
 
 bool CWallet::TransactionCanBeAbandoned(const uint256& hashTx) const
