@@ -640,6 +640,7 @@ public:
     bool AddCryptedKey(const CKeyID& key_id, const CPubKey& pubkey, const std::vector<unsigned char>& crypted_key);
 
     void LoadSilentRecipient();
+    std::tuple<CKey,bool> GetPrivKeyForSilentPayment(const CScript& scriptPubKey, const bool onlyTaproot) const;
     int32_t RetrieveSilentIdentifier(XOnlyPubKey spend_key);
 
     bool HasWalletDescriptor(const WalletDescriptor& desc) const;
