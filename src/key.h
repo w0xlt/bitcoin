@@ -145,6 +145,8 @@ public:
      */
     bool SignSchnorr(const uint256& hash, Span<unsigned char> sig, const uint256* merkle_root, const uint256& aux) const;
 
+    bool TweakCKey(const uint256* merkle_root, CKey& key) const;
+
     //! Derive BIP32 child key.
     [[nodiscard]] bool Derive(CKey& keyChild, ChainCode &ccChild, unsigned int nChild, const ChainCode& cc) const;
 
