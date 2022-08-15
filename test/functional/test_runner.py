@@ -92,6 +92,8 @@ BASE_SCRIPTS = [
     'wallet_hd.py --descriptors',
     'wallet_backup.py --legacy-wallet',
     'wallet_backup.py --descriptors',
+    'wallet_silentpayment_tx.py',
+    'wallet_silentpayment_misc.py',
     # vv Tests less than 5m vv
     'mining_getblocktemplate_longpoll.py',
     'feature_maxuploadtarget.py',
