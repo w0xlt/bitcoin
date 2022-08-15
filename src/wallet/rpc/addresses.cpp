@@ -22,7 +22,7 @@ RPCHelpMan getnewaddress()
                 "so payments received with the address will be associated with 'label'.\n",
                 {
                     {"label", RPCArg::Type::STR, RPCArg::Default{""}, "The label name for the address to be linked to. It can also be set to the empty string \"\" to represent the default label. The label does not need to exist, it will be created if there is no label by the given name."},
-                    {"address_type", RPCArg::Type::STR, RPCArg::DefaultHint{"set by -addresstype"}, "The address type to use. Options are \"legacy\", \"p2sh-segwit\", \"bech32\", \"bech32m\" and \"silent-payment\"."},
+                    {"address_type", RPCArg::Type::STR, RPCArg::DefaultHint{"set by -addresstype"}, "The address type to use. Options are \"legacy\", \"p2sh-segwit\", \"bech32\", and \"bech32m\"."},
                 },
                 RPCResult{
                     RPCResult::Type::STR, "address", "The new bitcoin address"
@@ -42,8 +42,6 @@ RPCHelpMan getnewaddress()
         throw JSONRPCError(RPC_WALLET_ERROR, "Error: This wallet has no available keys");
     }
 
-    bool silent_payment{false};
-
     // Parse the label first so we don't generate a key if there's an error
     std::string label;
     if (!request.params[0].isNull())
@@ -58,18 +56,74 @@ RPCHelpMan getnewaddress()
             throw JSONRPCError(RPC_INVALID_PARAMETER, "Legacy wallets cannot provide bech32m addresses");
         }
         output_type = parsed.value();
-        silent_payment = output_type == OutputType::SILENT_PAYMENT;
-    }
 
-    int32_t current_index{0};
-
-    if (silent_payment) {
-        auto wallet_descriptor = pwallet->GetWalletDescriptor(output_type, /*internal=*/false);
-
-        current_index = wallet_descriptor->next_index;
+        if (output_type == OutputType::SILENT_PAYMENT) {
+            throw JSONRPCError(RPC_WALLET_ERROR, "Error: Use `getspaddress` RPC to generate silent payment address");
+        }
     }
 
     auto op_dest = pwallet->GetNewDestination(output_type, label);
+    if (!op_dest) {
+        throw JSONRPCError(RPC_WALLET_KEYPOOL_RAN_OUT, util::ErrorString(op_dest).original);
+    }
+
+    return EncodeDestination(*op_dest);
+},
+    };
+}
+
+RPCHelpMan getspaddress()
+{
+    return RPCHelpMan{"getspaddress",
+                "\nReturns a silent paymet address if it is enabled in wallet.\n"
+                "If 'label' is specified and it is new, a new address will be generated. \n"
+                "If the 'label' is already assigned to a silent address, this same address will be shown.\n",
+                {
+                    {"label", RPCArg::Type::STR, RPCArg::Default{""}, "The label name for the address to be linked to. It can also be set to the empty string \"\" to represent the default label. The label does not need to exist, it will be created if there is no label by the given name."},
+                },
+                RPCResult{
+                    RPCResult::Type::STR, "address", "The silent payment address"
+                },
+                RPCExamples{
+                    HelpExampleCli("getspaddress", "")
+            + HelpExampleRpc("getspaddress", "")
+                },
+        [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
+{
+    std::shared_ptr<CWallet> const pwallet = GetWalletForJSONRPCRequest(request);
+    if (!pwallet) return UniValue::VNULL;
+
+    LOCK(pwallet->cs_wallet);
+
+    if (!pwallet->IsWalletFlagSet(WALLET_FLAG_SILENT_PAYMENT)) {
+        throw JSONRPCError(RPC_WALLET_ERROR, "Error: This wallet is not enabled for silent payments");
+    }
+
+    if (!pwallet->CanGetAddresses()) {
+        throw JSONRPCError(RPC_WALLET_ERROR, "Error: This wallet has no available keys");
+    }
+
+    bool silent_payment{true};
+
+    // Parse the label first so we don't generate a key if there's an error
+    std::string label;
+    if (!request.params[0].isNull())
+        label = LabelFromValue(request.params[0]);
+
+    for (auto const& [key, val] : pwallet->m_silent_address_book)
+    {
+        if (val.m_label == label) {
+            return val.m_address;
+        }
+    }
+
+    OutputType output_type = OutputType::SILENT_PAYMENT;
+
+    auto wallet_descriptor = pwallet->GetWalletDescriptor(output_type, /*internal=*/false);
+
+    auto current_index = wallet_descriptor->next_index;
+
+    auto op_dest = pwallet->GetNewDestination(output_type, label, silent_payment, current_index);
     if (!op_dest) {
         throw JSONRPCError(RPC_WALLET_KEYPOOL_RAN_OUT, util::ErrorString(op_dest).original);
     }
@@ -146,12 +200,26 @@ RPCHelpMan setlabel()
 
     LOCK(pwallet->cs_wallet);
 
-    CTxDestination dest = DecodeDestination(request.params[0].get_str());
+    auto address = request.params[0].get_str();
+
+    auto [dest, silent_payment, identifier] = DecodeDestinationIndicatingSP(address);
+
     if (!IsValidDestination(dest)) {
         throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "Invalid Bitcoin address");
     }
 
     std::string label = LabelFromValue(request.params[1]);
+
+    if (silent_payment) {
+        for (auto const& [key, val] : pwallet->m_silent_address_book)
+        {
+            if (val.m_label == label) {
+                throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "Label " + label + " is already assigned to a silent payment address.");
+            }
+        }
+        pwallet->SetSilentAddressBook(identifier, address, label);
+        return UniValue::VNULL;
+    }
 
     if (pwallet->IsMine(dest)) {
         pwallet->SetAddressBook(dest, label, "receive");
@@ -657,7 +725,7 @@ RPCHelpMan getaddressesbylabel()
     return RPCHelpMan{"getaddressesbylabel",
                 "\nReturns the list of addresses assigned the specified label.\n",
                 {
-                    {"label", RPCArg::Type::STR, RPCArg::Optional::NO, "The label."},
+                    {"label", RPCArg::Type::STR, RPCArg::Optional::OMITTED_NAMED_ARG, "The label."},
                 },
                 RPCResult{
                     RPCResult::Type::OBJ_DYN, "", "json object with addresses as keys",
@@ -665,6 +733,7 @@ RPCHelpMan getaddressesbylabel()
                         {RPCResult::Type::OBJ, "address", "json object with information about address",
                         {
                             {RPCResult::Type::STR, "purpose", "Purpose of address (\"send\" for sending address, \"receive\" for receiving address)"},
+                            {RPCResult::Type::STR, "label", /*optional=*/true, "Label of address"},
                         }},
                     }
                 },
@@ -679,14 +748,17 @@ RPCHelpMan getaddressesbylabel()
 
     LOCK(pwallet->cs_wallet);
 
-    std::string label = LabelFromValue(request.params[0]);
+    std::optional<std::string> label = request.params[0].isNull() ?
+        std::nullopt :
+        std::optional<std::string>(LabelFromValue(request.params[0]));
 
     // Find all addresses that have the given label
     UniValue ret(UniValue::VOBJ);
     std::set<std::string> addresses;
     pwallet->ForEachAddrBookEntry([&](const CTxDestination& _dest, const std::string& _label, const std::string& _purpose, bool _is_change) {
         if (_is_change) return;
-        if (_label == label) {
+
+        if (!label.has_value() || label.value() == _label) {
             std::string address = EncodeDestination(_dest);
             // CWallet::m_address_book is not expected to contain duplicate
             // address strings, but build a separate set as a precaution just in
@@ -698,13 +770,28 @@ RPCHelpMan getaddressesbylabel()
             // std::set in O(log(N))), UniValue::__pushKV is used instead,
             // which currently is O(1).
             UniValue value(UniValue::VOBJ);
+            if (!label.has_value()) {
+                value.pushKV("label", _label);
+            }
             value.pushKV("purpose", _purpose);
             ret.__pushKV(address, value);
         }
     });
 
-    if (ret.empty()) {
-        throw JSONRPCError(RPC_WALLET_INVALID_LABEL_NAME, std::string("No addresses with label " + label));
+    for (auto const& [key, val] : pwallet->m_silent_address_book)
+    {
+        if (!label.has_value() || label.value() == val.m_label) {
+            UniValue value(UniValue::VOBJ);
+            if (!label.has_value()) {
+                value.pushKV("label", val.m_label);
+            }
+            value.pushKV("purpose", "silent-payment");
+            ret.__pushKV(val.m_address, value);
+        }
+    }
+
+    if (label.has_value() && ret.empty()) {
+        throw JSONRPCError(RPC_WALLET_INVALID_LABEL_NAME, std::string("No addresses with label " + label.value()));
     }
 
     return ret;
@@ -749,6 +836,17 @@ RPCHelpMan listlabels()
 
     // Add to a set to sort by label name, then insert into Univalue array
     std::set<std::string> label_set = pwallet->ListAddrBookLabels(purpose);
+
+    if(pwallet->IsWalletFlagSet(WALLET_FLAG_SILENT_PAYMENT)) {
+        if (request.params[0].isNull() || purpose == "silent-payment") {
+            for (auto const& [key, val] : pwallet->m_silent_address_book)
+            {
+                if (!val.m_label.empty()) {
+                    label_set.insert(val.m_label);
+                }
+            }
+        }
+    }
 
     UniValue ret(UniValue::VARR);
     for (const std::string& name : label_set) {
