@@ -193,6 +193,12 @@ public:
     std::string ToString() const;
 };
 
+struct SilentTxOut
+{
+    CTxOut tx_out;
+    int32_t identifier;
+};
+
 struct CMutableTransaction;
 
 /**
