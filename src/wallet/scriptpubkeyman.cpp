@@ -2007,7 +2007,9 @@ util::Result<CTxDestination> DescriptorScriptPubKeyMan::GetNewDestination(const 
         } else {
             throw std::runtime_error(std::string(__func__) + ": Types are inconsistent. Stored type does not match type of newly generated address");
         }
-        m_wallet_descriptor.next_index++;
+        if (m_wallet_descriptor.descriptor->IsRange()) {
+            m_wallet_descriptor.next_index++;
+        }
         WalletBatch(m_storage.GetDatabase()).WriteDescriptor(GetID(), m_wallet_descriptor);
         return dest;
     }
