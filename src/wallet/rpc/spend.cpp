@@ -1666,13 +1666,16 @@ RPCHelpMan walletcreatefundedpsbt()
     if (!replaceable_arg.isNull()) {
         rbf = replaceable_arg.isTrue();
     }
-    CMutableTransaction rawTx = ConstructTransaction(request.params[0], request.params[1], request.params[2], rbf);
+
+    std::vector<SilentTxOut> silent_payment_vouts;
+
+    CMutableTransaction rawTx = ConstructTransaction(request.params[0], request.params[1], request.params[2], rbf, &silent_payment_vouts);
     CCoinControl coin_control;
     // Automatically select coins, unless at least one is manually selected. Can
     // be overridden by options.add_inputs.
     coin_control.m_allow_other_inputs = rawTx.vin.size() == 0;
     SetOptionsInputWeights(request.params[0], options);
-    FundTransaction(wallet, rawTx, fee, change_position, options, coin_control, /*override_min_fee=*/true);
+    FundTransaction(wallet, rawTx, fee, change_position, options, coin_control, /*override_min_fee=*/true, &silent_payment_vouts);
 
     // Make a blank psbt
     PartiallySignedTransaction psbtx(rawTx);
