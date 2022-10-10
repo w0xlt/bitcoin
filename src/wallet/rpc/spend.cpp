@@ -1678,7 +1678,11 @@ RPCHelpMan walletcreatefundedpsbt()
     if (!replaceable_arg.isNull()) {
         rbf = replaceable_arg.isTrue();
     }
+
     CMutableTransaction rawTx = ConstructTransaction(request.params[0], request.params[1], request.params[2], rbf);
+
+    CheckSilentPayment(*pwallet, rawTx);
+
     CCoinControl coin_control;
     // Automatically select coins, unless at least one is manually selected. Can
     // be overridden by options.add_inputs.
