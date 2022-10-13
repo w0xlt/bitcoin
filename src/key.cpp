@@ -14,6 +14,7 @@
 #include <secp256k1_extrakeys.h>
 #include <secp256k1_recovery.h>
 #include <secp256k1_schnorrsig.h>
+#include <secp256k1_ecdh.h>
 
 static secp256k1_context* secp256k1_context_sign = nullptr;
 
@@ -169,6 +170,40 @@ bool CKey::Negate()
 {
     assert(fValid);
     return secp256k1_ec_seckey_negate(secp256k1_context_sign, keydata.data());
+}
+
+CKey CKey::AddTweak(const unsigned char *tweak32) const
+{
+    assert(fValid);
+
+    unsigned char tweaked_seckey[32];
+    memcpy(tweaked_seckey, data(), 32);
+
+    int ret = secp256k1_ec_seckey_tweak_add(secp256k1_context_sign, tweaked_seckey, tweak32);
+    assert(ret);
+
+    CKey new_seckey;
+    new_seckey.Set(std::begin(tweaked_seckey), std::end(tweaked_seckey), true);
+
+    return new_seckey;
+}
+
+std::array<unsigned char,32> CKey::ECDH(const CPubKey& pubkey) const
+{
+    unsigned char shared_secret[32];
+
+    secp256k1_pubkey ecdh_pubkey;
+    int return_val = secp256k1_ec_pubkey_parse(secp256k1_context_sign, &ecdh_pubkey, pubkey.data(), pubkey.size());
+    assert(return_val);
+
+    int ret = secp256k1_ecdh(secp256k1_context_sign, shared_secret, &ecdh_pubkey, begin(), nullptr, nullptr);
+    assert(ret);
+
+    std::array<unsigned char, 32> result;
+
+    std::copy(std::begin(shared_secret), std::end(shared_secret), std::begin(result));
+
+    return result;
 }
 
 CPrivKey CKey::GetPrivKey() const {
