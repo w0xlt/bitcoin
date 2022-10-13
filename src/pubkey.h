@@ -287,6 +287,13 @@ public:
     bool operator!=(const XOnlyPubKey& other) const { return m_keydata != other.m_keydata; }
     bool operator<(const XOnlyPubKey& other) const { return m_keydata < other.m_keydata; }
 
+    CPubKey ConvertToCompressedPubKey(bool even = true) const
+    {
+        std::vector<unsigned char> vch(std::begin(m_keydata), std::end(m_keydata));
+        vch.insert(vch.begin(), even ? 2 : 3);
+        return CPubKey(vch.begin(), vch.end());
+    }
+
     //! Implement serialization without length prefixes since it is a fixed length
     SERIALIZE_METHODS(XOnlyPubKey, obj) { READWRITE(obj.m_keydata); }
 };
