@@ -696,7 +696,8 @@ public:
      */
     void MarkDestinationsDirty(const std::set<CTxDestination>& destinations) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
 
-    util::Result<CTxDestination> GetNewDestination(const OutputType& type, const std::string& label, const bool silent_payment = false, const int32_t current_index = 0);
+    util::Result<CTxDestination> GetNewDestination(const OutputType& type, const std::string& label);
+    util::Result<std::tuple<std::string, int32_t>> GetSilentDestination(const std::string& label);
     util::Result<CTxDestination> GetNewChangeDestination(const OutputType type);
 
     isminetype IsMine(const CTxDestination& dest) const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);

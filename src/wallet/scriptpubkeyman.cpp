@@ -2021,6 +2021,44 @@ util::Result<CTxDestination> DescriptorScriptPubKeyMan::GetNewDestination(const 
     }
 }
 
+util::Result<CPubKey> DescriptorScriptPubKeyMan::GetSilentAddress()
+{
+    LOCK(cs_desc_man);
+
+    // Returns true if this descriptor supports getting new addresses. Conditions where we may be unable to fetch them (e.g. locked) are caught later
+    if (!CanGetAddresses()) {
+        return util::Error{_("No addresses available")};
+    }
+
+    assert(m_wallet_descriptor.descriptor->IsSingleType());
+    std::optional<OutputType> desc_addr_type = m_wallet_descriptor.descriptor->GetOutputType();
+    assert(desc_addr_type);
+    if (OutputType::SILENT_PAYMENT != *desc_addr_type) {
+        throw std::runtime_error(std::string(__func__) + ": Silent Payment output type is exepected.");
+    }
+
+    TopUp();
+
+    // Get the scriptPubKey from the descriptor
+    FlatSigningProvider out_keys;
+    std::vector<CScript> scripts_temp;
+    if (m_wallet_descriptor.range_end <= m_max_cached_index && !TopUp(1)) {
+        // We can't generate anymore keys
+        return util::Error{_("Error: Keypool ran out, please call keypoolrefill first")};
+    }
+    if (!m_wallet_descriptor.descriptor->ExpandFromCache(m_wallet_descriptor.next_index, m_wallet_descriptor.cache, scripts_temp, out_keys)) {
+        // We can't generate anymore keys
+        return util::Error{_("Error: Keypool ran out, please call keypoolrefill first")};
+    }
+
+    m_wallet_descriptor.next_index++;
+    WalletBatch(m_storage.GetDatabase()).WriteDescriptor(GetID(), m_wallet_descriptor);
+
+    CPubKey pubkey{scripts_temp[0].begin(), scripts_temp[0].end()};
+
+    return pubkey;
+}
+
 isminetype DescriptorScriptPubKeyMan::IsMine(const CScript& script) const
 {
     LOCK(cs_desc_man);

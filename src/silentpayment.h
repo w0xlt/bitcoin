@@ -9,6 +9,8 @@
 
 namespace silentpayment {
 
+using SilentKey = std::variant<CPubKey, XOnlyPubKey>;
+
 class Sender {
     private:
         secp256k1_context* m_context{nullptr};

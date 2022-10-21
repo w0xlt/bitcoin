@@ -1041,10 +1041,12 @@ protected:
     std::vector<CScript> MakeScripts(const std::vector<CPubKey>& keys, Span<const CScript> scripts, FlatSigningProvider& out) const override
     {
         assert(keys.size() == 1);
-        XOnlyPubKey xpk(keys[0]);
+        /* XOnlyPubKey xpk(keys[0]);
         if (!xpk.IsFullyValid()) return {};
-        WitnessV1Taproot output{xpk};
-        return Vector(GetScriptForDestination(output));
+        WitnessV1Taproot output{xpk}; */
+        CPubKey pubkey{keys[0]};
+        if (!pubkey.IsFullyValid()) return {};
+        return Vector(CScript(std::begin(pubkey), std::end(pubkey)));
     }
 public:
     SPDescriptor(std::unique_ptr<PubkeyProvider> internal_key) : DescriptorImpl(Vector(std::move(internal_key)), "sp") {}

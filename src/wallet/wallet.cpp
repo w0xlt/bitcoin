@@ -2580,34 +2580,63 @@ bool CWallet::TopUpKeyPool(unsigned int kpSize)
     return res;
 }
 
-util::Result<CTxDestination> CWallet::GetNewDestination(const OutputType& type, const std::string& label, const bool silent_payment, const int32_t current_index)
+util::Result<CTxDestination> CWallet::GetNewDestination(const OutputType& type, const std::string& label)
 {
+    assert(type != OutputType::SILENT_PAYMENT);
+
     LOCK(cs_wallet);
     auto spk_man = GetScriptPubKeyMan(type, false /* internal */);
     if (!spk_man) {
         return util::Error{strprintf(_("Error: No %s addresses available."), FormatOutputType(type))};
     }
 
-    if (silent_payment) {
-        for (auto const& [key, val] : m_silent_address_book)
-        {
-            if (val.m_label == label) {
-                return util::Error{strprintf(_("Label %s is already assigned to a silent payment address."), label)};
-            }
-        }
-    }
-
     auto op_dest = spk_man->GetNewDestination(type);
     if (op_dest) {
-        if (silent_payment) {
-            auto silent_address = EncodeDestination(*op_dest, silent_payment, current_index);
-            SetSilentAddressBook(current_index, silent_address, label);
-        } else {
-            SetAddressBook(*op_dest, label, "receive");
-        }
+        SetAddressBook(*op_dest, label, "receive");
     }
 
     return op_dest;
+}
+
+util::Result<std::tuple<std::string, int32_t>> CWallet::GetSilentDestination(const std::string& label)
+{
+    LOCK(cs_wallet);
+
+    auto wallet_descriptor = GetWalletDescriptor(OutputType::SILENT_PAYMENT, /*internal=*/false);
+    if (!wallet_descriptor) {
+        return util::Error{strprintf(_("Error: No %s output type available."), FormatOutputType(OutputType::SILENT_PAYMENT))};
+    }
+
+    auto current_index = wallet_descriptor->next_index;
+
+    auto spk_man = GetScriptPubKeyMan(OutputType::SILENT_PAYMENT, false /* internal */);
+    if (!spk_man) {
+        return util::Error{strprintf(_("Error: No %s addresses available."), FormatOutputType(OutputType::SILENT_PAYMENT))};
+    }
+
+    for (auto const& [key, val] : m_silent_address_book)
+    {
+        if (val.m_label == label) {
+            return util::Error{strprintf(_("Label %s is already assigned to a silent payment address."), label)};
+        }
+    }
+
+    DescriptorScriptPubKeyMan* desc_spkm = dynamic_cast<DescriptorScriptPubKeyMan*>(spk_man);
+    assert(desc_spkm);
+    auto pubkey{desc_spkm->GetSilentAddress()};
+
+    if (!pubkey) {
+        return util::Error{util::ErrorString(pubkey)};
+    }
+
+    if(!pubkey->IsFullyValid()) {
+        return util::Error{"Invalid silent key."};
+    }
+
+    const auto silent_address = EncodeSilentDestination(*pubkey, current_index);
+    SetSilentAddressBook(current_index, silent_address, label);
+
+    return std::make_tuple(silent_address, current_index);
 }
 
 util::Result<CTxDestination> CWallet::GetNewChangeDestination(const OutputType type)
