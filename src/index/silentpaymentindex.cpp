@@ -87,7 +87,8 @@ bool SilentPaymentIndex::GetSilentPaymentKey(const CTransactionRef& tx, const CB
 
     assert(tx->vin.size() == undoTX->vprevout.size());
 
-    std::vector<XOnlyPubKey> input_pubkeys;
+    std::vector<XOnlyPubKey> input_xonly_pubkeys;
+    std::vector<CPubKey> input_pubkeys;
 
     for (size_t i = 0; i < tx->vin.size(); i++)
     {
@@ -99,13 +100,24 @@ bool SilentPaymentIndex::GetSilentPaymentKey(const CTransactionRef& tx, const CB
         if (!silentpayment::ExtractPubkeyFromInput(prev_coin, txin, input_pubkey)) {
             return false;
         }
+        auto pubkey_variant = silentpayment::ExtractPubkeyFromInput2(prev_coin, txin);
 
-        input_pubkeys.push_back(input_pubkey);
+        if (std::holds_alternative<CPubKey>(pubkey_variant)) {
+            auto pubkey = std::get<CPubKey>(pubkey_variant);
+            if (pubkey.IsFullyValid()) {
+                input_pubkeys.push_back(pubkey);
+            }
+        } else if (std::holds_alternative<XOnlyPubKey>(pubkey_variant)) {
+            auto pubkey = std::get<XOnlyPubKey>(pubkey_variant);
+            if (pubkey.IsFullyValid()) {
+                input_xonly_pubkeys.push_back(pubkey);
+            }
+        }
     }
 
-    assert(!input_pubkeys.empty());
+    assert(!input_pubkeys.empty() || !input_xonly_pubkeys.empty());
 
-    sum_tx_pubkeys = silentpayment::Recipient::SumXOnlyPublicKeys(input_pubkeys);
+    sum_tx_pubkeys = silentpayment::Recipient::SumPublicKeys(input_pubkeys, input_xonly_pubkeys);
     assert(sum_tx_pubkeys.IsFullyValid());
 
     return true;

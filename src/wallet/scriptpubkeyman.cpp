@@ -2721,14 +2721,14 @@ bool DescriptorScriptPubKeyMan::GetPrivKeyForSilentPayment(const CScript& script
     return true;
 }
 
-CKey DescriptorScriptPubKeyMan::GetPrivKeyForSilentPayment(const CScript& scriptPubKey, const bool onlyTaproot) const
+std::tuple<CKey,bool> DescriptorScriptPubKeyMan::GetPrivKeyForSilentPayment(const CScript& scriptPubKey, const bool onlyTaproot) const
 {
     std::vector<std::vector<unsigned char>> solutions;
     TxoutType whichType = Solver(scriptPubKey, solutions);
 
     std::unique_ptr<FlatSigningProvider> coin_keys = GetSigningProvider(scriptPubKey, true);
     if (!coin_keys || coin_keys->keys.size() != 1) {
-        return {};
+        return {}; // returns an invalid private key
     }
 
     auto& key = *coin_keys->keys.begin();
@@ -2742,9 +2742,7 @@ CKey DescriptorScriptPubKeyMan::GetPrivKeyForSilentPayment(const CScript& script
 
         // this means it is a "rawtr" output
         if (XOnlyPubKey(key.second.GetPubKey()) == pubKeyFromScriptPubKey) {
-            CKey priv_key{key.second};
-            priv_key.Negate();
-            return priv_key;
+            return {key.second, true};
         }
 
         TaprootSpendData spenddata;
@@ -2755,14 +2753,13 @@ CKey DescriptorScriptPubKeyMan::GetPrivKeyForSilentPayment(const CScript& script
 
         assert(XOnlyPubKey(priv_key.GetPubKey()) ==  pubKeyFromScriptPubKey);
 
-        priv_key.Negate();
-        return priv_key;
+        return {priv_key, true};
     } else if (onlyTaproot) {
-        return {};
+        return {}; // returns an invalid private key
     } else if (whichType == TxoutType::NONSTANDARD || whichType == TxoutType::MULTISIG || whichType == TxoutType::WITNESS_UNKNOWN ) {
-        return {};
+        return {}; // returns an invalid private key
     } else {
-        return {key.second};
+        return {key.second, false};
     }
 }
 
@@ -2779,7 +2776,7 @@ void DescriptorScriptPubKeyMan::LoadSilentRecipient()
 
         assert(priv_keys.size() == 1);
 
-        m_silent_recipient = std::make_unique<silentpayment::Recipient>(priv_keys.at(0));
+        m_silent_recipient = std::make_unique<silentpayment::Recipient>(priv_keys.at(0), priv_keys.at(0));
     }
 }
 
@@ -2800,7 +2797,7 @@ std::vector<std::tuple<CKey, int32_t>> DescriptorScriptPubKeyMan::VerifySilentPa
         m_silent_recipient->SetSenderPublicKey(sender_pub_key);
 
         for (int32_t identifier = 0; identifier <= m_wallet_descriptor.next_index; identifier++) {
-            const auto [silKey, silPubKey] = m_silent_recipient->Tweak(identifier);
+            const auto [silKey, silPubKey] = m_silent_recipient->Tweak2(identifier);
 
             if (silPubKey == outputPubKey) {
                 raw_tr_keys.emplace_back(silKey, identifier);

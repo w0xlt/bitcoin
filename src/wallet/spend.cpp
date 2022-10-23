@@ -764,7 +764,7 @@ bool CreateSilentTransaction2(
     CMutableTransaction& txNew,
     bilingual_str& error)
 {
-    std::vector<CKey> input_private_keys;
+    std::vector<std::tuple<CKey,bool>> input_private_keys;
 
     for (const auto& input : selected_coins) {
         const auto& spk_managers = wallet.GetScriptPubKeyMans(input.txout.scriptPubKey);
@@ -776,31 +776,38 @@ bool CreateSilentTransaction2(
 
         DescriptorScriptPubKeyMan* spk_manager = dynamic_cast<DescriptorScriptPubKeyMan*>(*spk_managers.begin());
 
-        CKey sender_secret_key{spk_manager->GetPrivKeyForSilentPayment(input.txout.scriptPubKey, /*onlyTaproot=*/ false)};
+        const auto& [sender_secret_key, is_taproot]{spk_manager->GetPrivKeyForSilentPayment(input.txout.scriptPubKey, /*onlyTaproot=*/ false)};
 
         if (!sender_secret_key.IsValid()) {
             error = _("The private key of one of the inputs was not found.");
             return false;
         }
 
-        input_private_keys.push_back(sender_secret_key);
+        input_private_keys.push_back({sender_secret_key, false});
     }
 
     for (auto& vout : txNew.vout) {
 
-        if (vout.m_silentpayment) {
-            std::vector<unsigned char> data;
-            data.assign(vout.scriptPubKey.begin(), vout.scriptPubKey.end());
-            auto [pubkey, index] = DecodeSilentData(data);
+        if (!vout.m_silentpayment) continue;
 
-        }
+        std::vector<unsigned char> data;
+        data.assign(vout.scriptPubKey.begin(), vout.scriptPubKey.end());
+        auto [recipient_pubkey, identifier] = DecodeSilentData(data);
+        assert(recipient_pubkey.IsFullyValid());
+
+        silentpayment::Sender silent_sender{input_private_keys, recipient_pubkey};
+        XOnlyPubKey tweakedKey{silent_sender.Tweak2(identifier)};
+
+        assert(tweakedKey.IsFullyValid());
+        auto tap = WitnessV1Taproot(tweakedKey);
+        CScript tweakedScriptPubKey =  GetScriptForDestination(tap);
+        vout = CTxOut(vout.nValue, tweakedScriptPubKey);
     }
 
-    // TODO
-    return false;
+    return true;
 }
 
-bool CreateSilentTransaction(
+/* bool CreateSilentTransaction(
     const CWallet& wallet,
     const std::vector<COutput>& selected_coins,
     CMutableTransaction& txNew,
@@ -822,7 +829,7 @@ bool CreateSilentTransaction(
         DescriptorScriptPubKeyMan* spk_manager = dynamic_cast<DescriptorScriptPubKeyMan*>(*spk_managers.begin());
 
         CKey sender_secret_key;
-        bool privKeyRet = spk_manager->GetPrivKeyForSilentPayment(input.txout.scriptPubKey, /*privKey=*/ sender_secret_key, /*onlyTaproot=*/ false);
+        bool privKeyRet = spk_manager->GetPrivKeyForSilentPayment(input.txout.scriptPubKey, sender_secret_key, false);
 
         if (!privKeyRet) {
             error = _("The private key of one of the inputs was not found.");
@@ -855,7 +862,7 @@ bool CreateSilentTransaction(
         assert(recipientPubKey.IsFullyValid());
 
         silentpayment::Sender silent_sender{input_private_keys, recipientPubKey};
-        XOnlyPubKey tweakedKey{silent_sender.Tweak(identifier)};
+        XOnlyPubKey tweakedKey{silent_sender.Tweak2(identifier)};
 
         assert(tweakedKey.IsFullyValid());
 
@@ -867,7 +874,7 @@ bool CreateSilentTransaction(
     }
 
     return true;
-}
+} */
 
 static util::Result<CreatedTransactionResult> CreateTransactionInternal(
         CWallet& wallet,
@@ -1022,7 +1029,8 @@ static util::Result<CreatedTransactionResult> CreateTransactionInternal(
     TRACE5(coin_selection, selected_coins, wallet.GetName().c_str(), GetAlgorithmName(result->GetAlgo()).c_str(), result->GetTarget(), result->GetWaste(), result->GetSelectedValue());
 
     if (silent_payment_vouts != nullptr && !silent_payment_vouts->empty()) {
-        if (!CreateSilentTransaction(wallet, result->GetSelectedInputs(), txNew, silent_payment_vouts, error)) {
+        //if (!CreateSilentTransaction(wallet, result->GetSelectedInputs(), txNew, silent_payment_vouts, error)) {
+        if (!CreateSilentTransaction2(wallet, result->GetSelectedInputs(), txNew, error)) {
             return util::Error{_("Unable to create silent transaction")};
         }
     }

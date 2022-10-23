@@ -1313,7 +1313,7 @@ bool CWallet::VerifySilentPayment(const CTransaction& tx, std::vector<std::tuple
         return false;
     }
 
-    std::vector<XOnlyPubKey> sender_pubkeys;
+    /* std::vector<XOnlyPubKey> sender_pubkeys;
 
     for (const CTxIn& txin : tx.vin) {
         auto senderPubKey = XOnlyPubKey();
@@ -1327,16 +1327,42 @@ bool CWallet::VerifySilentPayment(const CTransaction& tx, std::vector<std::tuple
         assert(senderPubKey.IsFullyValid());
 
         sender_pubkeys.push_back(senderPubKey);
+    } */
+
+    std::vector<XOnlyPubKey> input_xonly_pubkeys;
+    std::vector<CPubKey> input_pubkeys;
+
+    for (const CTxIn& txin : tx.vin) {
+        const Coin prev_coin{FindPreviousCoin(txin)};
+
+        XOnlyPubKey input_pubkey;
+        if (!silentpayment::ExtractPubkeyFromInput(prev_coin, txin, input_pubkey)) {
+            return false;
+        }
+        auto pubkey_variant = silentpayment::ExtractPubkeyFromInput2(prev_coin, txin);
+
+        if (std::holds_alternative<CPubKey>(pubkey_variant)) {
+            auto pubkey = std::get<CPubKey>(pubkey_variant);
+            if (pubkey.IsFullyValid()) {
+                input_pubkeys.push_back(pubkey);
+            }
+        } else if (std::holds_alternative<XOnlyPubKey>(pubkey_variant)) {
+            auto pubkey = std::get<XOnlyPubKey>(pubkey_variant);
+            if (pubkey.IsFullyValid()) {
+                input_xonly_pubkeys.push_back(pubkey);
+            }
+        }
     }
 
     CPubKey sum_sender_pubkeys;
 
-    if (sender_pubkeys.empty() || sender_pubkeys.size() != tx.vin.size()) {
+    if ((input_pubkeys.empty() && input_xonly_pubkeys.empty())
+            || (input_pubkeys.size() + input_xonly_pubkeys.size()) != tx.vin.size()) {
         if (!m_chain->getSilentTransactionPubKey(tx.GetHash(), sum_sender_pubkeys)) {
             return false;
         }
     } else {
-        sum_sender_pubkeys = silentpayment::Recipient::SumXOnlyPublicKeys(sender_pubkeys);
+        sum_sender_pubkeys = silentpayment::Recipient::SumPublicKeys(input_pubkeys, input_xonly_pubkeys);
     }
 
     for (ScriptPubKeyMan* spkm : GetActiveScriptPubKeyMans()) {

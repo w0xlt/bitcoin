@@ -136,10 +136,10 @@ BOOST_AUTO_TEST_CASE(silent_addresses_new_approach_2)
     silentpayment::Sender silent_sender{sender_secret_keys, recipient_pubkey};
 
     for (int32_t identifier = 0; identifier < 10; identifier++) {
-        CPubKey sender_tweaked_pubkey = silent_sender.Tweak2(identifier);
+        XOnlyPubKey sender_tweaked_pubkey = silent_sender.Tweak2(identifier);
         const auto [recipient_priv_key, recipient_pub_key] = silent_recipient.Tweak2(identifier);
 
-        BOOST_CHECK(recipient_priv_key.GetPubKey() == recipient_pub_key);
+        BOOST_CHECK(XOnlyPubKey{recipient_priv_key.GetPubKey()} == recipient_pub_key);
 
         BOOST_CHECK(sender_tweaked_pubkey == recipient_pub_key);
 

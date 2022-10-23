@@ -39,7 +39,7 @@ static void SumXOnlyPublicKeys(benchmark::Bench& bench, int key_count)
     }
 
     bench.run([&] {
-        silentpayment::Recipient::SumXOnlyPublicKeys(sender_x_only_public_keys);
+        silentpayment::Recipient::SumPublicKeys({}, sender_x_only_public_keys);
     });
 
     secp256k1_context_destroy(ctx);

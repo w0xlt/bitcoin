@@ -9,7 +9,7 @@
 
 namespace silentpayment {
 
-Sender::Sender(const std::vector<CKey>& sender_secret_keys, const XOnlyPubKey& recipient_x_only_public_key)
+/* Sender::Sender(const std::vector<CKey>& sender_secret_keys, const XOnlyPubKey& recipient_x_only_public_key)
 {
     m_context = secp256k1_context_create(SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
 
@@ -96,7 +96,7 @@ Sender::Sender(const std::vector<CKey>& sender_secret_keys, const CPubKey& recip
     CKey ckey;
     ckey.Set(std::begin(m_shared_secret), std::end(m_shared_secret), true);
     std::cout << "Sender::Sender:     " << EncodeSecret(ckey) << std::endl;
-}
+} */
 
 Sender::Sender(const std::vector<std::tuple<CKey, bool>>& sender_secret_keys, const CPubKey& recipient_public_key)
 {
@@ -156,7 +156,7 @@ Sender::~Sender()
     memset(m_recipient_x_only_public_key.data, 0, sizeof(m_recipient_x_only_public_key.data));
 }
 
-XOnlyPubKey Sender::Tweak(const int32_t& identifier) const
+/* XOnlyPubKey Sender::Tweak(const int32_t& identifier) const
 {
     unsigned char shared_secret[32];
     memcpy(shared_secret, m_shared_secret, 32);
@@ -188,9 +188,9 @@ XOnlyPubKey Sender::Tweak(const int32_t& identifier) const
     assert(pubKey.IsFullyValid());
 
     return XOnlyPubKey(pubKey);
-}
+} */
 
-CPubKey Sender::Tweak2(const int32_t& identifier) const
+XOnlyPubKey Sender::Tweak2(const int32_t& identifier) const
 {
     unsigned char shared_secret[32];
     memcpy(shared_secret, m_shared_secret, 32);
@@ -222,10 +222,10 @@ CPubKey Sender::Tweak2(const int32_t& identifier) const
 
     assert(pubKey.IsFullyValid());
 
-    return pubKey;
+    return XOnlyPubKey(pubKey);
 }
 
-Recipient::Recipient(const CKey& recipient_secret_key)
+/* Recipient::Recipient(const CKey& recipient_secret_key)
 {
     m_context = secp256k1_context_create(SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
 
@@ -249,7 +249,7 @@ Recipient::Recipient(const CKey& recipient_secret_key)
         int return_val = secp256k1_ec_seckey_negate(m_context, m_recipient_seckey);
         assert(return_val);
     }
-}
+} */
 
 Recipient::Recipient(const CKey& recipient_secret_key, const CKey& possibly_negated_key)
 {
@@ -262,7 +262,7 @@ Recipient::Recipient(const CKey& recipient_secret_key, const CKey& possibly_nega
     assert(memcmp(m_recipient_seckey, possibly_negated_key.data(), 32) == 0);
 }
 
-CKey Recipient::NegatePrivateKeyIfOdd(const CKey& seckey)
+/* CKey Recipient::NegatePrivateKeyIfOdd(const CKey& seckey)
 {
     auto context = secp256k1_context_create(SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
 
@@ -292,7 +292,7 @@ CKey Recipient::NegatePrivateKeyIfOdd(const CKey& seckey)
     ckey.Set(std::begin(ret_seckey), std::end(ret_seckey), true);
 
     return ckey;
-}
+} */
 
 void Recipient::SetSenderPublicKey(const CPubKey& sender_public_key)
 {
@@ -317,7 +317,7 @@ Recipient::~Recipient()
     memset(m_recipient_keypair.data, 0, sizeof(m_recipient_keypair.data));
 }
 
-std::tuple<CKey,CPubKey> Recipient::Tweak2(const int32_t& identifier) const
+std::tuple<CKey,XOnlyPubKey> Recipient::Tweak2(const int32_t& identifier) const
 {
     secp256k1_keypair recipient_keypair;
     memcpy(recipient_keypair.data, m_recipient_keypair.data, 96);
@@ -358,10 +358,10 @@ std::tuple<CKey,CPubKey> Recipient::Tweak2(const int32_t& identifier) const
     CKey ckey;
     ckey.Set(std::begin(result_secret_key), std::end(result_secret_key), true);
 
-    return {ckey, CPubKey(pubkey_bytes)};
+    return {ckey, XOnlyPubKey{CPubKey{pubkey_bytes}}};
 }
 
-std::tuple<CKey,XOnlyPubKey> Recipient::Tweak(const int32_t& identifier) const
+/* std::tuple<CKey,XOnlyPubKey> Recipient::Tweak(const int32_t& identifier) const
 {
     secp256k1_keypair recipient_keypair;
     memcpy(recipient_keypair.data, m_recipient_keypair.data, 96);
@@ -479,7 +479,7 @@ CPubKey Recipient::SumPublicKeys(const std::vector<CPubKey>& sender_public_keys)
     secp256k1_context_destroy(context);
 
     return pubKey;
-}
+} */
 
 CPubKey Recipient::SumPublicKeys(const std::vector<CPubKey>& sender_public_keys, const std::vector<XOnlyPubKey>& sender_x_only_public_key)
 {
@@ -597,5 +597,70 @@ bool ExtractPubkeyFromInput(const Coin& prevCoin, const CTxIn& txin,  XOnlyPubKe
     ExtractDestination(scriptPubKey, address);
 
     return true;
+}
+
+std::variant<CPubKey, XOnlyPubKey> ExtractPubkeyFromInput2(const Coin& prevCoin, const CTxIn& txin)
+{
+    // scriptPubKey being spent by this input
+    CScript scriptPubKey = prevCoin.out.scriptPubKey;
+
+    if (scriptPubKey.IsPayToWitnessScriptHash()) {
+        return CPubKey(); // returns an invalid pubkey
+    }
+
+    // Vector of parsed pubkeys and hashes
+    std::vector<std::vector<unsigned char>> solutions;
+
+    TxoutType whichType = Solver(scriptPubKey, solutions);
+
+    if (whichType == TxoutType::NONSTANDARD ||
+    whichType == TxoutType::MULTISIG ||
+    whichType == TxoutType::WITNESS_UNKNOWN ) {
+        return CPubKey(); // returns an invalid pubkey
+    }
+
+    const CScript scriptSig = txin.scriptSig;
+    const CScriptWitness scriptWitness = txin.scriptWitness;
+
+    if (whichType == TxoutType::PUBKEY) {
+
+        CPubKey pubkey = CPubKey(solutions[0]);
+        assert(pubkey.IsFullyValid());
+        return pubkey;
+    }
+
+    else if (whichType == TxoutType::PUBKEYHASH) {
+
+        int sigSize = static_cast<int>(scriptSig[0]);
+        int pubKeySize = static_cast<int>(scriptSig[sigSize + 1]);
+        auto serializedPubKey = std::vector<unsigned char>(scriptSig.begin() + sigSize + 2, scriptSig.end());
+        assert(serializedPubKey.size() == (size_t) pubKeySize);
+
+        CPubKey pubkey = CPubKey(serializedPubKey);
+        assert(pubkey.IsFullyValid());
+
+        return pubkey;
+
+    }
+
+    else if (whichType == TxoutType::WITNESS_V0_KEYHASH || scriptPubKey.IsPayToScriptHash()) {
+        if (scriptWitness.stack.size() != 2) return CPubKey(); // returns an invalid pubkey
+        assert(scriptWitness.stack.at(1).size() == 33);
+
+        CPubKey pubkey = CPubKey(scriptWitness.stack.at(1));
+        assert(pubkey.IsFullyValid());
+
+        return pubkey;
+    }
+
+    else if (whichType == TxoutType::WITNESS_V1_TAPROOT) {
+
+        XOnlyPubKey pubkey = XOnlyPubKey(solutions[0]);
+        assert(pubkey.IsFullyValid());
+        return pubkey;
+    }
+
+    return CPubKey(); // returns an invalid pubkey
+
 }
 } // namespace silentpayment

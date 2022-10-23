@@ -1989,7 +1989,7 @@ bool CheckSilentPayment(
     silent_recipient.SetSenderPublicKey(sum_of_all_input_pubkeys);
 
     for (int64_t identifier = range.first; identifier <= range.second; identifier++) {
-        const auto [silKey, silPubKey] = silent_recipient.Tweak((int32_t) identifier);
+        const auto [silKey, silPubKey] = silent_recipient.Tweak2((int32_t) identifier);
 
         if (outputPubKey == silPubKey) {
             return true;
@@ -2231,7 +2231,7 @@ static RPCHelpMan scantxoutset()
                 }
 
                 if (!privkey_already_added) {
-                    sp_keys_range.emplace_back(privKey, silentpayment::Recipient::NegatePrivateKeyIfOdd(privKey), range);
+                    sp_keys_range.emplace_back(privKey, privKey, range);
                 }
             } else {
                 auto scripts = DescriptorToScripts(desc_str, range, provider);
