@@ -57,6 +57,98 @@ Sender::Sender(const std::vector<CKey>& sender_secret_keys, const XOnlyPubKey& r
     assert(return_val);
 }
 
+Sender::Sender(const std::vector<CKey>& sender_secret_keys, const CPubKey& recipient_public_key)
+{
+    m_context = secp256k1_context_create(SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+
+    const auto& first_seckey{sender_secret_keys.at(0)};
+
+    unsigned char sum_seckey[32];
+    memcpy(sum_seckey, first_seckey.data(), 32);
+    assert(memcmp(sum_seckey, first_seckey.data(), 32) == 0);
+
+    if (sender_secret_keys.size() > 1) {
+        for (size_t i = 1; i < sender_secret_keys.size(); i++) {
+
+            const auto& sender_seckey{sender_secret_keys.at(i)};
+
+            unsigned char seckey_i[32];
+            memcpy(seckey_i, sender_seckey.begin(), 32);
+            assert(memcmp(seckey_i, sender_seckey.begin(), 32) == 0);
+
+            int return_val = secp256k1_ec_seckey_tweak_add(m_context, sum_seckey, seckey_i);
+            assert(return_val);
+        }
+    }
+
+    secp256k1_pubkey parsed_recipient_public_key;
+    int return_val = secp256k1_ec_pubkey_parse(m_context, &parsed_recipient_public_key, recipient_public_key.data(), recipient_public_key.size());
+    assert(return_val);
+
+
+    return_val = secp256k1_ecdh(m_context, m_shared_secret, &parsed_recipient_public_key, sum_seckey, nullptr, nullptr);
+    assert(return_val);
+
+    // store recipient's pubkey
+    return_val = secp256k1_ec_pubkey_parse(m_context, &m_recipient_public_key, recipient_public_key.data(), recipient_public_key.size());
+    assert(return_val);
+
+    CKey ckey;
+    ckey.Set(std::begin(m_shared_secret), std::end(m_shared_secret), true);
+    std::cout << "Sender::Sender:     " << EncodeSecret(ckey) << std::endl;
+}
+
+Sender::Sender(const std::vector<std::tuple<CKey, bool>>& sender_secret_keys, const CPubKey& recipient_public_key)
+{
+    m_context = secp256k1_context_create(SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+
+    const auto& [seckey, is_taproot] = sender_secret_keys.at(0);
+
+    unsigned char sum_seckey[32];
+    memcpy(sum_seckey, seckey.data(), 32);
+    assert(memcmp(sum_seckey, seckey.data(), 32) == 0);
+
+    if (is_taproot && seckey.GetPubKey()[0] == 3) {
+        int return_val = secp256k1_ec_seckey_negate(m_context, sum_seckey);
+        assert(return_val);
+    }
+
+    if (sender_secret_keys.size() > 1) {
+        for (size_t i = 1; i < sender_secret_keys.size(); i++) {
+
+            const auto& [sender_seckey, sender_is_taproot] = sender_secret_keys.at(i);
+
+            unsigned char seckey_i[32];
+            memcpy(seckey_i, sender_seckey.begin(), 32);
+            assert(memcmp(seckey_i, sender_seckey.begin(), 32) == 0);
+
+            if (sender_is_taproot && sender_seckey.GetPubKey()[0] == 3) {
+                int return_val = secp256k1_ec_seckey_negate(m_context, seckey_i);
+                assert(return_val);
+            }
+
+            int return_val = secp256k1_ec_seckey_tweak_add(m_context, sum_seckey, seckey_i);
+            assert(return_val);
+        }
+    }
+
+    secp256k1_pubkey parsed_recipient_public_key;
+    int return_val = secp256k1_ec_pubkey_parse(m_context, &parsed_recipient_public_key, recipient_public_key.data(), recipient_public_key.size());
+    assert(return_val);
+
+
+    return_val = secp256k1_ecdh(m_context, m_shared_secret, &parsed_recipient_public_key, sum_seckey, nullptr, nullptr);
+    assert(return_val);
+
+    // store recipient's pubkey
+    return_val = secp256k1_ec_pubkey_parse(m_context, &m_recipient_public_key, recipient_public_key.data(), recipient_public_key.size());
+    assert(return_val);
+
+    CKey ckey;
+    ckey.Set(std::begin(m_shared_secret), std::end(m_shared_secret), true);
+    std::cout << "Sender::Sender:     " << EncodeSecret(ckey) << std::endl;
+}
+
 Sender::~Sender()
 {
     secp256k1_context_destroy(m_context);
@@ -96,6 +188,41 @@ XOnlyPubKey Sender::Tweak(const int32_t& identifier) const
     assert(pubKey.IsFullyValid());
 
     return XOnlyPubKey(pubKey);
+}
+
+CPubKey Sender::Tweak2(const int32_t& identifier) const
+{
+    unsigned char shared_secret[32];
+    memcpy(shared_secret, m_shared_secret, 32);
+    int return_val = memcmp(shared_secret, m_shared_secret, 32);
+    assert(return_val == 0);
+
+    // Add the identifier to the shared_secret
+    arith_uint256 tweak;
+    tweak = tweak + identifier;
+
+    return_val = secp256k1_ec_seckey_tweak_add(m_context, shared_secret, ArithToUint256(tweak).data());
+    assert(return_val);
+
+    secp256k1_pubkey recipient_public_key;
+    memcpy(recipient_public_key.data, m_recipient_public_key.data, 64);
+    assert(memcmp(recipient_public_key.data, m_recipient_public_key.data, 64) == 0);
+
+    // Tweak the recipient's pubkey with identifier + shared_secret
+    return_val = secp256k1_ec_pubkey_tweak_add(m_context, &recipient_public_key, shared_secret);
+
+    // Serialize and test the tweaked public key
+    size_t len;
+    unsigned char serialized_output_pubkey[33];
+    len = sizeof(serialized_output_pubkey);
+    return_val = secp256k1_ec_pubkey_serialize(m_context, serialized_output_pubkey, &len, &recipient_public_key, SECP256K1_EC_COMPRESSED);
+    assert(return_val);
+
+    CPubKey pubKey = CPubKey(serialized_output_pubkey);
+
+    assert(pubKey.IsFullyValid());
+
+    return pubKey;
 }
 
 Recipient::Recipient(const CKey& recipient_secret_key)
@@ -175,6 +302,11 @@ void Recipient::SetSenderPublicKey(const CPubKey& sender_public_key)
 
     return_val = secp256k1_ecdh(m_context, m_shared_secret, &sender_pubkey, m_recipient_seckey, nullptr, nullptr);
     assert(return_val);
+
+    CKey ckey;
+    ckey.Set(std::begin(m_shared_secret), std::end(m_shared_secret), true);
+    std::cout << "SetSenderPublicKey: " << EncodeSecret(ckey) << std::endl;
+
 }
 
 Recipient::~Recipient()
@@ -183,6 +315,50 @@ Recipient::~Recipient()
     memset(m_recipient_seckey, 0, sizeof(m_recipient_seckey));
     memset(m_shared_secret, 0, sizeof(m_shared_secret));
     memset(m_recipient_keypair.data, 0, sizeof(m_recipient_keypair.data));
+}
+
+std::tuple<CKey,CPubKey> Recipient::Tweak2(const int32_t& identifier) const
+{
+    secp256k1_keypair recipient_keypair;
+    memcpy(recipient_keypair.data, m_recipient_keypair.data, 96);
+    assert(memcmp(recipient_keypair.data, m_recipient_keypair.data, 96) == 0);
+
+    unsigned char shared_secret[32];
+    memcpy(shared_secret, m_shared_secret, 32);
+    int return_val = memcmp(shared_secret, m_shared_secret, 32);
+    assert(return_val == 0);
+
+    arith_uint256 tweak;
+    tweak = tweak + identifier;
+
+    return_val = secp256k1_ec_seckey_tweak_add(m_context, shared_secret, ArithToUint256(tweak).data());
+    assert(return_val);
+
+    unsigned char result_secret_key[32];
+    return_val = secp256k1_keypair_sec(m_context, result_secret_key, &recipient_keypair);
+    assert(return_val);
+
+    secp256k1_pubkey result_pubkey;
+    return_val = secp256k1_keypair_pub(m_context, &result_pubkey, &recipient_keypair);
+    assert(return_val);
+
+    return_val = secp256k1_ec_seckey_tweak_add(m_context, result_secret_key, shared_secret);
+    assert(return_val);
+
+    return_val = secp256k1_ec_pubkey_tweak_add(m_context, &result_pubkey, shared_secret);
+    assert(return_val);
+
+    // Serialize and test the tweaked public key
+    size_t len;
+    unsigned char pubkey_bytes[33];
+    len = sizeof(pubkey_bytes);
+    return_val = secp256k1_ec_pubkey_serialize(m_context, pubkey_bytes, &len, &result_pubkey, SECP256K1_EC_COMPRESSED);
+    assert(return_val);
+
+    CKey ckey;
+    ckey.Set(std::begin(result_secret_key), std::end(result_secret_key), true);
+
+    return {ckey, CPubKey(pubkey_bytes)};
 }
 
 std::tuple<CKey,XOnlyPubKey> Recipient::Tweak(const int32_t& identifier) const
@@ -237,6 +413,95 @@ CPubKey Recipient::SumXOnlyPublicKeys(const std::vector<XOnlyPubKey>& sender_x_o
         assert(return_val);
 
         v_pubkeys.push_back(parsed_sender_public_key);
+    }
+
+    std::vector<secp256k1_pubkey *> p_pubkeys;
+    for (size_t i = 0; i < v_pubkeys.size(); i++) {
+        p_pubkeys.push_back(&v_pubkeys.at(i));
+    }
+
+    // Sum all pubkeys
+    secp256k1_pubkey sum_pubkey;
+    int return_val = secp256k1_ec_pubkey_combine(context, &sum_pubkey, p_pubkeys.data(), v_pubkeys.size());
+    assert(return_val);
+
+    // Serialize and test the tweaked public key
+    size_t len;
+    unsigned char output_pubkey[33];
+    len = sizeof(output_pubkey);
+    return_val = secp256k1_ec_pubkey_serialize(context, output_pubkey, &len, &sum_pubkey, SECP256K1_EC_COMPRESSED);
+    assert(return_val);
+
+    CPubKey pubKey = CPubKey(output_pubkey);
+
+    assert(pubKey.IsFullyValid());
+
+    secp256k1_context_destroy(context);
+
+    return pubKey;
+}
+
+CPubKey Recipient::SumPublicKeys(const std::vector<CPubKey>& sender_public_keys)
+{
+    auto context = secp256k1_context_create(SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+
+    std::vector<secp256k1_pubkey> v_pubkeys;
+
+    for (auto& pubkey : sender_public_keys) {
+        secp256k1_pubkey parsed_pubkey;
+        int return_val = secp256k1_ec_pubkey_parse(context, &parsed_pubkey, pubkey.data(), pubkey.size());
+        assert(return_val);
+
+        v_pubkeys.push_back(parsed_pubkey);
+    }
+
+    std::vector<secp256k1_pubkey *> p_pubkeys;
+    for (size_t i = 0; i < v_pubkeys.size(); i++) {
+        p_pubkeys.push_back(&v_pubkeys.at(i));
+    }
+
+    // Sum all pubkeys
+    secp256k1_pubkey sum_pubkey;
+    int return_val = secp256k1_ec_pubkey_combine(context, &sum_pubkey, p_pubkeys.data(), v_pubkeys.size());
+    assert(return_val);
+
+    // Serialize and test the tweaked public key
+    size_t len;
+    unsigned char output_pubkey[33];
+    len = sizeof(output_pubkey);
+    return_val = secp256k1_ec_pubkey_serialize(context, output_pubkey, &len, &sum_pubkey, SECP256K1_EC_COMPRESSED);
+    assert(return_val);
+
+    CPubKey pubKey = CPubKey(output_pubkey);
+
+    assert(pubKey.IsFullyValid());
+
+    secp256k1_context_destroy(context);
+
+    return pubKey;
+}
+
+CPubKey Recipient::SumPublicKeys(const std::vector<CPubKey>& sender_public_keys, const std::vector<XOnlyPubKey>& sender_x_only_public_key)
+{
+    auto context = secp256k1_context_create(SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+
+    std::vector<secp256k1_pubkey> v_pubkeys;
+
+    for (auto& pubkey : sender_public_keys) {
+        secp256k1_pubkey parsed_pubkey;
+        int return_val = secp256k1_ec_pubkey_parse(context, &parsed_pubkey, pubkey.data(), pubkey.size());
+        assert(return_val);
+
+        v_pubkeys.push_back(parsed_pubkey);
+    }
+
+    for (auto& xpubkey : sender_x_only_public_key) {
+        auto pubkey = xpubkey.ConvertToCompressedPubKey();
+        secp256k1_pubkey parsed_pubkey;
+        int return_val = secp256k1_ec_pubkey_parse(context, &parsed_pubkey, pubkey.data(), pubkey.size());
+        assert(return_val);
+
+        v_pubkeys.push_back(parsed_pubkey);
     }
 
     std::vector<secp256k1_pubkey *> p_pubkeys;

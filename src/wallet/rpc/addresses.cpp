@@ -669,7 +669,8 @@ RPCHelpMan decodesilentaddress()
 
     std::string error_msg;
 
-    auto [pubkey, identifier] = DecodeSilentAddress(request.params[0].get_str());
+    auto data = DecodeSilentAddress(request.params[0].get_str());
+    auto [pubkey, identifier] = DecodeSilentData(data);
 
     if(!pubkey.IsFullyValid()) {
         throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "Invalid address.");
@@ -749,12 +750,6 @@ RPCHelpMan getaddressinfo()
     std::string error_msg;
 
     auto [dest, silent_payment, identifier] = DecodeDestinationIndicatingSP(request.params[0].get_str(), error_msg);
-
-    auto [pubkey, identifier2] =  DecodeSilentAddress(request.params[0].get_str());
-    if(pubkey.IsFullyValid()) {
-        std::cout << "pubkey: " << HexStr(pubkey) << std::endl;
-        std::cout << "identifier: " << identifier2 << std::endl;
-    }
 
     // Make sure the destination is valid
     if (!IsValidDestination(dest)) {

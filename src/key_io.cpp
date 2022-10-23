@@ -388,10 +388,30 @@ bool IsValidDestinationString(const std::string& str)
     return IsValidDestinationString(str, Params());
 }
 
-std::tuple<CPubKey,int32_t> DecodeSilentAddress(const std::string& str)
+std::tuple<CPubKey, int32_t> DecodeSilentData(const std::vector<unsigned char>& data)
 {
-    bool silent_payment{false};
+    if (data.size() <= 33) {
+        return {CPubKey(), 0};
+    }
 
+    std::vector<unsigned char> pubkey_data(data.end() - 33, data.end());
+    CPubKey pubkey{pubkey_data.begin(), pubkey_data.end()};
+
+    std::vector<unsigned char> index_data(data.begin(), data.end() - 33);
+
+    int32_t index = 0;
+    int shift = 0;
+
+    for (auto it = index_data.begin(); it != index_data.end(); it++) {
+        index |=  (*it << shift);
+        shift += 8;
+    }
+
+    return {pubkey, index};
+}
+
+std::vector<unsigned char> DecodeSilentAddress(const std::string& str)
+{
     auto params{Params()};
 
     const auto& silent_payment_hrp = params.SilentPaymentHRP();
@@ -400,7 +420,7 @@ std::tuple<CPubKey,int32_t> DecodeSilentAddress(const std::string& str)
     bool is_sp = dest_silent_payment_hrp == silent_payment_hrp;
 
     if (!is_sp) {
-        return {CPubKey(), 0};
+        return {};
     }
 
     std::vector<unsigned char> data;
@@ -408,29 +428,14 @@ std::tuple<CPubKey,int32_t> DecodeSilentAddress(const std::string& str)
     const auto dec = bech32::Decode(str);
     auto dec_silent_payment_hrp = dec.hrp.substr(0, params.SilentPaymentHRP().size());
 
-    if (dec.encoding != bech32::Encoding::BECH32M || dec.data.size() <= 0 || dec.hrp != silent_payment_hrp) {
-        return {CPubKey(), 0};
+    if (dec.encoding != bech32::Encoding::BECH32M || dec.data.empty() || dec.hrp != silent_payment_hrp) {
+        return {};
     }
 
     data.reserve(((dec.data.size() - 1) * 5) / 8);
     if (ConvertBits<5, 8, false>([&](unsigned char c) { data.push_back(c); }, dec.data.begin(), dec.data.end())) {
-        assert(data.size() > 33);
-        std::cout << "data.size(): " << data.size() << std::endl;
-        std::vector<unsigned char> pubkey_data(data.end() - 33, data.end());
-        CPubKey pubkey{pubkey_data.begin(), pubkey_data.end()};
-
-        std::vector<unsigned char> index_data(data.begin(), data.end() - 33);
-
-        int32_t index = 0;
-        int shift = 0;
-
-        for (auto it = index_data.begin(); it != index_data.end(); it++) {
-            index |=  (*it << shift);
-            shift += 8;
-        }
-
-        return {CPubKey(pubkey_data), index};
+        return data;
     }
 
-    return {CPubKey(), 0};
+    return {};
 }

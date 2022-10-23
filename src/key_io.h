@@ -29,7 +29,10 @@ CTxDestination DecodeDestination(const std::string& str);
 CTxDestination DecodeDestination(const std::string& str, std::string& error_msg, std::vector<int>* error_locations = nullptr);
 std::tuple<CTxDestination,bool,int32_t> DecodeDestinationIndicatingSP(const std::string& str, std::string& error_msg);
 std::tuple<CTxDestination,bool,int32_t> DecodeDestinationIndicatingSP(const std::string& str);
-std::tuple<CPubKey,int32_t> DecodeSilentAddress(const std::string& str);
+
+std::tuple<CPubKey, int32_t> DecodeSilentData(const std::vector<unsigned char>& data);
+std::vector<unsigned char> DecodeSilentAddress(const std::string& str);
+
 bool IsValidDestinationString(const std::string& str);
 bool IsValidDestinationString(const std::string& str, const CChainParams& params);
 

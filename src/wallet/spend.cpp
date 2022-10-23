@@ -758,6 +758,48 @@ static void DiscourageFeeSniping(CMutableTransaction& tx, FastRandomContext& rng
     }
 }
 
+bool CreateSilentTransaction2(
+    const CWallet& wallet,
+    const std::vector<COutput>& selected_coins,
+    CMutableTransaction& txNew,
+    bilingual_str& error)
+{
+    std::vector<CKey> input_private_keys;
+
+    for (const auto& input : selected_coins) {
+        const auto& spk_managers = wallet.GetScriptPubKeyMans(input.txout.scriptPubKey);
+
+        if (spk_managers.size() != 1) {
+            error = _("Only one ScriptPubKeyManager was expected for the input.");
+            return false;
+        }
+
+        DescriptorScriptPubKeyMan* spk_manager = dynamic_cast<DescriptorScriptPubKeyMan*>(*spk_managers.begin());
+
+        CKey sender_secret_key{spk_manager->GetPrivKeyForSilentPayment(input.txout.scriptPubKey, /*onlyTaproot=*/ false)};
+
+        if (!sender_secret_key.IsValid()) {
+            error = _("The private key of one of the inputs was not found.");
+            return false;
+        }
+
+        input_private_keys.push_back(sender_secret_key);
+    }
+
+    for (auto& vout : txNew.vout) {
+
+        if (vout.m_silentpayment) {
+            std::vector<unsigned char> data;
+            data.assign(vout.scriptPubKey.begin(), vout.scriptPubKey.end());
+            auto [pubkey, index] = DecodeSilentData(data);
+
+        }
+    }
+
+    // TODO
+    return false;
+}
+
 bool CreateSilentTransaction(
     const CWallet& wallet,
     const std::vector<COutput>& selected_coins,

@@ -105,6 +105,8 @@ CMutableTransaction ConstructTransaction(const UniValue& inputs_in, const UniVal
     std::set<std::tuple<CTxDestination, int32_t>> destinations;
     bool has_data{false};
 
+    std::set<std::tuple<CScript, int32_t>> silent_vouts;
+
     for (const std::string& name_ : outputs.getKeys()) {
         if (name_ == "data") {
             if (has_data) {
@@ -116,26 +118,45 @@ CMutableTransaction ConstructTransaction(const UniValue& inputs_in, const UniVal
             CTxOut out(0, CScript() << OP_RETURN << data);
             rawTx.vout.push_back(out);
         } else {
-            auto [destination, silent_payment, identifier] = DecodeDestinationIndicatingSP(name_);
 
-            if (!IsValidDestination(destination)) {
-                throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, std::string("Invalid Bitcoin address: ") + name_);
+            CScript scriptPubKey;
+            CAmount nAmount;
+
+            auto data = DecodeSilentAddress(name_);
+            auto [pubkey, _] = DecodeSilentData(data);
+            (void) _;
+
+            CTxOut out;
+
+            if (pubkey.IsFullyValid()) {
+                // this scriptPubKey is the identifier + pubkey
+                // This is not a valid pubkey but will be changed to a P2TR when creating the transaction
+                CScript scriptPubKey = CScript(std::begin(data), std::end(data));
+                CAmount nAmount = AmountFromValue(outputs[name_]);
+                out = {nAmount, scriptPubKey, true};
+            }
+            else {
+                auto [destination, silent_payment, identifier] = DecodeDestinationIndicatingSP(name_);
+
+                if (!IsValidDestination(destination)) {
+                    throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, std::string("Invalid Bitcoin address: ") + name_);
+                }
+
+                if (!destinations.emplace(destination, identifier).second) {
+                    throw JSONRPCError(RPC_INVALID_PARAMETER, std::string("Invalid parameter, duplicated address: ") + name_);
+                }
+
+                CScript scriptPubKey = GetScriptForDestination(destination);
+                CAmount nAmount = AmountFromValue(outputs[name_]);
+                out = {nAmount, scriptPubKey};
             }
 
-            if (!destinations.emplace(destination, identifier).second) {
-                throw JSONRPCError(RPC_INVALID_PARAMETER, std::string("Invalid parameter, duplicated address: ") + name_);
-            }
-
-            CScript scriptPubKey = GetScriptForDestination(destination);
-            CAmount nAmount = AmountFromValue(outputs[name_]);
-
-            CTxOut out(nAmount, scriptPubKey);
             rawTx.vout.push_back(out);
 
-            if (silent_payment && silent_payment_vouts != nullptr) {
-                const SilentTxOut silent_out { .tx_out = out, .identifier = identifier };
-                silent_payment_vouts->push_back(silent_out);
-            }
+            // if (silent_payment && silent_payment_vouts != nullptr) {
+            //     const SilentTxOut silent_out { .tx_out = out, .identifier = identifier };
+            //     silent_payment_vouts->push_back(silent_out);
+            // }
         }
     }
 

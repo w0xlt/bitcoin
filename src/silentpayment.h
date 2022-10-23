@@ -17,9 +17,16 @@ class Sender {
         secp256k1_xonly_pubkey m_recipient_x_only_public_key;
         unsigned char m_shared_secret[32];
 
+        secp256k1_pubkey m_recipient_public_key;
+
     public:
         Sender(const std::vector<CKey>& sender_secret_keys, const XOnlyPubKey& recipient_x_only_public_key);
+        Sender(const std::vector<CKey>& sender_secret_keys, const CPubKey& recipient_public_key);
+
+        Sender(const std::vector<std::tuple<CKey, bool>>& sender_secret_keys, const CPubKey& recipient_public_key);
+
         XOnlyPubKey Tweak(const int32_t& identifier) const;
+        CPubKey Tweak2(const int32_t& identifier) const;
         ~Sender();
 };// class Sender
 
@@ -37,10 +44,13 @@ class Recipient {
          * the sender's public keys already summed. See SumXOnlyPublicKeys().**/
         void SetSenderPublicKey(const CPubKey& sender_public_key);
         std::tuple<CKey,XOnlyPubKey> Tweak(const int32_t& identifier) const;
+        std::tuple<CKey,CPubKey> Tweak2(const int32_t& identifier) const;
         ~Recipient();
 
         static CKey NegatePrivateKeyIfOdd(const CKey& seckey);
         static CPubKey SumXOnlyPublicKeys(const std::vector<XOnlyPubKey>& sender_x_only_public_key);
+        static CPubKey SumPublicKeys(const std::vector<CPubKey>& sender_public_keys);
+        static CPubKey SumPublicKeys(const std::vector<CPubKey>& sender_public_keys, const std::vector<XOnlyPubKey>& sender_x_only_public_key);
 }; // class Recipient
 
 /** Extract Pubkey from an input according to the transaction type **/
