@@ -1231,6 +1231,13 @@ RPCHelpMan send()
                 EnsureWalletIsUnlocked(*pwallet);
             }
 
+            for (const auto& out : rawTx.vout) {
+                std::cout << "--> -------------    " << std::endl;
+                std::cout << "--> scriptPubKey:    " << HexStr(out.scriptPubKey) << std::endl;
+                std::cout << "--> nValue:          " << out.nValue << std::endl;
+                std::cout << "--> m_silentpayment: " << (out.m_silentpayment ? "true" : "false") << std::endl;
+            }
+
             CCoinControl coin_control;
             // Automatically select coins, unless at least one is manually selected. Can
             // be overridden by options.add_inputs.

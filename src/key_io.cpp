@@ -335,11 +335,18 @@ std::string EncodeSilentDestination(const CPubKey pubkey, const int32_t silent_p
 
     std::vector<unsigned char> index_data = {};
     unsigned char index_chunk = silent_payment_index & 0xFF;
+    index_data.push_back(index_chunk);
+
+    // this guarantees the same size if the identifier is between 0 and 255
+    if (index_chunk == 0) {
+        index_data.push_back(index_chunk);
+    }
+
     int8_t shift = 8;
 
     while(index_chunk != 0) {
-        index_data.push_back(index_chunk);
         index_chunk = (silent_payment_index >> shift) & 0xFF;
+        index_data.push_back(index_chunk);
         shift += 8;
     }
 

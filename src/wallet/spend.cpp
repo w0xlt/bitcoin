@@ -788,6 +788,11 @@ bool CreateSilentTransaction2(
 
     for (auto& vout : txNew.vout) {
 
+        std::cout << "--> 1. CST ------------- " << std::endl;
+        std::cout << "--> scriptPubKey:    " << HexStr(vout.scriptPubKey) << std::endl;
+        std::cout << "--> nValue:          " << vout.nValue << std::endl;
+        std::cout << "--> m_silentpayment: " << (vout.m_silentpayment ? "true" : "false") << std::endl;
+
         if (!vout.m_silentpayment) continue;
 
         std::vector<unsigned char> data;
@@ -802,8 +807,12 @@ bool CreateSilentTransaction2(
         auto tap = WitnessV1Taproot(tweakedKey);
         CScript tweakedScriptPubKey =  GetScriptForDestination(tap);
         vout = CTxOut(vout.nValue, tweakedScriptPubKey);
-    }
 
+        std::cout << "--> 2. CST ------------- ";
+        std::cout << "--> scriptPubKey:    " << HexStr(vout.scriptPubKey) << std::endl;
+        std::cout << "--> nValue:          " << vout.nValue << std::endl;
+        std::cout << "--> m_silentpayment: " << (vout.m_silentpayment ? "true" : "false") << std::endl;
+    }
     return true;
 }
 
@@ -995,7 +1004,7 @@ static util::Result<CreatedTransactionResult> CreateTransactionInternal(
     }
     for (const auto& recipient : vecSend)
     {
-        CTxOut txout(recipient.nAmount, recipient.scriptPubKey);
+        CTxOut txout(recipient.nAmount, recipient.scriptPubKey, recipient.m_silentpayment);
 
         // Include the fee cost for outputs.
         if (!coin_selection_params.m_subtract_fee_outputs) {
@@ -1028,12 +1037,12 @@ static util::Result<CreatedTransactionResult> CreateTransactionInternal(
     }
     TRACE5(coin_selection, selected_coins, wallet.GetName().c_str(), GetAlgorithmName(result->GetAlgo()).c_str(), result->GetTarget(), result->GetWaste(), result->GetSelectedValue());
 
-    if (silent_payment_vouts != nullptr && !silent_payment_vouts->empty()) {
+    // if (silent_payment_vouts != nullptr && !silent_payment_vouts->empty()) {
         //if (!CreateSilentTransaction(wallet, result->GetSelectedInputs(), txNew, silent_payment_vouts, error)) {
-        if (!CreateSilentTransaction2(wallet, result->GetSelectedInputs(), txNew, error)) {
-            return util::Error{_("Unable to create silent transaction")};
-        }
+    if (!CreateSilentTransaction2(wallet, result->GetSelectedInputs(), txNew, error)) {
+        return util::Error{_("Unable to create silent transaction")};
     }
+    // }
 
     const CAmount change_amount = result->GetChange(coin_selection_params.min_viable_change, coin_selection_params.m_change_fee);
     if (change_amount > 0) {
@@ -1225,7 +1234,7 @@ bool FundTransaction(
     // Turn the txout set into a CRecipient vector.
     for (size_t idx = 0; idx < tx.vout.size(); idx++) {
         const CTxOut& txOut = tx.vout[idx];
-        CRecipient recipient = {txOut.scriptPubKey, txOut.nValue, setSubtractFeeFromOutputs.count(idx) == 1};
+        CRecipient recipient = {txOut.scriptPubKey, txOut.nValue, setSubtractFeeFromOutputs.count(idx) == 1, txOut.m_silentpayment};
         vecSend.push_back(recipient);
     }
 
