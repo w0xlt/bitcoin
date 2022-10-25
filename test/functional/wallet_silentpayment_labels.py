@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
 from test_framework.test_framework import BitcoinTestFramework
+from test_framework.segwit_addr import (
+    bech32_decode,
+    convertbits,
+    Encoding
+)
 from test_framework.util import (
     assert_raises_rpc_error,
     assert_equal,
@@ -67,11 +72,18 @@ class SilentLabelTest(BitcoinTestFramework):
         for _ in range(97):
             label = self.random_string(8)
             existing_labels.append(label)
-            assert_equal(identifier, int(sp_wallet_01.getsilentaddress(label)['address'][4:6]))
+            addr = sp_wallet_01.getsilentaddress(label)['address']
+            encoding, hrp, data = bech32_decode(addr)
+            decoded = convertbits(data, 5, 8, False)
+
+            assert_equal(encoding, Encoding.BECH32M)
+            assert_equal(hrp, "sprt")
+            assert_equal(identifier,decoded[0])
+
             identifier = identifier + 1
 
         label = self.random_string(8)
-        assert_raises_rpc_error(-12, "No addresses available", sp_wallet_01.getsilentaddress, label=label)
+        assert_raises_rpc_error(-4, "No addresses available", sp_wallet_01.getsilentaddress, label=label)
 
         ret = sp_wallet_01.listsilentaddresses()
         assert_equal(ret['wallet_name'], 'sp_wallet_01')
@@ -80,10 +92,14 @@ class SilentLabelTest(BitcoinTestFramework):
 
         for addr in ret['silent_addresses']:
             assert_equal(addr['label'], existing_labels[identifier])
-            assert_equal(addr['identifier'], identifier)
-            assert(addr['address'].startswith('sprt'))
-            identifier = identifier + 1
+            encoding, hrp, data = bech32_decode(addr['address'])
+            decoded = convertbits(data, 5, 8, False)
 
+            assert_equal(encoding, Encoding.BECH32M)
+            assert_equal(hrp, "sprt")
+            assert_equal(identifier,decoded[0])
+
+            identifier = identifier + 1
 
     def run_test(self):
         self.test_address_label()

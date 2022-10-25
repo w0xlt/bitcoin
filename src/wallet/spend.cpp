@@ -783,7 +783,7 @@ bool CreateSilentTransaction2(
             return false;
         }
 
-        input_private_keys.push_back({sender_secret_key, false});
+        input_private_keys.push_back({sender_secret_key, is_taproot});
     }
 
     for (auto& vout : txNew.vout) {

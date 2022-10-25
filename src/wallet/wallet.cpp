@@ -1356,8 +1356,7 @@ bool CWallet::VerifySilentPayment(const CTransaction& tx, std::vector<std::tuple
 
     CPubKey sum_sender_pubkeys;
 
-    if ((input_pubkeys.empty() && input_xonly_pubkeys.empty())
-            || (input_pubkeys.size() + input_xonly_pubkeys.size()) != tx.vin.size()) {
+    if ((input_pubkeys.size() + input_xonly_pubkeys.size()) != tx.vin.size()) {
         if (!m_chain->getSilentTransactionPubKey(tx.GetHash(), sum_sender_pubkeys)) {
             return false;
         }

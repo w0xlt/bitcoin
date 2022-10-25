@@ -29,7 +29,11 @@ class SilentIdentifierTest(BitcoinTestFramework):
         self.nodes[0].createwallet(wallet_name=f'sender_wallet', descriptors=True)
         sender_wallet = self.nodes[0].get_wallet_rpc(f'sender_wallet')
 
-        self.generatetoaddress(self.nodes[0], COINBASE_MATURITY + 10, sender_wallet.getnewaddress())
+        #self.generatetoaddress(self.nodes[0], COINBASE_MATURITY + 10, sender_wallet.getnewaddress())
+        # self.generatetoaddress(self.nodes[0], 1, sender_wallet.getnewaddress('legacy'))
+        # self.generatetoaddress(self.nodes[0], 1, sender_wallet.getnewaddress('', 'bech32m'))
+        self.generatetoaddress(self.nodes[0], 1, sender_wallet.getnewaddress('', 'bech32'))
+        self.generatetoaddress(self.nodes[0], COINBASE_MATURITY + 10, "bcrt1qjqmxmkpmxt80xz4y3746zgt0q3u3ferr34acd5")
 
         self.nodes[0].createwallet(wallet_name=f'recipient_wallet_01', descriptors=True, silent_payment=True)
         recipient_wallet_01 = self.nodes[0].get_wallet_rpc(f'recipient_wallet_01')
@@ -48,6 +52,11 @@ class SilentIdentifierTest(BitcoinTestFramework):
         recv_addr_03 = recipient_wallet_02.getsilentaddress()['address']
         recv_addr_04 = recipient_wallet_02.getsilentaddress(label02)['address']
 
+        print("recv_addr_01: " + recv_addr_01)
+        print("recv_addr_02: " + recv_addr_02)
+        print("recv_addr_03: " + recv_addr_03)
+        print("recv_addr_04: " + recv_addr_04)
+
         # generate a large index
         recipient_wallet_03.getsilentaddress()['address']
         for _ in range(85):
@@ -56,18 +65,24 @@ class SilentIdentifierTest(BitcoinTestFramework):
         label03 = self.random_string(8)
         recv_addr_05 = recipient_wallet_03.getsilentaddress(label03)['address']
 
-        outputs = [{recv_addr_01: 3}, {recv_addr_02: 2}, {recv_addr_03: 4}, {recv_addr_04: 6},
-            {recv_addr_05: 7}]
+        # outputs = [{recv_addr_01: 3}, {recv_addr_02: 2}, {recv_addr_03: 4}, {recv_addr_04: 6},
+        #     {recv_addr_05: 7}]
 
-        sender_wallet.send(outputs=outputs)
+        outputs = [{recv_addr_01: 3}, {recv_addr_02: 2}, {recv_addr_03: 4}, {recv_addr_04: 6}]
+
+        res = sender_wallet.send(outputs=outputs)#,  options={"add_to_wallet": False})
+
+        #print(self.nodes[0].decoderawtransaction(res['hex']))
 
         self.generatetoaddress(self.nodes[0], 1, sender_wallet.getnewaddress())
 
         recipient_wallet_01_utxos = recipient_wallet_01.listunspent()
+        print(recipient_wallet_01_utxos)
         assert_equal(len(recipient_wallet_01_utxos), 2)
         assert(label01 in [utxo['label'] for utxo in recipient_wallet_01_utxos])
 
         recipient_wallet_02_utxos = recipient_wallet_02.listunspent()
+        print(recipient_wallet_02_utxos)
         assert_equal(len(recipient_wallet_02_utxos), 2)
         assert(label02 in [utxo['label'] for utxo in recipient_wallet_02_utxos])
 
