@@ -2776,7 +2776,7 @@ void DescriptorScriptPubKeyMan::LoadSilentRecipient()
 
         assert(priv_keys.size() == 1);
 
-        m_silent_recipient = std::make_unique<silentpayment::Recipient>(priv_keys.at(0), priv_keys.at(0));
+        m_silent_recipient = std::make_unique<silentpayment::Recipient>(priv_keys.at(0));
     }
 }
 
@@ -2788,29 +2788,16 @@ std::vector<std::tuple<CKey, int32_t>> DescriptorScriptPubKeyMan::VerifySilentPa
 
     std::vector<std::tuple<CKey, int32_t>> raw_tr_keys;
 
-    // LoadSilentRecipient();
+    LoadSilentRecipient();
 
-    std::vector<CKey> priv_keys;
+    assert(m_silent_recipient != nullptr);
 
-    for (auto& [_, priv_key] : m_map_keys) {
-        priv_keys.push_back(priv_key);
-    }
-
-    assert(priv_keys.size() == 1);
-
-    auto silent_recipient = silentpayment::Recipient{priv_keys.at(0), priv_keys.at(0)};
-    silent_recipient.SetSenderPublicKey(sender_pub_key);
-
-    // assert(m_silent_recipient != nullptr);
+    m_silent_recipient->SetSenderPublicKey(sender_pub_key);
 
     for(const auto& [outputScriptPubKey, outputPubKey] : tx_output_pub_keys) {
 
-        // m_silent_recipient->SetSenderPublicKey(sender_pub_key);
-
-
         for (int32_t identifier = 0; identifier <= m_wallet_descriptor.next_index; identifier++) {
-            // const auto [silKey, silPubKey] = m_silent_recipient->Tweak2(identifier);
-            const auto [silKey, silPubKey] = silent_recipient.Tweak2(identifier);
+            const auto [silKey, silPubKey] = m_silent_recipient->Tweak2(identifier);
 
             if (silPubKey == outputPubKey) {
                 raw_tr_keys.emplace_back(silKey, identifier);

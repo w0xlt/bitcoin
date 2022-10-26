@@ -57,7 +57,6 @@ Sender::Sender(const std::vector<std::tuple<CKey, bool>>& sender_secret_keys, co
 
     CKey ckey;
     ckey.Set(std::begin(m_shared_secret), std::end(m_shared_secret), true);
-    std::cout << "Sender::Sender:     " << EncodeSecret(ckey) << std::endl;
 }
 
 Sender::~Sender()
@@ -102,15 +101,15 @@ XOnlyPubKey Sender::Tweak2(const int32_t& identifier) const
     return XOnlyPubKey(pubKey);
 }
 
-Recipient::Recipient(const CKey& recipient_secret_key, const CKey& possibly_negated_key)
+Recipient::Recipient(const CKey& recipient_secret_key)
 {
     m_context = secp256k1_context_create(SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
 
     int return_val = secp256k1_keypair_create(m_context, &m_recipient_keypair, recipient_secret_key.begin());
     assert(return_val);
 
-    memcpy(m_recipient_seckey, possibly_negated_key.data(), 32);
-    assert(memcmp(m_recipient_seckey, possibly_negated_key.data(), 32) == 0);
+    memcpy(m_recipient_seckey, recipient_secret_key.data(), 32);
+    assert(memcmp(m_recipient_seckey, recipient_secret_key.data(), 32) == 0);
 }
 
 void Recipient::SetSenderPublicKey(const CPubKey& sender_public_key)
@@ -124,8 +123,6 @@ void Recipient::SetSenderPublicKey(const CPubKey& sender_public_key)
 
     CKey ckey;
     ckey.Set(std::begin(m_shared_secret), std::end(m_shared_secret), true);
-    std::cout << "SetSenderPublicKey: " << EncodeSecret(ckey) << std::endl;
-
 }
 
 Recipient::~Recipient()

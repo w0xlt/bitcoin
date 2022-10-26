@@ -1965,7 +1965,6 @@ bool CheckSilentPayment(
     const uint256& txhash,
     const CScript& outScriptPubKey,
     const CKey& privKey,
-    const CKey& possibly_negated_key,
     const std::pair<int64_t, int64_t>& range)
 {
     std::vector<std::vector<unsigned char>> solutions;
@@ -1985,7 +1984,7 @@ bool CheckSilentPayment(
         return false;
     }
 
-    silentpayment::Recipient silent_recipient{privKey, possibly_negated_key};
+    silentpayment::Recipient silent_recipient{privKey};
     silent_recipient.SetSenderPublicKey(sum_of_all_input_pubkeys);
 
     for (int64_t identifier = range.first; identifier <= range.second; identifier++) {
@@ -2008,7 +2007,7 @@ bool FindScriptPubKey(
     const std::set<CScript>& needles,
     std::map<COutPoint, Coin>& out_results,
     std::function<void()>& interruption_point,
-    const std::vector<std::tuple<CKey, CKey, std::pair<int64_t, int64_t>>>& sp_keys_range)
+    const std::vector<std::tuple<CKey, std::pair<int64_t, int64_t>>>& sp_keys_range)
 {
     scan_progress = 0;
     count = 0;
@@ -2031,8 +2030,8 @@ bool FindScriptPubKey(
         if (needles.count(coin.out.scriptPubKey)) {
             out_results.emplace(key, coin);
         }
-        for(const auto& [sp_key, possibly_negated_key, sp_range]: sp_keys_range) {
-            if(CheckSilentPayment(key.hash, coin.out.scriptPubKey, sp_key, possibly_negated_key, sp_range)) {
+        for(const auto& [sp_key, sp_range]: sp_keys_range) {
+            if(CheckSilentPayment(key.hash, coin.out.scriptPubKey, sp_key, sp_range)) {
                 out_results.emplace(key, coin);
             }
         }
@@ -2194,7 +2193,7 @@ static RPCHelpMan scantxoutset()
         }
 
         std::set<CScript> needles;
-        std::vector<std::tuple<CKey, CKey, std::pair<int64_t, int64_t>>> sp_keys_range; // Moriginal key, negated key, range
+        std::vector<std::tuple<CKey, std::pair<int64_t, int64_t>>> sp_keys_range;
         std::map<CScript, std::string> descriptors;
         CAmount total_in = 0;
 
@@ -2219,10 +2218,9 @@ static RPCHelpMan scantxoutset()
                 auto privKey = keys.at(0);
 
                 bool privkey_already_added{false};
-                for (const auto& [key, k2, r1] : sp_keys_range) {
+                for (const auto& [key, _] : sp_keys_range) {
 
-                    (void) k2;
-                    (void) r1;
+                    (void) _;
 
                     if (key == privKey) {
                         privkey_already_added = true;
@@ -2231,7 +2229,7 @@ static RPCHelpMan scantxoutset()
                 }
 
                 if (!privkey_already_added) {
-                    sp_keys_range.emplace_back(privKey, privKey, range);
+                    sp_keys_range.emplace_back(privKey, range);
                 }
             } else {
                 auto scripts = DescriptorToScripts(desc_str, range, provider);

@@ -33,7 +33,7 @@ class Recipient {
         unsigned char m_shared_secret[32];
 
     public:
-        Recipient(const CKey& recipient_secret_key, const CKey& possibly_negated_key);
+        Recipient(const CKey& recipient_secret_key);
         /** This method expects the sender_public_key parameter to be
          * the sender's public keys already summed. See SumXOnlyPublicKeys().**/
         void SetSenderPublicKey(const CPubKey& sender_public_key);
