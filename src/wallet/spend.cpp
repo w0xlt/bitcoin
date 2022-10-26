@@ -788,11 +788,6 @@ bool CreateSilentTransaction2(
 
     for (auto& vout : txNew.vout) {
 
-        std::cout << "--> 1. CST ------------- " << std::endl;
-        std::cout << "--> scriptPubKey:    " << HexStr(vout.scriptPubKey) << std::endl;
-        std::cout << "--> nValue:          " << vout.nValue << std::endl;
-        std::cout << "--> m_silentpayment: " << (vout.m_silentpayment ? "true" : "false") << std::endl;
-
         if (!vout.m_silentpayment) continue;
 
         std::vector<unsigned char> data;
@@ -807,11 +802,6 @@ bool CreateSilentTransaction2(
         auto tap = WitnessV1Taproot(tweakedKey);
         CScript tweakedScriptPubKey =  GetScriptForDestination(tap);
         vout = CTxOut(vout.nValue, tweakedScriptPubKey);
-
-        std::cout << "--> 2. CST ------------- ";
-        std::cout << "--> scriptPubKey:    " << HexStr(vout.scriptPubKey) << std::endl;
-        std::cout << "--> nValue:          " << vout.nValue << std::endl;
-        std::cout << "--> m_silentpayment: " << (vout.m_silentpayment ? "true" : "false") << std::endl;
     }
     return true;
 }
@@ -1037,12 +1027,18 @@ static util::Result<CreatedTransactionResult> CreateTransactionInternal(
     }
     TRACE5(coin_selection, selected_coins, wallet.GetName().c_str(), GetAlgorithmName(result->GetAlgo()).c_str(), result->GetTarget(), result->GetWaste(), result->GetSelectedValue());
 
-    // if (silent_payment_vouts != nullptr && !silent_payment_vouts->empty()) {
-        //if (!CreateSilentTransaction(wallet, result->GetSelectedInputs(), txNew, silent_payment_vouts, error)) {
-    if (!CreateSilentTransaction2(wallet, result->GetSelectedInputs(), txNew, error)) {
+    bool is_silent_payment{false};
+
+    for (uint64_t i = 0; i < txNew.vout.size(); i++) {
+        if (txNew.vout[i].m_silentpayment) {
+            is_silent_payment = true;
+            break;
+        }
+    }
+
+    if (is_silent_payment && !CreateSilentTransaction2(wallet, result->GetSelectedInputs(), txNew, error)) {
         return util::Error{_("Unable to create silent transaction")};
     }
-    // }
 
     const CAmount change_amount = result->GetChange(coin_selection_params.min_viable_change, coin_selection_params.m_change_fee);
     if (change_amount > 0) {

@@ -46,8 +46,6 @@ class SilentIdentifierSimple(BitcoinTestFramework):
         assert_equal(len(recipient_wallet_01_utxos), 2)
         assert(label01 in [utxo['label'] for utxo in recipient_wallet_01_utxos])
 
-        self.nodes[0].unloadwallet('recipient_wallet_01')
-
     def two_wallets(self, sender_wallet):
         self.nodes[0].createwallet(wallet_name=f'recipient_wallet_02', descriptors=True, silent_payment=True)
         recipient_wallet_02 = self.nodes[0].get_wallet_rpc(f'recipient_wallet_02')
@@ -65,22 +63,13 @@ class SilentIdentifierSimple(BitcoinTestFramework):
 
         outputs = [{recv_addr_01: 1}, {recv_addr_02: 2}, {recv_addr_03: 3}, {recv_addr_04: 4}]
 
-        # self.nodes[0].unloadwallet('recipient_wallet_02')
-
-        # recipient_wallet_01 = self.nodes[0].get_wallet_rpc(f'recipient_wallet_01')
-        # print("w1.len: " + str(len(recipient_wallet_01.listunspent())))
-
-        sender_wallet.send(outputs=outputs)
+        assert(sender_wallet.send(outputs=outputs)['complete'])
 
         self.generatetoaddress(self.nodes[0], 1, sender_wallet.getnewaddress())
-
-        # print("w1.len: " + str(len(recipient_wallet_01.listunspent())))
 
         recipient_wallet_02_utxos = recipient_wallet_02.listunspent()
         assert_equal(len(recipient_wallet_02_utxos), 2)
         assert(label01 in [utxo['label'] for utxo in recipient_wallet_02_utxos])
-
-        # time.sleep(5)
 
         recipient_wallet_03_utxos = recipient_wallet_03.listunspent()
         assert_equal(len(recipient_wallet_03_utxos), 2)
@@ -93,7 +82,7 @@ class SilentIdentifierSimple(BitcoinTestFramework):
         self.generatetoaddress(self.nodes[0], 1, sender_wallet.getnewaddress('', 'bech32'))
         self.generatetoaddress(self.nodes[0], COINBASE_MATURITY + 10, "bcrt1qjqmxmkpmxt80xz4y3746zgt0q3u3ferr34acd5")
 
-        # self.one_wallet(sender_wallet)
+        self.one_wallet(sender_wallet)
         self.two_wallets(sender_wallet)
 
 

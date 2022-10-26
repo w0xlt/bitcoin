@@ -1221,7 +1221,16 @@ RPCHelpMan send()
             bool rbf{options.exists("replaceable") ? options["replaceable"].get_bool() : pwallet->m_signal_rbf};
             CMutableTransaction rawTx = ConstructTransaction(options["inputs"], request.params[0], options["locktime"], rbf, &silent_payment_vouts);
 
-            if (!silent_payment_vouts.empty()) {
+            bool is_silent_payment{false};
+
+            for (uint64_t i = 0; i < rawTx.vout.size(); i++) {
+                if (rawTx.vout[i].m_silentpayment) {
+                    is_silent_payment = true;
+                    break;
+                }
+            }
+
+            if (is_silent_payment) {
                 if (!pwallet->IsWalletFlagSet(WALLET_FLAG_DESCRIPTORS)) {
                     throw JSONRPCError(RPC_WALLET_ERROR, "Only descriptor wallets support silent payments.");
                 }
@@ -1229,13 +1238,6 @@ RPCHelpMan send()
                     throw JSONRPCError(RPC_WALLET_ERROR, "Silent payments require access to private keys to build transactions.");
                 }
                 EnsureWalletIsUnlocked(*pwallet);
-            }
-
-            for (const auto& out : rawTx.vout) {
-                std::cout << "--> -------------    " << std::endl;
-                std::cout << "--> scriptPubKey:    " << HexStr(out.scriptPubKey) << std::endl;
-                std::cout << "--> nValue:          " << out.nValue << std::endl;
-                std::cout << "--> m_silentpayment: " << (out.m_silentpayment ? "true" : "false") << std::endl;
             }
 
             CCoinControl coin_control;

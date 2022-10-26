@@ -6,6 +6,8 @@ from test_framework.util import (
     assert_equal
 )
 from test_framework.descriptors import descsum_create
+from test_framework.key import ECKey
+from test_framework.wallet_util import bytes_to_wif
 
 
 class SilentTransactioTest(BitcoinTestFramework):
@@ -63,7 +65,7 @@ class SilentTransactioTest(BitcoinTestFramework):
         self.generatetoaddress(self.nodes[0], COINBASE_MATURITY + 10, watch_only_wallet.getnewaddress())
 
         self.log.info("Watch-only wallets cannot send coins using silent_payment option")
-        outputs = [{"sprt001pxlz8k0lg672eehess44tgl27v3mwcy3hpfs83mfs262m5j206ufsna0xnz": 15}]
+        outputs = [{"sprt1qyqq8mvtqcy9t03c9fhsmu0v8ul2srqy27kfqlu93t70cslgw9h9lkxp5elyuw": 15}]
 
         assert_raises_rpc_error(-4, "Silent payments require access to private keys to build transactions.",
             watch_only_wallet.send, outputs=outputs)
@@ -84,7 +86,7 @@ class SilentTransactioTest(BitcoinTestFramework):
         assert(not tx['complete'])
 
         # but when silent_payment option is enabled, wallet must be decrypted
-        outputs = [{"sprt001phdzxent77kwy2y2ckzse9sh2sv3uj2ptz2uzxx2yqtj9wsp363wsu7edkz": 15}]
+        outputs = [{"sprt1qqqq8mvtqcy9t03c9fhsmu0v8ul2srqy27kfqlu93t70cslgw9h9lkxpsszqk5": 15}]
         assert_raises_rpc_error(-13, "Please enter the wallet passphrase with walletpassphrase first.",
             encrypted_wallet.send, outputs=outputs)
 
@@ -94,28 +96,31 @@ class SilentTransactioTest(BitcoinTestFramework):
         assert(tx['complete'])
 
     def test_addressinfo(self):
-        self.log.info("Testing getaddressinfo RPC")
+        self.log.info("Testing decodesilentaddress RPC")
         self.nodes[1].createwallet(wallet_name='sp_addr_info_01', descriptors=True, silent_payment=True)
         sp_addr_info_01 = self.nodes[1].get_wallet_rpc('sp_addr_info_01')
 
         addr01 = sp_addr_info_01.getsilentaddress()['address']
 
-        addr01_info = sp_addr_info_01.getaddressinfo(addr01)
-        assert_equal(addr01_info['silent_payment_identifier'], 0)
+        assert_raises_rpc_error(-5, "Use `decodesilentaddress` RPC to get information about silent addresses.",
+            sp_addr_info_01.getaddressinfo, addr01)
+
+        addr01_info = sp_addr_info_01.decodesilentaddress(addr01)
+        assert_equal(addr01_info['identifier'], 0)
 
         for i in range(20):
             sp_addr_info_01.getsilentaddress(str(i))['address']
 
         addr01 = sp_addr_info_01.getsilentaddress(str(21))['address']
-        addr01_info = sp_addr_info_01.getaddressinfo(addr01)
-        assert_equal(addr01_info['silent_payment_identifier'], 21)
+        addr01_info = sp_addr_info_01.decodesilentaddress(addr01)
+        assert_equal(addr01_info['identifier'], 21)
 
         for i in range(22,67):
             sp_addr_info_01.getsilentaddress(str(i))['address']
 
         addr01 = sp_addr_info_01.getsilentaddress(str(67))['address']
-        addr01_info = sp_addr_info_01.getaddressinfo(addr01)
-        assert_equal(addr01_info['silent_payment_identifier'], 67)
+        addr01_info = sp_addr_info_01.decodesilentaddress(addr01)
+        assert_equal(addr01_info['identifier'], 67)
 
     def test_sp_descriptor(self):
         self.log.info("Testing if SP descriptor works as expected")
@@ -157,9 +162,14 @@ class SilentTransactioTest(BitcoinTestFramework):
         # This will fail because "active = True" was not present in descriptor
         assert_raises_rpc_error(-4, "Error: This wallet has no available keys", sp_wallet_02.getsilentaddress)
 
+        eckey = ECKey()
+        eckey.generate()
+        privkey = bytes_to_wif(eckey.get_bytes())
+        pubkey = eckey.get_pubkey().get_bytes().hex()
+
         xpriv1 = "sp(cNSWZfhJWf1uYcsMKZxN94SgNiM8xQPhGyGaEkyCSR1GtSweLkdr)#vs4h975j"
         xpriv2 = "sp(cS1NMRiK87hdpzzNJgiYcdABjCPGxbBAdCrHoosqzjfeQY4z85rn)#dh4rsd8m"
-        xpriv3 = "sp(cQUVgcphF27yReKMNduhr9ig24uJj6jC1BxEXNSUZYxNTbG3cCka)#8uvrehfs"
+        xpriv3 = descsum_create("sp(" + privkey + ")")
 
         result = sp_wallet_02.importdescriptors([
             {"desc": xpriv1, "timestamp": "now", "active": True},
@@ -177,10 +187,15 @@ class SilentTransactioTest(BitcoinTestFramework):
                 assert(not desc['active'])
 
         sp_addr = sp_wallet_02.getsilentaddress()['address']
-        addr_info = sp_wallet_02.getaddressinfo(sp_addr)
+        assert_raises_rpc_error(-5, "Use `decodesilentaddress` RPC to get information about silent addresses.",
+            sp_wallet_02.getaddressinfo, sp_addr)
+
+        addr_info = sp_wallet_02.decodesilentaddress(sp_addr)
+
         assert_equal(addr_info['address'], sp_addr)
-        assert addr_info['parent_desc'], xpriv3
-        assert addr_info['desc'].startswith('rawtr(')
+        assert_equal(addr_info['identifier'], 0)
+        assert_equal(addr_info['label'], '')
+        assert_equal(addr_info['pubkey'], pubkey)
 
     def test_big_transaction_multiple_wallets(self):
         self.log.info("Testing a big transaction to SP wallet")

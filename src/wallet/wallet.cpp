@@ -1335,10 +1335,10 @@ bool CWallet::VerifySilentPayment(const CTransaction& tx, std::vector<std::tuple
     for (const CTxIn& txin : tx.vin) {
         const Coin prev_coin{FindPreviousCoin(txin)};
 
-        XOnlyPubKey input_pubkey;
-        if (!silentpayment::ExtractPubkeyFromInput(prev_coin, txin, input_pubkey)) {
-            return false;
-        }
+        // XOnlyPubKey input_pubkey;
+        // if (!silentpayment::ExtractPubkeyFromInput(prev_coin, txin, input_pubkey)) {
+        //     return false;
+        // }
         auto pubkey_variant = silentpayment::ExtractPubkeyFromInput2(prev_coin, txin);
 
         if (std::holds_alternative<CPubKey>(pubkey_variant)) {
