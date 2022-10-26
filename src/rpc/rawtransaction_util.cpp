@@ -21,7 +21,7 @@
 #include <util/strencodings.h>
 #include <util/translation.h>
 
-CMutableTransaction ConstructTransaction(const UniValue& inputs_in, const UniValue& outputs_in, const UniValue& locktime, std::optional<bool> rbf, std::vector<SilentTxOut>* silent_payment_vouts)
+CMutableTransaction ConstructTransaction(const UniValue& inputs_in, const UniValue& outputs_in, const UniValue& locktime, std::optional<bool> rbf)
 {
     if (outputs_in.isNull()) {
         throw JSONRPCError(RPC_INVALID_PARAMETER, "Invalid parameter, output argument must be non-null");
@@ -152,11 +152,6 @@ CMutableTransaction ConstructTransaction(const UniValue& inputs_in, const UniVal
             }
 
             rawTx.vout.push_back(out);
-
-            // if (silent_payment && silent_payment_vouts != nullptr) {
-            //     const SilentTxOut silent_out { .tx_out = out, .identifier = identifier };
-            //     silent_payment_vouts->push_back(silent_out);
-            // }
         }
     }
 

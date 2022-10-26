@@ -758,7 +758,7 @@ static void DiscourageFeeSniping(CMutableTransaction& tx, FastRandomContext& rng
     }
 }
 
-bool CreateSilentTransaction2(
+bool CreateSilentTransaction(
     const CWallet& wallet,
     const std::vector<COutput>& selected_coins,
     CMutableTransaction& txNew,
@@ -806,82 +806,12 @@ bool CreateSilentTransaction2(
     return true;
 }
 
-/* bool CreateSilentTransaction(
-    const CWallet& wallet,
-    const std::vector<COutput>& selected_coins,
-    CMutableTransaction& txNew,
-    const std::vector<SilentTxOut>* silent_payment_vouts,
-    bilingual_str& error)
-{
-    assert(silent_payment_vouts != nullptr);
-
-    std::vector<CKey> input_private_keys;
-
-    for (const auto& input : selected_coins) {
-        const auto& spk_managers = wallet.GetScriptPubKeyMans(input.txout.scriptPubKey);
-
-        if (spk_managers.size() != 1) {
-            error = _("Only one ScriptPubKeyManager was expected for the input.");
-            return false;
-        }
-
-        DescriptorScriptPubKeyMan* spk_manager = dynamic_cast<DescriptorScriptPubKeyMan*>(*spk_managers.begin());
-
-        CKey sender_secret_key;
-        bool privKeyRet = spk_manager->GetPrivKeyForSilentPayment(input.txout.scriptPubKey, sender_secret_key, false);
-
-        if (!privKeyRet) {
-            error = _("The private key of one of the inputs was not found.");
-            return false;
-        }
-
-        input_private_keys.push_back(sender_secret_key);
-    }
-
-    for (auto& vout : txNew.vout) {
-
-        int32_t identifier = 0;
-
-        auto it = std::find_if(silent_payment_vouts->begin(), silent_payment_vouts->end(),
-            [&vout](const SilentTxOut& obj) {return obj.tx_out == vout;});
-
-        if (it == silent_payment_vouts->end()) {
-            continue;
-        } else {
-            identifier = it->identifier;
-        }
-
-        std::vector<std::vector<unsigned char>> solutions;
-        TxoutType whichType = Solver(vout.scriptPubKey, solutions);
-
-        assert(whichType == TxoutType::WITNESS_V1_TAPROOT);
-
-        auto recipientPubKey = XOnlyPubKey(solutions[0]);
-
-        assert(recipientPubKey.IsFullyValid());
-
-        silentpayment::Sender silent_sender{input_private_keys, recipientPubKey};
-        XOnlyPubKey tweakedKey{silent_sender.Tweak2(identifier)};
-
-        assert(tweakedKey.IsFullyValid());
-
-        auto tap = WitnessV1Taproot(tweakedKey);
-
-        CScript tweakedScriptPubKey =  GetScriptForDestination(tap);
-
-        vout = CTxOut(vout.nValue, tweakedScriptPubKey);
-    }
-
-    return true;
-} */
-
 static util::Result<CreatedTransactionResult> CreateTransactionInternal(
         CWallet& wallet,
         const std::vector<CRecipient>& vecSend,
         int change_pos,
         const CCoinControl& coin_control,
-        bool sign,
-        const std::vector<SilentTxOut>* silent_payment_vouts = nullptr) EXCLUSIVE_LOCKS_REQUIRED(wallet.cs_wallet)
+        bool sign) EXCLUSIVE_LOCKS_REQUIRED(wallet.cs_wallet)
 {
     AssertLockHeld(wallet.cs_wallet);
 
@@ -1036,7 +966,7 @@ static util::Result<CreatedTransactionResult> CreateTransactionInternal(
         }
     }
 
-    if (is_silent_payment && !CreateSilentTransaction2(wallet, result->GetSelectedInputs(), txNew, error)) {
+    if (is_silent_payment && !CreateSilentTransaction(wallet, result->GetSelectedInputs(), txNew, error)) {
         return util::Error{_("Unable to create silent transaction")};
     }
 
@@ -1177,8 +1107,7 @@ util::Result<CreatedTransactionResult> CreateTransaction(
         const std::vector<CRecipient>& vecSend,
         int change_pos,
         const CCoinControl& coin_control,
-        bool sign,
-        const std::vector<SilentTxOut>* silent_payment_vouts)
+        bool sign)
 {
     if (vecSend.empty()) {
         return util::Error{_("Transaction must have at least one recipient")};
@@ -1190,7 +1119,7 @@ util::Result<CreatedTransactionResult> CreateTransaction(
 
     LOCK(wallet.cs_wallet);
 
-    auto res = CreateTransactionInternal(wallet, vecSend, change_pos, coin_control, sign, silent_payment_vouts);
+    auto res = CreateTransactionInternal(wallet, vecSend, change_pos, coin_control, sign);
     TRACE4(coin_selection, normal_create_tx_internal, wallet.GetName().c_str(), bool(res),
            res ? res->fee : 0, res ? res->change_pos : 0);
     if (!res) return res;
@@ -1200,7 +1129,7 @@ util::Result<CreatedTransactionResult> CreateTransaction(
         TRACE1(coin_selection, attempting_aps_create_tx, wallet.GetName().c_str());
         CCoinControl tmp_cc = coin_control;
         tmp_cc.m_avoid_partial_spends = true;
-        auto txr_grouped = CreateTransactionInternal(wallet, vecSend, change_pos, tmp_cc, sign, silent_payment_vouts);
+        auto txr_grouped = CreateTransactionInternal(wallet, vecSend, change_pos, tmp_cc, sign);
         // if fee of this alternative one is within the range of the max fee, we use this one
         const bool use_aps{txr_grouped.has_value() ? (txr_grouped->fee <= txr_ungrouped.fee + wallet.m_max_aps_fee) : false};
         TRACE5(coin_selection, aps_create_tx_internal, wallet.GetName().c_str(), use_aps, txr_grouped.has_value(),
@@ -1222,8 +1151,7 @@ bool FundTransaction(
     bilingual_str& error,
     bool lockUnspents,
     const std::set<int>& setSubtractFeeFromOutputs,
-    CCoinControl coinControl,
-    const std::vector<SilentTxOut>* silent_payment_vouts)
+    CCoinControl coinControl)
 {
     std::vector<CRecipient> vecSend;
 
@@ -1260,7 +1188,7 @@ bool FundTransaction(
         }
     }
 
-    auto res = CreateTransaction(wallet, vecSend, nChangePosInOut, coinControl, false, silent_payment_vouts);
+    auto res = CreateTransaction(wallet, vecSend, nChangePosInOut, coinControl, false);
     if (!res) {
         error = util::ErrorString(res);
         return false;

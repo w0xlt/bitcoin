@@ -42,6 +42,6 @@ void SignTransactionResultToJSON(CMutableTransaction& mtx, bool complete, const 
 void ParsePrevouts(const UniValue& prevTxsUnival, FillableSigningProvider* keystore, std::map<COutPoint, Coin>& coins);
 
 /** Create a transaction from univalue parameters */
-CMutableTransaction ConstructTransaction(const UniValue& inputs_in, const UniValue& outputs_in, const UniValue& locktime, std::optional<bool> rbf, std::vector<SilentTxOut>* silent_payment_vouts = nullptr);
+CMutableTransaction ConstructTransaction(const UniValue& inputs_in, const UniValue& outputs_in, const UniValue& locktime, std::optional<bool> rbf);
 
 #endif // BITCOIN_RPC_RAWTRANSACTION_UTIL_H

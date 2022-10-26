@@ -97,6 +97,7 @@ BASE_SCRIPTS = [
     'wallet_silentpayment_labels.py',
     'wallet_silentpayment_identifier.py',
     'wallet_silentpayment_psbt.py',
+    'wallet_silentpayment_simple.py',
     # vv Tests less than 5m vv
     'mining_getblocktemplate_longpoll.py',
     'feature_maxuploadtarget.py',
