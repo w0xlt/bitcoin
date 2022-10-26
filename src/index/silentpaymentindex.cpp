@@ -96,11 +96,7 @@ bool SilentPaymentIndex::GetSilentPaymentKey(const CTransactionRef& tx, const CB
 
         const CTxIn& txin{tx->vin.at(i)};
 
-        XOnlyPubKey input_pubkey;
-        if (!silentpayment::ExtractPubkeyFromInput(prev_coin, txin, input_pubkey)) {
-            return false;
-        }
-        auto pubkey_variant = silentpayment::ExtractPubkeyFromInput2(prev_coin, txin);
+        auto pubkey_variant = silentpayment::ExtractPubkeyFromInput(prev_coin, txin);
 
         if (std::holds_alternative<CPubKey>(pubkey_variant)) {
             auto pubkey = std::get<CPubKey>(pubkey_variant);

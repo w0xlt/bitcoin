@@ -20,12 +20,7 @@ class Sender {
         secp256k1_pubkey m_recipient_public_key;
 
     public:
-        // Sender(const std::vector<CKey>& sender_secret_keys, const XOnlyPubKey& recipient_x_only_public_key);
-        // Sender(const std::vector<CKey>& sender_secret_keys, const CPubKey& recipient_public_key);
-
         Sender(const std::vector<std::tuple<CKey, bool>>& sender_secret_keys, const CPubKey& recipient_public_key);
-
-        // XOnlyPubKey Tweak(const int32_t& identifier) const;
         XOnlyPubKey Tweak2(const int32_t& identifier) const;
         ~Sender();
 };// class Sender
@@ -38,24 +33,18 @@ class Recipient {
         unsigned char m_shared_secret[32];
 
     public:
-        // Recipient(const CKey& recipient_secret_key);
         Recipient(const CKey& recipient_secret_key, const CKey& possibly_negated_key);
         /** This method expects the sender_public_key parameter to be
          * the sender's public keys already summed. See SumXOnlyPublicKeys().**/
         void SetSenderPublicKey(const CPubKey& sender_public_key);
-        // std::tuple<CKey,XOnlyPubKey> Tweak(const int32_t& identifier) const;
         std::tuple<CKey,XOnlyPubKey> Tweak2(const int32_t& identifier) const;
         ~Recipient();
 
-        // static CKey NegatePrivateKeyIfOdd(const CKey& seckey);
-        // static CPubKey SumXOnlyPublicKeys(const std::vector<XOnlyPubKey>& sender_x_only_public_key);
-        // static CPubKey SumPublicKeys(const std::vector<CPubKey>& sender_public_keys);
         static CPubKey SumPublicKeys(const std::vector<CPubKey>& sender_public_keys, const std::vector<XOnlyPubKey>& sender_x_only_public_key);
 }; // class Recipient
 
 /** Extract Pubkey from an input according to the transaction type **/
-bool ExtractPubkeyFromInput(const Coin& prevCoin, const CTxIn& txin,  XOnlyPubKey& senderPubKey);
-std::variant<CPubKey, XOnlyPubKey> ExtractPubkeyFromInput2(const Coin& prevCoin, const CTxIn& txin);
+std::variant<CPubKey, XOnlyPubKey> ExtractPubkeyFromInput(const Coin& prevCoin, const CTxIn& txin);
 } // namespace silentpayment
 
 #endif // BITCOIN_SILENTPAYMENT_H
