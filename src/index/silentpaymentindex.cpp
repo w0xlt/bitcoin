@@ -111,7 +111,11 @@ bool SilentPaymentIndex::GetSilentPaymentKey(const CTransactionRef& tx, const CB
         }
     }
 
-    assert(!input_pubkeys.empty() || !input_xonly_pubkeys.empty());
+    // Currently Silent Payment scheme uses all keys. If not possible to
+    // retrieve all keys, it is not a SP transaction.
+    if ((input_pubkeys.size() + input_xonly_pubkeys.size()) != tx->vin.size()) {
+        return false;
+    }
 
     sum_tx_pubkeys = silentpayment::Recipient::SumPublicKeys(input_pubkeys, input_xonly_pubkeys);
     assert(sum_tx_pubkeys.IsFullyValid());

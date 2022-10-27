@@ -1304,7 +1304,9 @@ bool CWallet::VerifySilentPayment(const CTransaction& tx, std::vector<std::tuple
 
         auto xOnlyPubKey = XOnlyPubKey(solutions[0]);
 
-        assert(xOnlyPubKey.IsFullyValid());
+        if (!xOnlyPubKey.IsFullyValid()) {
+            continue;
+        }
 
         outputPubKeys.emplace_back(vout.scriptPubKey, xOnlyPubKey);
     }
@@ -1336,6 +1338,8 @@ bool CWallet::VerifySilentPayment(const CTransaction& tx, std::vector<std::tuple
 
     CPubKey sum_sender_pubkeys;
 
+    // Currently Silent Payment scheme uses all keys. If not possible to
+    // retrieve all keys, it is not a SP transaction.
     if ((input_pubkeys.size() + input_xonly_pubkeys.size()) != tx.vin.size()) {
         if (!m_chain->getSilentTransactionPubKey(tx.GetHash(), sum_sender_pubkeys)) {
             return false;
