@@ -45,6 +45,49 @@ class Recipient {
 
 /** Extract Pubkey from an input according to the transaction type **/
 std::variant<CPubKey, XOnlyPubKey> ExtractPubkeyFromInput(const Coin& prevCoin, const CTxIn& txin);
+
+
+class SenderNS {
+    private:
+        secp256k1_context* m_context{nullptr};
+
+        secp256k1_xonly_pubkey m_recipient_spend_xonly_pubkey;
+        secp256k1_pubkey m_recipient_scan_pubkey;
+
+        unsigned char m_shared_secret[32];
+
+    public:
+        SenderNS(
+            const std::vector<std::tuple<CKey, bool>>& sender_secret_keys,
+            const XOnlyPubKey& recipient_spend_xonly_pubkey,
+            const XOnlyPubKey& recipient_scan_xonly_pubkey);
+
+        XOnlyPubKey Tweak(const int32_t& identifier) const;
+        ~SenderNS();
+}; // class SenderNS
+
+class RecipientNS {
+    private:
+        secp256k1_context* m_context{nullptr};
+
+        // unsigned char m_spend_seckey[32];
+        unsigned char m_scan_seckey[32];
+
+        // unsigned char m_negated_spend_seckey[32];
+        unsigned char m_negated_scan_seckey[32];
+
+        secp256k1_keypair m_spend_keypair;
+
+        unsigned char m_shared_secret[32];
+
+    public:
+        RecipientNS(const CKey& spend_seckey);
+        void SetSenderPublicKey(const CPubKey& sender_public_key);
+        std::tuple<CKey,XOnlyPubKey> Tweak(const int32_t& identifier) const;
+        ~RecipientNS();
+
+}; // class RecipientNS
+
 } // namespace silentpayment
 
 #endif // BITCOIN_SILENTPAYMENT_H

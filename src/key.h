@@ -99,7 +99,7 @@ public:
     void MakeNewKey(bool fCompressed);
 
     //! Negate private key
-    bool Negate();
+    CKey Negate() const;
 
     /**
      * Convert the private key to a CPrivKey (serialized OpenSSL private key data).

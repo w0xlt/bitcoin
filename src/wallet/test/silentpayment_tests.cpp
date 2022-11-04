@@ -51,5 +51,79 @@ BOOST_AUTO_TEST_CASE(silent_addresses_new_approach_2)
     }
 }
 
+BOOST_AUTO_TEST_CASE(silent_addresses_2)
+{
+    std::vector<std::tuple<CKey, bool>> sender_secret_keys;
+    std::vector<CPubKey> sender_pub_keys;
+    std::vector<XOnlyPubKey> sender_x_only_pub_keys;
+
+    // non-taproot inputs
+    for(size_t i =0; i < 38; i++) {
+        CKey senderkey;
+        senderkey.MakeNewKey(true);
+        CPubKey senderPubkey = senderkey.GetPubKey();
+
+        sender_secret_keys.push_back({senderkey, false});
+        sender_pub_keys.push_back(senderPubkey);
+    }
+
+    // taproot inputs
+    for(size_t i =0; i < 49; i++) {
+        CKey senderkey;
+        senderkey.MakeNewKey(true);
+
+        sender_secret_keys.push_back({senderkey, true});
+        sender_x_only_pub_keys.push_back(XOnlyPubKey{senderkey.GetPubKey()});
+    }
+
+    CKey recipient_spend_seckey;
+    recipient_spend_seckey.MakeNewKey(true);
+    CPubKey recipient_spend_pubkey = recipient_spend_seckey.GetPubKey();
+
+    unsigned char hash[32] = {};
+    CSHA256().Write(recipient_spend_seckey.begin(), 32).Finalize(hash);
+
+    CKey recipient_scan_key;
+    recipient_scan_key.Set(std::begin(hash), std::end(hash), true);
+
+    int32_t identifier = 0;
+
+    auto silent_recipient = silentpayment::RecipientNS(recipient_spend_seckey);
+    CPubKey sum_tx_pubkeys{silentpayment::Recipient::SumPublicKeys(sender_pub_keys, sender_x_only_pub_keys)};
+    silent_recipient.SetSenderPublicKey(sum_tx_pubkeys);
+    //const auto [recipient_priv_key, recipient_pub_key] = silent_recipient.Tweak(identifier);
+
+    // std::cout << "recipient_priv_key: " << EncodeSecret(recipient_priv_key) << std::endl;
+    // std::cout << "recipient_pub_key:  " << HexStr(recipient_pub_key) << std::endl;
+
+    // std::cout << "---" << std::endl;
+    // std::cout << "recipient_scan_pubkey: " << HexStr(recipient_scan_key.GetPubKey()) << std::endl;
+    // std::cout << "recipient_spend_pubkey: " << HexStr(recipient_spend_seckey.GetPubKey()) << std::endl;
+
+    // std::cout << "---" << std::endl;
+
+
+    silentpayment::SenderNS silent_sender{
+        sender_secret_keys,
+        XOnlyPubKey(recipient_spend_pubkey),
+        XOnlyPubKey(recipient_scan_key.GetPubKey())
+    };
+
+    for (int32_t identifier = 0; identifier < 4; identifier++) {
+
+        std::cout << "-------" << std::endl;
+
+        XOnlyPubKey sender_tweaked_pubkey = silent_sender.Tweak(identifier);
+        const auto [recipient_priv_key, recipient_pub_key] = silent_recipient.Tweak(identifier);
+
+        //std::cout << "XOnlyPubKey{recipient_priv_key.GetPubKey()}: " << HexStr(XOnlyPubKey{recipient_priv_key.GetPubKey()}) << std::endl;
+        std::cout << "recipient_pub_key:                           " << HexStr(recipient_pub_key) << std::endl;
+        std::cout << "sender_tweaked_pubkey:                       " << HexStr(sender_tweaked_pubkey) << std::endl;
+        /* BOOST_CHECK(XOnlyPubKey{recipient_priv_key.GetPubKey()} == recipient_pub_key);
+
+        BOOST_CHECK(sender_tweaked_pubkey == recipient_pub_key); */
+    }
+}
+
 BOOST_AUTO_TEST_SUITE_END()
 } // namespace wallet
