@@ -52,7 +52,6 @@ class SenderNS {
         secp256k1_context* m_context{nullptr};
 
         secp256k1_xonly_pubkey m_recipient_spend_xonly_pubkey;
-        secp256k1_pubkey m_recipient_scan_pubkey;
 
         unsigned char m_shared_secret[32];
 
@@ -70,10 +69,6 @@ class RecipientNS {
     private:
         secp256k1_context* m_context{nullptr};
 
-        // unsigned char m_spend_seckey[32];
-        unsigned char m_scan_seckey[32];
-
-        // unsigned char m_negated_spend_seckey[32];
         unsigned char m_negated_scan_seckey[32];
 
         secp256k1_keypair m_spend_keypair;

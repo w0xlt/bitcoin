@@ -304,23 +304,11 @@ RecipientNS::RecipientNS(const CKey& spend_seckey)
     int return_val = secp256k1_keypair_create(m_context, &m_spend_keypair, spend_seckey.begin());
     assert(return_val);
 
-    // memcpy(m_spend_seckey, spend_seckey.data(), 32);
-    // assert(memcmp(m_spend_seckey, spend_seckey.data(), 32) == 0);
-
-    CSHA256().Write(spend_seckey.begin(), 32).Finalize(m_scan_seckey);
+    unsigned char scan_seckey_bytes[32];
+    CSHA256().Write(spend_seckey.begin(), 32).Finalize(scan_seckey_bytes);
 
     CKey scan_key;
-    scan_key.Set(std::begin(m_scan_seckey), std::end(m_scan_seckey), true);
-
-    // if (spend_seckey.GetPubKey().data()[0] == 3) {
-    //     auto temp_key{spend_seckey.Negate()};
-
-    //     memcpy(m_negated_spend_seckey, temp_key.data(), 32);
-    //     assert(memcmp(m_negated_spend_seckey, temp_key.data(), 32) == 0);
-    // } else {
-    //     memcpy(m_negated_spend_seckey, spend_seckey.data(), 32);
-    //     assert(memcmp(m_negated_spend_seckey, spend_seckey.data(), 32) == 0);
-    // }
+    scan_key.Set(std::begin(scan_seckey_bytes), std::end(scan_seckey_bytes), true);
 
     if (scan_key.GetPubKey().data()[0] == 3) {
         auto temp_key{scan_key.Negate()};
@@ -331,35 +319,12 @@ RecipientNS::RecipientNS(const CKey& spend_seckey)
         memcpy(m_negated_scan_seckey, scan_key.data(), 32);
         assert(memcmp(m_negated_scan_seckey, scan_key.data(), 32) == 0);
     }
-
-    // -- Apagar
-
-    /* CKey negated_spend_seckey;
-    negated_spend_seckey.Set(std::begin(m_negated_spend_seckey), std::end(m_negated_spend_seckey), true);
-
-    std::cout << "spend_seckey:           " << EncodeSecret(spend_seckey) << std::endl;
-    std::cout << "spend_pubkey:           " << HexStr(spend_seckey.GetPubKey()) << std::endl;
-    std::cout << "negated_spend_seckey:   " << EncodeSecret(negated_spend_seckey) << std::endl;
-
-    std::cout << "---" << std::endl;
-
-    CKey negated_scan_seckey;
-    negated_scan_seckey.Set(std::begin(m_negated_scan_seckey), std::end(m_negated_scan_seckey), true);
-
-    std::cout << "scan_key:               " << EncodeSecret(scan_key) << std::endl;
-    std::cout << "scan_pubkey:            " << HexStr(scan_key.GetPubKey()) << std::endl;
-    std::cout << "negated_scan_seckey:    " << EncodeSecret(negated_scan_seckey) << std::endl; */
-
 }
 
 RecipientNS::~RecipientNS()
 {
     secp256k1_context_destroy(m_context);
 
-    // memset(m_spend_seckey, 0, sizeof(m_spend_seckey));
-    memset(m_scan_seckey, 0, sizeof(m_scan_seckey));
-
-    // memset(m_negated_spend_seckey, 0, sizeof(m_negated_spend_seckey));
     memset(m_negated_scan_seckey, 0, sizeof(m_negated_scan_seckey));
 
     memset(m_shared_secret, 0, sizeof(m_shared_secret));
@@ -374,11 +339,6 @@ void RecipientNS::SetSenderPublicKey(const CPubKey& sender_public_key)
 
     return_val = secp256k1_ecdh(m_context, m_shared_secret, &sender_pubkey, m_negated_scan_seckey, nullptr, nullptr);
     assert(return_val);
-
-    CKey ckey;
-    ckey.Set(std::begin(m_shared_secret), std::end(m_shared_secret), true);
-
-    std::cout << "RecipientNS::m_shared_secret: " << EncodeSecret(ckey) << std::endl;
 }
 
 std::tuple<CKey,XOnlyPubKey> RecipientNS::Tweak(const int32_t& identifier) const
@@ -397,48 +357,6 @@ std::tuple<CKey,XOnlyPubKey> RecipientNS::Tweak(const int32_t& identifier) const
 
     return_val = secp256k1_ec_seckey_tweak_add(m_context, shared_secret, ArithToUint256(tweak).data());
     assert(return_val);
-
-    // -- Apagar
-
-    secp256k1_xonly_pubkey result_xonly_pubkey_before;
-    return_val = secp256k1_keypair_xonly_pub(m_context, &result_xonly_pubkey_before, nullptr, &spend_keypair);
-    assert(return_val);
-
-    unsigned char xonly_pubkey_bytes_before[32];
-    return_val = secp256k1_xonly_pubkey_serialize(m_context, xonly_pubkey_bytes_before, &result_xonly_pubkey_before);
-    assert(return_val);
-
-    CKey ss;
-    ss.Set(std::begin(shared_secret), std::end(shared_secret), true);
-
-    std::cout << "RecipientNS::xonly_pubkey_before: " << HexStr(XOnlyPubKey(xonly_pubkey_bytes_before)) << std::endl;
-    std::cout << "RecipientNS::tweak:               " << EncodeSecret(ss) << std::endl;
-
-    // -- Apagar
-
-
-    // unsigned char result_secret_key[32];
-    // return_val = secp256k1_keypair_sec(m_context, result_secret_key, &recipient_keypair);
-    // assert(return_val);
-
-    // secp256k1_pubkey result_pubkey;
-    // return_val = secp256k1_keypair_pub(m_context, &result_pubkey, &recipient_keypair);
-    // assert(return_val);
-
-    // return_val = secp256k1_ec_seckey_tweak_add(m_context, result_secret_key, shared_secret);
-    // assert(return_val);
-
-    // return_val = secp256k1_ec_pubkey_tweak_add(m_context, &result_pubkey, shared_secret);
-    // assert(return_val);
-
-    // Serialize and test the tweaked public key
-    // size_t len;
-    // unsigned char pubkey_bytes[33];
-    // len = sizeof(pubkey_bytes);
-    // return_val = secp256k1_ec_pubkey_serialize(m_context, pubkey_bytes, &len, &result_pubkey, SECP256K1_EC_COMPRESSED);
-    // assert(return_val);
-
-    // --
 
     return_val = secp256k1_keypair_xonly_tweak_add(m_context, &spend_keypair, shared_secret);
     assert(return_val);
@@ -499,25 +417,17 @@ SenderNS::SenderNS(
         }
     }
 
-    // CPubKey recipient_spend_pubkey = recipient_spend_xonly_pubkey.ConvertToCompressedPubKey();
     CPubKey recipient_scan_pubkey = recipient_scan_xonly_pubkey.ConvertToCompressedPubKey();
-
-    // int return_val = secp256k1_ec_pubkey_parse(m_context, &m_recipient_spend_pubkey, recipient_spend_pubkey.data(), recipient_spend_pubkey.size());
-    // assert(return_val);
 
     int return_val = secp256k1_xonly_pubkey_parse(m_context, &m_recipient_spend_xonly_pubkey, recipient_spend_xonly_pubkey.data());
     assert(return_val);
 
-    return_val = secp256k1_ec_pubkey_parse(m_context, &m_recipient_scan_pubkey, recipient_scan_pubkey.data(), recipient_scan_pubkey.size());
+    secp256k1_pubkey scan_pubkey;
+    return_val = secp256k1_ec_pubkey_parse(m_context, &scan_pubkey, recipient_scan_pubkey.data(), recipient_scan_pubkey.size());
     assert(return_val);
 
-    return_val = secp256k1_ecdh(m_context, m_shared_secret, &m_recipient_scan_pubkey, sum_seckey, nullptr, nullptr);
+    return_val = secp256k1_ecdh(m_context, m_shared_secret, &scan_pubkey, sum_seckey, nullptr, nullptr);
     assert(return_val);
-
-    CKey ckey;
-    ckey.Set(std::begin(m_shared_secret), std::end(m_shared_secret), true);
-
-    std::cout << "SenderNS::m_shared_secret:    " << EncodeSecret(ckey) << std::endl;
 }
 
 SenderNS::~SenderNS()
@@ -525,7 +435,6 @@ SenderNS::~SenderNS()
     secp256k1_context_destroy(m_context);
     memset(m_shared_secret, 0, sizeof(m_shared_secret));
     memset(m_recipient_spend_xonly_pubkey.data, 0, sizeof(m_recipient_spend_xonly_pubkey.data));
-    memset(m_recipient_scan_pubkey.data, 0, sizeof(m_recipient_scan_pubkey.data));
 }
 
 XOnlyPubKey SenderNS::Tweak(const int32_t& identifier) const
@@ -545,24 +454,6 @@ XOnlyPubKey SenderNS::Tweak(const int32_t& identifier) const
     secp256k1_xonly_pubkey recipient_spend_xonly_pubkey;
     memcpy(recipient_spend_xonly_pubkey.data, m_recipient_spend_xonly_pubkey.data, 64);
     assert(memcmp(recipient_spend_xonly_pubkey.data, m_recipient_spend_xonly_pubkey.data, 64) == 0);
-
-    // Tweak the recipient's pubkey with identifier + shared_secret
-    // return_val = secp256k1_ec_pubkey_tweak_add(m_context, &recipient_spend_pubkey, shared_secret);
-    // assert(return_val);
-
-    // -- Apagar
-
-    unsigned char xonly_pubkey_bytes_before[32];
-    return_val = secp256k1_xonly_pubkey_serialize(m_context, xonly_pubkey_bytes_before, &recipient_spend_xonly_pubkey);
-    assert(return_val);
-
-    CKey ss;
-    ss.Set(std::begin(shared_secret), std::end(shared_secret), true);
-
-    std::cout << "SenderNS::xonly_pubkey_before:    " << HexStr(XOnlyPubKey(xonly_pubkey_bytes_before)) << std::endl;
-    std::cout << "SenderNS::tweak:                  " << EncodeSecret(ss) << std::endl;
-
-    // -- Apagar
 
     secp256k1_pubkey result_pubkey;
     return_val = secp256k1_xonly_pubkey_tweak_add(m_context, &result_pubkey, &recipient_spend_xonly_pubkey, shared_secret);

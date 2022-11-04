@@ -91,17 +91,6 @@ BOOST_AUTO_TEST_CASE(silent_addresses_2)
     auto silent_recipient = silentpayment::RecipientNS(recipient_spend_seckey);
     CPubKey sum_tx_pubkeys{silentpayment::Recipient::SumPublicKeys(sender_pub_keys, sender_x_only_pub_keys)};
     silent_recipient.SetSenderPublicKey(sum_tx_pubkeys);
-    //const auto [recipient_priv_key, recipient_pub_key] = silent_recipient.Tweak(identifier);
-
-    // std::cout << "recipient_priv_key: " << EncodeSecret(recipient_priv_key) << std::endl;
-    // std::cout << "recipient_pub_key:  " << HexStr(recipient_pub_key) << std::endl;
-
-    // std::cout << "---" << std::endl;
-    // std::cout << "recipient_scan_pubkey: " << HexStr(recipient_scan_key.GetPubKey()) << std::endl;
-    // std::cout << "recipient_spend_pubkey: " << HexStr(recipient_spend_seckey.GetPubKey()) << std::endl;
-
-    // std::cout << "---" << std::endl;
-
 
     silentpayment::SenderNS silent_sender{
         sender_secret_keys,
@@ -109,19 +98,12 @@ BOOST_AUTO_TEST_CASE(silent_addresses_2)
         XOnlyPubKey(recipient_scan_key.GetPubKey())
     };
 
-    for (int32_t identifier = 0; identifier < 4; identifier++) {
-
-        std::cout << "-------" << std::endl;
-
+    for (int32_t identifier = 0; identifier < 100; identifier++) {
         XOnlyPubKey sender_tweaked_pubkey = silent_sender.Tweak(identifier);
         const auto [recipient_priv_key, recipient_pub_key] = silent_recipient.Tweak(identifier);
 
-        //std::cout << "XOnlyPubKey{recipient_priv_key.GetPubKey()}: " << HexStr(XOnlyPubKey{recipient_priv_key.GetPubKey()}) << std::endl;
-        std::cout << "recipient_pub_key:                           " << HexStr(recipient_pub_key) << std::endl;
-        std::cout << "sender_tweaked_pubkey:                       " << HexStr(sender_tweaked_pubkey) << std::endl;
-        /* BOOST_CHECK(XOnlyPubKey{recipient_priv_key.GetPubKey()} == recipient_pub_key);
-
-        BOOST_CHECK(sender_tweaked_pubkey == recipient_pub_key); */
+        BOOST_CHECK(XOnlyPubKey{recipient_priv_key.GetPubKey()} == recipient_pub_key);
+        BOOST_CHECK(sender_tweaked_pubkey == recipient_pub_key);
     }
 }
 
