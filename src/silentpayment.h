@@ -43,10 +43,6 @@ class Recipient {
         static CPubKey SumPublicKeys(const std::vector<CPubKey>& sender_public_keys, const std::vector<XOnlyPubKey>& sender_x_only_public_key);
 }; // class Recipient
 
-/** Extract Pubkey from an input according to the transaction type **/
-std::variant<CPubKey, XOnlyPubKey> ExtractPubkeyFromInput(const Coin& prevCoin, const CTxIn& txin);
-
-
 class SenderNS {
     private:
         secp256k1_context* m_context{nullptr};
@@ -62,6 +58,7 @@ class SenderNS {
             const XOnlyPubKey& recipient_scan_xonly_pubkey);
 
         XOnlyPubKey Tweak(const int32_t& identifier) const;
+        XOnlyPubKey Tweak(const XOnlyPubKey spend_xonly_pubkey) const;
         ~SenderNS();
 }; // class SenderNS
 
@@ -76,12 +73,29 @@ class RecipientNS {
         unsigned char m_shared_secret[32];
 
     public:
+        XOnlyPubKey scan_xonly_pubkey;
+        XOnlyPubKey original_spend_xonly_pubkey;
+
         RecipientNS(const CKey& spend_seckey);
         void SetSenderPublicKey(const CPubKey& sender_public_key);
+        XOnlyPubKey TweakSpendPubkey(const int32_t& identifier);
         std::tuple<CKey,XOnlyPubKey> Tweak(const int32_t& identifier) const;
+        std::tuple<CKey,XOnlyPubKey> Tweak2(const int32_t& identifier) const;
+        std::tuple<CKey,XOnlyPubKey> Tweak3(const int32_t& identifier) const;
         ~RecipientNS();
 
+        /** Tweak a public key with an identifier. */
+        static XOnlyPubKey TweakSpendPubkey(const XOnlyPubKey spend_xonly_pubkey, const int32_t& identifier);
+        /** Create scan and spend public keys based on the spend secret key */
+        static XOnlyPubKey GenerateScanPubkey(const CKey& spend_seckey);
 }; // class RecipientNS
+
+
+
+
+/** Extract Pubkey from an input according to the transaction type **/
+std::variant<CPubKey, XOnlyPubKey> ExtractPubkeyFromInput(const Coin& prevCoin, const CTxIn& txin);
+
 
 } // namespace silentpayment
 

@@ -107,5 +107,58 @@ BOOST_AUTO_TEST_CASE(silent_addresses_2)
     }
 }
 
+BOOST_AUTO_TEST_CASE(silent_addresses_3)
+{
+    std::vector<std::tuple<CKey, bool>> sender_secret_keys;
+    std::vector<CPubKey> sender_pub_keys;
+    std::vector<XOnlyPubKey> sender_x_only_pub_keys;
+
+    // non-taproot inputs
+    for(size_t i =0; i < 38; i++) {
+        CKey senderkey;
+        senderkey.MakeNewKey(true);
+        CPubKey senderPubkey = senderkey.GetPubKey();
+
+        sender_secret_keys.push_back({senderkey, false});
+        sender_pub_keys.push_back(senderPubkey);
+    }
+
+    // taproot inputs
+    for(size_t i =0; i < 49; i++) {
+        CKey senderkey;
+        senderkey.MakeNewKey(true);
+
+        sender_secret_keys.push_back({senderkey, true});
+        sender_x_only_pub_keys.push_back(XOnlyPubKey{senderkey.GetPubKey()});
+    }
+
+    CKey recipient_spend_seckey;
+    recipient_spend_seckey.MakeNewKey(true);
+    XOnlyPubKey recipient_spend_pubkey = XOnlyPubKey{recipient_spend_seckey.GetPubKey()};
+
+    XOnlyPubKey recipient_scan_pubkey = silentpayment::RecipientNS::GenerateScanPubkey(recipient_spend_seckey);
+
+    silentpayment::SenderNS silent_sender{
+        sender_secret_keys,
+        recipient_spend_pubkey,
+        recipient_scan_pubkey
+    };
+
+    auto silent_recipient = silentpayment::RecipientNS(recipient_spend_seckey);
+    CPubKey sum_tx_pubkeys{silentpayment::Recipient::SumPublicKeys(sender_pub_keys, sender_x_only_pub_keys)};
+    silent_recipient.SetSenderPublicKey(sum_tx_pubkeys);
+
+    for (int32_t identifier = 0; identifier < 450; identifier++) {
+
+        XOnlyPubKey tweaked_recipient_spend_pubkey = silentpayment::RecipientNS::TweakSpendPubkey(recipient_spend_pubkey, identifier);
+        XOnlyPubKey sender_tweaked_pubkey = silent_sender.Tweak(tweaked_recipient_spend_pubkey);
+
+        const auto [recipient_priv_key, recipient_pub_key] = silent_recipient.Tweak2(identifier);
+
+        BOOST_CHECK(XOnlyPubKey{recipient_priv_key.GetPubKey()} == recipient_pub_key);
+        BOOST_CHECK(sender_tweaked_pubkey == recipient_pub_key);
+    }
+}
+
 BOOST_AUTO_TEST_SUITE_END()
 } // namespace wallet
