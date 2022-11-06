@@ -553,7 +553,7 @@ private:
     KeyMap m_map_keys GUARDED_BY(cs_desc_man);
     CryptedKeyMap m_map_crypted_keys GUARDED_BY(cs_desc_man);
 
-    std::unique_ptr<silentpayment::Recipient> m_silent_recipient{nullptr};
+    std::unique_ptr<silentpayment::RecipientOLD> m_silent_recipient{nullptr};
 
     //! keeps track of whether Unlock has run a thorough check before
     bool m_decryption_thoroughly_checked = false;

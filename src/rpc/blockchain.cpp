@@ -1990,7 +1990,7 @@ bool CheckSilentPayment(
         return false;
     }
 
-    silentpayment::Recipient silent_recipient{privKey};
+    silentpayment::RecipientOLD silent_recipient{privKey};
     silent_recipient.SetSenderPublicKey(sum_of_all_input_pubkeys);
 
     for (int64_t identifier = range.first; identifier <= range.second; identifier++) {

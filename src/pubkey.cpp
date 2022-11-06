@@ -402,6 +402,36 @@ bool CExtPubKey::Derive(CExtPubKey &out, unsigned int _nChild) const {
     return (!secp256k1_ecdsa_signature_normalize(secp256k1_context_verify, nullptr, &sig));
 }
 
+/* static */ CPubKey CPubKey::Combine(std::vector<CPubKey> pubkeys)
+{
+    std::vector<secp256k1_pubkey> o_pubkeys;
+    for (auto& pubkey : pubkeys) {
+        secp256k1_pubkey parsed_pubkey;
+        int return_val = secp256k1_ec_pubkey_parse(secp256k1_context_verify, &parsed_pubkey, pubkey.data(), pubkey.size());
+        assert(return_val);
+
+        o_pubkeys.push_back(parsed_pubkey);
+    }
+
+    std::vector<secp256k1_pubkey *> p_pubkeys;
+    for (auto& pubkey : o_pubkeys) {
+        p_pubkeys.push_back(&pubkey);
+    }
+
+    secp256k1_pubkey sum_pubkey;
+    int return_val = secp256k1_ec_pubkey_combine(secp256k1_context_verify, &sum_pubkey, p_pubkeys.data(), p_pubkeys.size());
+    assert(return_val);
+
+    // Serialize and test the tweaked public key
+    size_t len;
+    unsigned char output_pubkey[33];
+    len = sizeof(output_pubkey);
+    return_val = secp256k1_ec_pubkey_serialize(secp256k1_context_verify, output_pubkey, &len, &sum_pubkey, SECP256K1_EC_COMPRESSED);
+    assert(return_val);
+
+    return CPubKey(output_pubkey);
+}
+
 /* static */ int ECCVerifyHandle::refcount = 0;
 
 ECCVerifyHandle::ECCVerifyHandle()

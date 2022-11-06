@@ -211,6 +211,9 @@ public:
      */
     static bool CheckLowS(const std::vector<unsigned char>& vchSig);
 
+    //! Add a number of public keys together.
+    static CPubKey Combine(std::vector<CPubKey> pubkeys);
+
     //! Recover a public key from a compact signature.
     bool RecoverCompact(const uint256& hash, const std::vector<unsigned char>& vchSig);
 

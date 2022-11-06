@@ -34,7 +34,7 @@ static void SumXOnlyPublicKeys(benchmark::Bench& bench, size_t key_count)
     }
 
     bench.run([&] {
-        CPubKey sum_tx_pubkeys{silentpayment::Recipient::SumPublicKeys(sender_pub_keys, sender_x_only_pub_keys)};
+        CPubKey sum_tx_pubkeys{silentpayment::RecipientOLD::SumPublicKeys(sender_pub_keys, sender_x_only_pub_keys)};
     });
 
     ECC_Stop();
@@ -69,7 +69,7 @@ static void ECDHPerformance(benchmark::Bench& bench, int32_t pool_size)
     };
 
     auto silent_recipient = silentpayment::RecipientNS2(recipient_spend_seckey, pool_size);
-    CPubKey sum_tx_pubkeys{silentpayment::Recipient::SumPublicKeys({senderPubkey1}, {senderPubkey2})};
+    CPubKey sum_tx_pubkeys{silentpayment::RecipientOLD::SumPublicKeys({senderPubkey1}, {senderPubkey2})};
 
     bench.run([&] {
         silent_recipient.SetSenderPublicKey(sum_tx_pubkeys);

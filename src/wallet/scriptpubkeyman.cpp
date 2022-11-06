@@ -2739,7 +2739,7 @@ void DescriptorScriptPubKeyMan::LoadSilentRecipient()
 
         assert(priv_keys.size() == 1);
 
-        m_silent_recipient = std::make_unique<silentpayment::Recipient>(priv_keys.at(0));
+        m_silent_recipient = std::make_unique<silentpayment::RecipientOLD>(priv_keys.at(0));
     }
 }
 

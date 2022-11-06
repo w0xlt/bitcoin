@@ -11,7 +11,7 @@ namespace silentpayment {
 
 using SilentKey = std::variant<CPubKey, XOnlyPubKey>;
 
-class Sender {
+class SenderOLD {
     private:
         secp256k1_context* m_context{nullptr};
         secp256k1_xonly_pubkey m_recipient_x_only_public_key;
@@ -20,12 +20,12 @@ class Sender {
         secp256k1_pubkey m_recipient_public_key;
 
     public:
-        Sender(const std::vector<std::tuple<CKey, bool>>& sender_secret_keys, const CPubKey& recipient_public_key);
+        SenderOLD(const std::vector<std::tuple<CKey, bool>>& sender_secret_keys, const CPubKey& recipient_public_key);
         XOnlyPubKey Tweak2(const int32_t& identifier) const;
-        ~Sender();
+        ~SenderOLD();
 };// class Sender
 
-class Recipient {
+class RecipientOLD {
     private:
         secp256k1_context* m_context{nullptr};
         unsigned char m_recipient_seckey[32];
@@ -33,12 +33,12 @@ class Recipient {
         unsigned char m_shared_secret[32];
 
     public:
-        Recipient(const CKey& recipient_secret_key);
+        RecipientOLD(const CKey& recipient_secret_key);
         /** This method expects the sender_public_key parameter to be
          * the sender's public keys already summed. See SumXOnlyPublicKeys().**/
         void SetSenderPublicKey(const CPubKey& sender_public_key);
         std::tuple<CKey,XOnlyPubKey> Tweak2(const int32_t& identifier) const;
-        ~Recipient();
+        ~RecipientOLD();
 
         static CPubKey SumPublicKeys(const std::vector<CPubKey>& sender_public_keys, const std::vector<XOnlyPubKey>& sender_x_only_public_key);
 }; // class Recipient
@@ -100,6 +100,7 @@ class RecipientNS2 {
 
         static XOnlyPubKey GenerateScanPubkey(const CKey& spend_seckey);
         static XOnlyPubKey TweakSpendPubkey(const XOnlyPubKey spend_xonly_pubkey, const int32_t& identifier);
+        static CPubKey CombinePublicKeys(const std::vector<CPubKey>& sender_public_keys, const std::vector<XOnlyPubKey>& sender_x_only_public_key);
 }; // class RecipientNS2
 
 class SenderNS2 {

@@ -167,7 +167,7 @@ BOOST_AUTO_TEST_CASE(silent_addresses_4)
     std::vector<XOnlyPubKey> sender_x_only_pub_keys;
 
     // non-taproot inputs
-    for(size_t i =0; i < 38; i++) {
+    for(size_t i =0; i < 2; i++) {
         CKey senderkey;
         senderkey.MakeNewKey(true);
         CPubKey senderPubkey = senderkey.GetPubKey();
@@ -177,7 +177,7 @@ BOOST_AUTO_TEST_CASE(silent_addresses_4)
     }
 
     // taproot inputs
-    for(size_t i =0; i < 49; i++) {
+    for(size_t i =0; i < 2; i++) {
         CKey senderkey;
         senderkey.MakeNewKey(true);
 
@@ -198,8 +198,10 @@ BOOST_AUTO_TEST_CASE(silent_addresses_4)
     };
 
     auto silent_recipient = silentpayment::RecipientNS2(recipient_spend_seckey, 440);
-    CPubKey sum_tx_pubkeys{silentpayment::Recipient::SumPublicKeys(sender_pub_keys, sender_x_only_pub_keys)};
-    silent_recipient.SetSenderPublicKey(sum_tx_pubkeys);
+
+    CPubKey combined_tx_pubkeys{silentpayment::RecipientNS2::CombinePublicKeys(sender_pub_keys, sender_x_only_pub_keys)};
+
+    silent_recipient.SetSenderPublicKey(combined_tx_pubkeys);
 
     for (int32_t identifier = 0; identifier < 440; identifier++) {
         XOnlyPubKey tweaked_recipient_spend_pubkey = silentpayment::RecipientNS2::TweakSpendPubkey(recipient_spend_pubkey, identifier);

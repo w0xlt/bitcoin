@@ -787,7 +787,7 @@ bool CreateSilentTransaction(
         auto [recipient_pubkey, identifier] = DecodeSilentData(data);
         assert(recipient_pubkey.IsFullyValid());
 
-        silentpayment::Sender silent_sender{input_private_keys, recipient_pubkey};
+        silentpayment::SenderOLD silent_sender{input_private_keys, recipient_pubkey};
         XOnlyPubKey tweakedKey{silent_sender.Tweak2(identifier)};
 
         assert(tweakedKey.IsFullyValid());

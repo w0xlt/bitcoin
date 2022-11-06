@@ -1404,7 +1404,7 @@ bool CWallet::VerifySilentPayment(const CTransaction& tx, std::vector<std::tuple
             return false;
         }
     } else {
-        sum_sender_pubkeys = silentpayment::Recipient::SumPublicKeys(input_pubkeys, input_xonly_pubkeys);
+        sum_sender_pubkeys = silentpayment::RecipientOLD::SumPublicKeys(input_pubkeys, input_xonly_pubkeys);
     }
 
     for (ScriptPubKeyMan* spkm : GetActiveScriptPubKeyMans()) {

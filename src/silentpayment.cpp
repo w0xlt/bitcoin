@@ -10,7 +10,7 @@
 
 namespace silentpayment {
 
-Sender::Sender(const std::vector<std::tuple<CKey, bool>>& sender_secret_keys, const CPubKey& recipient_public_key)
+SenderOLD::SenderOLD(const std::vector<std::tuple<CKey, bool>>& sender_secret_keys, const CPubKey& recipient_public_key)
 {
     m_context = secp256k1_context_create(SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
 
@@ -60,14 +60,14 @@ Sender::Sender(const std::vector<std::tuple<CKey, bool>>& sender_secret_keys, co
     ckey.Set(std::begin(m_shared_secret), std::end(m_shared_secret), true);
 }
 
-Sender::~Sender()
+SenderOLD::~SenderOLD()
 {
     secp256k1_context_destroy(m_context);
     memset(m_shared_secret, 0, sizeof(m_shared_secret));
     memset(m_recipient_x_only_public_key.data, 0, sizeof(m_recipient_x_only_public_key.data));
 }
 
-XOnlyPubKey Sender::Tweak2(const int32_t& identifier) const
+XOnlyPubKey SenderOLD::Tweak2(const int32_t& identifier) const
 {
     unsigned char shared_secret[32];
     memcpy(shared_secret, m_shared_secret, 32);
@@ -103,7 +103,7 @@ XOnlyPubKey Sender::Tweak2(const int32_t& identifier) const
     return XOnlyPubKey(pubKey);
 }
 
-Recipient::Recipient(const CKey& recipient_secret_key)
+RecipientOLD::RecipientOLD(const CKey& recipient_secret_key)
 {
     m_context = secp256k1_context_create(SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
 
@@ -114,7 +114,7 @@ Recipient::Recipient(const CKey& recipient_secret_key)
     assert(memcmp(m_recipient_seckey, recipient_secret_key.data(), 32) == 0);
 }
 
-void Recipient::SetSenderPublicKey(const CPubKey& sender_public_key)
+void RecipientOLD::SetSenderPublicKey(const CPubKey& sender_public_key)
 {
     secp256k1_pubkey sender_pubkey;
     int return_val = secp256k1_ec_pubkey_parse(m_context, &sender_pubkey, sender_public_key.data(), sender_public_key.size());
@@ -127,7 +127,7 @@ void Recipient::SetSenderPublicKey(const CPubKey& sender_public_key)
     ckey.Set(std::begin(m_shared_secret), std::end(m_shared_secret), true);
 }
 
-Recipient::~Recipient()
+RecipientOLD::~RecipientOLD()
 {
     secp256k1_context_destroy(m_context);
     memset(m_recipient_seckey, 0, sizeof(m_recipient_seckey));
@@ -135,7 +135,7 @@ Recipient::~Recipient()
     memset(m_recipient_keypair.data, 0, sizeof(m_recipient_keypair.data));
 }
 
-std::tuple<CKey,XOnlyPubKey> Recipient::Tweak2(const int32_t& identifier) const
+std::tuple<CKey,XOnlyPubKey> RecipientOLD::Tweak2(const int32_t& identifier) const
 {
     secp256k1_keypair recipient_keypair;
     memcpy(recipient_keypair.data, m_recipient_keypair.data, 96);
@@ -179,7 +179,7 @@ std::tuple<CKey,XOnlyPubKey> Recipient::Tweak2(const int32_t& identifier) const
     return {ckey, XOnlyPubKey{CPubKey{pubkey_bytes}}};
 }
 
-CPubKey Recipient::SumPublicKeys(const std::vector<CPubKey>& sender_public_keys, const std::vector<XOnlyPubKey>& sender_x_only_public_key)
+CPubKey RecipientOLD::SumPublicKeys(const std::vector<CPubKey>& sender_public_keys, const std::vector<XOnlyPubKey>& sender_x_only_public_key)
 {
     auto context = secp256k1_context_create(SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
 
@@ -691,6 +691,21 @@ XOnlyPubKey RecipientNS2::TweakSpendPubkey(const XOnlyPubKey spend_xonly_pubkey,
     tweak = tweak + identifier;
 
     return spend_xonly_pubkey.AddTweak(ArithToUint256(tweak).data());
+}
+
+CPubKey RecipientNS2::CombinePublicKeys(const std::vector<CPubKey>& sender_public_keys, const std::vector<XOnlyPubKey>& sender_x_only_public_key)
+{
+    auto context = secp256k1_context_create(SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+
+    std::vector<CPubKey> v_pubkeys;
+
+    v_pubkeys.insert(v_pubkeys.end(), sender_public_keys.begin(), sender_public_keys.end());
+
+    for (auto& xpubkey : sender_x_only_public_key) {
+        v_pubkeys.push_back(xpubkey.ConvertToCompressedPubKey());
+    }
+
+    return CPubKey::Combine(v_pubkeys);
 }
 
 SenderNS2::SenderNS2(

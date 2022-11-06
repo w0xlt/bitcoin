@@ -117,7 +117,7 @@ bool SilentPaymentIndex::GetSilentPaymentKey(const CTransactionRef& tx, const CB
         return false;
     }
 
-    sum_tx_pubkeys = silentpayment::Recipient::SumPublicKeys(input_pubkeys, input_xonly_pubkeys);
+    sum_tx_pubkeys = silentpayment::RecipientOLD::SumPublicKeys(input_pubkeys, input_xonly_pubkeys);
     assert(sum_tx_pubkeys.IsFullyValid());
 
     return true;
