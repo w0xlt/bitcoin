@@ -87,33 +87,33 @@ class RecipientNS {
         static XOnlyPubKey GenerateScanPubkey(const CKey& spend_seckey);
 }; // class RecipientNS */
 
-class RecipientNS2 {
+class Recipient {
     private:
         CKey m_negated_scan_seckey;
         unsigned char m_shared_secret[32];
         std::vector<std::pair<CKey, XOnlyPubKey>> m_spend_keys;
 
     public:
-        RecipientNS2(const CKey& spend_seckey, size_t pool_size);
+        Recipient(const CKey& spend_seckey, size_t pool_size);
         void SetSenderPublicKey(const CPubKey& sender_public_key);
         std::tuple<CKey,XOnlyPubKey> Tweak(const int32_t& identifier) const;
 
         static XOnlyPubKey GenerateScanPubkey(const CKey& spend_seckey);
         static XOnlyPubKey TweakSpendPubkey(const XOnlyPubKey spend_xonly_pubkey, const int32_t& identifier);
         static CPubKey CombinePublicKeys(const std::vector<CPubKey>& sender_public_keys, const std::vector<XOnlyPubKey>& sender_x_only_public_key);
-}; // class RecipientNS2
+}; // class Recipient
 
-class SenderNS2 {
+class Sender {
     private:
         XOnlyPubKey m_recipient_spend_xonly_pubkey;
         unsigned char m_shared_secret[32];
 
     public:
-        SenderNS2(const std::vector<std::tuple<CKey, bool>>& sender_secret_keys,
+        Sender(const std::vector<std::tuple<CKey, bool>>& sender_secret_keys,
             const XOnlyPubKey& recipient_spend_xonly_pubkey,
             const XOnlyPubKey& recipient_scan_xonly_pubkey);
         XOnlyPubKey Tweak(const XOnlyPubKey spend_xonly_pubkey) const;
-};  // class SenderNS2
+};  // class Sender
 
 
 /** Extract Pubkey from an input according to the transaction type **/

@@ -99,7 +99,7 @@ public:
     void MakeNewKey(bool fCompressed);
 
     //! Negate private key
-    CKey Negate() const;
+    bool Negate();
 
     //! Tweak a secret key by adding tweak to it.
     CKey AddTweak(const unsigned char *tweak32) const;

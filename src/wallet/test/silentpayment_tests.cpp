@@ -189,22 +189,22 @@ BOOST_AUTO_TEST_CASE(silent_addresses_4)
     recipient_spend_seckey.MakeNewKey(true);
     XOnlyPubKey recipient_spend_pubkey = XOnlyPubKey{recipient_spend_seckey.GetPubKey()};
 
-    XOnlyPubKey recipient_scan_pubkey = silentpayment::RecipientNS2::GenerateScanPubkey(recipient_spend_seckey);
+    XOnlyPubKey recipient_scan_pubkey = silentpayment::Recipient::GenerateScanPubkey(recipient_spend_seckey);
 
-    silentpayment::SenderNS2 silent_sender{
+    silentpayment::Sender silent_sender{
         sender_secret_keys,
         recipient_spend_pubkey,
         recipient_scan_pubkey
     };
 
-    auto silent_recipient = silentpayment::RecipientNS2(recipient_spend_seckey, 440);
+    auto silent_recipient = silentpayment::Recipient(recipient_spend_seckey, 440);
 
-    CPubKey combined_tx_pubkeys{silentpayment::RecipientNS2::CombinePublicKeys(sender_pub_keys, sender_x_only_pub_keys)};
+    CPubKey combined_tx_pubkeys{silentpayment::Recipient::CombinePublicKeys(sender_pub_keys, sender_x_only_pub_keys)};
 
     silent_recipient.SetSenderPublicKey(combined_tx_pubkeys);
 
     for (int32_t identifier = 0; identifier < 440; identifier++) {
-        XOnlyPubKey tweaked_recipient_spend_pubkey = silentpayment::RecipientNS2::TweakSpendPubkey(recipient_spend_pubkey, identifier);
+        XOnlyPubKey tweaked_recipient_spend_pubkey = silentpayment::Recipient::TweakSpendPubkey(recipient_spend_pubkey, identifier);
 
         XOnlyPubKey sender_tweaked_pubkey = silent_sender.Tweak(tweaked_recipient_spend_pubkey);
         const auto [recipient_priv_key, recipient_pub_key] = silent_recipient.Tweak(identifier);

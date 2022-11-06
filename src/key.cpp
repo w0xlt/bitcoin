@@ -166,20 +166,10 @@ void CKey::MakeNewKey(bool fCompressedIn) {
     fCompressed = fCompressedIn;
 }
 
-CKey CKey::Negate() const
+bool CKey::Negate()
 {
     assert(fValid);
-
-    unsigned char negated_seckey[32];
-    memcpy(negated_seckey, data(), 32);
-
-    int ret = secp256k1_ec_seckey_negate(secp256k1_context_sign, negated_seckey);
-    assert(ret);
-
-    CKey new_seckey;
-    new_seckey.Set(std::begin(negated_seckey), std::end(negated_seckey), true);
-
-    return new_seckey;
+    return secp256k1_ec_seckey_negate(secp256k1_context_sign, keydata.data());
 }
 
 CKey CKey::AddTweak(const unsigned char *tweak32) const

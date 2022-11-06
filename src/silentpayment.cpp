@@ -628,7 +628,7 @@ XOnlyPubKey SenderNS::Tweak(const XOnlyPubKey spend_xonly_pubkey) const
     return XOnlyPubKey(pubKey);
 } */
 
-RecipientNS2::RecipientNS2(const CKey& spend_seckey, size_t pool_size)
+Recipient::Recipient(const CKey& spend_seckey, size_t pool_size)
 {
     std::vector<std::pair<CKey, XOnlyPubKey>> spend_keys;
 
@@ -638,17 +638,27 @@ RecipientNS2::RecipientNS2(const CKey& spend_seckey, size_t pool_size)
     CKey scan_key;
     scan_key.Set(std::begin(scan_seckey_bytes), std::end(scan_seckey_bytes), true);
 
-    m_negated_scan_seckey = (scan_key.GetPubKey().data()[0] == 3) ? scan_key.Negate() : scan_key;
+    m_negated_scan_seckey = scan_key;
+    if (scan_key.GetPubKey().data()[0] == 3) {
+        m_negated_scan_seckey.Negate();
+    }
 
     for(size_t identifier = 0; identifier < pool_size; identifier++) {
-        CKey spend_seckey1 = (spend_seckey.GetPubKey().data()[0] == 3) ? spend_seckey.Negate() : spend_seckey;
+
+        CKey spend_seckey1{spend_seckey};
+        if (spend_seckey.GetPubKey().data()[0] == 3) {
+            spend_seckey1.Negate();
+        }
 
         arith_uint256 tweak;
         tweak = tweak + identifier;
 
         CKey spend_seckey2 = spend_seckey1.AddTweak(ArithToUint256(tweak).data());
 
-        CKey tweaked_spend_seckey = (spend_seckey2.GetPubKey().data()[0] == 3) ? spend_seckey2.Negate() : spend_seckey2;
+        CKey tweaked_spend_seckey{spend_seckey2};
+        if (spend_seckey2.GetPubKey().data()[0] == 3) {
+            tweaked_spend_seckey.Negate();
+        }
 
         spend_keys.push_back(std::make_pair(tweaked_spend_seckey, XOnlyPubKey{tweaked_spend_seckey.GetPubKey()}));
     }
@@ -656,14 +666,14 @@ RecipientNS2::RecipientNS2(const CKey& spend_seckey, size_t pool_size)
     m_spend_keys = spend_keys;
 }
 
-void RecipientNS2::SetSenderPublicKey(const CPubKey& sender_public_key)
+void Recipient::SetSenderPublicKey(const CPubKey& sender_public_key)
 {
     std::array<unsigned char, 32> result = m_negated_scan_seckey.ECDH(sender_public_key);
 
     std::copy(std::begin(result), std::end(result), std::begin(m_shared_secret));
 }
 
-std::tuple<CKey,XOnlyPubKey> RecipientNS2::Tweak(const int32_t& identifier) const
+std::tuple<CKey,XOnlyPubKey> Recipient::Tweak(const int32_t& identifier) const
 {
     const auto& [seckey, xonly_pubkey]{m_spend_keys.at(identifier)};
 
@@ -674,7 +684,7 @@ std::tuple<CKey,XOnlyPubKey> RecipientNS2::Tweak(const int32_t& identifier) cons
     return {result_seckey, result_xonly_pubkey};
 }
 
-XOnlyPubKey RecipientNS2::GenerateScanPubkey(const CKey& spend_seckey)
+XOnlyPubKey Recipient::GenerateScanPubkey(const CKey& spend_seckey)
 {
     unsigned char scan_seckey_bytes[32];
     CSHA256().Write(spend_seckey.begin(), 32).Finalize(scan_seckey_bytes);
@@ -685,7 +695,7 @@ XOnlyPubKey RecipientNS2::GenerateScanPubkey(const CKey& spend_seckey)
     return XOnlyPubKey(scan_key.GetPubKey());
 }
 
-XOnlyPubKey RecipientNS2::TweakSpendPubkey(const XOnlyPubKey spend_xonly_pubkey, const int32_t& identifier)
+XOnlyPubKey Recipient::TweakSpendPubkey(const XOnlyPubKey spend_xonly_pubkey, const int32_t& identifier)
 {
     arith_uint256 tweak;
     tweak = tweak + identifier;
@@ -693,7 +703,7 @@ XOnlyPubKey RecipientNS2::TweakSpendPubkey(const XOnlyPubKey spend_xonly_pubkey,
     return spend_xonly_pubkey.AddTweak(ArithToUint256(tweak).data());
 }
 
-CPubKey RecipientNS2::CombinePublicKeys(const std::vector<CPubKey>& sender_public_keys, const std::vector<XOnlyPubKey>& sender_x_only_public_key)
+CPubKey Recipient::CombinePublicKeys(const std::vector<CPubKey>& sender_public_keys, const std::vector<XOnlyPubKey>& sender_x_only_public_key)
 {
     auto context = secp256k1_context_create(SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
 
@@ -708,7 +718,7 @@ CPubKey RecipientNS2::CombinePublicKeys(const std::vector<CPubKey>& sender_publi
     return CPubKey::Combine(v_pubkeys);
 }
 
-SenderNS2::SenderNS2(
+Sender::Sender(
             const std::vector<std::tuple<CKey, bool>>& sender_secret_keys,
             const XOnlyPubKey& recipient_spend_xonly_pubkey,
             const XOnlyPubKey& recipient_scan_xonly_pubkey)
@@ -718,13 +728,19 @@ SenderNS2::SenderNS2(
     CKey sum_seckey{seckey};
 
     if (is_taproot && sum_seckey.GetPubKey()[0] == 3) {
-        sum_seckey = sum_seckey.Negate();
+        sum_seckey.Negate();
     }
 
     if (sender_secret_keys.size() > 1) {
         for (size_t i = 1; i < sender_secret_keys.size(); i++) {
             const auto& [sender_seckey, sender_is_taproot] = sender_secret_keys.at(i);
-            sum_seckey = sum_seckey.AddTweak((sender_is_taproot && sender_seckey.GetPubKey()[0] == 3) ? sender_seckey.Negate().begin() : sender_seckey.begin());
+
+            auto temp_key{sender_seckey};
+            if (sender_is_taproot && sender_seckey.GetPubKey()[0] == 3) {
+                temp_key.Negate();
+            }
+
+            sum_seckey = sum_seckey.AddTweak(temp_key.begin());
         }
     }
 
@@ -737,7 +753,7 @@ SenderNS2::SenderNS2(
     std::copy(std::begin(result), std::end(result), std::begin(m_shared_secret));
 }
 
-XOnlyPubKey SenderNS2::Tweak(const XOnlyPubKey spend_xonly_pubkey) const
+XOnlyPubKey Sender::Tweak(const XOnlyPubKey spend_xonly_pubkey) const
 {
     return spend_xonly_pubkey.AddTweak(m_shared_secret);
 }
