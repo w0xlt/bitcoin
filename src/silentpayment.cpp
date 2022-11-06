@@ -297,7 +297,7 @@ std::variant<CPubKey, XOnlyPubKey> ExtractPubkeyFromInput(const Coin& prevCoin, 
 
 }
 
-RecipientNS::RecipientNS(const CKey& spend_seckey)
+/* RecipientNS::RecipientNS(const CKey& spend_seckey)
 {
     m_context = secp256k1_context_create(SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
 
@@ -505,11 +505,6 @@ std::tuple<CKey,XOnlyPubKey> RecipientNS::Tweak2(const int32_t& identifier) cons
     return {ckey, XOnlyPubKey(xonly_pubkey_bytes)};
 }
 
-std::tuple<CKey,XOnlyPubKey> RecipientNS::Tweak3(const int32_t& identifier) const
-{
-    return {CKey(), XOnlyPubKey()};
-}
-
 SenderNS::SenderNS(
             const std::vector<std::tuple<CKey, bool>>& sender_secret_keys,
             const XOnlyPubKey& recipient_spend_xonly_pubkey,
@@ -631,5 +626,105 @@ XOnlyPubKey SenderNS::Tweak(const XOnlyPubKey spend_xonly_pubkey) const
     assert(pubKey.IsFullyValid());
 
     return XOnlyPubKey(pubKey);
+} */
+
+RecipientNS2::RecipientNS2(const CKey& spend_seckey, size_t pool_size)
+{
+    std::vector<std::pair<CKey, XOnlyPubKey>> spend_keys;
+
+    unsigned char scan_seckey_bytes[32];
+    CSHA256().Write(spend_seckey.begin(), 32).Finalize(scan_seckey_bytes);
+
+    CKey scan_key;
+    scan_key.Set(std::begin(scan_seckey_bytes), std::end(scan_seckey_bytes), true);
+
+    m_negated_scan_seckey = (scan_key.GetPubKey().data()[0] == 3) ? scan_key.Negate() : scan_key;
+
+    for(size_t identifier = 0; identifier < pool_size; identifier++) {
+        CKey spend_seckey1 = (spend_seckey.GetPubKey().data()[0] == 3) ? spend_seckey.Negate() : spend_seckey;
+
+        arith_uint256 tweak;
+        tweak = tweak + identifier;
+
+        CKey spend_seckey2 = spend_seckey1.AddTweak(ArithToUint256(tweak).data());
+
+        CKey tweaked_spend_seckey = (spend_seckey2.GetPubKey().data()[0] == 3) ? spend_seckey2.Negate() : spend_seckey2;
+
+        spend_keys.push_back(std::make_pair(tweaked_spend_seckey, XOnlyPubKey{tweaked_spend_seckey.GetPubKey()}));
+    }
+
+    m_spend_keys = spend_keys;
 }
+
+void RecipientNS2::SetSenderPublicKey(const CPubKey& sender_public_key)
+{
+    std::array<unsigned char, 32> result = m_negated_scan_seckey.ECDH(sender_public_key);
+
+    std::copy(std::begin(result), std::end(result), std::begin(m_shared_secret));
+}
+
+std::tuple<CKey,XOnlyPubKey> RecipientNS2::Tweak(const int32_t& identifier) const
+{
+    const auto& [seckey, xonly_pubkey]{m_spend_keys.at(identifier)};
+
+    const auto& result_xonly_pubkey{xonly_pubkey.AddTweak(m_shared_secret)};
+
+    const auto& result_seckey{seckey.AddTweak(m_shared_secret)};
+
+    return {result_seckey, result_xonly_pubkey};
+}
+
+XOnlyPubKey RecipientNS2::GenerateScanPubkey(const CKey& spend_seckey)
+{
+    unsigned char scan_seckey_bytes[32];
+    CSHA256().Write(spend_seckey.begin(), 32).Finalize(scan_seckey_bytes);
+
+    CKey scan_key;
+    scan_key.Set(std::begin(scan_seckey_bytes), std::end(scan_seckey_bytes), true);
+
+    return XOnlyPubKey(scan_key.GetPubKey());
+}
+
+XOnlyPubKey RecipientNS2::TweakSpendPubkey(const XOnlyPubKey spend_xonly_pubkey, const int32_t& identifier)
+{
+    arith_uint256 tweak;
+    tweak = tweak + identifier;
+
+    return spend_xonly_pubkey.AddTweak(ArithToUint256(tweak).data());
+}
+
+SenderNS2::SenderNS2(
+            const std::vector<std::tuple<CKey, bool>>& sender_secret_keys,
+            const XOnlyPubKey& recipient_spend_xonly_pubkey,
+            const XOnlyPubKey& recipient_scan_xonly_pubkey)
+{
+    const auto& [seckey, is_taproot] = sender_secret_keys.at(0);
+
+    CKey sum_seckey{seckey};
+
+    if (is_taproot && sum_seckey.GetPubKey()[0] == 3) {
+        sum_seckey = sum_seckey.Negate();
+    }
+
+    if (sender_secret_keys.size() > 1) {
+        for (size_t i = 1; i < sender_secret_keys.size(); i++) {
+            const auto& [sender_seckey, sender_is_taproot] = sender_secret_keys.at(i);
+            sum_seckey = sum_seckey.AddTweak((sender_is_taproot && sender_seckey.GetPubKey()[0] == 3) ? sender_seckey.Negate().begin() : sender_seckey.begin());
+        }
+    }
+
+    m_recipient_spend_xonly_pubkey = XOnlyPubKey{recipient_spend_xonly_pubkey};
+
+    CPubKey recipient_scan_pubkey = recipient_scan_xonly_pubkey.ConvertToCompressedPubKey();
+
+    std::array<unsigned char, 32> result = sum_seckey.ECDH(recipient_scan_pubkey);
+
+    std::copy(std::begin(result), std::end(result), std::begin(m_shared_secret));
+}
+
+XOnlyPubKey SenderNS2::Tweak(const XOnlyPubKey spend_xonly_pubkey) const
+{
+    return spend_xonly_pubkey.AddTweak(m_shared_secret);
+}
+
 } // namespace silentpayment

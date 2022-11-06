@@ -101,6 +101,11 @@ public:
     //! Negate private key
     CKey Negate() const;
 
+    //! Tweak a secret key by adding tweak to it.
+    CKey AddTweak(const unsigned char *tweak32) const;
+
+    std::array<unsigned char,32> ECDH(const CPubKey& pubkey) const;
+
     /**
      * Convert the private key to a CPrivKey (serialized OpenSSL private key data).
      * This is expensive.

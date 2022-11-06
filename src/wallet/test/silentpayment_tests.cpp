@@ -6,7 +6,7 @@
 namespace wallet {
 BOOST_FIXTURE_TEST_SUITE(silentpayment_tests, BasicTestingSetup)
 
-BOOST_AUTO_TEST_CASE(silent_addresses_new_approach_2)
+/* BOOST_AUTO_TEST_CASE(silent_addresses_new_approach_2)
 {
     std::vector<std::tuple<CKey, bool>> sender_secret_keys;
     std::vector<CPubKey> sender_pub_keys;
@@ -154,6 +154,58 @@ BOOST_AUTO_TEST_CASE(silent_addresses_3)
         XOnlyPubKey sender_tweaked_pubkey = silent_sender.Tweak(tweaked_recipient_spend_pubkey);
 
         const auto [recipient_priv_key, recipient_pub_key] = silent_recipient.Tweak2(identifier);
+
+        BOOST_CHECK(XOnlyPubKey{recipient_priv_key.GetPubKey()} == recipient_pub_key);
+        BOOST_CHECK(sender_tweaked_pubkey == recipient_pub_key);
+    }
+} */
+
+BOOST_AUTO_TEST_CASE(silent_addresses_4)
+{
+    std::vector<std::tuple<CKey, bool>> sender_secret_keys;
+    std::vector<CPubKey> sender_pub_keys;
+    std::vector<XOnlyPubKey> sender_x_only_pub_keys;
+
+    // non-taproot inputs
+    for(size_t i =0; i < 38; i++) {
+        CKey senderkey;
+        senderkey.MakeNewKey(true);
+        CPubKey senderPubkey = senderkey.GetPubKey();
+
+        sender_secret_keys.push_back({senderkey, false});
+        sender_pub_keys.push_back(senderPubkey);
+    }
+
+    // taproot inputs
+    for(size_t i =0; i < 49; i++) {
+        CKey senderkey;
+        senderkey.MakeNewKey(true);
+
+        sender_secret_keys.push_back({senderkey, true});
+        sender_x_only_pub_keys.push_back(XOnlyPubKey{senderkey.GetPubKey()});
+    }
+
+    CKey recipient_spend_seckey;
+    recipient_spend_seckey.MakeNewKey(true);
+    XOnlyPubKey recipient_spend_pubkey = XOnlyPubKey{recipient_spend_seckey.GetPubKey()};
+
+    XOnlyPubKey recipient_scan_pubkey = silentpayment::RecipientNS2::GenerateScanPubkey(recipient_spend_seckey);
+
+    silentpayment::SenderNS2 silent_sender{
+        sender_secret_keys,
+        recipient_spend_pubkey,
+        recipient_scan_pubkey
+    };
+
+    auto silent_recipient = silentpayment::RecipientNS2(recipient_spend_seckey, 440);
+    CPubKey sum_tx_pubkeys{silentpayment::Recipient::SumPublicKeys(sender_pub_keys, sender_x_only_pub_keys)};
+    silent_recipient.SetSenderPublicKey(sum_tx_pubkeys);
+
+    for (int32_t identifier = 0; identifier < 440; identifier++) {
+        XOnlyPubKey tweaked_recipient_spend_pubkey = silentpayment::RecipientNS2::TweakSpendPubkey(recipient_spend_pubkey, identifier);
+
+        XOnlyPubKey sender_tweaked_pubkey = silent_sender.Tweak(tweaked_recipient_spend_pubkey);
+        const auto [recipient_priv_key, recipient_pub_key] = silent_recipient.Tweak(identifier);
 
         BOOST_CHECK(XOnlyPubKey{recipient_priv_key.GetPubKey()} == recipient_pub_key);
         BOOST_CHECK(sender_tweaked_pubkey == recipient_pub_key);
