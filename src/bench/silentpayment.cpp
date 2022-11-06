@@ -11,73 +11,80 @@
 #include <silentpayment.h>
 #include <test/util/setup_common.h>
 
-static XOnlyPubKey gen_key(secp256k1_context* ctx) {
-    unsigned char seckey[32];
-    GetRandBytes(seckey);
-
-    secp256k1_pubkey pubkey;
-    int return_val = secp256k1_ec_pubkey_create(ctx, &pubkey, seckey);
-    assert(return_val);
-
-    secp256k1_xonly_pubkey xonly_pubkey;
-    return_val = secp256k1_xonly_pubkey_from_pubkey(ctx, &xonly_pubkey, nullptr, &pubkey);
-    assert(return_val);
-
-    unsigned char xonly_pubkey_bytes[32];
-    return_val = secp256k1_xonly_pubkey_serialize(ctx, xonly_pubkey_bytes, &xonly_pubkey);
-    assert(return_val);
-
-    return XOnlyPubKey(xonly_pubkey_bytes);
-}
-
-static void SumXOnlyPublicKeys(benchmark::Bench& bench, int key_count)
+static void SumXOnlyPublicKeys(benchmark::Bench& bench, size_t key_count)
 {
-    auto ctx = secp256k1_context_create(SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
-    std::vector<XOnlyPubKey> sender_x_only_public_keys;
-    for (int i = 0; i < key_count; i++) {
-        sender_x_only_public_keys.push_back(gen_key(ctx));
+    ECC_Start();
+
+    std::vector<CPubKey> sender_pub_keys;
+    std::vector<XOnlyPubKey> sender_x_only_pub_keys;
+
+    // non-taproot inputs
+    for(size_t i =0; i < key_count; i++) {
+        CKey senderkey;
+        senderkey.MakeNewKey(true);
+        CPubKey senderPubkey = senderkey.GetPubKey();
+        sender_pub_keys.push_back(senderPubkey);
+    }
+
+    // taproot inputs
+    for(size_t i =0; i < key_count; i++) {
+        CKey senderkey;
+        senderkey.MakeNewKey(true);
+        sender_x_only_pub_keys.push_back(XOnlyPubKey{senderkey.GetPubKey()});
     }
 
     bench.run([&] {
-        silentpayment::Recipient::SumPublicKeys({}, sender_x_only_public_keys);
+        CPubKey sum_tx_pubkeys{silentpayment::Recipient::SumPublicKeys(sender_pub_keys, sender_x_only_pub_keys)};
     });
 
-    secp256k1_context_destroy(ctx);
+    ECC_Stop();
 }
 
-/** Test ECDH performance **/
-static void ECDHPerformance(benchmark::Bench& bench, size_t sender_key_count, size_t op_count)
+static void ECDHPerformance(benchmark::Bench& bench, int32_t pool_size)
 {
-    auto ctx = secp256k1_context_create(SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
-    std::vector<XOnlyPubKey> sender_x_only_public_keys;
-    for (size_t i = 0; i < sender_key_count; i++) {
-        sender_x_only_public_keys.push_back(gen_key(ctx));
-    }
+    ECC_Start();
 
-    unsigned char seckey1[32];
-    GetRandBytes(seckey1);
+    std::vector<std::tuple<CKey, bool>> sender_secret_keys;
 
-    secp256k1_pubkey pubkey1;
-    int return_val = secp256k1_ec_pubkey_create(ctx, &pubkey1, seckey1);
-    assert(return_val);
+    CKey senderkey1;
+    senderkey1.MakeNewKey(true);
+    CPubKey senderPubkey1 = senderkey1.GetPubKey();
+    sender_secret_keys.push_back({senderkey1, false});
 
-    unsigned char seckey2[32];
-    GetRandBytes(seckey2);
+    CKey senderkey2;
+    senderkey2.MakeNewKey(true);
+    XOnlyPubKey senderPubkey2 = XOnlyPubKey(senderkey2.GetPubKey());
+    sender_secret_keys.push_back({senderkey2, true});
 
-    secp256k1_pubkey pubkey2;
-    return_val = secp256k1_ec_pubkey_create(ctx, &pubkey2, seckey2);
-    assert(return_val);
+    CKey recipient_spend_seckey;
+    recipient_spend_seckey.MakeNewKey(true);
+    XOnlyPubKey recipient_spend_pubkey = XOnlyPubKey{recipient_spend_seckey.GetPubKey()};
+
+    XOnlyPubKey recipient_scan_pubkey = silentpayment::RecipientNS2::GenerateScanPubkey(recipient_spend_seckey);
+
+    silentpayment::SenderNS2 silent_sender{
+        sender_secret_keys,
+        recipient_spend_pubkey,
+        recipient_scan_pubkey
+    };
+
+    auto silent_recipient = silentpayment::RecipientNS2(recipient_spend_seckey, pool_size);
+    CPubKey sum_tx_pubkeys{silentpayment::Recipient::SumPublicKeys({senderPubkey1}, {senderPubkey2})};
 
     bench.run([&] {
-        for(size_t i = 0; i < op_count; i++) {
-            // Silent payment recipients perform an ECDH for each transaction received
-            unsigned char shared_secret[32];
-            return_val = secp256k1_ecdh(ctx, shared_secret, &pubkey2, seckey1, nullptr, nullptr);
-            assert(return_val);
+        silent_recipient.SetSenderPublicKey(sum_tx_pubkeys);
+
+        for (int32_t identifier = 0; identifier < pool_size; identifier++) {
+            XOnlyPubKey tweaked_recipient_spend_pubkey = silentpayment::RecipientNS2::TweakSpendPubkey(recipient_spend_pubkey, identifier);
+
+            XOnlyPubKey sender_tweaked_pubkey = silent_sender.Tweak(tweaked_recipient_spend_pubkey);
+            const auto [recipient_priv_key, recipient_pub_key] = silent_recipient.Tweak(identifier);
+
+            assert(sender_tweaked_pubkey == recipient_pub_key);
         }
     });
 
-    secp256k1_context_destroy(ctx);
+    ECC_Stop();
 }
 
 static void SumXOnlyPublicKeys_1(benchmark::Bench& bench)
@@ -97,13 +104,13 @@ static void SumXOnlyPublicKeys_1000(benchmark::Bench& bench)
     SumXOnlyPublicKeys(bench, 1000);
 }
 
-static void ECDHPerformance_10_100(benchmark::Bench& bench)
+static void ECDHPerformance_100(benchmark::Bench& bench)
 {
-    ECDHPerformance(bench, 10, 100);
+    ECDHPerformance(bench, 100);
 }
 
 BENCHMARK(SumXOnlyPublicKeys_1, benchmark::PriorityLevel::HIGH);
 BENCHMARK(SumXOnlyPublicKeys_10, benchmark::PriorityLevel::HIGH);
 BENCHMARK(SumXOnlyPublicKeys_100, benchmark::PriorityLevel::HIGH);
 BENCHMARK(SumXOnlyPublicKeys_1000, benchmark::PriorityLevel::HIGH);
-BENCHMARK(ECDHPerformance_10_100, benchmark::PriorityLevel::HIGH);
+BENCHMARK(ECDHPerformance_100, benchmark::PriorityLevel::HIGH);
