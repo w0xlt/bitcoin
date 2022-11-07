@@ -2714,7 +2714,7 @@ util::Result<std::tuple<std::string, int32_t>> CWallet::GetSilentDestination(con
 
     DescriptorScriptPubKeyMan* desc_spkm = dynamic_cast<DescriptorScriptPubKeyMan*>(spk_man);
     assert(desc_spkm);
-    auto pubkey{desc_spkm->GetSilentAddress()};
+    auto pubkey{desc_spkm->GetSilentAddressOLD()};
 
     if (!pubkey) {
         return util::Error{util::ErrorString(pubkey)};

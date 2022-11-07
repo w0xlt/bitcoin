@@ -553,7 +553,8 @@ private:
     KeyMap m_map_keys GUARDED_BY(cs_desc_man);
     CryptedKeyMap m_map_crypted_keys GUARDED_BY(cs_desc_man);
 
-    std::unique_ptr<silentpayment::RecipientOLD> m_silent_recipient{nullptr};
+    std::unique_ptr<silentpayment::RecipientOLD> m_silent_recipient_old{nullptr};
+    std::unique_ptr<silentpayment::Recipient> m_silent_recipient{nullptr};
 
     //! keeps track of whether Unlock has run a thorough check before
     bool m_decryption_thoroughly_checked = false;
@@ -586,7 +587,8 @@ public:
     mutable RecursiveMutex cs_desc_man;
 
     util::Result<CTxDestination> GetNewDestination(const OutputType type) override;
-    util::Result<CPubKey> GetSilentAddress();
+    util::Result<CPubKey> GetSilentAddressOLD();
+    util::Result<std::pair<XOnlyPubKey,XOnlyPubKey>> GetSilentAddress();
     isminetype IsMine(const CScript& script) const override;
 
     bool CheckDecryptionKey(const CKeyingMaterial& master_key, bool accept_no_keys = false) override;

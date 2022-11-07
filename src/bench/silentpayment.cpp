@@ -58,15 +58,10 @@ static void ECDHPerformance(benchmark::Bench& bench, int32_t pool_size)
 
     CKey recipient_spend_seckey;
     recipient_spend_seckey.MakeNewKey(true);
-    XOnlyPubKey recipient_spend_pubkey = XOnlyPubKey{recipient_spend_seckey.GetPubKey()};
+    // XOnlyPubKey recipient_spend_pubkey = XOnlyPubKey{recipient_spend_seckey.GetPubKey()};
 
-    XOnlyPubKey recipient_scan_pubkey = silentpayment::Recipient::GenerateScanPubkey(recipient_spend_seckey);
-
-    silentpayment::Sender silent_sender{
-        sender_secret_keys,
-        recipient_spend_pubkey,
-        recipient_scan_pubkey
-    };
+    // TODO: REMOVE
+    // XOnlyPubKey recipient_scan_pubkey = silentpayment::Recipient::GenerateScanPubkey(recipient_spend_seckey);
 
     auto silent_recipient = silentpayment::Recipient(recipient_spend_seckey, pool_size);
     CPubKey sum_tx_pubkeys{silentpayment::RecipientOLD::SumPublicKeys({senderPubkey1}, {senderPubkey2})};
@@ -75,9 +70,17 @@ static void ECDHPerformance(benchmark::Bench& bench, int32_t pool_size)
         silent_recipient.SetSenderPublicKey(sum_tx_pubkeys);
 
         for (int32_t identifier = 0; identifier < pool_size; identifier++) {
-            XOnlyPubKey tweaked_recipient_spend_pubkey = silentpayment::Recipient::TweakSpendPubkey(recipient_spend_pubkey, identifier);
+            // TODO: REMOVE
+            // XOnlyPubKey tweaked_recipient_spend_pubkey = silentpayment::Recipient::TweakSpendPubkey(recipient_spend_pubkey, identifier);
 
-            XOnlyPubKey sender_tweaked_pubkey = silent_sender.Tweak(tweaked_recipient_spend_pubkey);
+            const auto&[recipient_scan_pubkey, recipient_spend_pubkey]{silent_recipient.GetAddress(identifier)};
+
+            silentpayment::Sender silent_sender{
+                sender_secret_keys,
+                recipient_scan_pubkey
+            };
+
+            XOnlyPubKey sender_tweaked_pubkey = silent_sender.Tweak(recipient_spend_pubkey);
             const auto [recipient_priv_key, recipient_pub_key] = silent_recipient.Tweak(identifier);
 
             assert(sender_tweaked_pubkey == recipient_pub_key);

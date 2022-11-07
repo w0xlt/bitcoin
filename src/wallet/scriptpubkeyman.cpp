@@ -2021,7 +2021,7 @@ util::Result<CTxDestination> DescriptorScriptPubKeyMan::GetNewDestination(const 
     }
 }
 
-util::Result<CPubKey> DescriptorScriptPubKeyMan::GetSilentAddress()
+util::Result<CPubKey> DescriptorScriptPubKeyMan::GetSilentAddressOLD()
 {
     LOCK(cs_desc_man);
 
@@ -2057,6 +2057,34 @@ util::Result<CPubKey> DescriptorScriptPubKeyMan::GetSilentAddress()
     CPubKey pubkey{scripts_temp[0].begin(), scripts_temp[0].end()};
 
     return pubkey;
+}
+
+util::Result<std::pair<XOnlyPubKey,XOnlyPubKey>> DescriptorScriptPubKeyMan::GetSilentAddress()
+{
+    LOCK(cs_desc_man);
+
+    // Returns true if this descriptor supports getting new addresses. Conditions where we may be unable to fetch them (e.g. locked) are caught later
+    if (!CanGetAddresses()) {
+        return util::Error{_("No addresses available")};
+    }
+
+    assert(m_wallet_descriptor.descriptor->IsSingleType());
+    std::optional<OutputType> desc_addr_type = m_wallet_descriptor.descriptor->GetOutputType();
+    assert(desc_addr_type);
+    if (OutputType::SILENT_PAYMENT != *desc_addr_type) {
+        throw std::runtime_error(std::string(__func__) + ": Silent Payment output type is exepected.");
+    }
+
+    LoadSilentRecipient();
+
+    auto identifier{m_wallet_descriptor.next_index};
+
+    const auto&[recipient_scan_pubkey, recipient_spend_pubkey]{m_silent_recipient->GetAddress(identifier)};
+
+    m_wallet_descriptor.next_index++;
+    WalletBatch(m_storage.GetDatabase()).WriteDescriptor(GetID(), m_wallet_descriptor);
+
+    return std::make_pair(recipient_scan_pubkey, recipient_spend_pubkey);
 }
 
 isminetype DescriptorScriptPubKeyMan::IsMine(const CScript& script) const
@@ -2728,7 +2756,7 @@ std::tuple<CKey,bool> DescriptorScriptPubKeyMan::GetPrivKeyForSilentPayment(cons
 
 void DescriptorScriptPubKeyMan::LoadSilentRecipient()
 {
-    if (m_silent_recipient == nullptr) {
+    if (m_silent_recipient_old == nullptr) {
         LOCK(cs_desc_man);
 
         std::vector<CKey> priv_keys;
@@ -2739,7 +2767,8 @@ void DescriptorScriptPubKeyMan::LoadSilentRecipient()
 
         assert(priv_keys.size() == 1);
 
-        m_silent_recipient = std::make_unique<silentpayment::RecipientOLD>(priv_keys.at(0));
+        m_silent_recipient_old = std::make_unique<silentpayment::RecipientOLD>(priv_keys.at(0));
+        m_silent_recipient = std::make_unique<silentpayment::Recipient>(priv_keys.at(0), SILENT_ADDRESS_MAXIMUM_IDENTIFIER);
     }
 }
 
@@ -2753,14 +2782,14 @@ std::vector<std::tuple<CKey, int32_t>> DescriptorScriptPubKeyMan::VerifySilentPa
 
     LoadSilentRecipient();
 
-    assert(m_silent_recipient != nullptr);
+    assert(m_silent_recipient_old != nullptr);
 
-    m_silent_recipient->SetSenderPublicKey(sender_pub_key);
+    m_silent_recipient_old->SetSenderPublicKey(sender_pub_key);
 
     for(const auto& [outputScriptPubKey, outputPubKey] : tx_output_pub_keys) {
 
         for (int32_t identifier = 0; identifier <= m_wallet_descriptor.next_index; identifier++) {
-            const auto [silKey, silPubKey] = m_silent_recipient->Tweak2(identifier);
+            const auto [silKey, silPubKey] = m_silent_recipient_old->Tweak2(identifier);
 
             if (silPubKey == outputPubKey) {
                 raw_tr_keys.emplace_back(silKey, identifier);

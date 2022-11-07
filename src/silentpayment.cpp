@@ -638,6 +638,8 @@ Recipient::Recipient(const CKey& spend_seckey, size_t pool_size)
     CKey scan_key;
     scan_key.Set(std::begin(scan_seckey_bytes), std::end(scan_seckey_bytes), true);
 
+    m_scan_pubkey = XOnlyPubKey(scan_key.GetPubKey());
+
     m_negated_scan_seckey = scan_key;
     if (scan_key.GetPubKey().data()[0] == 3) {
         m_negated_scan_seckey.Negate();
@@ -684,7 +686,13 @@ std::tuple<CKey,XOnlyPubKey> Recipient::Tweak(const int32_t& identifier) const
     return {result_seckey, result_xonly_pubkey};
 }
 
-XOnlyPubKey Recipient::GenerateScanPubkey(const CKey& spend_seckey)
+std::pair<XOnlyPubKey,XOnlyPubKey> Recipient::GetAddress(const int32_t& identifier) const
+{
+    const auto& [_, spend_pubkey]{m_spend_keys.at(identifier)};
+    return {m_scan_pubkey, spend_pubkey};
+}
+
+/* XOnlyPubKey Recipient::GenerateScanPubkey(const CKey& spend_seckey)
 {
     unsigned char scan_seckey_bytes[32];
     CSHA256().Write(spend_seckey.begin(), 32).Finalize(scan_seckey_bytes);
@@ -701,7 +709,7 @@ XOnlyPubKey Recipient::TweakSpendPubkey(const XOnlyPubKey spend_xonly_pubkey, co
     tweak = tweak + identifier;
 
     return spend_xonly_pubkey.AddTweak(ArithToUint256(tweak).data());
-}
+} */
 
 CPubKey Recipient::CombinePublicKeys(const std::vector<CPubKey>& sender_public_keys, const std::vector<XOnlyPubKey>& sender_x_only_public_key)
 {
@@ -718,10 +726,7 @@ CPubKey Recipient::CombinePublicKeys(const std::vector<CPubKey>& sender_public_k
     return CPubKey::Combine(v_pubkeys);
 }
 
-Sender::Sender(
-            const std::vector<std::tuple<CKey, bool>>& sender_secret_keys,
-            const XOnlyPubKey& recipient_spend_xonly_pubkey,
-            const XOnlyPubKey& recipient_scan_xonly_pubkey)
+Sender::Sender(const std::vector<std::tuple<CKey, bool>>& sender_secret_keys, const XOnlyPubKey& recipient_scan_xonly_pubkey)
 {
     const auto& [seckey, is_taproot] = sender_secret_keys.at(0);
 
@@ -743,8 +748,6 @@ Sender::Sender(
             sum_seckey = sum_seckey.AddTweak(temp_key.begin());
         }
     }
-
-    m_recipient_spend_xonly_pubkey = XOnlyPubKey{recipient_spend_xonly_pubkey};
 
     CPubKey recipient_scan_pubkey = recipient_scan_xonly_pubkey.ConvertToCompressedPubKey();
 

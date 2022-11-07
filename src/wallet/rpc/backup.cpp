@@ -1533,6 +1533,8 @@ static UniValue ProcessDescriptorImport(CWallet& wallet, const UniValue& data, c
         }
         parsed_desc->ExpandPrivate(0, keys, expand_keys);
 
+        std::cout << "--> scripts.size: " << scripts.size() << std::endl;
+
         // Check if all private keys are provided
         bool have_all_privkeys = !expand_keys.keys.empty();
         for (const auto& entry : expand_keys.origins) {
