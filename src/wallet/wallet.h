@@ -699,7 +699,7 @@ public:
     void MarkDestinationsDirty(const std::set<CTxDestination>& destinations) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
 
     util::Result<CTxDestination> GetNewDestination(const OutputType& type, const std::string& label);
-    util::Result<std::tuple<std::string, int32_t>> GetSilentDestination(const std::string& label);
+    util::Result<std::pair<std::string, int32_t>> GetSilentDestination(const std::string& label);
     util::Result<CTxDestination> GetNewChangeDestination(const OutputType type);
 
     isminetype IsMine(const CTxDestination& dest) const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
@@ -723,6 +723,7 @@ public:
     bool SetAddressBook(const CTxDestination& address, const std::string& strName, const std::string& purpose);
 
     bool SetSilentAddressBook(int32_t identifier, const std::string& silent_address, const std::string& label) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+    bool SetSilentAddressBook(XOnlyPubKey spend_pubkey, const std::string& silent_address, const std::string& label) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
 
     bool DelAddressBook(const CTxDestination& address);
 
