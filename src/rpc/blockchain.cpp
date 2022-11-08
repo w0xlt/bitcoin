@@ -1970,7 +1970,7 @@ namespace {
 bool CheckSilentPayment(
     const uint256& txhash,
     const CScript& outScriptPubKey,
-    const CKey& privKey,
+    silentpayment::Recipient& silent_recipient,
     const std::pair<int64_t, int64_t>& range)
 {
     std::vector<std::vector<unsigned char>> solutions;
@@ -1990,7 +1990,6 @@ bool CheckSilentPayment(
         return false;
     }
 
-    silentpayment::Recipient silent_recipient{privKey, ((size_t) range.second)};
     silent_recipient.SetSenderPublicKey(sum_of_all_input_pubkeys);
 
     for (int64_t identifier = range.first; identifier < range.second; identifier++) {
@@ -2013,7 +2012,7 @@ bool FindScriptPubKey(
     const std::set<CScript>& needles,
     std::map<COutPoint, Coin>& out_results,
     std::function<void()>& interruption_point,
-    const std::vector<std::tuple<CKey, std::pair<int64_t, int64_t>>>& sp_keys_range)
+    std::vector<std::tuple<silentpayment::Recipient, std::pair<int64_t, int64_t>>>& recipient_range)
 {
     scan_progress = 0;
     count = 0;
@@ -2036,8 +2035,8 @@ bool FindScriptPubKey(
         if (needles.count(coin.out.scriptPubKey)) {
             out_results.emplace(key, coin);
         }
-        for(const auto& [sp_key, sp_range]: sp_keys_range) {
-            if(CheckSilentPayment(key.hash, coin.out.scriptPubKey, sp_key, sp_range)) {
+        for(auto& [silent_recipient, range]: recipient_range) {
+            if(CheckSilentPayment(key.hash, coin.out.scriptPubKey, silent_recipient, range)) {
                 out_results.emplace(key, coin);
             }
         }
@@ -2247,6 +2246,13 @@ static RPCHelpMan scantxoutset()
             }
         }
 
+        std::vector<std::tuple<silentpayment::Recipient, std::pair<int64_t, int64_t>>> recipient_range;
+
+        for(const auto& [priv_key, range]: sp_keys_range) {
+            silentpayment::Recipient silent_recipient{priv_key, ((size_t) range.second)};
+            recipient_range.emplace_back(silent_recipient, range);
+        }
+
         // Scan the unspent transaction output set for inputs
         UniValue unspents(UniValue::VARR);
         std::vector<CTxOut> input_txos;
@@ -2265,7 +2271,7 @@ static RPCHelpMan scantxoutset()
             tip = CHECK_NONFATAL(active_chainstate.m_chain.Tip());
         }
 
-        bool res = FindScriptPubKey(g_scan_progress, g_should_abort_scan, count, pcursor.get(), needles, coins, node.rpc_interruption_point, sp_keys_range);
+        bool res = FindScriptPubKey(g_scan_progress, g_should_abort_scan, count, pcursor.get(), needles, coins, node.rpc_interruption_point, recipient_range);
         result.pushKV("success", res);
         result.pushKV("txouts", count);
         result.pushKV("height", tip->nHeight);
