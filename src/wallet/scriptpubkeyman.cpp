@@ -2756,7 +2756,8 @@ std::tuple<CKey,bool> DescriptorScriptPubKeyMan::GetPrivKeyForSilentPayment(cons
 
 void DescriptorScriptPubKeyMan::LoadSilentRecipient()
 {
-    if (m_silent_recipient_old == nullptr) {
+    // if (m_silent_recipient_old == nullptr) {
+    if (m_silent_recipient == nullptr) {
         LOCK(cs_desc_man);
 
         std::vector<CKey> priv_keys;
@@ -2767,7 +2768,7 @@ void DescriptorScriptPubKeyMan::LoadSilentRecipient()
 
         assert(priv_keys.size() == 1);
 
-        m_silent_recipient_old = std::make_unique<silentpayment::RecipientOLD>(priv_keys.at(0));
+        // m_silent_recipient_old = std::make_unique<silentpayment::RecipientOLD>(priv_keys.at(0));
         m_silent_recipient = std::make_unique<silentpayment::Recipient>(priv_keys.at(0), SILENT_ADDRESS_MAXIMUM_IDENTIFIER);
     }
 }
@@ -2782,17 +2783,20 @@ std::vector<std::tuple<CKey, int32_t>> DescriptorScriptPubKeyMan::VerifySilentPa
 
     LoadSilentRecipient();
 
-    assert(m_silent_recipient_old != nullptr);
+    // assert(m_silent_recipient_old != nullptr);
+    assert(m_silent_recipient != nullptr);
 
-    m_silent_recipient_old->SetSenderPublicKey(sender_pub_key);
+    // m_silent_recipient_old->SetSenderPublicKey(sender_pub_key);
+    m_silent_recipient->SetSenderPublicKey(sender_pub_key);
 
     for(const auto& [outputScriptPubKey, outputPubKey] : tx_output_pub_keys) {
 
         for (int32_t identifier = 0; identifier <= m_wallet_descriptor.next_index; identifier++) {
-            const auto [silKey, silPubKey] = m_silent_recipient_old->Tweak2(identifier);
+            // const auto [silKey, silPubKey] = m_silent_recipient_old->Tweak2(identifier);
+            const auto [silent_priv_key, silent_pub_key] = m_silent_recipient->Tweak(identifier);
 
-            if (silPubKey == outputPubKey) {
-                raw_tr_keys.emplace_back(silKey, identifier);
+            if (silent_pub_key == outputPubKey) {
+                raw_tr_keys.emplace_back(silent_priv_key, identifier);
                 WalletLogPrintf("Silent scriptPubKey identified: %s\n", HexStr(outputScriptPubKey));
                 break;
             }

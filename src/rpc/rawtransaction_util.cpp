@@ -122,12 +122,13 @@ CMutableTransaction ConstructTransaction(const UniValue& inputs_in, const UniVal
             CScript scriptPubKey;
 
             auto data = DecodeSilentAddress(name_);
-            auto [pubkey, _] = DecodeSilentDataOLD(data);
-            (void) _;
+            // auto [pubkey, _] = DecodeSilentDataOLD(data);
+            // (void) _;
+            auto [scan_pubkey, spend_pubkey] = DecodeSilentData(data);
 
             CTxOut out;
 
-            if (pubkey.IsFullyValid()) {
+            if (scan_pubkey.IsFullyValid() && spend_pubkey.IsFullyValid()) {
 
                 if (!silent_data.insert(data).second) {
                     throw JSONRPCError(RPC_INVALID_PARAMETER, std::string("Invalid parameter, duplicated address: ") + name_);

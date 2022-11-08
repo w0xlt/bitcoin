@@ -199,7 +199,7 @@ BOOST_AUTO_TEST_CASE(silent_addresses_4)
 
     silent_recipient.SetSenderPublicKey(combined_tx_pubkeys);
 
-    for (int32_t identifier = 0; identifier < 4; identifier++) {
+    for (int32_t identifier = 0; identifier < 434; identifier++) {
         // TODO: REMOVE
         // XOnlyPubKey tweaked_recipient_spend_pubkey = silentpayment::Recipient::TweakSpendPubkey(recipient_spend_pubkey, identifier);
 
