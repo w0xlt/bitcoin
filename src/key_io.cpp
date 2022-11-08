@@ -280,39 +280,6 @@ std::string EncodeDestination(const CTxDestination& dest)
     return std::visit(DestinationEncoder(Params()), dest);
 }
 
-std::string EncodeSilentDestinationOLD(const CPubKey& pubkey, const int32_t silent_payment_index)
-{
-    // The data_in is index + public key
-    std::vector<unsigned char> data_in = {};
-    std::vector<unsigned char> data_out = {};
-
-    std::vector<unsigned char> index_data = {};
-    unsigned char index_chunk = silent_payment_index & 0xFF;
-    index_data.push_back(index_chunk);
-
-    // this guarantees the same size if the identifier is between 0 and 255
-    if (index_chunk == 0) {
-        index_data.push_back(index_chunk);
-    }
-
-    int8_t shift = 8;
-
-    while(index_chunk != 0) {
-        index_chunk = (silent_payment_index >> shift) & 0xFF;
-        index_data.push_back(index_chunk);
-        shift += 8;
-    }
-
-    data_in.insert(data_in.end(), index_data.begin(), index_data.end());
-    data_in.insert(data_in.end(), pubkey.begin(), pubkey.end());
-
-    ConvertBits<8, 5, true>([&](unsigned char c) { data_out.push_back(c); }, data_in.begin(), data_in.end());
-
-    std::string hrp = Params().SilentPaymentHRP();
-
-    return bech32::Encode(bech32::Encoding::BECH32M, hrp, data_out);
-}
-
 std::string EncodeSilentDestination(const XOnlyPubKey& scan_pubkey, const XOnlyPubKey& spend_pubkey)
 {
     // The data_in is scan_pubkey + spend_pubkey
@@ -349,28 +316,6 @@ bool IsValidDestinationString(const std::string& str, const CChainParams& params
 bool IsValidDestinationString(const std::string& str)
 {
     return IsValidDestinationString(str, Params());
-}
-
-std::tuple<CPubKey, int32_t> DecodeSilentDataOLD(const std::vector<unsigned char>& data)
-{
-    if (data.size() <= 33) {
-        return {CPubKey(), 0};
-    }
-
-    std::vector<unsigned char> pubkey_data(data.end() - 33, data.end());
-    CPubKey pubkey{pubkey_data.begin(), pubkey_data.end()};
-
-    std::vector<unsigned char> index_data(data.begin(), data.end() - 33);
-
-    int32_t index = 0;
-    int shift = 0;
-
-    for (const auto& it : index_data) {
-        index |=  (it << shift);
-        shift += 8;
-    }
-
-    return {pubkey, index};
 }
 
 std::pair<XOnlyPubKey, XOnlyPubKey> DecodeSilentData(const std::vector<unsigned char>& data)

@@ -1990,13 +1990,10 @@ bool CheckSilentPayment(
         return false;
     }
 
-    // silentpayment::RecipientOLD silent_recipient{privKey};
-    // silent_recipient.SetSenderPublicKey(sum_of_all_input_pubkeys);
-
-    silentpayment::Recipient silent_recipient{privKey, SILENT_ADDRESS_MAXIMUM_IDENTIFIER};
+    silentpayment::Recipient silent_recipient{privKey, ((size_t) range.second)};
     silent_recipient.SetSenderPublicKey(sum_of_all_input_pubkeys);
 
-    for (int64_t identifier = range.first; identifier <= range.second; identifier++) {
+    for (int64_t identifier = range.first; identifier < range.second; identifier++) {
         const auto [silKey, silPubKey] = silent_recipient.Tweak((int32_t) identifier);
 
         if (outputPubKey == silPubKey) {

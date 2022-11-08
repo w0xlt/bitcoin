@@ -69,16 +69,13 @@ class SilentLabelTest(BitcoinTestFramework):
         existing_labels.append(label01)
         existing_labels.append(label02)
 
-        for _ in range(97):
+        for _ in range(96):
             label = self.random_string(8)
             existing_labels.append(label)
             addr = sp_wallet_01.getsilentaddress(label)['address']
-            encoding, hrp, data = bech32_decode(addr)
-            decoded = convertbits(data, 5, 8, False)
 
-            assert_equal(encoding, Encoding.BECH32M)
-            assert_equal(hrp, "sprt")
-            assert_equal(identifier,decoded[0])
+            ret = sp_wallet_01.decodesilentaddress(addr)
+            assert_equal(identifier,ret['identifier'])
 
             identifier = identifier + 1
 
@@ -92,12 +89,8 @@ class SilentLabelTest(BitcoinTestFramework):
 
         for addr in ret['silent_addresses']:
             assert_equal(addr['label'], existing_labels[identifier])
-            encoding, hrp, data = bech32_decode(addr['address'])
-            decoded = convertbits(data, 5, 8, False)
-
-            assert_equal(encoding, Encoding.BECH32M)
-            assert_equal(hrp, "sprt")
-            assert_equal(identifier,decoded[0])
+            ret = sp_wallet_01.decodesilentaddress(addr['address'])
+            assert_equal(identifier,ret['identifier'])
 
             identifier = identifier + 1
 

@@ -24,12 +24,10 @@ CExtPubKey DecodeExtPubKey(const std::string& str);
 std::string EncodeExtPubKey(const CExtPubKey& extpubkey);
 
 std::string EncodeDestination(const CTxDestination& dest);
-std::string EncodeSilentDestinationOLD(const CPubKey& pubkey, const int32_t silent_payment_index = 0);
 std::string EncodeSilentDestination(const XOnlyPubKey& scan_pubkey, const XOnlyPubKey& spend_pubkey);
 CTxDestination DecodeDestination(const std::string& str);
 CTxDestination DecodeDestination(const std::string& str, std::string& error_msg, std::vector<int>* error_locations = nullptr);
 
-std::tuple<CPubKey, int32_t> DecodeSilentDataOLD(const std::vector<unsigned char>& data);
 std::pair<XOnlyPubKey, XOnlyPubKey> DecodeSilentData(const std::vector<unsigned char>& data);
 std::vector<unsigned char> DecodeSilentAddress(const std::string& str);
 

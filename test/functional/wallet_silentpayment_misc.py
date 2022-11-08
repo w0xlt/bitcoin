@@ -6,7 +6,10 @@ from test_framework.util import (
     assert_equal
 )
 from test_framework.descriptors import descsum_create
-from test_framework.key import ECKey
+from test_framework.key import (
+    ECKey,
+    compute_xonly_pubkey,
+)
 from test_framework.wallet_util import bytes_to_wif
 
 
@@ -65,7 +68,7 @@ class SilentTransactioTest(BitcoinTestFramework):
         self.generatetoaddress(self.nodes[0], COINBASE_MATURITY + 10, watch_only_wallet.getnewaddress())
 
         self.log.info("Watch-only wallets cannot send coins using silent_payment option")
-        outputs = [{"sprt1qyqq8mvtqcy9t03c9fhsmu0v8ul2srqy27kfqlu93t70cslgw9h9lkxp5elyuw": 15}]
+        outputs = [{"sprt1nnspl0k3p5atkj88lsk703dv0nwczz440huq9dhzdj5un2aa76t2ptnk3pl2tg6v080uq2nvylqq8398zu6422n2lzaz403tpuq44egxa4t46": 15}]
 
         assert_raises_rpc_error(-4, "Silent payments require access to private keys to build transactions.",
             watch_only_wallet.send, outputs=outputs)
@@ -86,7 +89,7 @@ class SilentTransactioTest(BitcoinTestFramework):
         assert(not tx['complete'])
 
         # but when silent_payment option is enabled, wallet must be decrypted
-        outputs = [{"sprt1qqqq8mvtqcy9t03c9fhsmu0v8ul2srqy27kfqlu93t70cslgw9h9lkxpsszqk5": 15}]
+        outputs = [{"sprt1nnspl0k3p5atkj88lsk703dv0nwczz440huq9dhzdj5un2aa76t9jt4nlxwucu9lzw75yxl74x9vq6jl7v33064hrx8kd0q5rgvjctq354m7t": 15}]
         assert_raises_rpc_error(-13, "Please enter the wallet passphrase with walletpassphrase first.",
             encrypted_wallet.send, outputs=outputs)
 
@@ -165,7 +168,7 @@ class SilentTransactioTest(BitcoinTestFramework):
         eckey = ECKey()
         eckey.generate()
         privkey = bytes_to_wif(eckey.get_bytes())
-        pubkey = eckey.get_pubkey().get_bytes().hex()
+        pubkey = compute_xonly_pubkey(eckey.get_bytes())[0].hex()
 
         xpriv1 = "sp(cNSWZfhJWf1uYcsMKZxN94SgNiM8xQPhGyGaEkyCSR1GtSweLkdr)#vs4h975j"
         xpriv2 = "sp(cS1NMRiK87hdpzzNJgiYcdABjCPGxbBAdCrHoosqzjfeQY4z85rn)#dh4rsd8m"
@@ -195,7 +198,7 @@ class SilentTransactioTest(BitcoinTestFramework):
         assert_equal(addr_info['address'], sp_addr)
         assert_equal(addr_info['identifier'], 0)
         assert_equal(addr_info['label'], '')
-        assert_equal(addr_info['pubkey'], pubkey)
+        assert_equal(addr_info['spend_pubkey'], pubkey)
 
     def test_big_transaction_multiple_wallets(self):
         self.log.info("Testing a big transaction to SP wallet")

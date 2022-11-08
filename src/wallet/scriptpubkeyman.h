@@ -553,7 +553,6 @@ private:
     KeyMap m_map_keys GUARDED_BY(cs_desc_man);
     CryptedKeyMap m_map_crypted_keys GUARDED_BY(cs_desc_man);
 
-    std::unique_ptr<silentpayment::RecipientOLD> m_silent_recipient_old{nullptr};
     std::unique_ptr<silentpayment::Recipient> m_silent_recipient{nullptr};
 
     //! keeps track of whether Unlock has run a thorough check before
@@ -587,7 +586,6 @@ public:
     mutable RecursiveMutex cs_desc_man;
 
     util::Result<CTxDestination> GetNewDestination(const OutputType type) override;
-    util::Result<CPubKey> GetSilentAddressOLD();
     util::Result<std::tuple<int32_t,XOnlyPubKey,XOnlyPubKey>> GetSilentAddress();
     isminetype IsMine(const CScript& script) const override;
 
@@ -644,6 +642,7 @@ public:
     void LoadSilentRecipient();
     std::tuple<CKey,bool> GetPrivKeyForSilentPayment(const CScript& scriptPubKey, const bool onlyTaproot) const;
     std::vector<std::tuple<CKey, int32_t>> VerifySilentPaymentAddress(const std::vector<std::tuple<CScript, XOnlyPubKey>>& txOutputPubKeys, const CPubKey& senderPubKey);
+    int32_t RetrieveSilentIdentifier(XOnlyPubKey spend_key);
 
     bool HasWalletDescriptor(const WalletDescriptor& desc) const;
     void UpdateWalletDescriptor(WalletDescriptor& descriptor);

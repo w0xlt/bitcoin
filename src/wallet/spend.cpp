@@ -784,11 +784,10 @@ bool CreateSilentTransaction(
 
         std::vector<unsigned char> data;
         data.assign(vout.scriptPubKey.begin(), vout.scriptPubKey.end());
-        // auto [recipient_pubkey, identifier] = DecodeSilentDataOLD(data);
+
         auto [scan_pubkey, spend_pubkey] = DecodeSilentData(data);
         assert(scan_pubkey.IsFullyValid() && spend_pubkey.IsFullyValid());
 
-        // silentpayment::SenderOLD silent_sender{input_private_keys, recipient_pubkey};
         silentpayment::Sender silent_sender{
             input_private_keys,
             scan_pubkey
