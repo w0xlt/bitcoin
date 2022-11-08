@@ -2689,7 +2689,7 @@ util::Result<CTxDestination> CWallet::GetNewDestination(const OutputType& type, 
     return op_dest;
 }
 
-util::Result<std::tuple<std::string, int32_t>> CWallet::GetSilentDestination(const std::string& label)
+util::Result<std::tuple<std::string, int32_t>> CWallet::GetSilentDestinationOLD(const std::string& label)
 {
     LOCK(cs_wallet);
 
@@ -2724,10 +2724,45 @@ util::Result<std::tuple<std::string, int32_t>> CWallet::GetSilentDestination(con
         return util::Error{_("Invalid silent key.")};
     }
 
-    const auto silent_address = EncodeSilentDestination(*pubkey, current_index);
+    const auto silent_address = EncodeSilentDestinationOLD(*pubkey, current_index);
     SetSilentAddressBook(current_index, silent_address, label);
 
     return std::make_tuple(silent_address, current_index);
+}
+
+util::Result<std::pair<std::string, int32_t>>  CWallet::GetSilentDestination(const std::string& label)
+{
+    LOCK(cs_wallet);
+
+    auto spk_man = GetScriptPubKeyMan(OutputType::SILENT_PAYMENT, false /* internal */);
+    if (!spk_man) {
+        return util::Error{strprintf(_("Error: No %s addresses available."), FormatOutputType(OutputType::SILENT_PAYMENT))};
+    }
+
+    for (auto const& [key, val] : m_silent_address_book)
+    {
+        if (val.m_label == label) {
+            return util::Error{strprintf(_("Label %s is already assigned to a silent payment address."), label)};
+        }
+    }
+
+    DescriptorScriptPubKeyMan* desc_spkm = dynamic_cast<DescriptorScriptPubKeyMan*>(spk_man);
+    assert(desc_spkm);
+    const auto result{desc_spkm->GetSilentAddress()};
+    if (!result) {
+        return util::Error{util::ErrorString(result)};
+    }
+
+    auto const& [identifier, scan_pubkey, spend_pubkey] = result.value();
+
+    if(!scan_pubkey.IsFullyValid() || !spend_pubkey.IsFullyValid()) {
+        return util::Error{_("Invalid scan or spend key.")};
+    }
+
+    const auto silent_address = EncodeSilentDestination(scan_pubkey, spend_pubkey);
+    SetSilentAddressBook(identifier, silent_address, label);
+
+    return std::make_pair(silent_address, identifier);
 }
 
 util::Result<CTxDestination> CWallet::GetNewChangeDestination(const OutputType type)

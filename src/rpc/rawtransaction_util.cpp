@@ -122,7 +122,7 @@ CMutableTransaction ConstructTransaction(const UniValue& inputs_in, const UniVal
             CScript scriptPubKey;
 
             auto data = DecodeSilentAddress(name_);
-            auto [pubkey, _] = DecodeSilentData(data);
+            auto [pubkey, _] = DecodeSilentDataOLD(data);
             (void) _;
 
             CTxOut out;

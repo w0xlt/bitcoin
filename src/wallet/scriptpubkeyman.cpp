@@ -2059,7 +2059,7 @@ util::Result<CPubKey> DescriptorScriptPubKeyMan::GetSilentAddressOLD()
     return pubkey;
 }
 
-util::Result<std::pair<XOnlyPubKey,XOnlyPubKey>> DescriptorScriptPubKeyMan::GetSilentAddress()
+util::Result<std::tuple<int32_t,XOnlyPubKey,XOnlyPubKey>> DescriptorScriptPubKeyMan::GetSilentAddress()
 {
     LOCK(cs_desc_man);
 
@@ -2084,7 +2084,7 @@ util::Result<std::pair<XOnlyPubKey,XOnlyPubKey>> DescriptorScriptPubKeyMan::GetS
     m_wallet_descriptor.next_index++;
     WalletBatch(m_storage.GetDatabase()).WriteDescriptor(GetID(), m_wallet_descriptor);
 
-    return std::make_pair(recipient_scan_pubkey, recipient_spend_pubkey);
+    return std::make_tuple(identifier, recipient_scan_pubkey, recipient_spend_pubkey);
 }
 
 isminetype DescriptorScriptPubKeyMan::IsMine(const CScript& script) const

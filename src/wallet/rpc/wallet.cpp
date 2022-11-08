@@ -766,6 +766,7 @@ static RPCHelpMan migratewallet()
 // addresses
 RPCHelpMan getaddressinfo();
 RPCHelpMan decodesilentaddress();
+RPCHelpMan decodesilentaddressnew();
 RPCHelpMan getnewaddress();
 RPCHelpMan getrawchangeaddress();
 RPCHelpMan setlabel();
@@ -776,6 +777,7 @@ RPCHelpMan newkeypool();
 RPCHelpMan getaddressesbylabel();
 RPCHelpMan listlabels();
 RPCHelpMan getsilentaddress();
+RPCHelpMan getsilentaddressnew();
 RPCHelpMan listsilentaddresses();
 #ifdef ENABLE_EXTERNAL_SIGNER
 RPCHelpMan walletdisplayaddress();
@@ -856,12 +858,14 @@ Span<const CRPCCommand> GetWalletRPCCommands()
         {"wallet", &getaddressesbylabel},
         {"wallet", &getaddressinfo},
         {"wallet", &decodesilentaddress},
+        {"wallet", &decodesilentaddressnew},
         {"wallet", &getbalance},
         {"wallet", &getnewaddress},
         {"wallet", &getrawchangeaddress},
         {"wallet", &getreceivedbyaddress},
         {"wallet", &getreceivedbylabel},
         {"wallet", &getsilentaddress},
+        {"wallet", &getsilentaddressnew},
         {"wallet", &listsilentaddresses},
         {"wallet", &gettransaction},
         {"wallet", &getunconfirmedbalance},

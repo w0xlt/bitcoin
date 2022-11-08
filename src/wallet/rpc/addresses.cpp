@@ -125,7 +125,7 @@ RPCHelpMan getsilentaddress()
         }
     }
 
-    const auto result = pwallet->GetSilentDestination(label);
+    const auto result = pwallet->GetSilentDestinationOLD(label);
 
     if (!result) {
         throw JSONRPCError(RPC_WALLET_ERROR, util::ErrorString(result).original);
@@ -141,6 +141,80 @@ RPCHelpMan getsilentaddress()
     }
 
     return ret;
+},
+    };
+}
+
+RPCHelpMan getsilentaddressnew()
+{
+    return RPCHelpMan{"getsilentaddressnew",
+                "\nReturns a silent paymet address if it is enabled in wallet.\n"
+                "If 'label' is specified and it is new, a new address will be generated. \n"
+                "If the 'label' is already assigned to a silent address, this same address will be shown.\n",
+                {
+                    {"label", RPCArg::Type::STR, RPCArg::Default{""}, "The label name for the address to be linked to. It can also be set to the empty string \"\" to represent the default label. The label does not need to exist, it will be created if there is no label by the given name."},
+                },
+                RPCResult{
+                    RPCResult::Type::OBJ, "", "",
+                    {
+                        {RPCResult::Type::STR, "address", "The silent address"},
+                        {RPCResult::Type::STR_HEX, "label", "The label assigned to this silent address"},
+                        {RPCResult::Type::NUM, "identifier", "The identifier corresponding to the given label"},
+                        {RPCResult::Type::STR, "warnings", /*optional=*/true, "Any warnings associated with the address"},
+                    }
+                },
+                RPCExamples{
+                    HelpExampleCli("getsilentaddressnew", "")
+            + HelpExampleRpc("getsilentaddressnew", "")
+                },
+        [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
+{
+    std::shared_ptr<CWallet> const pwallet = GetWalletForJSONRPCRequest(request);
+    if (!pwallet) return UniValue::VNULL;
+
+    LOCK(pwallet->cs_wallet);
+
+    if (!pwallet->IsWalletFlagSet(WALLET_FLAG_SILENT_PAYMENT)) {
+        throw JSONRPCError(RPC_WALLET_ERROR, "Error: This wallet is not enabled for silent payments");
+    }
+
+    if (!pwallet->CanGetAddresses()) {
+        throw JSONRPCError(RPC_WALLET_ERROR, "Error: This wallet has no available keys");
+    }
+
+    // Parse the label first so we don't generate a key if there's an error
+    std::string label;
+    if (!request.params[0].isNull())
+        label = LabelFromValue(request.params[0]);
+
+    UniValue ret(UniValue::VOBJ);
+    for (auto const& [key, val] : pwallet->m_silent_address_book)
+    {
+        if (val.m_label == label) {
+            ret.pushKV("address", val.m_address);
+            ret.pushKV("label", val.m_label);
+            ret.pushKV("identifier", key);
+            return ret;
+        }
+    }
+
+    const auto result = pwallet->GetSilentDestination(label);
+
+    if (!result) {
+        throw JSONRPCError(RPC_WALLET_ERROR, util::ErrorString(result).original);
+    }
+
+    const auto& [address, identifier] = *result;
+
+    ret.pushKV("address", address);
+    ret.pushKV("label", label);
+    ret.pushKV("identifier", identifier);
+    if (identifier > 0) {
+        ret.pushKV("warnings", "This address is not a new identity. It is a re-use of an existing identity with a different label.");
+    }
+
+    return ret;
+
 },
     };
 }
@@ -274,7 +348,7 @@ RPCHelpMan setlabel()
     std::string label = LabelFromValue(request.params[1]);
 
     auto data = DecodeSilentAddress(request.params[0].get_str());
-    auto [pubkey, identifier] = DecodeSilentData(data);
+    auto [pubkey, identifier] = DecodeSilentDataOLD(data);
 
     if(pubkey.IsFullyValid()) {
         for (auto const& [key, val] : pwallet->m_silent_address_book)
@@ -665,7 +739,7 @@ RPCHelpMan decodesilentaddress()
         [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
 {
     auto data = DecodeSilentAddress(request.params[0].get_str());
-    auto [pubkey, identifier] = DecodeSilentData(data);
+    auto [pubkey, identifier] = DecodeSilentDataOLD(data);
 
     if(!pubkey.IsFullyValid()) {
         throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "Invalid address.");
@@ -685,6 +759,59 @@ RPCHelpMan decodesilentaddress()
     {
         if (val.m_address == request.params[0].get_str()) {
             ret.pushKV("label", val.m_label);
+        }
+    }
+
+    return ret;
+},
+    };
+}
+
+RPCHelpMan decodesilentaddressnew()
+{
+    return RPCHelpMan{"decodesilentaddressnew",
+                "\nReturn information about the given silejt address.\n"
+                "Some of the information will only be present if the address is in the active wallet.\n",
+                {
+                    {"address", RPCArg::Type::STR, RPCArg::Optional::NO, "The silent address for which to get information."},
+                },
+                RPCResult{
+                    RPCResult::Type::OBJ, "", "",
+                    {
+                        {RPCResult::Type::STR, "address", "The silent address validated."},
+                        {RPCResult::Type::STR_HEX, "scan_pubkey", "The hex-encoded scan public key."},
+                        {RPCResult::Type::STR_HEX, "spend_pubkey", "The hex-encoded spend public key."},
+                        {RPCResult::Type::NUM, "identifier", /*optional=*/true, "The identifier used by the silent payment address if it belongs to the wallet."},
+                        {RPCResult::Type::STR, "label", /*optional=*/true, "The label assigned to the address if it belongs to the wallet."}
+                    },
+                },
+                RPCExamples{
+                    HelpExampleCli("decodesilentaddressnew", "\"sprt1yvpttj5ts7z0g8dxng2ppfjua5c8z6u7068mdc8m5543nuascg33jlcpe5xc6\"")
+                },
+        [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
+{
+    auto data = DecodeSilentAddress(request.params[0].get_str());
+    auto [scan_pubkey, spend_pubkey] = DecodeSilentData(data);
+
+    if(!scan_pubkey.IsFullyValid() ||  !spend_pubkey.IsFullyValid()) {
+        throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "Invalid address.");
+    }
+
+    UniValue ret(UniValue::VOBJ);
+    ret.pushKV("address", request.params[0].get_str());
+    ret.pushKV("scan_pubkey", HexStr(scan_pubkey));
+    ret.pushKV("spend_pubkey", HexStr(spend_pubkey));
+
+    const std::shared_ptr<const CWallet> pwallet = GetWalletForJSONRPCRequest(request);
+    if (!pwallet) return ret;
+
+    LOCK(pwallet->cs_wallet);
+
+    for (auto const& [key, val] : pwallet->m_silent_address_book)
+    {
+        if (val.m_address == request.params[0].get_str()) {
+            ret.pushKV("label", val.m_label);
+            ret.pushKV("identifier", key);
         }
     }
 
@@ -755,7 +882,7 @@ RPCHelpMan getaddressinfo()
     LOCK(pwallet->cs_wallet);
 
     auto data = DecodeSilentAddress(request.params[0].get_str());
-    auto [pubkey, identifier] = DecodeSilentData(data);
+    auto [pubkey, identifier] = DecodeSilentDataOLD(data);
 
     if (pubkey.IsFullyValid()) {
         throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "Use `decodesilentaddress` RPC to get information about silent addresses.");

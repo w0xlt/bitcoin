@@ -588,7 +588,7 @@ public:
 
     util::Result<CTxDestination> GetNewDestination(const OutputType type) override;
     util::Result<CPubKey> GetSilentAddressOLD();
-    util::Result<std::pair<XOnlyPubKey,XOnlyPubKey>> GetSilentAddress();
+    util::Result<std::tuple<int32_t,XOnlyPubKey,XOnlyPubKey>> GetSilentAddress();
     isminetype IsMine(const CScript& script) const override;
 
     bool CheckDecryptionKey(const CKeyingMaterial& master_key, bool accept_no_keys = false) override;

@@ -280,7 +280,7 @@ std::string EncodeDestination(const CTxDestination& dest)
     return std::visit(DestinationEncoder(Params()), dest);
 }
 
-std::string EncodeSilentDestination(const CPubKey& pubkey, const int32_t silent_payment_index)
+std::string EncodeSilentDestinationOLD(const CPubKey& pubkey, const int32_t silent_payment_index)
 {
     // The data_in is index + public key
     std::vector<unsigned char> data_in = {};
@@ -313,6 +313,22 @@ std::string EncodeSilentDestination(const CPubKey& pubkey, const int32_t silent_
     return bech32::Encode(bech32::Encoding::BECH32M, hrp, data_out);
 }
 
+std::string EncodeSilentDestination(const XOnlyPubKey& scan_pubkey, const XOnlyPubKey& spend_pubkey)
+{
+    // The data_in is scan_pubkey + spend_pubkey
+    std::vector<unsigned char> data_in = {};
+    std::vector<unsigned char> data_out = {};
+
+    data_in.insert(data_in.end(), scan_pubkey.begin(), scan_pubkey.end());
+    data_in.insert(data_in.end(), spend_pubkey.begin(), spend_pubkey.end());
+
+    ConvertBits<8, 5, true>([&](unsigned char c) { data_out.push_back(c); }, data_in.begin(), data_in.end());
+
+    std::string hrp = Params().SilentPaymentHRP();
+
+    return bech32::Encode(bech32::Encoding::BECH32M, hrp, data_out);
+}
+
 CTxDestination DecodeDestination(const std::string& str, std::string& error_msg, std::vector<int>* error_locations)
 {
     return DecodeDestination(str, Params(), error_msg, error_locations);
@@ -335,7 +351,7 @@ bool IsValidDestinationString(const std::string& str)
     return IsValidDestinationString(str, Params());
 }
 
-std::tuple<CPubKey, int32_t> DecodeSilentData(const std::vector<unsigned char>& data)
+std::tuple<CPubKey, int32_t> DecodeSilentDataOLD(const std::vector<unsigned char>& data)
 {
     if (data.size() <= 33) {
         return {CPubKey(), 0};
@@ -357,6 +373,24 @@ std::tuple<CPubKey, int32_t> DecodeSilentData(const std::vector<unsigned char>& 
     return {pubkey, index};
 }
 
+std::pair<XOnlyPubKey, XOnlyPubKey> DecodeSilentData(const std::vector<unsigned char>& data)
+{
+    std::cout << "data.size: " << data.size() << std::endl;
+    if (data.size() != 64) {
+        return {XOnlyPubKey(), XOnlyPubKey()};
+    }
+
+    std::vector<unsigned char> scan_pubkey_data(data.begin(), data.begin() + 32);
+     std::cout << "scan_pubkey_data.size: " << scan_pubkey_data.size() << std::endl;
+    XOnlyPubKey scan_pubkey{scan_pubkey_data};
+
+    std::vector<unsigned char> spend_pubkey_data(data.begin() + 32, data.end());
+     std::cout << "spend_pubkey_data.size: " << spend_pubkey_data.size() << std::endl;
+    XOnlyPubKey spend_pubkey{spend_pubkey_data};
+
+    return {scan_pubkey, spend_pubkey};
+}
+
 std::vector<unsigned char> DecodeSilentAddress(const std::string& str)
 {
     const auto& params{Params()};
@@ -364,16 +398,16 @@ std::vector<unsigned char> DecodeSilentAddress(const std::string& str)
     const auto& silent_payment_hrp = params.SilentPaymentHRP();
     auto dest_silent_payment_hrp = ToLower(std::string_view(str).substr(0, params.SilentPaymentHRP().size()));
 
-    bool is_sp = dest_silent_payment_hrp == silent_payment_hrp;
-
-    if (!is_sp) {
+    if (dest_silent_payment_hrp != silent_payment_hrp) {
         return {};
     }
 
     std::vector<unsigned char> data;
     data.clear();
-    const auto dec = bech32::Decode(str);
+    const auto dec = bech32::Decode(str, /*silent*/true);
     auto dec_silent_payment_hrp = dec.hrp.substr(0, params.SilentPaymentHRP().size());
+
+    std::cout << "dec.data.size: " << dec.data.size() << std::endl;
 
     if (dec.encoding != bech32::Encoding::BECH32M || dec.data.empty() || dec.hrp != silent_payment_hrp) {
         return {};
