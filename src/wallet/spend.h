@@ -9,6 +9,7 @@
 #include <policy/fees.h> // for FeeCalculation
 #include <util/result.h>
 #include <wallet/coinselection.h>
+#include <wallet/receive.h>
 #include <wallet/transaction.h>
 #include <wallet/wallet.h>
 
@@ -29,6 +30,18 @@ struct TxSize {
 TxSize CalculateMaximumSignedTxSize(const CTransaction& tx, const CWallet* wallet, const std::vector<CTxOut>& txouts, const CCoinControl* coin_control = nullptr);
 TxSize CalculateMaximumSignedTxSize(const CTransaction& tx, const CWallet* wallet, const CCoinControl* coin_control = nullptr) EXCLUSIVE_LOCKS_REQUIRED(wallet->cs_wallet);
 
+
+enum class CoinStatus {
+    TRUSTED,
+    UNTRUSTED_PENDING,
+    IMMATURE
+};
+
+enum class CoinOwnership {
+    MINE,
+    WATCH_ONLY
+};
+
 /**
  * COutputs available for spending, stored by OutputType.
  * This struct is really just a wrapper around OutputType vectors with a convenient
@@ -39,6 +52,9 @@ TxSize CalculateMaximumSignedTxSize(const CTransaction& tx, const CWallet* walle
  */
 struct CoinsResult {
     std::map<OutputType, std::vector<COutput>> coins;
+    // std::map<std::pair<CoinOwnership,CoinStatus>, std::vector<COutput>> coins_classification;
+
+    std::map<std::pair<CoinOwnership,CoinStatus>, CAmount> balances;
 
     /** Concatenate and return all COutputs as one vector */
     std::vector<COutput> All() const;
@@ -50,9 +66,12 @@ struct CoinsResult {
     void Erase(const std::unordered_set<COutPoint, SaltedOutpointHasher>& coins_to_remove);
     void Shuffle(FastRandomContext& rng_fast);
     void Add(OutputType type, const COutput& out);
+    void Add(CoinOwnership ownership, CoinStatus status, OutputType type, const COutput& out);
 
     CAmount GetTotalAmount() { return total_amount; }
     std::optional<CAmount> GetEffectiveTotalAmount() {return total_effective_amount; }
+
+    Balance balance;
 
 private:
     /** Sum of all available coins raw value */
@@ -74,6 +93,11 @@ struct CoinFilterParams {
     bool only_spendable{true};
     // By default, do not include immature coinbase outputs
     bool include_immature_coinbase{false};
+    // By default, do not include locked coins
+    bool include_locked_coins{false};
+    // By default, do not include coins from transactions that are not in our mempool
+    // Even with this option enabled, conflicted or inactive transactions will not be included
+    bool include_tx_not_in_mempool{false};
 };
 
 /**

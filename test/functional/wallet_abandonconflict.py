@@ -173,6 +173,11 @@ class AbandonConflictTest(BitcoinTestFramework):
         self.nodes[0].loadwallet("bob")
         bob = self.nodes[0].get_wallet_rpc("bob")
 
+        # print("balance before generate", alice.getbalance())
+        # print(len(alice.listunspent(0)))
+
+        alice_balance_before_last_block = alice.getbalance()
+
         # Create a double spend of AB1 by spending again from only A's 10 output
         # Mine double spend from node 1
         inputs = []
@@ -185,6 +190,9 @@ class AbandonConflictTest(BitcoinTestFramework):
         double_spend_txid = self.nodes[1].sendrawtransaction(signed["hex"])
         self.connect_nodes(0, 1)
         self.generate(self.nodes[1], 1)
+
+        # print("balance after generate", alice.getbalance())
+        # print(len(alice.listunspent(0)))
 
         tx_list = alice.listtransactions()
 
@@ -230,15 +238,30 @@ class AbandonConflictTest(BitcoinTestFramework):
         assert_equal(newbalance, balance + Decimal("20"))
         balance = newbalance
 
+        # print(self.nodes[1].getblock(self.nodes[0].getbestblockhash(), 3))
+
         # There is currently a minor bug around this and so this test doesn't work.  See Issue #7315
         # Invalidate the block with the double spend and B's 10 BTC output should no longer be available
         # Don't think C's should either
         self.nodes[0].invalidateblock(self.nodes[0].getbestblockhash())
         newbalance = alice.getbalance()
-        #assert_equal(newbalance, balance - Decimal("10"))
-        self.log.info("If balance has not declined after invalidateblock then out of mempool wallet tx which is no longer")
-        self.log.info("conflicted has not resumed causing its inputs to be seen as spent.  See Issue #7315")
-        assert_equal(balance, newbalance)
+
+        print("balance in the end", balance)
+
+        # assert_equal(newbalance, balance - Decimal("20"))
+        assert_equal(newbalance, alice_balance_before_last_block)
+        # self.log.info("If balance has not declined after invalidateblock then out of mempool wallet tx which is no longer")
+        # self.log.info("conflicted has not resumed causing its inputs to be seen as spent.  See Issue #7315")
+        # assert_equal(balance, newbalance)
+
+
+
+
+        # print("2. alice.getbalances()", alice.getbalances())
+
+        # print("2. alice balance", balance)
+        # print("2. alice newbalance", newbalance)
+        #print("2. bob balance  ", bob.getbalance())
 
 
 if __name__ == '__main__':

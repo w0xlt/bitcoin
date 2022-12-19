@@ -138,6 +138,27 @@ void CoinsResult::Add(OutputType type, const COutput& out)
     }
 }
 
+void CoinsResult::Add(CoinOwnership ownership, CoinStatus status, OutputType type, const COutput& out)
+{
+    // coins_classification[std::make_pair(ownership,status)].emplace_back(out);
+
+    Add(type, out);
+    balances[std::make_pair(ownership,status)] += out.txout.nValue;
+
+    // if (ownership == CoinOwnership::WATCH_ONLY) {
+    //     balances[std::make_pair(CoinOwnership::MINE,status)] += out.txout.nValue;
+    // }
+
+    /*
+    if (status == CoinStatus::IMMATURE) {
+        if(ownership == CoinOwnership::MINE) {
+            balance.m_mine_immature += out.txout.nValue;
+        } else if (ownership == CoinOwnership::WATCH_ONLY) {
+            balance.m_watchonly_immature += out.txout.nValue;
+        }
+    } else if () */
+}
+
 static OutputType GetOutputType(TxoutType type, bool is_from_p2sh)
 {
     switch (type) {
@@ -215,14 +236,30 @@ CoinsResult AvailableCoins(const CWallet& wallet,
     const int max_depth = {coinControl ? coinControl->m_max_depth : DEFAULT_MAX_DEPTH};
     const bool only_safe = {coinControl ? !coinControl->m_include_unsafe_inputs : true};
 
+
+    wallet.WalletLogPrintf("--> TEST\n");
+
+    wallet.WalletLogPrintf("wallet.mapWallet size: %d\n", wallet.mapWallet.size());
+
     std::set<uint256> trusted_parents;
     for (const auto& entry : wallet.mapWallet)
     {
+        CoinOwnership coin_ownership{CoinOwnership::MINE};
+        CoinStatus coin_status{CoinStatus::TRUSTED};
+
         const uint256& wtxid = entry.first;
         const CWalletTx& wtx = entry.second;
 
-        if (wallet.IsTxImmatureCoinBase(wtx) && !params.include_immature_coinbase)
-            continue;
+        /* if (wallet.IsTxImmatureCoinBase(wtx) && !params.include_immature_coinbase)
+            continue; */
+
+        if (wallet.IsTxImmatureCoinBase(wtx)) {
+            if (!params.include_immature_coinbase) {
+                continue;
+            } else {
+                coin_status = CoinStatus::IMMATURE;
+            }
+        }
 
         int nDepth = wallet.GetTxDepthInMainChain(wtx);
         if (nDepth < 0)
@@ -230,8 +267,15 @@ CoinsResult AvailableCoins(const CWallet& wallet,
 
         // We should not consider coins which aren't at least in our mempool
         // It's possible for these to be conflicted via ancestors which we may never be able to detect
-        if (nDepth == 0 && !wtx.InMempool())
-            continue;
+        if (nDepth == 0 && !wtx.InMempool()) {
+            if (!params.include_tx_not_in_mempool) {
+                continue;
+            }
+
+            if (!wtx.state<TxStateConflicted>() || !wtx.state<TxStateInactive>()) {
+                continue;
+            }
+        }
 
         bool safeTx = CachedTxIsTrusted(wallet, wtx, trusted_parents);
 
@@ -270,7 +314,12 @@ CoinsResult AvailableCoins(const CWallet& wallet,
             continue;
         }
 
+        if (wtx.InMempool() && !safeTx) {
+            coin_status = CoinStatus::UNTRUSTED_PENDING;
+        }
+
         if (nDepth < min_depth || nDepth > max_depth) {
+            wallet.WalletLogPrintf("--> XCMSN nDepth < min_depth || nDepth > max_depth\n");
             continue;
         }
 
@@ -280,28 +329,28 @@ CoinsResult AvailableCoins(const CWallet& wallet,
             const CTxOut& output = wtx.tx->vout[i];
             const COutPoint outpoint(wtxid, i);
 
-            if (output.nValue < params.min_amount || output.nValue > params.max_amount)
-                continue;
+            if (output.nValue < params.min_amount || output.nValue > params.max_amount) continue;
 
             // Skip manually selected coins (the caller can fetch them directly)
-            if (coinControl && coinControl->HasSelected() && coinControl->IsSelected(outpoint))
-                continue;
+            if (coinControl && coinControl->HasSelected() && coinControl->IsSelected(outpoint)) continue;
 
-            if (wallet.IsLockedCoin(outpoint))
-                continue;
+            if (wallet.IsLockedCoin(outpoint) && !params.include_locked_coins) continue;
 
-            if (wallet.IsSpent(outpoint))
-                continue;
+            if (wallet.IsSpent(outpoint) || (!allow_used_addresses && wallet.IsSpentKey(output.scriptPubKey))) continue;
+            // if (wallet.IsSpent(outpoint)) {
+            //     wtx.isConflicted();
+            //     wallet.WalletLogPrintf("--> STEP 4\n");
+            //     continue;
+            // }
 
             isminetype mine = wallet.IsMine(output);
 
-            if (mine == ISMINE_NO) {
-                continue;
-            }
+            if (mine == ISMINE_NO) continue;
 
-            if (!allow_used_addresses && wallet.IsSpentKey(output.scriptPubKey)) {
-                continue;
-            }
+            // if (!allow_used_addresses && wallet.IsSpentKey(output.scriptPubKey)) {
+            //     wallet.WalletLogPrintf("--> STEP 6\n");
+            //     continue;
+            // }
 
             std::unique_ptr<SigningProvider> provider = wallet.GetSolvingProvider(output.scriptPubKey);
 
@@ -313,6 +362,10 @@ CoinsResult AvailableCoins(const CWallet& wallet,
 
             // Filter by spendable outputs only
             if (!spendable && params.only_spendable) continue;
+
+            if (mine & ISMINE_WATCH_ONLY) {
+                coin_ownership = CoinOwnership::WATCH_ONLY;
+            }
 
             // Obtain script type
             std::vector<std::vector<uint8_t>> script_solutions;
@@ -330,7 +383,7 @@ CoinsResult AvailableCoins(const CWallet& wallet,
                 is_from_p2sh = true;
             }
 
-            result.Add(GetOutputType(type, is_from_p2sh),
+            result.Add(coin_ownership, coin_status, GetOutputType(type, is_from_p2sh),
                        COutput(outpoint, output, nDepth, input_bytes, spendable, solvable, safeTx, wtx.GetTxTime(), tx_from_me, feerate));
 
             // Checks the sum amount of all UTXO's.

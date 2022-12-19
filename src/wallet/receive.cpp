@@ -4,7 +4,9 @@
 
 #include <consensus/amount.h>
 #include <consensus/consensus.h>
+#include <wallet/coincontrol.h>
 #include <wallet/receive.h>
+#include <wallet/spend.h>
 #include <wallet/transaction.h>
 #include <wallet/wallet.h>
 
@@ -156,40 +158,41 @@ CAmount CachedTxGetImmatureCredit(const CWallet& wallet, const CWalletTx& wtx, c
     return 0;
 }
 
-CAmount CachedTxGetAvailableCredit(const CWallet& wallet, const CWalletTx& wtx, const isminefilter& filter)
-{
-    AssertLockHeld(wallet.cs_wallet);
+// CAmount CachedTxGetAvailableCredit(const CWallet& wallet, const CWalletTx& wtx, const isminefilter& filter)
+// {
+//     AssertLockHeld(wallet.cs_wallet);
 
-    // Avoid caching ismine for NO or ALL cases (could remove this check and simplify in the future).
-    bool allow_cache = (filter & ISMINE_ALL) && (filter & ISMINE_ALL) != ISMINE_ALL;
+//     // Avoid caching ismine for NO or ALL cases (could remove this check and simplify in the future).
+//     bool allow_cache = (filter & ISMINE_ALL) && (filter & ISMINE_ALL) != ISMINE_ALL;
 
-    // Must wait until coinbase is safely deep enough in the chain before valuing it
-    if (wallet.IsTxImmatureCoinBase(wtx))
-        return 0;
+//     // Must wait until coinbase is safely deep enough in the chain before valuing it
+//     if (wallet.IsTxImmatureCoinBase(wtx))
+//         return 0;
 
-    if (allow_cache && wtx.m_amounts[CWalletTx::AVAILABLE_CREDIT].m_cached[filter]) {
-        return wtx.m_amounts[CWalletTx::AVAILABLE_CREDIT].m_value[filter];
-    }
+//     if (allow_cache && wtx.m_amounts[CWalletTx::AVAILABLE_CREDIT].m_cached[filter]) {
+//         return wtx.m_amounts[CWalletTx::AVAILABLE_CREDIT].m_value[filter];
+//     }
 
-    bool allow_used_addresses = (filter & ISMINE_USED) || !wallet.IsWalletFlagSet(WALLET_FLAG_AVOID_REUSE);
-    CAmount nCredit = 0;
-    uint256 hashTx = wtx.GetHash();
-    for (unsigned int i = 0; i < wtx.tx->vout.size(); i++) {
-        const CTxOut& txout = wtx.tx->vout[i];
-        if (!wallet.IsSpent(COutPoint(hashTx, i)) && (allow_used_addresses || !wallet.IsSpentKey(txout.scriptPubKey))) {
-            nCredit += OutputGetCredit(wallet, txout, filter);
-            if (!MoneyRange(nCredit))
-                throw std::runtime_error(std::string(__func__) + " : value out of range");
-        }
-    }
+//     bool allow_used_addresses = (filter & ISMINE_USED) || !wallet.IsWalletFlagSet(WALLET_FLAG_AVOID_REUSE);
 
-    if (allow_cache) {
-        wtx.m_amounts[CWalletTx::AVAILABLE_CREDIT].Set(filter, nCredit);
-        wtx.m_is_cache_empty = false;
-    }
+//     CAmount nCredit = 0;
+//     uint256 hashTx = wtx.GetHash();
+//     for (unsigned int i = 0; i < wtx.tx->vout.size(); i++) {
+//         const CTxOut& txout = wtx.tx->vout[i];
+//         if (!wallet.IsSpent(COutPoint(hashTx, i)) && (allow_used_addresses || !wallet.IsSpentKey(txout.scriptPubKey))) {
+//             nCredit += OutputGetCredit(wallet, txout, filter);
+//             if (!MoneyRange(nCredit))
+//                 throw std::runtime_error(std::string(__func__) + " : value out of range");
+//         }
+//     }
 
-    return nCredit;
-}
+//     if (allow_cache) {
+//         wtx.m_amounts[CWalletTx::AVAILABLE_CREDIT].Set(filter, nCredit);
+//         wtx.m_is_cache_empty = false;
+//     }
+
+//     return nCredit;
+// }
 
 void CachedTxGetAmounts(const CWallet& wallet, const CWalletTx& wtx,
                   std::list<COutputEntry>& listReceived,
@@ -293,18 +296,35 @@ bool CachedTxIsTrusted(const CWallet& wallet, const CWalletTx& wtx)
 Balance GetBalance(const CWallet& wallet, const int min_depth, bool avoid_reuse)
 {
     Balance ret;
-    isminefilter reuse_filter = avoid_reuse ? ISMINE_NO : ISMINE_USED;
+    //isminefilter reuse_filter = avoid_reuse ? ISMINE_NO : ISMINE_USED;
     {
         LOCK(wallet.cs_wallet);
-        std::set<uint256> trusted_parents;
+        /* std::set<uint256> trusted_parents;
+
+        std::set<uint256> wtx_ids;
+
+        wallet.WalletLogPrintf("GetBalance()\n");
+
         for (const auto& entry : wallet.mapWallet)
         {
             const CWalletTx& wtx = entry.second;
+
+            wallet.WalletLogPrintf("CACHED TX wtx.id: %s\n", HexStr(wtx.GetHash()));
+
             const bool is_trusted{CachedTxIsTrusted(wallet, wtx, trusted_parents)};
             const int tx_depth{wallet.GetTxDepthInMainChain(wtx)};
             const CAmount tx_credit_mine{CachedTxGetAvailableCredit(wallet, wtx, ISMINE_SPENDABLE | reuse_filter)};
             const CAmount tx_credit_watchonly{CachedTxGetAvailableCredit(wallet, wtx, ISMINE_WATCH_ONLY | reuse_filter)};
+
+            // wallet.WalletLogPrintf("wtx.id: %s\n", HexStr(wtx.GetHash()));
+            // wallet.WalletLogPrintf("is_trusted: %s\n", is_trusted ? "yes" : "no");
+            // wallet.WalletLogPrintf("tx_depth: %d\n", tx_depth);
+            // wallet.WalletLogPrintf("tx_credit_mine: %d\n", tx_credit_mine);
+
             if (is_trusted && tx_depth >= min_depth) {
+                if (tx_credit_mine != 0) {
+                    wtx_ids.insert(wtx.GetHash());
+                }
                 ret.m_mine_trusted += tx_credit_mine;
                 ret.m_watchonly_trusted += tx_credit_watchonly;
             }
@@ -314,8 +334,65 @@ Balance GetBalance(const CWallet& wallet, const int min_depth, bool avoid_reuse)
             }
             ret.m_mine_immature += CachedTxGetImmatureCredit(wallet, wtx, ISMINE_SPENDABLE);
             ret.m_watchonly_immature += CachedTxGetImmatureCredit(wallet, wtx, ISMINE_WATCH_ONLY);
-        }
+        } */
+
+        wallet::CCoinControl coin_control;
+        coin_control.m_include_unsafe_inputs = true;
+        coin_control.m_avoid_address_reuse = avoid_reuse;
+        coin_control.m_min_depth = min_depth;
+
+        CoinFilterParams coin_filter;
+        coin_filter.only_spendable = false;
+        coin_filter.include_immature_coinbase = true;
+        coin_filter.include_locked_coins = true;
+        coin_filter.include_tx_not_in_mempool = true;
+
+        auto res = wallet::AvailableCoins(wallet, &coin_control, /*feerate=*/std::nullopt, coin_filter);
+
+        // wallet.WalletLogPrintf("-----\n");
+
+        // for(const auto& coin: res.All()) {
+        //     wallet.WalletLogPrintf("coin.outpoint.hash: %s\n", HexStr(coin.outpoint.hash));
+        //     wallet.WalletLogPrintf("coin.outpoint.n: %d\n", coin.outpoint.n);
+        //     wallet.WalletLogPrintf("coin.txout.nValue: %d\n", coin.txout.nValue);
+        // }
+
+        // auto amount = res.GetTotalAmount();
+
+        // for (uint256 wtx_id: wtx_ids) {
+        //     bool is_found = false;
+        //     for (const auto& output: res.All()) {
+        //         if (wtx_id == output.outpoint.hash) {
+        //             is_found = true;
+        //             break;
+        //         }
+        //     }
+        //     if (!is_found) {
+        //         wallet.WalletLogPrintf("wtx diff %s\n", HexStr(wtx_id));
+        //     }
+        // }
+
+        // std::cout << "--> amount: " << amount << std::endl;
+        // std::cout << "--> balance.m_mine_trusted: " << res.balances[std::make_pair(CoinOwnership::MINE,CoinStatus::TRUSTED)] << std::endl;
+        // std::cout << "--> balance.m_mine_untrusted_pending: " << res.balances[std::make_pair(CoinOwnership::MINE,CoinStatus::UNTRUSTED_PENDING)] << std::endl;
+        // std::cout << "--> balance.m_mine_immature: " << res.balances[std::make_pair(CoinOwnership::MINE,CoinStatus::IMMATURE)] << std::endl;
+
+        // wallet.WalletLogPrintf("wtx_ids.Size %d\n", wtx_ids.size());
+        // wallet.WalletLogPrintf("legacy TRUSTED VALUE %d\n", ret.m_mine_trusted);
+
+        // wallet.WalletLogPrintf("result.Size: %d\n", res.Size());
+        // wallet.WalletLogPrintf("result.balances.TRUSTED: %d\n", res.balances[std::make_pair(CoinOwnership::MINE,CoinStatus::TRUSTED)]);
+
+        ret.m_mine_trusted = res.balances[std::make_pair(CoinOwnership::MINE,CoinStatus::TRUSTED)];
+        ret.m_mine_untrusted_pending = res.balances[std::make_pair(CoinOwnership::MINE,CoinStatus::UNTRUSTED_PENDING)];
+        ret.m_mine_immature = res.balances[std::make_pair(CoinOwnership::MINE,CoinStatus::IMMATURE)];
+
+        ret.m_watchonly_trusted = res.balances[std::make_pair(CoinOwnership::WATCH_ONLY,CoinStatus::TRUSTED)];
+        ret.m_watchonly_untrusted_pending = res.balances[std::make_pair(CoinOwnership::WATCH_ONLY,CoinStatus::UNTRUSTED_PENDING)];
+        ret.m_watchonly_immature = res.balances[std::make_pair(CoinOwnership::WATCH_ONLY,CoinStatus::IMMATURE)];
+
     }
+
     return ret;
 }
 

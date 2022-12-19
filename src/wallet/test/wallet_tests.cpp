@@ -937,7 +937,13 @@ BOOST_FIXTURE_TEST_CASE(wallet_sync_tx_invalid_state_test, TestingSetup)
         // Cache and verify available balance for the wtx
         LOCK(wallet.cs_wallet);
         const CWalletTx* wtx_to_spend = wallet.GetWalletTx(tx_id_to_spend);
-        BOOST_CHECK_EQUAL(CachedTxGetAvailableCredit(wallet, *wtx_to_spend), 1 * COIN);
+        //BOOST_CHECK_EQUAL(CachedTxGetAvailableCredit(wallet, *wtx_to_spend), 1 * COIN);
+
+        const auto bal = GetBalance(wallet);
+        // std::cout << "bal.m_mine_trusted: " << bal.m_mine_trusted << std::endl;
+        // std::cout << "bal.m_mine_untrusted_pending: " << bal.m_mine_untrusted_pending << std::endl;
+
+        BOOST_CHECK_EQUAL(bal.m_mine_untrusted_pending, 1 * COIN);
     }
 
     // Now the good case:
@@ -952,12 +958,20 @@ BOOST_FIXTURE_TEST_CASE(wallet_sync_tx_invalid_state_test, TestingSetup)
     {
         // Verify balance update for the new tx and the old one
         LOCK(wallet.cs_wallet);
-        const CWalletTx* new_wtx = wallet.GetWalletTx(good_tx_id);
-        BOOST_CHECK_EQUAL(CachedTxGetAvailableCredit(wallet, *new_wtx), 1 * COIN);
+        // const CWalletTx* new_wtx = wallet.GetWalletTx(good_tx_id);
+
+        const auto bal = GetBalance(wallet);
+        // std::cout << "bal.m_mine_trusted: " << bal.m_mine_trusted << std::endl;
+        // std::cout << "bal.m_mine_untrusted_pending: " << bal.m_mine_untrusted_pending << std::endl;
+
+        // Verify tx is spent
+        BOOST_CHECK_EQUAL(bal.m_mine_untrusted_pending, 0);
+
+        //BOOST_CHECK_EQUAL(CachedTxGetAvailableCredit(wallet, *new_wtx), 1 * COIN);
 
         // Now the old wtx
-        const CWalletTx* wtx_to_spend = wallet.GetWalletTx(tx_id_to_spend);
-        BOOST_CHECK_EQUAL(CachedTxGetAvailableCredit(wallet, *wtx_to_spend), 0 * COIN);
+        // const CWalletTx* wtx_to_spend = wallet.GetWalletTx(tx_id_to_spend);
+        //BOOST_CHECK_EQUAL(CachedTxGetAvailableCredit(wallet, *wtx_to_spend), 0 * COIN);
     }
 
     // Now the bad case:
