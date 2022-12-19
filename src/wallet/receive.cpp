@@ -5,6 +5,7 @@
 #include <consensus/amount.h>
 #include <consensus/consensus.h>
 #include <wallet/receive.h>
+#include <wallet/spend.h>
 #include <wallet/transaction.h>
 #include <wallet/wallet.h>
 
@@ -315,7 +316,18 @@ Balance GetBalance(const CWallet& wallet, const int min_depth, bool avoid_reuse)
             ret.m_mine_immature += CachedTxGetImmatureCredit(wallet, wtx, ISMINE_SPENDABLE);
             ret.m_watchonly_immature += CachedTxGetImmatureCredit(wallet, wtx, ISMINE_WATCH_ONLY);
         }
+
+        CoinFilterParams coin_filter;
+        coin_filter.include_immature_coinbase = true;
+
+        auto res = wallet::AvailableCoins(wallet, /*coinControl=*/nullptr, /*feerate=*/std::nullopt, coin_filter);
+        auto amount = res.GetTotalAmount();
+
+        std::cout << "--> amount: " << amount << std::endl;
+        std::cout << "--> balance.m_mine_trusted: " << res.balances[std::make_pair(CoinOwnership::MINE,CoinStatus::TRUSTED)] << std::endl;
+        std::cout << "--> balance.m_mine_immature: " << res.balances[std::make_pair(CoinOwnership::MINE,CoinStatus::IMMATURE)] << std::endl;
     }
+
     return ret;
 }
 

@@ -138,6 +138,23 @@ void CoinsResult::Add(OutputType type, const COutput& out)
     }
 }
 
+void CoinsResult::Add(CoinOwnership ownership, CoinStatus status, OutputType type, const COutput& out)
+{
+    // coins_classification[std::make_pair(ownership,status)].emplace_back(out);
+
+    Add(type, out);
+    balances[std::make_pair(ownership,status)] += out.txout.nValue;
+
+    /* 
+    if (status == CoinStatus::IMMATURE) {
+        if(ownership == CoinOwnership::MINE) {
+            balance.m_mine_immature += out.txout.nValue;
+        } else if (ownership == CoinOwnership::WATCH_ONLY) {
+            balance.m_watchonly_immature += out.txout.nValue;
+        }
+    } else if () */
+}
+
 static OutputType GetOutputType(TxoutType type, bool is_from_p2sh)
 {
     switch (type) {
@@ -218,11 +235,22 @@ CoinsResult AvailableCoins(const CWallet& wallet,
     std::set<uint256> trusted_parents;
     for (const auto& entry : wallet.mapWallet)
     {
+        CoinOwnership coin_ownership{CoinOwnership::MINE};
+        CoinStatus coin_status{CoinStatus::TRUSTED};
+
         const uint256& wtxid = entry.first;
         const CWalletTx& wtx = entry.second;
 
-        if (wallet.IsTxImmatureCoinBase(wtx) && !params.include_immature_coinbase)
-            continue;
+        /* if (wallet.IsTxImmatureCoinBase(wtx) && !params.include_immature_coinbase)
+            continue; */
+
+        if (wallet.IsTxImmatureCoinBase(wtx)) {
+            if (!params.include_immature_coinbase) {
+                continue;
+            } else {
+                coin_status = CoinStatus::IMMATURE;
+            }
+        }
 
         int nDepth = wallet.GetTxDepthInMainChain(wtx);
         if (nDepth < 0)
@@ -330,7 +358,7 @@ CoinsResult AvailableCoins(const CWallet& wallet,
                 is_from_p2sh = true;
             }
 
-            result.Add(GetOutputType(type, is_from_p2sh),
+            result.Add(coin_ownership, coin_status, GetOutputType(type, is_from_p2sh),
                        COutput(outpoint, output, nDepth, input_bytes, spendable, solvable, safeTx, wtx.GetTxTime(), tx_from_me, feerate));
 
             // Checks the sum amount of all UTXO's.
