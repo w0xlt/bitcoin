@@ -4,6 +4,7 @@
 
 #include <consensus/amount.h>
 #include <consensus/consensus.h>
+#include <wallet/coincontrol.h>
 #include <wallet/receive.h>
 #include <wallet/spend.h>
 #include <wallet/transaction.h>
@@ -317,15 +318,26 @@ Balance GetBalance(const CWallet& wallet, const int min_depth, bool avoid_reuse)
             ret.m_watchonly_immature += CachedTxGetImmatureCredit(wallet, wtx, ISMINE_WATCH_ONLY);
         }
 
+        wallet::CCoinControl coin_control;
+        coin_control.m_include_unsafe_inputs = true;
+        coin_control.m_avoid_address_reuse = avoid_reuse;
+        coin_control.m_min_depth = min_depth;
+
         CoinFilterParams coin_filter;
         coin_filter.include_immature_coinbase = true;
+        coin_filter.include_locked_coins = true;
 
-        auto res = wallet::AvailableCoins(wallet, /*coinControl=*/nullptr, /*feerate=*/std::nullopt, coin_filter);
+        auto res = wallet::AvailableCoins(wallet, &coin_control, /*feerate=*/std::nullopt, coin_filter);
         auto amount = res.GetTotalAmount();
 
-        std::cout << "--> amount: " << amount << std::endl;
-        std::cout << "--> balance.m_mine_trusted: " << res.balances[std::make_pair(CoinOwnership::MINE,CoinStatus::TRUSTED)] << std::endl;
-        std::cout << "--> balance.m_mine_immature: " << res.balances[std::make_pair(CoinOwnership::MINE,CoinStatus::IMMATURE)] << std::endl;
+        // std::cout << "--> amount: " << amount << std::endl;
+        // std::cout << "--> balance.m_mine_trusted: " << res.balances[std::make_pair(CoinOwnership::MINE,CoinStatus::TRUSTED)] << std::endl;
+        // std::cout << "--> balance.m_mine_untrusted_pending: " << res.balances[std::make_pair(CoinOwnership::MINE,CoinStatus::UNTRUSTED_PENDING)] << std::endl;
+        // std::cout << "--> balance.m_mine_immature: " << res.balances[std::make_pair(CoinOwnership::MINE,CoinStatus::IMMATURE)] << std::endl;
+    
+        ret.m_mine_trusted = res.balances[std::make_pair(CoinOwnership::MINE,CoinStatus::TRUSTED)];
+        ret.m_mine_untrusted_pending = res.balances[std::make_pair(CoinOwnership::MINE,CoinStatus::UNTRUSTED_PENDING)];
+        ret.m_mine_immature = res.balances[std::make_pair(CoinOwnership::MINE,CoinStatus::IMMATURE)];
     }
 
     return ret;

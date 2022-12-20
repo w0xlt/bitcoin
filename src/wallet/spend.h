@@ -93,6 +93,8 @@ struct CoinFilterParams {
     bool only_spendable{true};
     // By default, do not include immature coinbase outputs
     bool include_immature_coinbase{false};
+    // By default, do not include locked coins
+    bool include_locked_coins{false};
 };
 
 /**

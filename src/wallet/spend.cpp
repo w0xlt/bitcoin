@@ -298,6 +298,10 @@ CoinsResult AvailableCoins(const CWallet& wallet,
             continue;
         }
 
+        if (wtx.InMempool() && !safeTx) {
+            coin_status = CoinStatus::UNTRUSTED_PENDING;
+        }
+
         if (nDepth < min_depth || nDepth > max_depth) {
             continue;
         }
@@ -315,8 +319,9 @@ CoinsResult AvailableCoins(const CWallet& wallet,
             if (coinControl && coinControl->HasSelected() && coinControl->IsSelected(outpoint))
                 continue;
 
-            if (wallet.IsLockedCoin(outpoint))
+            if (wallet.IsLockedCoin(outpoint) && !params.include_locked_coins) {
                 continue;
+            }
 
             if (wallet.IsSpent(outpoint))
                 continue;
