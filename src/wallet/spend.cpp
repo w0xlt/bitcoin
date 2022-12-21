@@ -232,6 +232,11 @@ CoinsResult AvailableCoins(const CWallet& wallet,
     const int max_depth = {coinControl ? coinControl->m_max_depth : DEFAULT_MAX_DEPTH};
     const bool only_safe = {coinControl ? !coinControl->m_include_unsafe_inputs : true};
 
+
+    wallet.WalletLogPrintf("--> TEST\n");
+
+    wallet.WalletLogPrintf("wallet.mapWallet size: %d\n", wallet.mapWallet.size());
+
     std::set<uint256> trusted_parents;
     for (const auto& entry : wallet.mapWallet)
     {
@@ -258,8 +263,13 @@ CoinsResult AvailableCoins(const CWallet& wallet,
 
         // We should not consider coins which aren't at least in our mempool
         // It's possible for these to be conflicted via ancestors which we may never be able to detect
-        if (nDepth == 0 && !wtx.InMempool())
-            continue;
+        if (nDepth == 0 && !wtx.InMempool()) {
+            if (!wtx.state<TxStateConflicted>()) {
+                continue;
+            }
+            wallet.WalletLogPrintf("--> XCMSN nDepth == 0 && !wtx.InMempool\n");
+        }
+            
 
         bool safeTx = CachedTxIsTrusted(wallet, wtx, trusted_parents);
 
@@ -303,6 +313,7 @@ CoinsResult AvailableCoins(const CWallet& wallet,
         }
 
         if (nDepth < min_depth || nDepth > max_depth) {
+            wallet.WalletLogPrintf("--> XCMSN nDepth < min_depth || nDepth > max_depth\n");
             continue;
         }
 

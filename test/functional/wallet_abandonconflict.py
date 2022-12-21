@@ -227,6 +227,10 @@ class AbandonConflictTest(BitcoinTestFramework):
 
         # Verify that B and C's 10 BTC outputs are available for spending again because AB1 is now conflicted
         newbalance = alice.getbalance()
+
+        print("--- balance")
+        print(alice.getbalances())
+
         assert_equal(newbalance, balance + Decimal("20"))
         balance = newbalance
 
@@ -235,9 +239,18 @@ class AbandonConflictTest(BitcoinTestFramework):
         # Don't think C's should either
         self.nodes[0].invalidateblock(self.nodes[0].getbestblockhash())
         newbalance = alice.getbalance()
+
+        print("--- newbalance")
+        print(alice.getbalances())
+
         #assert_equal(newbalance, balance - Decimal("10"))
         self.log.info("If balance has not declined after invalidateblock then out of mempool wallet tx which is no longer")
         self.log.info("conflicted has not resumed causing its inputs to be seen as spent.  See Issue #7315")
+
+        # print("---")
+        # print(balance)
+        # print(newbalance)
+
         assert_equal(balance, newbalance)
 
 
