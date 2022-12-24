@@ -145,7 +145,7 @@ void CoinsResult::Add(CoinOwnership ownership, CoinStatus status, OutputType typ
     Add(type, out);
     balances[std::make_pair(ownership,status)] += out.txout.nValue;
 
-    /* 
+    /*
     if (status == CoinStatus::IMMATURE) {
         if(ownership == CoinOwnership::MINE) {
             balance.m_mine_immature += out.txout.nValue;
@@ -264,12 +264,12 @@ CoinsResult AvailableCoins(const CWallet& wallet,
         // We should not consider coins which aren't at least in our mempool
         // It's possible for these to be conflicted via ancestors which we may never be able to detect
         if (nDepth == 0 && !wtx.InMempool()) {
-            if (!wtx.state<TxStateConflicted>()) {
+            if (!wtx.state<TxStateConflicted>() || !wtx.state<TxStateInactive>()) {
                 continue;
             }
             wallet.WalletLogPrintf("--> XCMSN nDepth == 0 && !wtx.InMempool\n");
         }
-            
+
 
         bool safeTx = CachedTxIsTrusted(wallet, wtx, trusted_parents);
 

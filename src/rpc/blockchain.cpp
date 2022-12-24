@@ -1536,6 +1536,8 @@ static RPCHelpMan invalidateblock()
     uint256 hash(ParseHashV(request.params[0], "blockhash"));
     BlockValidationState state;
 
+    LogPrintf("invalidateblock() called.\n");
+
     ChainstateManager& chainman = EnsureAnyChainman(request.context);
     CBlockIndex* pblockindex;
     {
