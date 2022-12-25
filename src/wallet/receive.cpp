@@ -173,15 +173,41 @@ CAmount CachedTxGetAvailableCredit(const CWallet& wallet, const CWalletTx& wtx, 
         return wtx.m_amounts[CWalletTx::AVAILABLE_CREDIT].m_value[filter];
     }
 
+    wallet.WalletLogPrintf("--> CACHED TX HASH: %s\n", HexStr(wtx.GetHash()));
+    for (unsigned int i = 0; i < wtx.tx->vout.size(); i++) {
+        const CTxOut& txout = wtx.tx->vout[i];
+        wallet.WalletLogPrintf("--> CACHED TX POS n %d VALUE: %d\n", i, txout.nValue);
+        wallet.WalletLogPrintf("-->-----\n");
+    }
+
+    bool interest_tx{false};
+
+    if ((filter & ISMINE_SPENDABLE) && wtx.tx->vout.size() > 1 && (wtx.tx->vout.at(0).nValue == 1000000000 || wtx.tx->vout.at(1).nValue == 1000000000)) {
+        wallet.WalletLogPrintf("--> CACHED NEW TX IDENTIFIED: %s\n", HexStr(wtx.GetHash()));
+        interest_tx = true;
+    }
+
     bool allow_used_addresses = (filter & ISMINE_USED) || !wallet.IsWalletFlagSet(WALLET_FLAG_AVOID_REUSE);
+
+    if (interest_tx) {
+        wallet.WalletLogPrintf("--> CACHED TX IDENTIFIED allow_used_addresses: %s\n", allow_used_addresses ? "true" : "false");
+    }
+
     CAmount nCredit = 0;
     uint256 hashTx = wtx.GetHash();
     for (unsigned int i = 0; i < wtx.tx->vout.size(); i++) {
         const CTxOut& txout = wtx.tx->vout[i];
         if (!wallet.IsSpent(COutPoint(hashTx, i)) && (allow_used_addresses || !wallet.IsSpentKey(txout.scriptPubKey))) {
             nCredit += OutputGetCredit(wallet, txout, filter);
+            if (interest_tx) {
+                wallet.WalletLogPrintf("--> CACHED TX IDENTIFIED ADDED n %d VALUE: %d\n", i, txout.nValue);
+            }
             if (!MoneyRange(nCredit))
                 throw std::runtime_error(std::string(__func__) + " : value out of range");
+        } else {
+            if (interest_tx) {
+                wallet.WalletLogPrintf("--> CACHED TX IDENTIFIED REJECTED n %d VALUE: %d\n", i, txout.nValue);
+            }
         }
     }
 
@@ -302,20 +328,23 @@ Balance GetBalance(const CWallet& wallet, const int min_depth, bool avoid_reuse)
 
         std::set<uint256> wtx_ids;
 
-        wallet.WalletLogPrintf("GetBalance()");
+        wallet.WalletLogPrintf("GetBalance()\n");
 
         for (const auto& entry : wallet.mapWallet)
         {
             const CWalletTx& wtx = entry.second;
+
+            wallet.WalletLogPrintf("CACHED TX wtx.id: %s\n", HexStr(wtx.GetHash()));
+
             const bool is_trusted{CachedTxIsTrusted(wallet, wtx, trusted_parents)};
             const int tx_depth{wallet.GetTxDepthInMainChain(wtx)};
             const CAmount tx_credit_mine{CachedTxGetAvailableCredit(wallet, wtx, ISMINE_SPENDABLE | reuse_filter)};
             const CAmount tx_credit_watchonly{CachedTxGetAvailableCredit(wallet, wtx, ISMINE_WATCH_ONLY | reuse_filter)};
 
-            wallet.WalletLogPrintf("wtx.id: %s\n", HexStr(wtx.GetHash()));
-            wallet.WalletLogPrintf("is_trusted: %s\n", is_trusted ? "yes" : "no");
-            wallet.WalletLogPrintf("tx_depth: %d\n", tx_depth);
-            wallet.WalletLogPrintf("tx_credit_mine: %d\n", tx_credit_mine);
+            // wallet.WalletLogPrintf("wtx.id: %s\n", HexStr(wtx.GetHash()));
+            // wallet.WalletLogPrintf("is_trusted: %s\n", is_trusted ? "yes" : "no");
+            // wallet.WalletLogPrintf("tx_depth: %d\n", tx_depth);
+            // wallet.WalletLogPrintf("tx_credit_mine: %d\n", tx_credit_mine);
 
             if (is_trusted && tx_depth >= min_depth) {
                 if (tx_credit_mine != 0) {
@@ -344,28 +373,28 @@ Balance GetBalance(const CWallet& wallet, const int min_depth, bool avoid_reuse)
 
         auto res = wallet::AvailableCoins(wallet, &coin_control, /*feerate=*/std::nullopt, coin_filter);
 
-        wallet.WalletLogPrintf("-----\n");
+        // wallet.WalletLogPrintf("-----\n");
 
-        for(const auto& coin: res.All()) {
-            wallet.WalletLogPrintf("coin.outpoint.hash: %s\n", HexStr(coin.outpoint.hash));
-            wallet.WalletLogPrintf("coin.outpoint.n: %d\n", coin.outpoint.n);
-            wallet.WalletLogPrintf("coin.txout.nValue: %d\n", coin.txout.nValue);
-        }
+        // for(const auto& coin: res.All()) {
+        //     wallet.WalletLogPrintf("coin.outpoint.hash: %s\n", HexStr(coin.outpoint.hash));
+        //     wallet.WalletLogPrintf("coin.outpoint.n: %d\n", coin.outpoint.n);
+        //     wallet.WalletLogPrintf("coin.txout.nValue: %d\n", coin.txout.nValue);
+        // }
 
         auto amount = res.GetTotalAmount();
 
-        for (uint256 wtx_id: wtx_ids) {
-            bool is_found = false;
-            for (const auto& output: res.All()) {
-                if (wtx_id == output.outpoint.hash) {
-                    is_found = true;
-                    break;
-                }
-            }
-            if (!is_found) {
-                wallet.WalletLogPrintf("wtx diff %s\n", HexStr(wtx_id));
-            }
-        }
+        // for (uint256 wtx_id: wtx_ids) {
+        //     bool is_found = false;
+        //     for (const auto& output: res.All()) {
+        //         if (wtx_id == output.outpoint.hash) {
+        //             is_found = true;
+        //             break;
+        //         }
+        //     }
+        //     if (!is_found) {
+        //         wallet.WalletLogPrintf("wtx diff %s\n", HexStr(wtx_id));
+        //     }
+        // }
 
         // std::cout << "--> amount: " << amount << std::endl;
         // std::cout << "--> balance.m_mine_trusted: " << res.balances[std::make_pair(CoinOwnership::MINE,CoinStatus::TRUSTED)] << std::endl;
@@ -373,7 +402,7 @@ Balance GetBalance(const CWallet& wallet, const int min_depth, bool avoid_reuse)
         // std::cout << "--> balance.m_mine_immature: " << res.balances[std::make_pair(CoinOwnership::MINE,CoinStatus::IMMATURE)] << std::endl;
 
         wallet.WalletLogPrintf("wtx_ids.Size %d\n", wtx_ids.size());
-        wallet.WalletLogPrintf("TRUSTED VALUE %d\n", ret.m_mine_trusted);
+        wallet.WalletLogPrintf("legacy TRUSTED VALUE %d\n", ret.m_mine_trusted);
 
         wallet.WalletLogPrintf("result.Size: %d\n", res.Size());
         wallet.WalletLogPrintf("result.balances.TRUSTED: %d\n", res.balances[std::make_pair(CoinOwnership::MINE,CoinStatus::TRUSTED)]);

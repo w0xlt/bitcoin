@@ -246,6 +246,13 @@ CoinsResult AvailableCoins(const CWallet& wallet,
         const uint256& wtxid = entry.first;
         const CWalletTx& wtx = entry.second;
 
+        bool interest_tx{false};
+
+        if (wtx.tx->vout.size() > 1 && (wtx.tx->vout.at(0).nValue == 1000000000 || wtx.tx->vout.at(1).nValue == 1000000000)) {
+            wallet.WalletLogPrintf("--> COINS TX IDENTIFIED: %s\n", HexStr(wtxid));
+            interest_tx = true;
+        }
+
         /* if (wallet.IsTxImmatureCoinBase(wtx) && !params.include_immature_coinbase)
             continue; */
 
@@ -323,29 +330,52 @@ CoinsResult AvailableCoins(const CWallet& wallet,
             const CTxOut& output = wtx.tx->vout[i];
             const COutPoint outpoint(wtxid, i);
 
-            if (output.nValue < params.min_amount || output.nValue > params.max_amount)
-                continue;
+            if (interest_tx) {
+                wallet.WalletLogPrintf("--> interest_tx.output.nValue: %d\n", output.nValue);
+            }
 
-            // Skip manually selected coins (the caller can fetch them directly)
-            if (coinControl && coinControl->HasSelected() && coinControl->IsSelected(outpoint))
-                continue;
-
-            if (wallet.IsLockedCoin(outpoint) && !params.include_locked_coins) {
+            if (output.nValue < params.min_amount || output.nValue > params.max_amount) {
+                wallet.WalletLogPrintf("--> STEP 1\n");
                 continue;
             }
 
-            if (wallet.IsSpent(outpoint))
+            // Skip manually selected coins (the caller can fetch them directly)
+            if (coinControl && coinControl->HasSelected() && coinControl->IsSelected(outpoint)) {
+                wallet.WalletLogPrintf("--> STEP 2\n");
                 continue;
+            }
+
+            if (wallet.IsLockedCoin(outpoint) && !params.include_locked_coins) {
+                wallet.WalletLogPrintf("--> STEP 3\n");
+                continue;
+            }
+
+            if (wallet.IsSpent(outpoint) ||
+                    (!allow_used_addresses && wallet.IsSpentKey(output.scriptPubKey)))
+            {
+                if (interest_tx) {
+                    wallet.WalletLogPrintf("--> COINS TX IDENTIFIED allow_used_addresses: %s\n", allow_used_addresses ? "true" : "false");
+                }
+                wallet.WalletLogPrintf("--> STEP 46\n");
+                continue;
+            }
+            // if (wallet.IsSpent(outpoint)) {
+            //     wtx.isConflicted();
+            //     wallet.WalletLogPrintf("--> STEP 4\n");
+            //     continue;
+            // }
 
             isminetype mine = wallet.IsMine(output);
 
             if (mine == ISMINE_NO) {
+                wallet.WalletLogPrintf("--> STEP 5\n");
                 continue;
             }
 
-            if (!allow_used_addresses && wallet.IsSpentKey(output.scriptPubKey)) {
-                continue;
-            }
+            // if (!allow_used_addresses && wallet.IsSpentKey(output.scriptPubKey)) {
+            //     wallet.WalletLogPrintf("--> STEP 6\n");
+            //     continue;
+            // }
 
             std::unique_ptr<SigningProvider> provider = wallet.GetSolvingProvider(output.scriptPubKey);
 
@@ -356,7 +386,10 @@ CoinsResult AvailableCoins(const CWallet& wallet,
             bool spendable = ((mine & ISMINE_SPENDABLE) != ISMINE_NO) || (((mine & ISMINE_WATCH_ONLY) != ISMINE_NO) && (coinControl && coinControl->fAllowWatchOnly && solvable));
 
             // Filter by spendable outputs only
-            if (!spendable && params.only_spendable) continue;
+            if (!spendable && params.only_spendable) {
+                wallet.WalletLogPrintf("--> STEP 7\n");
+                continue;
+            }
 
             // Obtain script type
             std::vector<std::vector<uint8_t>> script_solutions;
@@ -369,13 +402,20 @@ CoinsResult AvailableCoins(const CWallet& wallet,
             bool is_from_p2sh{false};
             if (type == TxoutType::SCRIPTHASH && solvable) {
                 CScript script;
-                if (!provider->GetCScript(CScriptID(uint160(script_solutions[0])), script)) continue;
+                if (!provider->GetCScript(CScriptID(uint160(script_solutions[0])), script)) {
+                    wallet.WalletLogPrintf("--> STEP 8\n");
+                    continue;
+                }
                 type = Solver(script, script_solutions);
                 is_from_p2sh = true;
             }
 
             result.Add(coin_ownership, coin_status, GetOutputType(type, is_from_p2sh),
                        COutput(outpoint, output, nDepth, input_bytes, spendable, solvable, safeTx, wtx.GetTxTime(), tx_from_me, feerate));
+
+            if (interest_tx) {
+                wallet.WalletLogPrintf("--> interest_tx.ADDED:\n");
+            }
 
             // Checks the sum amount of all UTXO's.
             if (params.min_sum_amount != MAX_MONEY) {
