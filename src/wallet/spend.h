@@ -95,8 +95,9 @@ struct CoinFilterParams {
     bool include_immature_coinbase{false};
     // By default, do not include locked coins
     bool include_locked_coins{false};
-
-    bool include_unknown{false};
+    // By default, do not include coins from transactions that are not in our mempool
+    // Even with this option enabled, conflicted or inactive transactions will not be included
+    bool include_tx_not_in_mempool{false};
 };
 
 /**

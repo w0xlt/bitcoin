@@ -344,7 +344,7 @@ Balance GetBalance(const CWallet& wallet, const int min_depth, bool avoid_reuse)
         CoinFilterParams coin_filter;
         coin_filter.include_immature_coinbase = true;
         coin_filter.include_locked_coins = true;
-        coin_filter.include_unknown = true;
+        coin_filter.include_tx_not_in_mempool = true;
 
         auto res = wallet::AvailableCoins(wallet, &coin_control, /*feerate=*/std::nullopt, coin_filter);
 

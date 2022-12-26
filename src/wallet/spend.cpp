@@ -264,12 +264,14 @@ CoinsResult AvailableCoins(const CWallet& wallet,
         // We should not consider coins which aren't at least in our mempool
         // It's possible for these to be conflicted via ancestors which we may never be able to detect
         if (nDepth == 0 && !wtx.InMempool()) {
+            if (!params.include_tx_not_in_mempool) {
+                continue;
+            }
+
             if (!wtx.state<TxStateConflicted>() || !wtx.state<TxStateInactive>()) {
                 continue;
             }
-            wallet.WalletLogPrintf("--> XCMSN nDepth == 0 && !wtx.InMempool\n");
         }
-
 
         bool safeTx = CachedTxIsTrusted(wallet, wtx, trusted_parents);
 
