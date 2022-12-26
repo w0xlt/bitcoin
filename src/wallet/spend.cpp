@@ -145,6 +145,10 @@ void CoinsResult::Add(CoinOwnership ownership, CoinStatus status, OutputType typ
     Add(type, out);
     balances[std::make_pair(ownership,status)] += out.txout.nValue;
 
+    // if (ownership == CoinOwnership::WATCH_ONLY) {
+    //     balances[std::make_pair(CoinOwnership::MINE,status)] += out.txout.nValue;
+    // }
+
     /*
     if (status == CoinStatus::IMMATURE) {
         if(ownership == CoinOwnership::MINE) {
@@ -358,6 +362,10 @@ CoinsResult AvailableCoins(const CWallet& wallet,
 
             // Filter by spendable outputs only
             if (!spendable && params.only_spendable) continue;
+
+            if (mine & ISMINE_WATCH_ONLY) {
+                coin_ownership = CoinOwnership::WATCH_ONLY;
+            }
 
             // Obtain script type
             std::vector<std::vector<uint8_t>> script_solutions;

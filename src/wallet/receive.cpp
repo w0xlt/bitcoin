@@ -296,10 +296,10 @@ bool CachedTxIsTrusted(const CWallet& wallet, const CWalletTx& wtx)
 Balance GetBalance(const CWallet& wallet, const int min_depth, bool avoid_reuse)
 {
     Balance ret;
-    isminefilter reuse_filter = avoid_reuse ? ISMINE_NO : ISMINE_USED;
+    //isminefilter reuse_filter = avoid_reuse ? ISMINE_NO : ISMINE_USED;
     {
         LOCK(wallet.cs_wallet);
-        std::set<uint256> trusted_parents;
+        /* std::set<uint256> trusted_parents;
 
         std::set<uint256> wtx_ids;
 
@@ -334,7 +334,7 @@ Balance GetBalance(const CWallet& wallet, const int min_depth, bool avoid_reuse)
             }
             ret.m_mine_immature += CachedTxGetImmatureCredit(wallet, wtx, ISMINE_SPENDABLE);
             ret.m_watchonly_immature += CachedTxGetImmatureCredit(wallet, wtx, ISMINE_WATCH_ONLY);
-        }
+        } */
 
         wallet::CCoinControl coin_control;
         coin_control.m_include_unsafe_inputs = true;
@@ -342,6 +342,7 @@ Balance GetBalance(const CWallet& wallet, const int min_depth, bool avoid_reuse)
         coin_control.m_min_depth = min_depth;
 
         CoinFilterParams coin_filter;
+        coin_filter.only_spendable = false;
         coin_filter.include_immature_coinbase = true;
         coin_filter.include_locked_coins = true;
         coin_filter.include_tx_not_in_mempool = true;
@@ -356,7 +357,7 @@ Balance GetBalance(const CWallet& wallet, const int min_depth, bool avoid_reuse)
         //     wallet.WalletLogPrintf("coin.txout.nValue: %d\n", coin.txout.nValue);
         // }
 
-        auto amount = res.GetTotalAmount();
+        // auto amount = res.GetTotalAmount();
 
         // for (uint256 wtx_id: wtx_ids) {
         //     bool is_found = false;
@@ -376,15 +377,20 @@ Balance GetBalance(const CWallet& wallet, const int min_depth, bool avoid_reuse)
         // std::cout << "--> balance.m_mine_untrusted_pending: " << res.balances[std::make_pair(CoinOwnership::MINE,CoinStatus::UNTRUSTED_PENDING)] << std::endl;
         // std::cout << "--> balance.m_mine_immature: " << res.balances[std::make_pair(CoinOwnership::MINE,CoinStatus::IMMATURE)] << std::endl;
 
-        wallet.WalletLogPrintf("wtx_ids.Size %d\n", wtx_ids.size());
-        wallet.WalletLogPrintf("legacy TRUSTED VALUE %d\n", ret.m_mine_trusted);
+        // wallet.WalletLogPrintf("wtx_ids.Size %d\n", wtx_ids.size());
+        // wallet.WalletLogPrintf("legacy TRUSTED VALUE %d\n", ret.m_mine_trusted);
 
-        wallet.WalletLogPrintf("result.Size: %d\n", res.Size());
-        wallet.WalletLogPrintf("result.balances.TRUSTED: %d\n", res.balances[std::make_pair(CoinOwnership::MINE,CoinStatus::TRUSTED)]);
+        // wallet.WalletLogPrintf("result.Size: %d\n", res.Size());
+        // wallet.WalletLogPrintf("result.balances.TRUSTED: %d\n", res.balances[std::make_pair(CoinOwnership::MINE,CoinStatus::TRUSTED)]);
 
         ret.m_mine_trusted = res.balances[std::make_pair(CoinOwnership::MINE,CoinStatus::TRUSTED)];
         ret.m_mine_untrusted_pending = res.balances[std::make_pair(CoinOwnership::MINE,CoinStatus::UNTRUSTED_PENDING)];
         ret.m_mine_immature = res.balances[std::make_pair(CoinOwnership::MINE,CoinStatus::IMMATURE)];
+
+        ret.m_watchonly_trusted = res.balances[std::make_pair(CoinOwnership::WATCH_ONLY,CoinStatus::TRUSTED)];
+        ret.m_watchonly_untrusted_pending = res.balances[std::make_pair(CoinOwnership::WATCH_ONLY,CoinStatus::UNTRUSTED_PENDING)];
+        ret.m_watchonly_immature = res.balances[std::make_pair(CoinOwnership::WATCH_ONLY,CoinStatus::IMMATURE)];
+
     }
 
     return ret;
