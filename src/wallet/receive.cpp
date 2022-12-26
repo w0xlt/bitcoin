@@ -173,25 +173,7 @@ CAmount CachedTxGetAvailableCredit(const CWallet& wallet, const CWalletTx& wtx, 
         return wtx.m_amounts[CWalletTx::AVAILABLE_CREDIT].m_value[filter];
     }
 
-    wallet.WalletLogPrintf("--> CACHED TX HASH: %s\n", HexStr(wtx.GetHash()));
-    for (unsigned int i = 0; i < wtx.tx->vout.size(); i++) {
-        const CTxOut& txout = wtx.tx->vout[i];
-        wallet.WalletLogPrintf("--> CACHED TX POS n %d VALUE: %d\n", i, txout.nValue);
-        wallet.WalletLogPrintf("-->-----\n");
-    }
-
-    bool interest_tx{false};
-
-    if ((filter & ISMINE_SPENDABLE) && wtx.tx->vout.size() > 1 && (wtx.tx->vout.at(0).nValue == 1000000000 || wtx.tx->vout.at(1).nValue == 1000000000)) {
-        wallet.WalletLogPrintf("--> CACHED NEW TX IDENTIFIED: %s\n", HexStr(wtx.GetHash()));
-        interest_tx = true;
-    }
-
     bool allow_used_addresses = (filter & ISMINE_USED) || !wallet.IsWalletFlagSet(WALLET_FLAG_AVOID_REUSE);
-
-    if (interest_tx) {
-        wallet.WalletLogPrintf("--> CACHED TX IDENTIFIED allow_used_addresses: %s\n", allow_used_addresses ? "true" : "false");
-    }
 
     CAmount nCredit = 0;
     uint256 hashTx = wtx.GetHash();
@@ -199,15 +181,8 @@ CAmount CachedTxGetAvailableCredit(const CWallet& wallet, const CWalletTx& wtx, 
         const CTxOut& txout = wtx.tx->vout[i];
         if (!wallet.IsSpent(COutPoint(hashTx, i)) && (allow_used_addresses || !wallet.IsSpentKey(txout.scriptPubKey))) {
             nCredit += OutputGetCredit(wallet, txout, filter);
-            if (interest_tx) {
-                wallet.WalletLogPrintf("--> CACHED TX IDENTIFIED ADDED n %d VALUE: %d\n", i, txout.nValue);
-            }
             if (!MoneyRange(nCredit))
                 throw std::runtime_error(std::string(__func__) + " : value out of range");
-        } else {
-            if (interest_tx) {
-                wallet.WalletLogPrintf("--> CACHED TX IDENTIFIED REJECTED n %d VALUE: %d\n", i, txout.nValue);
-            }
         }
     }
 
