@@ -578,6 +578,50 @@ static RPCHelpMan getblockheader()
     };
 }
 
+static RPCHelpMan getsilentpaymentblockdata()
+{
+    return RPCHelpMan{"getsilentpaymentblockdata",
+                "\nReturns a string that is serialized, hex-encoded data for the public key sum of candidate silent transaction inputs in the block.\n",
+                {
+                    {"blockhash", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "The block hash"},
+                },
+                {
+                    RPCResult{
+                        RPCResult::Type::OBJ, "", "",
+                        {
+                            {RPCResult::Type::NUM, "total_tx", "Total of candidate transactions in the block"},
+                            {RPCResult::Type::STR_HEX, "data", "A string that is serialized, hex-encoded data for the public key sum of candidate silent transaction inputs in the block (format <txid><sum_public_keys>)"},
+                        }},
+                },
+                RPCExamples{
+                    HelpExampleCli("getsilentpaymentblockdata", "\"00000000000000000002cbdf64ae445b53b545ba1e960f9e83787130d1530484\"")
+            + HelpExampleRpc("getsilentpaymentblockdata", "\"00000000000000000002cbdf64ae445b53b545ba1e960f9e83787130d1530484\"")
+                },
+        [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
+{
+    uint256 hash(ParseHashV(request.params[0], "hash"));
+
+    if (g_silentpaymentindex == nullptr) {
+        throw JSONRPCError(RPC_INTERNAL_ERROR, "Silent Payment index not enabled.");
+    }
+
+    const auto& items = g_silentpaymentindex->FindSilentPaymentByBlockHash(hash);
+
+    std::stringstream ss;
+
+    for (const auto& [pubkey, outpoint_hash] : items) {
+        ss << HexStr(pubkey);
+        ss << outpoint_hash.ToString();
+    }
+
+    UniValue ret(UniValue::VOBJ);
+    ret.pushKV("data", ss.str());
+    ret.pushKV("total_tx", items.size());
+    return ret;
+},
+    };
+}
+
 static CBlock GetBlockChecked(BlockManager& blockman, const CBlockIndex* pblockindex)
 {
     CBlock block;
@@ -2808,6 +2852,7 @@ void RegisterBlockchainRPCCommands(CRPCTable& t)
         {"blockchain", &getblockfrompeer},
         {"blockchain", &getblockhash},
         {"blockchain", &getblockheader},
+        {"blockchain", &getsilentpaymentblockdata},
         {"blockchain", &getchaintips},
         {"blockchain", &getdifficulty},
         {"blockchain", &getdeploymentinfo},
