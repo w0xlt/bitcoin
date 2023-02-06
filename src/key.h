@@ -104,6 +104,9 @@ public:
     //! Tweak a secret key by adding tweak to it.
     CKey AddTweak(const unsigned char *tweak32) const;
 
+    //! Tweak a secret key by adding tweak to it.
+    CKey MultiplyTweak(const unsigned char *tweak32) const;
+
     std::array<unsigned char,32> ECDH(const CPubKey& pubkey) const;
 
     /**

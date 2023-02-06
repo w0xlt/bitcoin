@@ -98,6 +98,7 @@ BASE_SCRIPTS = [
     'wallet_silentpayment_identifier.py',
     'wallet_silentpayment_psbt_send_many_addr.py',
     'wallet_silentpayment_blockfilterindex.py',
+    'wallet_silentpayment_addr_reuse.py',
     'feature_fee_estimation.py',
     'feature_taproot.py',
     'feature_block.py',

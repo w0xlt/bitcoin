@@ -189,6 +189,22 @@ CKey CKey::AddTweak(const unsigned char *tweak32) const
     return new_seckey;
 }
 
+CKey CKey::MultiplyTweak(const unsigned char *tweak32) const
+{
+    assert(fValid);
+
+    unsigned char tweaked_seckey[32];
+    memcpy(tweaked_seckey, data(), 32);
+
+    int ret = secp256k1_ec_seckey_tweak_mul(secp256k1_context_sign, tweaked_seckey, tweak32);
+    assert(ret);
+
+    CKey new_seckey;
+    new_seckey.Set(std::begin(tweaked_seckey), std::end(tweaked_seckey), true);
+
+    return new_seckey;
+}
+
 std::array<unsigned char,32> CKey::ECDH(const CPubKey& pubkey) const
 {
     unsigned char shared_secret[32];
