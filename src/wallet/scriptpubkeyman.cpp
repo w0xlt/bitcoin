@@ -2762,7 +2762,8 @@ std::tuple<CKey,bool> DescriptorScriptPubKeyMan::GetPrivKeyForSilentPayment(cons
 
 std::vector<std::tuple<CKey, int32_t>> DescriptorScriptPubKeyMan::VerifySilentPaymentAddress(
     const std::vector<std::tuple<CScript, XOnlyPubKey>>& tx_output_pub_keys,
-    const CPubKey& sender_pub_key)
+    const CPubKey& sender_pub_key,
+    const std::vector<COutPoint>& tx_outpoints)
 {
     LOCK(cs_desc_man);
 
@@ -2772,7 +2773,7 @@ std::vector<std::tuple<CKey, int32_t>> DescriptorScriptPubKeyMan::VerifySilentPa
 
     assert(m_silent_recipient != nullptr);
 
-    m_silent_recipient->SetSenderPublicKey(sender_pub_key);
+    m_silent_recipient->SetSenderPublicKey(sender_pub_key, tx_outpoints);
 
     for(const auto& [outputScriptPubKey, outputPubKey] : tx_output_pub_keys) {
 

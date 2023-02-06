@@ -7,7 +7,7 @@
 namespace silentpayment {
 
 class Recipient {
-    private:
+    protected:
         CKey m_negated_scan_seckey;
         unsigned char m_shared_secret[32];
         std::vector<std::pair<CKey, XOnlyPubKey>> m_spend_keys;
@@ -15,7 +15,7 @@ class Recipient {
 
     public:
         Recipient(const CKey& spend_seckey, size_t pool_size);
-        void SetSenderPublicKey(const CPubKey& sender_public_key);
+        void SetSenderPublicKey(const CPubKey& sender_public_key, const std::vector<COutPoint>& tx_outpoints);
         std::tuple<CKey,XOnlyPubKey> Tweak(const int32_t& identifier) const;
         std::pair<XOnlyPubKey,XOnlyPubKey> GetAddress(const int32_t& identifier) const;
         int32_t GetIdentifier(const XOnlyPubKey& spend_pubkey) const;
@@ -25,12 +25,12 @@ class Recipient {
 }; // class Recipient
 
 class Sender {
-    private:
+    protected:
         XOnlyPubKey m_recipient_spend_xonly_pubkey;
         unsigned char m_shared_secret[32];
 
     public:
-        Sender(const std::vector<std::tuple<CKey, bool>>& sender_secret_keys, const XOnlyPubKey& recipient_scan_xonly_pubkey);
+        Sender(const std::vector<std::tuple<CKey, bool>>& sender_secret_keys, const std::vector<COutPoint>& tx_outpoints, const XOnlyPubKey& recipient_scan_xonly_pubkey);
         XOnlyPubKey Tweak(const XOnlyPubKey spend_xonly_pubkey) const;
 };  // class Sender
 

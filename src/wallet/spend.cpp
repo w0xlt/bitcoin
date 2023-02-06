@@ -769,6 +769,7 @@ bool CreateSilentTransaction(
     bilingual_str& error)
 {
     std::vector<std::tuple<CKey,bool>> input_private_keys;
+    std::vector<COutPoint> tx_outpoints;
 
     for (const auto& input : selected_coins) {
         const auto& spk_managers = wallet.GetScriptPubKeyMans(input.txout.scriptPubKey);
@@ -788,6 +789,7 @@ bool CreateSilentTransaction(
         }
 
         input_private_keys.emplace_back(sender_secret_key, is_taproot);
+        tx_outpoints.push_back(input.outpoint);
     }
 
     for (auto& vout : txNew.vout) {
@@ -802,8 +804,10 @@ bool CreateSilentTransaction(
 
         silentpayment::Sender silent_sender{
             input_private_keys,
+            tx_outpoints,
             scan_pubkey
         };
+
         // XOnlyPubKey tweakedKey{silent_sender.Tweak2(identifier)};
         XOnlyPubKey tweakedKey{silent_sender.Tweak(spend_pubkey)};
 
