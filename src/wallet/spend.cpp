@@ -790,6 +790,11 @@ bool CreateSilentTransaction(
         input_private_keys.emplace_back(sender_secret_key, is_taproot);
     }
 
+    std::vector<COutPoint> tx_outpoints;
+    for (auto& vin : txNew.vin) {
+        tx_outpoints.push_back(vin.prevout);
+    }
+
     for (auto& vout : txNew.vout) {
 
         if (!vout.m_silentpayment) continue;
@@ -802,8 +807,10 @@ bool CreateSilentTransaction(
 
         silentpayment::Sender silent_sender{
             input_private_keys,
+            tx_outpoints,
             scan_pubkey
         };
+
         // XOnlyPubKey tweakedKey{silent_sender.Tweak2(identifier)};
         XOnlyPubKey tweakedKey{silent_sender.Tweak(spend_pubkey)};
 
@@ -971,19 +978,6 @@ static util::Result<CreatedTransactionResult> CreateTransactionInternal(
     const SelectionResult& result = *select_coins_res;
     TRACE5(coin_selection, selected_coins, wallet.GetName().c_str(), GetAlgorithmName(result.GetAlgo()).c_str(), result.GetTarget(), result.GetWaste(), result.GetSelectedValue());
 
-    bool is_silent_payment{false};
-
-    for (const auto& out : txNew.vout) {
-        if (out.m_silentpayment) {
-            is_silent_payment = true;
-            break;
-        }
-    }
-
-    if (is_silent_payment && !CreateSilentTransaction(wallet, result.GetSelectedInputs(), txNew, error)) {
-        return util::Error{_("Unable to create silent transaction")};
-    }
-
     const CAmount change_amount = result.GetChange(coin_selection_params.min_viable_change, coin_selection_params.m_change_fee);
     if (change_amount > 0) {
         CTxOut newTxOut(change_amount, scriptChange);
@@ -1014,6 +1008,19 @@ static util::Result<CreatedTransactionResult> CreateTransactionInternal(
         txNew.vin.push_back(CTxIn(coin.outpoint, CScript(), nSequence));
     }
     DiscourageFeeSniping(txNew, rng_fast, wallet.chain(), wallet.GetLastBlockHash(), wallet.GetLastBlockHeight());
+
+    bool is_silent_payment{false};
+
+    for (const auto& out : txNew.vout) {
+        if (out.m_silentpayment) {
+            is_silent_payment = true;
+            break;
+        }
+    }
+
+    if (is_silent_payment && !CreateSilentTransaction(wallet, result.GetSelectedInputs(), txNew, error)) {
+        return util::Error{_("Unable to create silent transaction")};
+    }
 
     // Calculate the transaction fee
     TxSize tx_sizes = CalculateMaximumSignedTxSize(CTransaction(txNew), &wallet, &coin_control);

@@ -1373,17 +1373,22 @@ bool CWallet::VerifySilentPayment(const CTransaction& tx, std::vector<std::tuple
     }
 
     std::vector<Coin> coins;
+    std::vector<COutPoint> tx_outpoints;
 
     for (const CTxIn& txin : tx.vin) {
         coins.push_back(FindPreviousCoin(txin));
+        tx_outpoints.push_back(txin.prevout);
     }
 
     CPubKey sum_sender_pubkeys{silentpayment::Recipient::CombinePublicKeys(tx, coins)};
 
     if (!sum_sender_pubkeys.IsFullyValid()) {
-        if (!m_chain->getSilentTransactionPubKey(tx.GetHash(), sum_sender_pubkeys)) {
+        const auto& [pubkeys_from_index, _] = m_chain->getSilentTransactionDataFromIndex(tx.GetHash());
+        (void) _;
+        if (!pubkeys_from_index.IsFullyValid()) {
             return false;
         }
+        sum_sender_pubkeys = pubkeys_from_index;
     }
 
     for (ScriptPubKeyMan* spkm : GetActiveScriptPubKeyMans()) {
@@ -1397,7 +1402,7 @@ bool CWallet::VerifySilentPayment(const CTransaction& tx, std::vector<std::tuple
             continue;
         }
 
-        rawTrKeys = desc_spkm->VerifySilentPaymentAddress(outputPubKeys, sum_sender_pubkeys);
+        rawTrKeys = desc_spkm->VerifySilentPaymentAddress(outputPubKeys, sum_sender_pubkeys, tx_outpoints);
     }
 
     return !rawTrKeys.empty();
