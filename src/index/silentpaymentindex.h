@@ -22,7 +22,7 @@ private:
 
     bool AllowPrune() const override { return false; }
 
-    std::vector<std::pair<uint256, CPubKey>> GetSilentPaymentKeysPerBlock(const interfaces::BlockInfo& block) const;
+    std::vector<std::tuple<uint256, CPubKey, uint256>> GetSilentPaymentKeysPerBlock(const interfaces::BlockInfo& block) const;
 
 protected:
     bool CustomAppend(const interfaces::BlockInfo& block) override;
@@ -35,8 +35,8 @@ public:
     // Destructor is declared because this class contains a unique_ptr to an incomplete type.
     virtual ~SilentPaymentIndex() override;
 
-    bool FindSilentPayment(const uint256& tx_hash, CPubKey& sum_tx_pubkeys) const;
-    std::vector<std::pair<uint256, CPubKey>> FindSilentPayment(const uint256& blockhash) const;
+    std::pair<CPubKey, uint256> FindSilentPaymentByTransactionId(const uint256& tx_hash) const;
+    std::vector<std::pair<CPubKey, uint256>> FindSilentPaymentByBlockHash(const uint256& blockhash) const;
 };
 
 /// The global txo silent payment index. May be null.

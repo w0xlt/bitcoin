@@ -15,6 +15,7 @@ class Recipient {
 
     public:
         Recipient(const CKey& spend_seckey, size_t pool_size);
+        void SetSenderPublicKey(const CPubKey& sender_public_key, const uint256& outpoint_hash);
         void SetSenderPublicKey(const CPubKey& sender_public_key, const std::vector<COutPoint>& tx_outpoints);
         std::tuple<CKey,XOnlyPubKey> Tweak(const int32_t& identifier) const;
         std::pair<XOnlyPubKey,XOnlyPubKey> GetAddress(const int32_t& identifier) const;
@@ -34,6 +35,7 @@ class Sender {
         XOnlyPubKey Tweak(const XOnlyPubKey spend_xonly_pubkey) const;
 };  // class Sender
 
+uint256 HashOutpoints(const std::vector<COutPoint>& tx_outpoints);
 /** Extract Pubkey from an input according to the transaction type **/
 std::variant<CPubKey, XOnlyPubKey> ExtractPubkeyFromInput(const Coin& prevCoin, const CTxIn& txin);
 } // namespace silentpayment

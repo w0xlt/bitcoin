@@ -47,26 +47,20 @@ Recipient::Recipient(const CKey& spend_seckey, size_t pool_size)
     m_spend_keys = spend_keys;
 }
 
-void Recipient::SetSenderPublicKey(const CPubKey& sender_public_key, const std::vector<COutPoint>& tx_outpoints)
+void Recipient::SetSenderPublicKey(const CPubKey& sender_public_key, const uint256& outpoint_hash)
 {
-    unsigned char outpoint_hash[32];
-
-    auto hash = CSHA256();
-
-    for (const auto& outpoint: tx_outpoints) {
-        auto arith_outpoint_hash = UintToArith256(outpoint.hash);
-        arith_outpoint_hash += outpoint.n;
-        auto outpoint_hash = ArithToUint256(arith_outpoint_hash);
-        hash.Write(std::begin(outpoint_hash), outpoint_hash.size());
-    }
-
-    hash.Finalize(outpoint_hash);
-
-    auto tweaked_scan_seckey = m_negated_scan_seckey.MultiplyTweak(outpoint_hash);
+    auto tweaked_scan_seckey = m_negated_scan_seckey.MultiplyTweak(outpoint_hash.begin());
 
     std::array<unsigned char, 32> result = tweaked_scan_seckey.ECDH(sender_public_key);
 
     std::copy(std::begin(result), std::end(result), std::begin(m_shared_secret));
+}
+
+void Recipient::SetSenderPublicKey(const CPubKey& sender_public_key, const std::vector<COutPoint>& tx_outpoints)
+{
+    const auto& outpoint_hash = HashOutpoints(tx_outpoints);
+
+    SetSenderPublicKey(sender_public_key, outpoint_hash);
 }
 
 std::tuple<CKey,XOnlyPubKey> Recipient::Tweak(const int32_t& identifier) const
@@ -179,23 +173,30 @@ Sender::Sender(const std::vector<std::tuple<CKey, bool>>& sender_secret_keys, co
 
     CPubKey recipient_scan_pubkey = recipient_scan_xonly_pubkey.ConvertToCompressedPubKey();
 
-    unsigned char outpoint_hash[32];
+    const auto& outpoint_hash = HashOutpoints(tx_outpoints);
 
-    auto hash = CSHA256();
+    auto tweaked_sum_seckey = sum_seckey.MultiplyTweak(outpoint_hash.begin());
+    std::array<unsigned char, 32> result = tweaked_sum_seckey.ECDH(recipient_scan_pubkey);
+
+    std::copy(std::begin(result), std::end(result), std::begin(m_shared_secret));
+}
+
+uint256 HashOutpoints(const std::vector<COutPoint>& tx_outpoints)
+{
+    uint256 outpoint_hash;
+
+    auto hash256 = CSHA256();
 
     for (const auto& outpoint: tx_outpoints) {
         auto arith_outpoint_hash = UintToArith256(outpoint.hash);
         arith_outpoint_hash += outpoint.n;
         auto outpoint_hash = ArithToUint256(arith_outpoint_hash);
-        hash.Write(std::begin(outpoint_hash), outpoint_hash.size());
+        hash256 = hash256.Write(std::begin(outpoint_hash), outpoint_hash.size());
     }
 
-    hash.Finalize(outpoint_hash);
+    hash256.Finalize(outpoint_hash.begin());
 
-    auto tweaked_sum_seckey = sum_seckey.MultiplyTweak(outpoint_hash);
-    std::array<unsigned char, 32> result = tweaked_sum_seckey.ECDH(recipient_scan_pubkey);
-
-    std::copy(std::begin(result), std::end(result), std::begin(m_shared_secret));
+    return outpoint_hash;
 }
 
 std::variant<CPubKey, XOnlyPubKey> ExtractPubkeyFromInput(const Coin& prevCoin, const CTxIn& txin)

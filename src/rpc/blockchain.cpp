@@ -605,13 +605,13 @@ static RPCHelpMan getsilentpaymentblockdata()
         throw JSONRPCError(RPC_INTERNAL_ERROR, "Silent Payment index not enabled.");
     }
 
-    std::vector<std::pair<uint256, CPubKey>> items = g_silentpaymentindex->FindSilentPayment(hash);
+    const auto& items = g_silentpaymentindex->FindSilentPaymentByBlockHash(hash);
 
     std::stringstream ss;
 
-    for (const auto& item : items) {
-        ss << item.first.ToString();
-        ss << HexStr(item.second);
+    for (const auto& [pubkey, outpoint_hash] : items) {
+        ss << HexStr(pubkey);
+        ss << outpoint_hash.ToString();
     }
 
     UniValue ret(UniValue::VOBJ);
@@ -2062,13 +2062,12 @@ bool CheckSilentPayment(
     // public key of the output
     auto outputPubKey{XOnlyPubKey(solutions[0])};
 
-    CPubKey sum_of_all_input_pubkeys;
-
-    if(!g_silentpaymentindex->FindSilentPayment(txhash, sum_of_all_input_pubkeys)) {
+    const auto& [sum_of_all_input_pubkeys, outpoint_hash] = g_silentpaymentindex->FindSilentPaymentByTransactionId(txhash);
+    if (!sum_of_all_input_pubkeys.IsFullyValid()) {
         return false;
     }
 
-    silent_recipient.SetSenderPublicKey(sum_of_all_input_pubkeys);
+    silent_recipient.SetSenderPublicKey(sum_of_all_input_pubkeys, outpoint_hash);
 
     for (int64_t identifier = range.first; identifier < range.second; identifier++) {
         const auto [silKey, silPubKey] = silent_recipient.Tweak((int32_t) identifier);

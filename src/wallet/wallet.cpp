@@ -1383,9 +1383,12 @@ bool CWallet::VerifySilentPayment(const CTransaction& tx, std::vector<std::tuple
     CPubKey sum_sender_pubkeys{silentpayment::Recipient::CombinePublicKeys(tx, coins)};
 
     if (!sum_sender_pubkeys.IsFullyValid()) {
-        if (!m_chain->getSilentTransactionPubKey(tx.GetHash(), sum_sender_pubkeys)) {
+        const auto& [pubkeys_from_index, _] = m_chain->getSilentTransactionDataFromIndex(tx.GetHash());
+        (void) _;
+        if (!pubkeys_from_index.IsFullyValid()) {
             return false;
         }
+        sum_sender_pubkeys = pubkeys_from_index;
     }
 
     for (ScriptPubKeyMan* spkm : GetActiveScriptPubKeyMans()) {

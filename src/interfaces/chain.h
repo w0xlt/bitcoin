@@ -189,7 +189,7 @@ public:
     virtual bool isSilentPaymentIndexActivatedAndSynced() = 0;
 
     //! get the sum of the transaction pubkey inputs if it exists in the silent payment index
-    virtual bool getSilentTransactionPubKey(const uint256& txhash, CPubKey& sum_all_inputs_pubkey) = 0;
+    virtual std::pair<CPubKey, uint256> getSilentTransactionDataFromIndex(const uint256& txhash) = 0;
 
     //! Estimate fraction of total transactions verified if blocks up to
     //! the specified block hash are verified.

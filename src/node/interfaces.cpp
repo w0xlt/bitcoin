@@ -604,9 +604,9 @@ public:
     {
         return g_silentpaymentindex ? g_silentpaymentindex->BlockUntilSyncedToCurrentChain() : false;
     }
-    bool getSilentTransactionPubKey(const uint256& txhash, CPubKey& sum_all_inputs_pubkey) override
+    std::pair<CPubKey, uint256> getSilentTransactionDataFromIndex(const uint256& txhash) override
     {
-        return g_silentpaymentindex->FindSilentPayment(txhash, sum_all_inputs_pubkey);
+        return g_silentpaymentindex->FindSilentPaymentByTransactionId(txhash);
     }
     double guessVerificationProgress(const uint256& block_hash) override
     {

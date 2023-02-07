@@ -55,9 +55,10 @@ class SilentAddressReuseTest(BitcoinTestFramework):
 
         utxos = silent_wallet.listunspent()
 
-        # these should fail
-        assert(utxos[0]['address'] == utxos[1]['address'])
-        assert(utxos[0]['scriptPubKey'] == utxos[1]['scriptPubKey'])
+        assert(len(utxos) == 2)
+
+        assert(utxos[0]['address'] != utxos[1]['address'])
+        assert(utxos[0]['scriptPubKey'] != utxos[1]['scriptPubKey'])
 
 if __name__ == '__main__':
     SilentAddressReuseTest().main()
