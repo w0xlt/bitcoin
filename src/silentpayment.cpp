@@ -183,20 +183,20 @@ Sender::Sender(const std::vector<std::tuple<CKey, bool>>& sender_secret_keys, co
 
 uint256 HashOutpoints(const std::vector<COutPoint>& tx_outpoints)
 {
-    uint256 outpoint_hash;
+    uint256 result_hash;
 
     auto hash256 = CSHA256();
 
     for (const auto& outpoint: tx_outpoints) {
-        auto arith_outpoint_hash = UintToArith256(outpoint.hash);
-        arith_outpoint_hash += outpoint.n;
-        auto outpoint_hash = ArithToUint256(arith_outpoint_hash);
-        hash256 = hash256.Write(std::begin(outpoint_hash), outpoint_hash.size());
+        hash256 = hash256.Write(std::begin(outpoint.hash), outpoint.hash.size());
+
+        uint256 hash_n = uint256(outpoint.n);
+        hash256 = hash256.Write(std::begin(hash_n), hash_n.size());
     }
 
-    hash256.Finalize(outpoint_hash.begin());
+    hash256.Finalize(result_hash.begin());
 
-    return outpoint_hash;
+    return result_hash;
 }
 
 std::variant<CPubKey, XOnlyPubKey> ExtractPubkeyFromInput(const Coin& prevCoin, const CTxIn& txin)
