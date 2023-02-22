@@ -68,12 +68,28 @@ BOOST_AUTO_TEST_CASE(silent_addresses)
 
 }
 
-class TestRecipient: silentpayment::Recipient {
+class TestRecipient: public silentpayment::Recipient {
     public:
         TestRecipient(const CKey& spend_seckey, size_t pool_size) : Recipient(spend_seckey, pool_size) {}
         CKey GetNegatedScanSecKey() { return m_negated_scan_seckey; }
         std::vector<std::pair<CKey, XOnlyPubKey>> GetSpendKeys() { return m_spend_keys; }
         XOnlyPubKey GetScanPubkey() { return m_scan_pubkey; }
+        std::array<unsigned char, 32> GetSharedSecret() {
+            std::array<unsigned char, 32> result;
+            std::copy(std::begin(m_shared_secret), std::end(m_shared_secret), std::begin(result));
+            return result;
+        }
+};
+
+class TestSender: public silentpayment::Sender {
+    public:
+        TestSender(const std::vector<std::tuple<CKey, bool>>& sender_secret_keys, const std::vector<COutPoint>& tx_outpoints, const XOnlyPubKey& recipient_scan_xonly_pubkey) :
+            Sender(sender_secret_keys, tx_outpoints, recipient_scan_xonly_pubkey) {}
+        std::array<unsigned char, 32> GetSharedSecret() {
+            std::array<unsigned char, 32> result;
+            std::copy(std::begin(m_shared_secret), std::end(m_shared_secret), std::begin(result));
+            return result;
+    }
 };
 
 BOOST_AUTO_TEST_CASE(silent_addresses2)
@@ -122,10 +138,6 @@ BOOST_AUTO_TEST_CASE(silent_addresses2)
 
         BOOST_CHECK(EncodeSecret(spend_seckey) == seckey);
         BOOST_CHECK(HexStr(spend_pubkey) == pubkey);
-
-        // std::cout << "spend_seckey: " <<  EncodeSecret(spend_seckey) << std::endl;
-        // std::cout << "spend_pubkey: " <<  HexStr(spend_pubkey) << std::endl;
-        // std::cout << "--- " << std::endl;
     }
 
     CPubKey combined_tx_pubkeys{silentpayment::Recipient::CombinePublicKeys(sender_pub_keys, sender_x_only_pub_keys)};
@@ -145,6 +157,59 @@ BOOST_AUTO_TEST_CASE(silent_addresses2)
     auto outpoint_hash = silentpayment::HashOutpoints(tx_outpoints);
 
     BOOST_CHECK(HexStr(outpoint_hash) == "bd37fdb110dc3df7435c4bb6a3d95e297ce4e620768fd100730538e519f9cc65");
+
+    silent_recipient.SetSenderPublicKey(combined_tx_pubkeys, tx_outpoints);
+
+    auto _recipient_shared_secret = silent_recipient.GetSharedSecret();
+
+    CKey recipient_shared_secret;
+    recipient_shared_secret.Set(std::begin(_recipient_shared_secret), std::end(_recipient_shared_secret), true);
+
+    BOOST_CHECK(EncodeSecret(recipient_shared_secret) == "KxD5GQSgk5mEjx141m5bswiUFYyKMrNVQ3pB3Hi5AUpX6VJvTrag");
+
+    int32_t identifier = 0;
+
+    const auto&[recipient_scan_pubkey, recipient_spend_pubkey]{silent_recipient.GetAddress(identifier)};
+
+    TestSender silent_sender{
+        sender_secret_keys,
+        tx_outpoints,
+        recipient_scan_pubkey
+    };
+
+    auto _silent_shared_secret = silent_sender.GetSharedSecret();
+
+    CKey silent_shared_secret;
+    silent_shared_secret.Set(std::begin(_silent_shared_secret), std::end(_silent_shared_secret), true);
+
+    BOOST_CHECK(recipient_shared_secret == silent_shared_secret);
+
+    const std::vector<std::pair<std::string, std::string>> results = {
+        {"914f60723398e9ae6c4cf06c66ac64e40ad00fc16d78d03c153d3305e73bf17c","KyF9LiLu5AAbHFu4jb9dyZDik1huLhT1z5b7CLp6zCncEFBjhQTG"},
+        {"5495a72360d9fddacc35fa0f0ff83090fb2f58d8585b5e353cdcde7de9d1f1d6","L5ih25fvZJrLx2JE96pqaYymEN3VcrKbSmv9csP4RPp4nhd2pmyb"},
+        {"036a09baa0db23a2d52d051800078c6ea3857d6a0db2b00687b599581ddaae50","KyK2q4oo8s1wjXYE9QJsyTrvHqw8mzrhjesFQq7UnC6d1EUsHRzq"},
+    };
+
+    for (int32_t identifier = 0; identifier < 3; identifier++) {
+        const auto&[recipient_scan_pubkey, recipient_spend_pubkey]{silent_recipient.GetAddress(identifier)};
+
+        TestSender silent_sender{
+            sender_secret_keys,
+            tx_outpoints,
+            recipient_scan_pubkey
+        };
+
+        XOnlyPubKey sender_tweaked_pubkey = silent_sender.Tweak(recipient_spend_pubkey);
+        const auto [recipient_priv_key, recipient_pub_key] = silent_recipient.Tweak(identifier);
+
+        BOOST_CHECK(XOnlyPubKey{recipient_priv_key.GetPubKey()} == recipient_pub_key);
+        BOOST_CHECK(sender_tweaked_pubkey == recipient_pub_key);
+
+        const auto& [expected_pubkey, expected_prvkey] = results.at(identifier);
+
+        BOOST_CHECK(expected_pubkey == HexStr(sender_tweaked_pubkey));
+        BOOST_CHECK(expected_prvkey == EncodeSecret(recipient_priv_key));
+    }
 }
 BOOST_AUTO_TEST_SUITE_END()
 } // namespace wallet

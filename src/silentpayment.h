@@ -28,7 +28,6 @@ class Recipient {
 
 class Sender {
     protected:
-        XOnlyPubKey m_recipient_spend_xonly_pubkey;
         unsigned char m_shared_secret[32];
 
     public:
