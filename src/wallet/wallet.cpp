@@ -2004,9 +2004,10 @@ std::map<uint256, CPubKey> CWallet::GetSilentPaymentKeysPerBlock(const uint256& 
 
     std::map<uint256, CPubKey> items;
 
-    for(const auto& [txid, sum_tx_pubkeys, _]: silentpayment::GetSilentPaymentKeysPerBlock(block_hash, blockUndo, vtx))
+    for(const auto& [txid, sum_tx_pubkeys, hash_outpoints, truncated_hash]: silentpayment::GetSilentPaymentKeysPerBlock(block_hash, blockUndo, vtx))
     {
-        (void) _;
+        (void) hash_outpoints; // not used
+        (void) truncated_hash; // not used
         items.emplace(txid, sum_tx_pubkeys);
     }
 

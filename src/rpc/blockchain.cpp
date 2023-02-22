@@ -685,11 +685,12 @@ static RPCHelpMan getsilentpaymentblockdata()
 
     std::stringstream ss;
 
-    for(const auto& [txid, sum_tx_pubkeys, outpoint_hash]: items)
+    for(const auto& [txid, sum_tx_pubkeys, outpoint_hash, truncated_hash]: items)
     {
         (void) txid; // not used
+        (void) outpoint_hash; // not used
         ss << HexStr(sum_tx_pubkeys);
-        ss << outpoint_hash.ToString();
+        ss << HexStr(truncated_hash);
     }
 
     UniValue ret(UniValue::VOBJ);
@@ -2141,8 +2142,9 @@ struct SilentScanner {
         const CBlock block{GetBlockChecked(m_chainman.m_blockman, pblockindex)};
         const CBlockUndo& blockUndo = GetUndoChecked(m_chainman.m_blockman, pblockindex);
 
-        for(const auto& [txid, sum_tx_pubkeys, hash_outpoints]: silentpayment::GetSilentPaymentKeysPerBlock(hashBlock, blockUndo, block.vtx))
+        for(const auto& [txid, sum_tx_pubkeys, hash_outpoints, truncated_hash]: silentpayment::GetSilentPaymentKeysPerBlock(hashBlock, blockUndo, block.vtx))
         {
+            (void) truncated_hash; // not used here
             m_silent_data.insert({txid, {sum_tx_pubkeys, hash_outpoints}});
         }
 

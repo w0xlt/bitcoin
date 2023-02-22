@@ -58,7 +58,8 @@ void Recipient::SetSenderPublicKey(const CPubKey& sender_public_key, const uint2
 
 void Recipient::SetSenderPublicKey(const CPubKey& sender_public_key, const std::vector<COutPoint>& tx_outpoints)
 {
-    const auto& outpoint_hash = HashOutpoints(tx_outpoints);
+    const auto& [truncated_hash, outpoint_hash] = HashOutpoints(tx_outpoints);
+    (void) truncated_hash; //not used here
 
     SetSenderPublicKey(sender_public_key, outpoint_hash);
 }
@@ -173,7 +174,8 @@ Sender::Sender(const std::vector<std::tuple<CKey, bool>>& sender_secret_keys, co
 
     CPubKey recipient_scan_pubkey = recipient_scan_xonly_pubkey.ConvertToCompressedPubKey();
 
-    const auto& outpoint_hash = HashOutpoints(tx_outpoints);
+    const auto& [truncated_hash, outpoint_hash] = HashOutpoints(tx_outpoints);
+    (void) truncated_hash; //not used here
 
     auto tweaked_sum_seckey = sum_seckey.MultiplyTweak(outpoint_hash.begin());
     std::array<unsigned char, 32> result = tweaked_sum_seckey.ECDH(recipient_scan_pubkey);
@@ -181,7 +183,7 @@ Sender::Sender(const std::vector<std::tuple<CKey, bool>>& sender_secret_keys, co
     std::copy(std::begin(result), std::end(result), std::begin(m_shared_secret));
 }
 
-uint256 HashOutpoints(const std::vector<COutPoint>& tx_outpoints)
+std::pair<std::array<uint8_t, 8>, uint256> HashOutpoints(const std::vector<COutPoint>& tx_outpoints)
 {
     uint256 result_hash;
 
@@ -196,7 +198,16 @@ uint256 HashOutpoints(const std::vector<COutPoint>& tx_outpoints)
 
     hash256.Finalize(result_hash.begin());
 
-    return result_hash;
+    std::array<uint8_t, 8> truncated_hash;
+
+    for (std::size_t i{ 0 }; i < truncated_hash.size(); ++i) {
+        truncated_hash[i] = result_hash.data()[i];
+    }
+
+    uint256 final_hash;
+    CSHA256().Write(std::begin(truncated_hash), truncated_hash.size()).Finalize(final_hash.begin());
+
+    return {truncated_hash, final_hash};
 }
 
 std::variant<CPubKey, XOnlyPubKey> ExtractPubkeyFromInput(const Coin& prevCoin, const CTxIn& txin)
@@ -267,9 +278,9 @@ std::variant<CPubKey, XOnlyPubKey> ExtractPubkeyFromInput(const Coin& prevCoin, 
     return CPubKey(); // returns an invalid pubkey
 }
 
-std::vector<std::tuple<uint256, CPubKey, uint256>> GetSilentPaymentKeysPerBlock(const uint256& block_hash, const CBlockUndo& blockUndo, const std::vector<CTransactionRef> vtx)
+std::vector<std::tuple<uint256, CPubKey, uint256, std::array<uint8_t, 8>>> GetSilentPaymentKeysPerBlock(const uint256& block_hash, const CBlockUndo& blockUndo, const std::vector<CTransactionRef> vtx)
 {
-    std::vector<std::tuple<uint256, CPubKey, uint256>> items; // <tx_hash, sum of public keys of transaction inputs, hash of the outpoints >
+    std::vector<std::tuple<uint256, CPubKey, uint256, std::array<uint8_t, 8>>>  items; // <tx_hash, sum of public keys of transaction inputs, hash of the outpoints >
 
     for (const auto& tx : vtx) {
 
@@ -312,10 +323,11 @@ std::vector<std::tuple<uint256, CPubKey, uint256>> GetSilentPaymentKeysPerBlock(
 
         CPubKey sum_tx_pubkeys = silentpayment::Recipient::CombinePublicKeys(*tx, coins);
 
-        const auto& outpoint_hash = silentpayment::HashOutpoints(tx_outpoints);
+        const auto& [truncated_hash, outpoint_hash] = HashOutpoints(tx_outpoints);
+        (void) truncated_hash; //not used here
 
         if (sum_tx_pubkeys.IsFullyValid()) {
-            items.emplace_back(tx->GetHash(), sum_tx_pubkeys, outpoint_hash);
+            items.emplace_back(tx->GetHash(), sum_tx_pubkeys, outpoint_hash, truncated_hash);
         }
     }
 

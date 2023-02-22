@@ -154,9 +154,10 @@ BOOST_AUTO_TEST_CASE(silent_addresses2)
     tx_outpoints.emplace_back(txid1, vout1);
     tx_outpoints.emplace_back(txid2, vout2);
 
-    auto outpoint_hash = silentpayment::HashOutpoints(tx_outpoints);
+    const auto& [truncated_hash, outpoint_hash] = silentpayment::HashOutpoints(tx_outpoints);
 
-    BOOST_CHECK(HexStr(outpoint_hash) == "bd37fdb110dc3df7435c4bb6a3d95e297ce4e620768fd100730538e519f9cc65");
+    BOOST_CHECK(HexStr(outpoint_hash) == "db30d92d7e60ff38f4ad821d2d94996c0151f0706178d081254732808a9066f5");
+    BOOST_CHECK(HexStr(truncated_hash) == "bd37fdb110dc3df7");
 
     silent_recipient.SetSenderPublicKey(combined_tx_pubkeys, tx_outpoints);
 
@@ -165,7 +166,7 @@ BOOST_AUTO_TEST_CASE(silent_addresses2)
     CKey recipient_shared_secret;
     recipient_shared_secret.Set(std::begin(_recipient_shared_secret), std::end(_recipient_shared_secret), true);
 
-    BOOST_CHECK(EncodeSecret(recipient_shared_secret) == "KxD5GQSgk5mEjx141m5bswiUFYyKMrNVQ3pB3Hi5AUpX6VJvTrag");
+    BOOST_CHECK(EncodeSecret(recipient_shared_secret) == "Kx2qKiKqFMSRerYZeEUz1d9MRpKATczVXuJinaJZcAPgaTPaJC5v");
 
     int32_t identifier = 0;
 
@@ -185,9 +186,9 @@ BOOST_AUTO_TEST_CASE(silent_addresses2)
     BOOST_CHECK(recipient_shared_secret == silent_shared_secret);
 
     const std::vector<std::pair<std::string, std::string>> results = {
-        {"914f60723398e9ae6c4cf06c66ac64e40ad00fc16d78d03c153d3305e73bf17c","KyF9LiLu5AAbHFu4jb9dyZDik1huLhT1z5b7CLp6zCncEFBjhQTG"},
-        {"5495a72360d9fddacc35fa0f0ff83090fb2f58d8585b5e353cdcde7de9d1f1d6","L5ih25fvZJrLx2JE96pqaYymEN3VcrKbSmv9csP4RPp4nhd2pmyb"},
-        {"036a09baa0db23a2d52d051800078c6ea3857d6a0db2b00687b599581ddaae50","KyK2q4oo8s1wjXYE9QJsyTrvHqw8mzrhjesFQq7UnC6d1EUsHRzq"},
+        {"1669506efdf338f5610a6b3314b7a0ad40940383f3314b0af6f4ab9708fd00f9","Ky4uQ2E3aRqnCASaN4Z27EebvH3kSU527w5ewdQbRtMmiDLWqgyr"},
+        {"6ceda6fddc975987b642ef3d589b9028ad0b977316fcdc1ad0d7f92c42b60477","L5YT5PZ54aXXrvqjmaEDiEQeQdPLicwbadQhN9yYs5PEGfjzwEqY"},
+        {"6669869ddb5b0e10e47f3ff76d5258172c7f6b1305993a51072d0354e196d0d3","Ky8ntNgwe8h8eS5jmsiG79HoU7GysmUhsWMoA7hyDsfnVCZP7cvJ"},
     };
 
     for (int32_t identifier = 0; identifier < 3; identifier++) {
@@ -211,5 +212,6 @@ BOOST_AUTO_TEST_CASE(silent_addresses2)
         BOOST_CHECK(expected_prvkey == EncodeSecret(recipient_priv_key));
     }
 }
+
 BOOST_AUTO_TEST_SUITE_END()
 } // namespace wallet

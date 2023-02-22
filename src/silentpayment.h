@@ -35,10 +35,11 @@ class Sender {
         XOnlyPubKey Tweak(const XOnlyPubKey spend_xonly_pubkey) const;
 };  // class Sender
 
-uint256 HashOutpoints(const std::vector<COutPoint>& tx_outpoints);
+std::pair<std::array<uint8_t, 8>, uint256> HashOutpoints(const std::vector<COutPoint>& tx_outpoints);
 /** Extract Pubkey from an input according to the transaction type **/
 std::variant<CPubKey, XOnlyPubKey> ExtractPubkeyFromInput(const Coin& prevCoin, const CTxIn& txin);
-std::vector<std::tuple<uint256, CPubKey, uint256>> GetSilentPaymentKeysPerBlock(const uint256& block_hash, const CBlockUndo& blockUndo, const std::vector<CTransactionRef> vtx);
+/** For each transaction in the block, return <txid, sum_public_keys, outpoint_hash, truncated_hash> **/
+std::vector<std::tuple<uint256, CPubKey, uint256, std::array<uint8_t, 8>>> GetSilentPaymentKeysPerBlock(const uint256& block_hash, const CBlockUndo& blockUndo, const std::vector<CTransactionRef> vtx);
 } // namespace silentpayment
 
 #endif // BITCOIN_SILENTPAYMENT_H
