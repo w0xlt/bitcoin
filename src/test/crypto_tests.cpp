@@ -6,6 +6,7 @@
 #include <crypto/chacha20.h>
 #include <crypto/chacha20poly1305.h>
 #include <crypto/hkdf_sha256_32.h>
+#include <crypto/hkdf_sha256.h>
 #include <crypto/hmac_sha256.h>
 #include <crypto/hmac_sha512.h>
 #include <crypto/poly1305.h>
@@ -1278,6 +1279,173 @@ BOOST_AUTO_TEST_CASE(muhash_tests)
     uint256 out4;
     overflowchk.Finalize(out4);
     BOOST_CHECK_EQUAL(HexStr(out4), "3a31e6903aff0de9f62f9a9f7f8b861de76ce2cda09822b90014319ae5dc2271");
+}
+
+// Test vectors from RFC 5869, Appendix A
+
+// Helper to compare two vectors of unsigned char
+// BOOST_CHECK_EQUAL_COLLECTIONS handles this, but sometimes a custom message is nice.
+void CheckEqualVectors(const std::vector<unsigned char>& v1, const std::vector<unsigned char>& v2, const std::string& message = "") {
+    BOOST_CHECK_EQUAL_COLLECTIONS(v1.begin(), v1.end(), v2.begin(), v2.end());
+    if (v1 != v2 && !message.empty()) {
+        BOOST_TEST_MESSAGE(message);
+    }
+}
+
+BOOST_AUTO_TEST_CASE(rfc5869_test_vector_1)
+{
+    // Test Case 1: Basic test case
+    // HMAC-SHA256, hash length = 32 bytes
+    std::vector<unsigned char> ikm  = ParseHex("0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b"); // 22 bytes
+    std::vector<unsigned char> salt = ParseHex("000102030405060708090a0b0c"); // 13 bytes
+    std::vector<unsigned char> info = ParseHex("f0f1f2f3f4f5f6f7f8f9"); // 10 bytes
+    size_t L = 42;
+
+    std::vector<unsigned char> expected_prk = ParseHex("077709362c2e32df0ddc3f0dc47bba63"
+                                                       "90b6c73bb50f9c3122ec844ad7c2b3e5");
+    std::vector<unsigned char> expected_okm = ParseHex("3cb25f25faacd57a90434f64d0362f2a"
+                                                       "2d2d0a90cf1a5a4c5db02d56ecc4c5bf"
+                                                       "34007208d5b887185865");
+
+    // Test Extract
+    std::vector<unsigned char> prk = crypto::HKDF_Extract_SHA256(salt, ikm);
+    CheckEqualVectors(prk, expected_prk, "Test Vector 1: PRK mismatch");
+
+    // Test Expand
+    std::vector<unsigned char> okm = crypto::HKDF_Expand_SHA256(prk, info, L);
+    CheckEqualVectors(okm, expected_okm, "Test Vector 1: OKM mismatch (separate expand)");
+
+    // Test Combined HKDF
+    std::vector<unsigned char> okm_combined = crypto::HKDF_SHA256(salt, ikm, info, L);
+    CheckEqualVectors(okm_combined, expected_okm, "Test Vector 1: OKM mismatch (combined HKDF)");
+}
+
+BOOST_AUTO_TEST_CASE(rfc5869_test_vector_2)
+{
+    // Test Case 2: From RFC 5869, Appendix A.2
+    // IKM, Salt, Info are 80 bytes each. L = 100.
+    std::vector<unsigned char> ikm = ParseHex(
+        "000102030405060708090a0b0c0d0e0f"
+        "101112131415161718191a1b1c1d1e1f"
+        "202122232425262728292a2b2c2d2e2f"
+        "303132333435363738393a3b3c3d3e3f"
+        "404142434445464748494a4b4c4d4e4f"
+    );
+    std::vector<unsigned char> salt = ParseHex(
+        "606162636465666768696a6b6c6d6e6f"
+        "707172737475767778797a7b7c7d7e7f"
+        "808182838485868788898a8b8c8d8e8f"
+        "909192939495969798999a9b9c9d9e9f"
+        "a0a1a2a3a4a5a6a7a8a9aaabacadaeaf"
+    );
+    std::vector<unsigned char> info = ParseHex(
+        "b0b1b2b3b4b5b6b7b8b9babbbcbdbebf"
+        "c0c1c2c3c4c5c6c7c8c9cacbcccdcecf"
+        "d0d1d2d3d4d5d6d7d8d9dadbdcdddedf"
+        "e0e1e2e3e4e5e6e7e8e9eaebecedeeef"
+        "f0f1f2f3f4f5f6f7f8f9fafbfcfdfeff"
+    );
+    size_t L = 82;
+
+    std::vector<unsigned char> expected_prk = ParseHex(
+        "06a6b88c5853361a06104c9ceb35b45c"
+        "ef760014904671014a193f40c15fc244"
+    );
+    std::vector<unsigned char> expected_okm = ParseHex(
+        "b11e398dc80327a1c8e7f78c596a4934"
+        "4f012eda2d4efad8a050cc4c19afa97c"
+        "59045a99cac7827271cb41c65e590e09"
+        "da3275600c2f09b8367793a9aca3db71"
+        "cc30c58179ec3e87c14c01d5c1f3434f"
+        "1d87"
+    );
+
+    // Check sizes of inputs to be sure
+    BOOST_CHECK_EQUAL(ikm.size(), 80);
+    BOOST_CHECK_EQUAL(salt.size(), 80);
+    BOOST_CHECK_EQUAL(info.size(), 80);
+
+    std::vector<unsigned char> prk = crypto::HKDF_Extract_SHA256(salt, ikm);
+    CheckEqualVectors(prk, expected_prk, "Test Vector 2: PRK mismatch");
+
+    std::vector<unsigned char> okm = crypto::HKDF_Expand_SHA256(prk, info, L);
+    CheckEqualVectors(okm, expected_okm, "Test Vector 2: OKM mismatch (separate expand)");
+
+    std::vector<unsigned char> okm_combined = crypto::HKDF_SHA256(salt, ikm, info, L);
+    CheckEqualVectors(okm_combined, expected_okm, "Test Vector 2: OKM mismatch (combined HKDF)");
+}
+
+BOOST_AUTO_TEST_CASE(rfc5869_test_vector_3)
+{
+    // Test Case 3: IKM = 0x0b...0b (22 times), Salt = empty, Info = empty, L = 42
+    std::vector<unsigned char> ikm  = ParseHex("0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b");
+    std::span<const unsigned char> salt_empty; // Empty salt
+    std::span<const unsigned char> info_empty; // Empty info
+    size_t L = 42;
+
+    // PRK with zero-length salt is HMAC(hash_len_zeros, IKM)
+    // The RFC shows this PRK directly for this case:
+    std::vector<unsigned char> expected_prk = ParseHex(
+        "19ef24a32c717b167f33a91d6f648bdf"
+        "96596776afdb6377ac434c1c293ccb04");
+    // OKM from RFC A.3
+    std::vector<unsigned char> expected_okm = ParseHex(
+        "8da4e775a563c18f715f802a063c5a31"
+        "b8a11f5c5ee1879ec3454e5f3c738d2d"
+        "9d201395faa4b61a96c8");
+
+    BOOST_CHECK_EQUAL(ikm.size(), 22);
+
+    // Default salt (all zeros)
+    std::vector<unsigned char> prk = crypto::HKDF_Extract_SHA256(salt_empty, ikm);
+    CheckEqualVectors(prk, expected_prk, "Test Vector 3: PRK mismatch (empty salt)");
+
+    std::vector<unsigned char> okm = crypto::HKDF_Expand_SHA256(prk, info_empty, L);
+    CheckEqualVectors(okm, expected_okm, "Test Vector 3: OKM mismatch (empty salt/info, separate expand)");
+
+    std::vector<unsigned char> okm_combined = crypto::HKDF_SHA256(salt_empty, ikm, info_empty, L);
+    CheckEqualVectors(okm_combined, expected_okm, "Test Vector 3: OKM mismatch (empty salt/info, combined HKDF)");
+}
+
+BOOST_AUTO_TEST_CASE(hkdf_edge_cases)
+{
+    std::vector<unsigned char> ikm = ParseHex("010203");
+    std::vector<unsigned char> salt = ParseHex("040506");
+    std::vector<unsigned char> info = ParseHex("070809");
+
+    // Test L = 0
+    std::vector<unsigned char> okm_l0 = crypto::HKDF_SHA256(salt, ikm, info, 0);
+    BOOST_CHECK(okm_l0.empty()); // Expect empty vector for L=0
+
+    // Test L > 255 * HashLen
+    size_t L_too_large = 255 * 32 + 1;
+    std::vector<unsigned char> okm_l_too_large = crypto::HKDF_SHA256(salt, ikm, info, L_too_large);
+    BOOST_CHECK(okm_l_too_large.empty()); // Expect empty for L too large
+
+    // Test HKDF_Expand_SHA256 with PRK too short (less than HashLen)
+    std::vector<unsigned char> short_prk_data(CHMAC_SHA256::OUTPUT_SIZE - 1, 0xAA); // Example short PRK
+    BOOST_CHECK_LT(short_prk_data.size(), CHMAC_SHA256::OUTPUT_SIZE); // Ensure it's actually too short
+    std::vector<unsigned char> okm_short_prk = crypto::HKDF_Expand_SHA256(short_prk_data, info, CHMAC_SHA256::OUTPUT_SIZE);
+    BOOST_CHECK(okm_short_prk.empty()); // Expect empty for short PRK
+
+    // Test L = 1 (smallest valid non-zero length)
+    size_t L_one = 1;
+    std::vector<unsigned char> okm_l1 = crypto::HKDF_SHA256(salt, ikm, info, L_one);
+    BOOST_CHECK_EQUAL(okm_l1.size(), L_one);
+    if (okm_l1.size() == 1) { // Check only if size is correct to avoid out-of-bounds
+        std::vector<unsigned char> expected_okm_l1 = {0xd5}; // Calculated expected byte
+        CheckEqualVectors(okm_l1, expected_okm_l1, "L=1 OKM mismatch");
+    }
+
+    // Test L = CHMAC_SHA256::OUTPUT_SIZE (32 bytes)
+    size_t L_32 = CHMAC_SHA256::OUTPUT_SIZE;
+    std::vector<unsigned char> okm_l32 = crypto::HKDF_SHA256(salt, ikm, info, L_32);
+    BOOST_CHECK_EQUAL(okm_l32.size(), L_32);
+
+    // Test L = CHMAC_SHA256::OUTPUT_SIZE + 1 (33 bytes, requires two blocks)
+    size_t L_33 = CHMAC_SHA256::OUTPUT_SIZE + 1;
+    std::vector<unsigned char> okm_l33 = crypto::HKDF_SHA256(salt, ikm, info, L_33);
+    BOOST_CHECK_EQUAL(okm_l33.size(), L_33);
 }
 
 BOOST_AUTO_TEST_SUITE_END()
