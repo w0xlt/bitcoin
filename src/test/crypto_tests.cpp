@@ -1443,16 +1443,19 @@ BOOST_AUTO_TEST_CASE(hkdf_edge_cases)
     BOOST_CHECK(okm_l_too_large.empty()); // Expect empty for L too large
 
     // Test HKDF_Expand_SHA256 with PRK too short (less than HashLen)
-    std::vector<unsigned char> short_prk = ParseHex("0102030405060708090a0b0c0d0e0f"); // 15 bytes
-    BOOST_CHECK_LT(short_prk.size(), CHMAC_SHA256::OUTPUT_SIZE); // Ensure it's actually too short
-    std::vector<unsigned char> okm_short_prk = crypto::HKDF_Expand_SHA256(short_prk, info, 32);
+    std::vector<unsigned char> short_prk_data(CHMAC_SHA256::OUTPUT_SIZE - 1, 0xAA); // Example short PRK
+    BOOST_CHECK_LT(short_prk_data.size(), CHMAC_SHA256::OUTPUT_SIZE); // Ensure it's actually too short
+    std::vector<unsigned char> okm_short_prk = crypto::HKDF_Expand_SHA256(short_prk_data, info, CHMAC_SHA256::OUTPUT_SIZE);
     BOOST_CHECK(okm_short_prk.empty()); // Expect empty for short PRK
 
     // Test L = 1 (smallest valid non-zero length)
     size_t L_one = 1;
     std::vector<unsigned char> okm_l1 = crypto::HKDF_SHA256(salt, ikm, info, L_one);
     BOOST_CHECK_EQUAL(okm_l1.size(), L_one);
-    // You could calculate the expected single byte here if needed for a more thorough check.
+    if (okm_l1.size() == 1) { // Check only if size is correct to avoid out-of-bounds
+        std::vector<unsigned char> expected_okm_l1 = {0xd5}; // Calculated expected byte
+        CheckEqualVectors(okm_l1, expected_okm_l1, "L=1 OKM mismatch");
+    }
 
     // Test L = CHMAC_SHA256::OUTPUT_SIZE (32 bytes)
     size_t L_32 = CHMAC_SHA256::OUTPUT_SIZE;
