@@ -36,6 +36,7 @@ add_executable(fuzz
   crypto_common.cpp
   crypto_diff_fuzz_chacha20.cpp
   crypto_hkdf_hmac_sha256_l32.cpp
+  crypto_hkdf_hmac_sha256.cpp
   crypto_poly1305.cpp
   cuckoocache.cpp
   decode_tx.cpp
