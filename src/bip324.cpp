@@ -7,6 +7,7 @@
 #include <chainparams.h>
 #include <crypto/chacha20.h>
 #include <crypto/chacha20poly1305.h>
+#include <crypto/hkdf_sha256.h>
 #include <crypto/hkdf_sha256_32.h>
 #include <key.h>
 #include <pubkey.h>
@@ -35,38 +36,60 @@ void BIP324Cipher::Initialize(const EllSwiftPubKey& their_pubkey, bool initiator
 {
     // Determine salt (fixed string + network magic bytes)
     const auto& message_header = Params().MessageStart();
-    std::string salt = std::string{"bitcoin_v2_shared_secret"} + std::string(std::begin(message_header), std::end(message_header));
+    std::string salt_str = std::string{"bitcoin_v2_shared_secret"} + std::string(std::begin(message_header), std::end(message_header));
+    const std::span<const unsigned char> salt_span(UCharCast(salt_str.data()), salt_str.length());
 
     // Perform ECDH to derive shared secret.
     ECDHSecret ecdh_secret = m_key.ComputeBIP324ECDHSecret(their_pubkey, m_our_pubkey, initiator);
+    const std::span<const unsigned char> ecdh_secret_span(UCharCast(ecdh_secret.data()), ecdh_secret.size());
 
-    // Derive encryption keys from shared secret, and initialize stream ciphers and AEADs.
+    // 1. Extract PRK once
+    std::vector<unsigned char> prk_material = crypto::HKDF_Extract_SHA256(salt_span, ecdh_secret_span);
+    const std::span<const unsigned char> prk_span(prk_material);
+
+    // Helper lambda for repeated Expand calls
+    auto expand_to_buffer = [&](const char* info_literal, std::span<std::byte> out_buffer) {
+        assert(out_buffer.size() == 32);
+        const std::span<const unsigned char> info_s(UCharCast(info_literal), strlen(info_literal));
+        std::vector<unsigned char> okm_vec = crypto::HKDF_Expand_SHA256(prk_span, info_s, 32);
+        assert(okm_vec.size() == 32);
+        std::transform(okm_vec.begin(), okm_vec.end(), out_buffer.begin(),
+                        [](unsigned char c) { return static_cast<std::byte>(c); });
+        // okm_vec is local and will be destroyed; its contents are copied.
+        // If okm_vec itself contained sensitive data that wasn't copied but only used via span,
+    };
+
     bool side = (initiator != self_decrypt);
-    CHKDF_HMAC_SHA256_L32 hkdf(UCharCast(ecdh_secret.data()), ecdh_secret.size(), salt);
-    std::array<std::byte, 32> hkdf_32_okm;
-    hkdf.Expand32("initiator_L", UCharCast(hkdf_32_okm.data()));
-    (side ? m_send_l_cipher : m_recv_l_cipher).emplace(hkdf_32_okm, REKEY_INTERVAL);
-    hkdf.Expand32("initiator_P", UCharCast(hkdf_32_okm.data()));
-    (side ? m_send_p_cipher : m_recv_p_cipher).emplace(hkdf_32_okm, REKEY_INTERVAL);
-    hkdf.Expand32("responder_L", UCharCast(hkdf_32_okm.data()));
-    (side ? m_recv_l_cipher : m_send_l_cipher).emplace(hkdf_32_okm, REKEY_INTERVAL);
-    hkdf.Expand32("responder_P", UCharCast(hkdf_32_okm.data()));
-    (side ? m_recv_p_cipher : m_send_p_cipher).emplace(hkdf_32_okm, REKEY_INTERVAL);
+    std::array<std::byte, 32> current_okm_buffer;
 
-    // Derive garbage terminators from shared secret.
-    hkdf.Expand32("garbage_terminators", UCharCast(hkdf_32_okm.data()));
-    std::copy(std::begin(hkdf_32_okm), std::begin(hkdf_32_okm) + GARBAGE_TERMINATOR_LEN,
+    expand_to_buffer("initiator_L", current_okm_buffer);
+    (side ? m_send_l_cipher : m_recv_l_cipher).emplace(current_okm_buffer, REKEY_INTERVAL);
+
+    expand_to_buffer("initiator_P", current_okm_buffer);
+    (side ? m_send_p_cipher : m_recv_p_cipher).emplace(current_okm_buffer, REKEY_INTERVAL);
+
+    expand_to_buffer("responder_L", current_okm_buffer);
+    (side ? m_recv_l_cipher : m_send_l_cipher).emplace(current_okm_buffer, REKEY_INTERVAL);
+
+    expand_to_buffer("responder_P", current_okm_buffer);
+    (side ? m_recv_p_cipher : m_send_p_cipher).emplace(current_okm_buffer, REKEY_INTERVAL);
+
+    expand_to_buffer("garbage_terminators", current_okm_buffer);
+    std::copy(std::begin(current_okm_buffer), std::begin(current_okm_buffer) + GARBAGE_TERMINATOR_LEN,
         (initiator ? m_send_garbage_terminator : m_recv_garbage_terminator).begin());
-    std::copy(std::end(hkdf_32_okm) - GARBAGE_TERMINATOR_LEN, std::end(hkdf_32_okm),
+    std::copy(std::end(current_okm_buffer) - GARBAGE_TERMINATOR_LEN, std::end(current_okm_buffer),
         (initiator ? m_recv_garbage_terminator : m_send_garbage_terminator).begin());
 
     // Derive session id from shared secret.
-    hkdf.Expand32("session_id", UCharCast(m_session_id.data()));
+    std::span<std::byte> session_id_span(m_session_id.data(), m_session_id.size());
+    assert(session_id_span.size() == 32);
+    expand_to_buffer("session_id", session_id_span);
 
     // Wipe all variables that contain information which could be used to re-derive encryption keys.
     memory_cleanse(ecdh_secret.data(), ecdh_secret.size());
-    memory_cleanse(hkdf_32_okm.data(), sizeof(hkdf_32_okm));
-    memory_cleanse(&hkdf, sizeof(hkdf));
+    memory_cleanse(current_okm_buffer.data(), current_okm_buffer.size());
+    memory_cleanse(prk_material.data(), prk_material.size()); // Cleanse the PRK
+    
     m_key = CKey();
 }
 
