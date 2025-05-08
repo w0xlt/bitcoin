@@ -5,7 +5,6 @@
 #include <crypto/aes.h>
 #include <crypto/chacha20.h>
 #include <crypto/chacha20poly1305.h>
-#include <crypto/hkdf_sha256_32.h>
 #include <crypto/hkdf_sha256.h>
 #include <crypto/hmac_sha256.h>
 #include <crypto/hmac_sha512.h>
@@ -339,20 +338,32 @@ void TestFSChaCha20Poly1305(const std::string& plain_hex, const std::string& aad
     }
 }
 
-void TestHKDF_SHA256_32(const std::string &ikm_hex, const std::string &salt_hex, const std::string &info_hex, const std::string &okm_check_hex) {
+void TestHKDF_SHA256(const std::string &ikm_hex, const std::string &salt_hex, const std::string &info_hex, const std::string &okm_check_hex) {
     std::vector<unsigned char> initial_key_material = ParseHex(ikm_hex);
-    std::vector<unsigned char> salt = ParseHex(salt_hex);
-    std::vector<unsigned char> info = ParseHex(info_hex);
+    std::vector<unsigned char> salt_bytes = ParseHex(salt_hex);
+    std::vector<unsigned char> info_bytes = ParseHex(info_hex);
 
+    // Create Spans from the byte vectors for the HKDF function
+    const std::span<const unsigned char> ikm_span(initial_key_material);
+    const std::span<const unsigned char> salt_span(salt_bytes);
+    const std::span<const unsigned char> info_span(info_bytes);
 
-    // our implementation only supports strings for the "info" and "salt", stringify them
-    std::string salt_stringified(reinterpret_cast<char*>(salt.data()), salt.size());
-    std::string info_stringified(reinterpret_cast<char*>(info.data()), info.size());
+    // Call the general crypto::HKDF_SHA256 function to get 32 bytes of output.
+    // It returns std::vector<unsigned char>.
+    std::vector<unsigned char> okm_output_vec = crypto::HKDF_SHA256(salt_span, ikm_span, info_span, 32);
 
-    CHKDF_HMAC_SHA256_L32 hkdf32(initial_key_material.data(), initial_key_material.size(), salt_stringified);
-    unsigned char out[32];
-    hkdf32.Expand32(info_stringified, out);
-    BOOST_CHECK(HexStr(out) == okm_check_hex);
+    // Check the output
+    BOOST_CHECK_EQUAL(okm_output_vec.size(), 32); // Ensure we got 32 bytes
+    if (okm_output_vec.size() == 32) { // Proceed with content check only if size is correct
+        // Use HexStr that works with std::vector or Span<const unsigned char>
+        // If HexStr(std::vector<...>) is available:
+        // BOOST_CHECK_EQUAL(HexStr(okm_output_vec), okm_check_hex);
+        // If HexStr(Span<...>) is available (preferred Bitcoin Core style):
+        BOOST_CHECK_EQUAL(HexStr(std::span<const unsigned char>(okm_output_vec)), okm_check_hex);
+    } else {
+        // If size is not 32, it's an unexpected failure from HKDF_SHA256
+        BOOST_ERROR("HKDF_SHA256 did not return 32 bytes for TestHKDF_SHA256_General_L32. Actual size: " + std::to_string(okm_output_vec.size()));
+    }
 }
 
 void TestSHA3_256(const std::string& input, const std::string& output);
@@ -1053,18 +1064,18 @@ BOOST_AUTO_TEST_CASE(chacha20poly1305_testvectors)
 
 BOOST_AUTO_TEST_CASE(hkdf_hmac_sha256_l32_tests)
 {
-    // Use rfc5869 test vectors but truncated to 32 bytes (our implementation only support length 32)
-    TestHKDF_SHA256_32(
+    // Use rfc5869 test vectors but truncated to 32 bytes
+    TestHKDF_SHA256(
                 /*ikm_hex=*/"0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b",
                 /*salt_hex=*/"000102030405060708090a0b0c",
                 /*info_hex=*/"f0f1f2f3f4f5f6f7f8f9",
                 /*okm_check_hex=*/"3cb25f25faacd57a90434f64d0362f2a2d2d0a90cf1a5a4c5db02d56ecc4c5bf");
-    TestHKDF_SHA256_32(
+    TestHKDF_SHA256(
                 "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f",
                 "606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeaf",
                 "b0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff",
                 "b11e398dc80327a1c8e7f78c596a49344f012eda2d4efad8a050cc4c19afa97c");
-    TestHKDF_SHA256_32(
+    TestHKDF_SHA256(
                 "0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b",
                 "",
                 "",

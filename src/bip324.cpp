@@ -8,7 +8,6 @@
 #include <crypto/chacha20.h>
 #include <crypto/chacha20poly1305.h>
 #include <crypto/hkdf_sha256.h>
-#include <crypto/hkdf_sha256_32.h>
 #include <key.h>
 #include <pubkey.h>
 #include <random.h>
