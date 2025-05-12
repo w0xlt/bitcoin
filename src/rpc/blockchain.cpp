@@ -19,11 +19,13 @@
 #include <deploymentinfo.h>
 #include <deploymentstatus.h>
 #include <flatfile.h>
+#include <index/txindex.h>
 #include <hash.h>
 #include <index/blockfilterindex.h>
 #include <index/coinstatsindex.h>
 #include <interfaces/mining.h>
 #include <kernel/coinstats.h>
+#include <key_io.h>
 #include <logging/timer.h>
 #include <net.h>
 #include <net_processing.h>
@@ -60,6 +62,7 @@
 #include <mutex>
 #include <optional>
 #include <vector>
+#include <sqlite3.h>
 
 using kernel::CCoinsStats;
 using kernel::CoinStatsHashType;
@@ -3378,6 +3381,514 @@ return RPCHelpMan{
     };
 }
 
+// --- SQLite Helper Functions ---
+
+// RAII wrapper for sqlite3_stmt
+class SQLiteStatement {
+    sqlite3_stmt* stmt = nullptr;
+public:
+    SQLiteStatement(sqlite3* db, const char* sql) {
+        if (sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr) != SQLITE_OK) {
+            std::string errMsg = sqlite3_errmsg(db);
+            sqlite3_finalize(stmt); // Finalize even if prepare failed but gave a stmt handle
+            throw std::runtime_error("SQLite prepare failed: " + errMsg);
+        }
+        if (!stmt) {
+             throw std::runtime_error("SQLite prepare failed: returned null statement");
+        }
+    }
+    ~SQLiteStatement() {
+        if (stmt) {
+            sqlite3_finalize(stmt);
+        }
+    }
+    // Getter for the raw statement
+    sqlite3_stmt* get() { return stmt; }
+
+    // Prevent copying
+    SQLiteStatement(const SQLiteStatement&) = delete;
+    SQLiteStatement& operator=(const SQLiteStatement&) = delete;
+};
+
+// Execute simple SQL command, throw on error
+static void ExecSqlOrThrow(sqlite3* db, const char* sql) {
+    char* errMsg = nullptr;
+    if (sqlite3_exec(db, sql, nullptr, nullptr, &errMsg) != SQLITE_OK) {
+        std::string err = "SQLite exec failed: ";
+        if (errMsg) {
+            err += errMsg;
+            sqlite3_free(errMsg);
+        } else {
+            err += "Unknown error";
+        }
+        throw std::runtime_error(err);
+    }
+}
+
+// Function to create the database schema
+static void CreateDatabaseSchema(sqlite3* db) {
+    ExecSqlOrThrow(db, "PRAGMA foreign_keys = ON;");
+    ExecSqlOrThrow(db, "BEGIN TRANSACTION;");
+
+    ExecSqlOrThrow(db, R"(
+        CREATE TABLE blocks (
+            height INTEGER PRIMARY KEY,
+            block_hash TEXT UNIQUE NOT NULL,
+            timestamp INTEGER NOT NULL
+        );
+    )");
+
+    ExecSqlOrThrow(db, R"(
+        CREATE TABLE transactions (
+            txid TEXT PRIMARY KEY,
+            block_hash TEXT NOT NULL,
+            tx_index_in_block INTEGER NOT NULL,
+            version INTEGER NOT NULL,
+            lock_time INTEGER NOT NULL,
+            fee_satoshi INTEGER,
+            size_bytes INTEGER NOT NULL,
+            weight_units INTEGER NOT NULL,
+            virtual_size_vbytes INTEGER NOT NULL,
+            FOREIGN KEY (block_hash) REFERENCES blocks(block_hash) ON DELETE CASCADE,
+            UNIQUE (block_hash, tx_index_in_block)
+        );
+    )");
+
+    ExecSqlOrThrow(db, R"(
+        CREATE TABLE tx_inputs (
+            txid TEXT NOT NULL,
+            input_index INTEGER NOT NULL,
+            prev_tx_hash TEXT,
+            prev_output_index INTEGER,
+            script_sig BLOB,
+            sequence INTEGER NOT NULL,
+            has_witness BOOLEAN NOT NULL,
+            FOREIGN KEY (txid) REFERENCES transactions(txid) ON DELETE CASCADE,
+            UNIQUE (txid, input_index)
+        );
+    )");
+
+     ExecSqlOrThrow(db, R"(
+        CREATE TABLE tx_outputs (
+            txid TEXT NOT NULL,
+            output_index INTEGER NOT NULL,
+            value_satoshi INTEGER NOT NULL,
+            address TEXT,
+            script_pub_key BLOB NOT NULL,
+            FOREIGN KEY (txid) REFERENCES transactions(txid) ON DELETE CASCADE,
+            UNIQUE (txid, output_index)
+        );
+    )");
+
+    ExecSqlOrThrow(db, R"(
+        CREATE TABLE witness_items (
+            txid TEXT NOT NULL,
+            input_index INTEGER NOT NULL,
+            item_index_in_stack INTEGER NOT NULL,
+            item_data BLOB NOT NULL,
+            FOREIGN KEY (txid, input_index) REFERENCES tx_inputs(txid, input_index) ON DELETE CASCADE,
+            UNIQUE (txid, input_index, item_index_in_stack)
+        );
+    )");
+
+    ExecSqlOrThrow(db, "COMMIT;");
+}
+
+
+// Function to store data for a single block
+static void storeBlockData(sqlite3* db, int block_height, const CBlock& block,
+                           SQLiteStatement& insert_block_stmt,
+                           SQLiteStatement& insert_tx_stmt,
+                           SQLiteStatement& insert_input_stmt,
+                           SQLiteStatement& insert_output_stmt,
+                           SQLiteStatement& insert_witness_stmt,
+                           const node::BlockManager& blockman,
+                           const CTxMemPool* const mempool)
+{
+    const uint256& block_hash = block.GetHash();
+    const std::string block_hash_hex = block_hash.GetHex();
+
+    // 1. Insert Block
+    sqlite3_reset(insert_block_stmt.get());
+    sqlite3_bind_int(insert_block_stmt.get(), 1, block_height);
+    sqlite3_bind_text(insert_block_stmt.get(), 2, block_hash_hex.c_str(), -1, SQLITE_STATIC);
+    sqlite3_bind_int(insert_block_stmt.get(), 3, block.nTime);
+    if (sqlite3_step(insert_block_stmt.get()) != SQLITE_DONE) {
+        throw std::runtime_error("Failed to insert block: " + std::string(sqlite3_errmsg(db)));
+    }
+
+    // 2. Insert Transactions, Inputs, Outputs, Witness Items
+    for (size_t tx_idx = 0; tx_idx < block.vtx.size(); ++tx_idx) {
+        const CTransactionRef& tx = block.vtx[tx_idx];
+        const Txid& txid = tx->GetHash();
+        const std::string txid_hex = txid.GetHex();
+
+        CAmount nTotalInputValue = 0;
+        bool all_inputs_found = true; // Assume true, set to false if any prev tx not found
+
+        if (!tx->IsCoinBase()) {
+            if (!g_txindex) { // Global variable indicating if txindex is enabled
+                all_inputs_found = false; // Cannot calculate fee without txindex
+                if (tx_idx > 0 && block_height % 1000 == 0 && tx_idx < 2) { // Log sparsely
+                     LogPrintf("Warning: txindex is not enabled. Fees will be NULL. (tx: %s)\n", txid_hex);
+                }
+            } else {
+                for (const CTxIn& txin : tx->vin) {
+
+                    if (txin.prevout.IsNull()) continue; // Should not happen for non-coinbase
+
+                    uint256 hashBlock = uint256();
+                    const CTransactionRef previous_tx{GetTransaction(
+                        /*block_index=*/nullptr, 
+                        mempool, 
+                        txin.prevout.hash, 
+                        hashBlock, 
+                        blockman
+                    )};
+
+                    if (!previous_tx) {
+                        LogPrintf("Warning: Could not find previous transaction %s (for input of tx %s) using txindex for fee calculation. Fee will be NULL.\n",
+                                  txin.prevout.hash.GetHex(), txid_hex);
+                        all_inputs_found = false;
+                        break;
+                    }
+
+                    if (txin.prevout.n >= previous_tx->vout.size()) {
+                        LogPrintf("Error: Previous transaction %s output index %u out of bounds (for input of tx %s). Fee will be NULL.\n",
+                                  txin.prevout.hash.GetHex(), txin.prevout.n, txid_hex);
+                        all_inputs_found = false;
+                        break;
+                    }
+                    nTotalInputValue += previous_tx->vout[txin.prevout.n].nValue;
+                }
+            }
+        }
+        
+        // Insert Transaction
+        sqlite3_reset(insert_tx_stmt.get());
+        sqlite3_bind_text(insert_tx_stmt.get(), 1, txid_hex.c_str(), -1, SQLITE_STATIC);
+        sqlite3_bind_text(insert_tx_stmt.get(), 2, block_hash_hex.c_str(), -1, SQLITE_STATIC);
+        sqlite3_bind_int(insert_tx_stmt.get(), 3, static_cast<int>(tx_idx));
+        sqlite3_bind_int(insert_tx_stmt.get(), 4, tx->version);
+        sqlite3_bind_int(insert_tx_stmt.get(), 5, tx->nLockTime);
+
+        if (tx->IsCoinBase() || !all_inputs_found) {
+            sqlite3_bind_null(insert_tx_stmt.get(), 6); // fee_satoshi
+        } else {
+            CAmount nTotalOutputValue = tx->GetValueOut();
+            CAmount fee = nTotalInputValue - nTotalOutputValue;
+            if (fee < 0) {
+                LogPrintf("Warning: Negative fee calculated for tx %s (Height: %d, Inputs: %lld, Outputs: %lld). Storing fee as NULL.\n",
+                          txid_hex, block_height, nTotalInputValue, nTotalOutputValue);
+                sqlite3_bind_null(insert_tx_stmt.get(), 6);
+            } else {
+                sqlite3_bind_int64(insert_tx_stmt.get(), 6, fee);
+            }
+        }
+
+        // Calculate Size and Weight
+        int64_t tx_size = tx->GetTotalSize();
+        int64_t weight = GetTransactionWeight(*tx);
+        int64_t virtual_size = GetVirtualTransactionSize(*tx);
+
+        sqlite3_bind_int64(insert_tx_stmt.get(), 7, tx_size);
+        sqlite3_bind_int64(insert_tx_stmt.get(), 8, weight);
+        sqlite3_bind_int64(insert_tx_stmt.get(), 9, virtual_size);   
+
+        if (sqlite3_step(insert_tx_stmt.get()) != SQLITE_DONE) {
+            throw std::runtime_error("Failed to insert transaction " + txid_hex + ": " + std::string(sqlite3_errmsg(db)));
+        }
+
+        // Insert Inputs
+        for (size_t vin_idx = 0; vin_idx < tx->vin.size(); ++vin_idx) {
+            const CTxIn& txin = tx->vin[vin_idx];
+            const COutPoint& prevout = txin.prevout;
+            const std::string prev_tx_hash_hex = prevout.hash.IsNull() ? "" : prevout.hash.GetHex(); // Handle coinbase
+            bool has_witness = !txin.scriptWitness.IsNull();
+
+            sqlite3_reset(insert_input_stmt.get());
+            sqlite3_bind_text(insert_input_stmt.get(), 1, txid_hex.c_str(), -1, SQLITE_STATIC);
+            sqlite3_bind_int(insert_input_stmt.get(), 2, static_cast<int>(vin_idx));
+            sqlite3_bind_text(insert_input_stmt.get(), 3, prev_tx_hash_hex.c_str(), -1, SQLITE_STATIC);
+            sqlite3_bind_int(insert_input_stmt.get(), 4, prevout.n);
+            sqlite3_bind_blob(insert_input_stmt.get(), 5, txin.scriptSig.data(), txin.scriptSig.size(), SQLITE_STATIC);
+            sqlite3_bind_int(insert_input_stmt.get(), 6, txin.nSequence);
+            sqlite3_bind_int(insert_input_stmt.get(), 7, has_witness ? 1 : 0);
+
+            if (sqlite3_step(insert_input_stmt.get()) != SQLITE_DONE) {
+                 throw std::runtime_error("Failed to insert input " + std::to_string(vin_idx) + " for tx " + txid_hex + ": " + std::string(sqlite3_errmsg(db)));
+            }
+
+            // Insert Witness Items (if any)
+            if (has_witness) {
+                for (size_t item_idx = 0; item_idx < txin.scriptWitness.stack.size(); ++item_idx) {
+                    const auto& witness_item = txin.scriptWitness.stack[item_idx];
+
+                    sqlite3_reset(insert_witness_stmt.get());
+                    sqlite3_bind_text(insert_witness_stmt.get(), 1, txid_hex.c_str(), -1, SQLITE_STATIC); // txid
+                    sqlite3_bind_int(insert_witness_stmt.get(), 2, static_cast<int>(vin_idx));          // input_index
+                    sqlite3_bind_int(insert_witness_stmt.get(), 3, static_cast<int>(item_idx));         // item_index_in_stack
+                    sqlite3_bind_blob(insert_witness_stmt.get(), 4, witness_item.data(), witness_item.size(), SQLITE_STATIC); // item_data
+
+                    if (sqlite3_step(insert_witness_stmt.get()) != SQLITE_DONE) {
+                        throw std::runtime_error("Failed to insert witness item " + std::to_string(item_idx) + " for input " + std::to_string(vin_idx) + " of tx " + txid_hex + ": " + std::string(sqlite3_errmsg(db)));
+                    }
+                }
+            }
+        } // End input loop
+
+        // Insert Outputs
+        for (size_t vout_idx = 0; vout_idx < tx->vout.size(); ++vout_idx) {
+            const CTxOut& txout = tx->vout[vout_idx];
+
+            sqlite3_reset(insert_output_stmt.get());
+            sqlite3_bind_text(insert_output_stmt.get(), 1, txid_hex.c_str(), -1, SQLITE_STATIC);
+            sqlite3_bind_int(insert_output_stmt.get(), 2, static_cast<int>(vout_idx));
+            sqlite3_bind_int64(insert_output_stmt.get(), 3, txout.nValue); // Use int64 for amount
+            sqlite3_bind_blob(insert_output_stmt.get(), 4, txout.scriptPubKey.data(), txout.scriptPubKey.size(), SQLITE_STATIC);
+
+            CTxDestination destination;
+            std::string address_str;
+            if (ExtractDestination(txout.scriptPubKey, destination)) {
+                address_str = EncodeDestination(destination);
+                sqlite3_bind_text(insert_output_stmt.get(), 5, address_str.c_str(), -1, SQLITE_STATIC); // address
+            } else {
+                sqlite3_bind_null(insert_output_stmt.get(), 5); // address
+            }
+
+            if (sqlite3_step(insert_output_stmt.get()) != SQLITE_DONE) {
+                throw std::runtime_error("Failed to insert output " + std::to_string(vout_idx) + " for tx " + txid_hex + ": " + std::string(sqlite3_errmsg(db)));
+            }
+        } // End output loop
+
+    } // End transaction loop
+}
+
+// Help text and metadata for the RPC command
+static RPCHelpMan createtransactiondatabase()
+{
+    return RPCHelpMan{"createtransactiondatabase",
+                "Iterates over blocks in a given height range and saves all transaction data into a new SQLite database.\n"
+                "The database file specified by 'path' must not exist.\n"
+                "Both start_height and end_height are inclusive block heights.\n",
+                {
+                    RPCArg{"path", RPCArg::Type::STR, RPCArg::Optional::NO, "The full path where the SQLite database file will be created. Must not exist."},
+                    RPCArg{"start_height", RPCArg::Type::NUM, RPCArg::Default{0}, "Height to start to scan from"},
+                    RPCArg{"end_height", RPCArg::Type::NUM, RPCArg::DefaultHint{"chain tip"}, "Height to stop to scan"},
+                },
+                RPCResult{
+                    RPCResult::Type::OBJ, "", "Status of the database creation process.",
+                    {
+                        {RPCResult::Type::NUM, "blocks_processed", "Number of blocks processed and stored."},
+                    }
+                },
+                RPCExamples{
+                    HelpExampleCli("createtransactiondatabase", "") +
+                    HelpExampleCli("createtransactiondatabase", "1000") +
+                    HelpExampleCli("createtransactiondatabase", "1000 1001") +
+                    HelpExampleRpc("createtransactiondatabase", "") +
+                    HelpExampleRpc("createtransactiondatabase", "1000") +
+                    HelpExampleRpc("createtransactiondatabase", "1000, 1001")
+                },
+                [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
+{
+    NodeContext& node = EnsureAnyNodeContext(request.context);
+    ChainstateManager& chainman = EnsureChainman(node);
+    Chainstate& active_chainstate = chainman.ActiveChainstate();
+    // const node::BlockManager& blockman = EnsureBlockman(node);
+    // const CTxMemPool& mempool = EnsureMemPool(node);
+    EnsureMemPool(node);
+
+    // It's crucial to lock cs_main when accessing chain state.
+    // The RPC framework usually takes care of this for read-only commands.
+    LOCK(cs_main);
+
+    const CChain& active_chain = active_chainstate.m_chain;
+    int chain_tip_height = active_chain.Height(); // Max block index on the active chain. -1 if empty.
+
+    std::string db_path_str = request.params[0].get_str();
+    fs::path db_path = fs::u8path(db_path_str);
+
+    if (fs::exists(db_path)) {
+        throw JSONRPCError(RPC_INVALID_PARAMETER, "Database file already exists at the specified path: " + db_path_str);
+    }
+
+    int start_height;
+    int end_height;
+
+    // Determine start_height
+    if (request.params.size() > 0 && !request.params[1].isNull()) {
+        start_height = request.params[1].getInt<int>();
+        if (start_height < 0) {
+            throw JSONRPCError(RPC_INVALID_PARAMETER, "Start height must be non-negative.");
+        }
+    } else {
+        start_height = 0; // Default for start_height
+    }
+
+    // Determine end_height
+    if (request.params.size() > 1 && !request.params[2].isNull()) {
+        end_height = request.params[2].getInt<int>();
+        if (end_height < 0) {
+            // User explicitly provided a negative end_height
+            throw JSONRPCError(RPC_INVALID_PARAMETER, "End height, if provided, must be non-negative.");
+        }
+    } else {
+        // Default for end_height: chain_tip_height - 1
+        // If chain_tip_height is 0 (genesis only), default end_height is -1.
+        // If chain_tip_height is -1 (empty chain), default end_height is -2.
+        // This ensures the loop condition `current_height <= end_height` correctly handles these edge cases.
+        end_height = chain_tip_height - 1;
+    }
+
+    // Validate the derived start_height and end_height
+    // Note: chain_tip_height is the *index* of the highest block. If chain_tip_height is 0, block 0 exists.
+    // If chain_tip_height is -1, the chain is empty.
+
+    // 1. Start height cannot be greater than end height, unless end_height is negative due to default on an empty/short chain.
+    if (start_height > end_height && end_height >= 0) {
+        throw JSONRPCError(RPC_INVALID_PARAMETER, strprintf("Start height %d cannot be greater than end height %d when end height is non-negative.", start_height, end_height));
+    }
+
+    // 2. End height must be less than the chain tip height.
+    //    (i.e., end_height <= chain_tip_height - 1)
+    //    This check is only meaningful if the chain is not empty (chain_tip_height >= 0).
+    //    If chain_tip_height is -1 (empty), end_height (default -2) is already < chain_tip_height.
+    if (chain_tip_height >= 0 && end_height >= chain_tip_height) {
+         throw JSONRPCError(RPC_INVALID_PARAMETER, strprintf("End height %d must be less than the current chain tip height %d.", end_height, chain_tip_height));
+    }
+    // Note: If chain_tip_height is 0 (genesis only), this means max end_height is -1.
+    // So, if user specified end_height=0, it would fail this check (0 >= 0 is true).
+    // This strictly adheres to "end parameter should be less than the blockchain tip".
+
+    // 3. start_height should not be excessively large (e.g. > tip), though other checks might catch this.
+    // If start_height > chain_tip_height, and end_height defaulted to (chain_tip_height - 1),
+    // then start_height > end_height condition (already checked) would catch it.
+    // If user provides start_height > chain_tip_height AND end_height > chain_tip_height,
+    // the end_height >= chain_tip_height check would catch it first.
+
+    const std::string filtertype_name{"basic"};
+
+    BlockFilterType filtertype;
+    if (!BlockFilterTypeByName(filtertype_name, filtertype)) {
+        throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "Unknown filtertype");
+    }
+
+    BlockFilterIndex* index = GetBlockFilterIndex(filtertype);
+    if (!index) {
+        return JSONRPCError(RPC_INVALID_REQUEST, "Index is not enabled for filtertype basic");
+    }
+
+    CBlockIndex* blockindex = active_chain[start_height];
+    int block_height = start_height;
+
+    CBlockIndex* target_index = active_chain[end_height];
+
+    if (!blockindex) {
+        return JSONRPCError(RPC_INVALID_REQUEST, "Start height not found.");
+    }
+
+    BlockFilter filter;
+    if (!index->LookupFilter(blockindex, filter)) {
+        return JSONRPCError(RPC_INVALID_REQUEST, "Start height not found.");
+    }
+
+    uint256 blockhash = filter.GetBlockHash();
+    
+    bool block_still_active;
+    bool next_block_exists;
+    uint256 next_blockhash;
+
+    int blocks_processed_count = 0;
+
+    sqlite3* db = nullptr;
+    try {
+        if (sqlite3_open(db_path.c_str(), &db) != SQLITE_OK) {
+            std::string errMsg = db ? sqlite3_errmsg(db) : "Cannot open database";
+            if (db) sqlite3_close(db); // Close if handle was obtained but open failed
+            throw JSONRPCError(RPC_DATABASE_ERROR, "Failed to open/create SQLite database: " + errMsg);
+        }
+
+        CreateDatabaseSchema(db); // Create tables
+
+        // Prepare INSERT statements once
+        SQLiteStatement insert_block_stmt(db, "INSERT INTO blocks (height, block_hash, timestamp) VALUES (?, ?, ?)");
+        SQLiteStatement insert_tx_stmt(db, "INSERT INTO transactions (txid, block_hash, tx_index_in_block, version, lock_time, fee_satoshi, size_bytes, weight_units, virtual_size_vbytes) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)");
+        SQLiteStatement insert_input_stmt(db, "INSERT INTO tx_inputs (txid, input_index, prev_tx_hash, prev_output_index, script_sig, sequence, has_witness) VALUES (?, ?, ?, ?, ?, ?, ?)");
+        SQLiteStatement insert_output_stmt(db, "INSERT INTO tx_outputs (txid, output_index, value_satoshi, script_pub_key, address) VALUES (?, ?, ?, ?, ?)");
+        SQLiteStatement insert_witness_stmt(db, "INSERT INTO witness_items (txid, input_index, item_index_in_stack, item_data) VALUES (?, ?, ?, ?)");
+
+        // --- 3. Block Processing Loop ---
+        while (!node.chain->shutdownRequested()) {
+
+            CBlock block;
+            bool found = node.chain->findBlock(
+                blockhash, 
+                interfaces::FoundBlock()
+                    .inActiveChain(block_still_active)
+                    .data(block)
+                    .nextBlock(interfaces::FoundBlock()
+                    .inActiveChain(next_block_exists)
+                    .hash(next_blockhash)));
+
+            if (!found) {
+                throw JSONRPCError(RPC_INTERNAL_ERROR, strprintf("Block not found height: %d hash: %s", block_height, blockhash.GetHex()));
+            }
+    
+            // Process this block within a DB transaction
+            ExecSqlOrThrow(db, "BEGIN TRANSACTION;");
+            try {
+                storeBlockData(db, block_height, block,
+                               insert_block_stmt, insert_tx_stmt, insert_input_stmt,
+                               insert_output_stmt, insert_witness_stmt, chainman.m_blockman, node.mempool.get());
+                ExecSqlOrThrow(db, "COMMIT;");
+                blocks_processed_count++;
+            } catch (const std::exception& e) {
+                 ExecSqlOrThrow(db, "ROLLBACK;"); // Rollback on error within block processing
+                 LogPrintf("Error processing block %d: %s. Rolling back block and stopping.\n", block_height, e.what());
+                 throw JSONRPCError(RPC_DATABASE_ERROR, strprintf("Error processing block %d: %s", block_height, e.what()));
+            }
+    
+            if (block_height >= target_index->nHeight) {
+                break;
+            }
+    
+            if (!next_block_exists) {
+                // break successfully when rescan has reached the tip, or
+                // previous block is no longer on the chain due to a reorg
+                break;
+            }
+    
+            // increment block and verification progress
+            blockhash = next_blockhash;
+            ++block_height;
+        }
+
+        // --- 4. Cleanup and Result ---
+        sqlite3_close(db);
+        db = nullptr; // Prevent double close in catch block
+
+        LogPrintf("Successfully created transaction database at %s. Processed %d blocks.\n", db_path_str, blocks_processed_count);
+
+    } catch (const UniValue& e) {
+        if (db) sqlite3_close(db); // Ensure DB is closed on RPC error exit
+        throw; // Re-throw JSONRPCError
+    } catch (const std::exception& e) {
+        if (db) sqlite3_close(db); // Ensure DB is closed on std::exception exit
+        LogPrintf("Standard exception during database creation: %s\n", e.what());
+        throw JSONRPCError(RPC_INTERNAL_ERROR, "An internal error occurred: " + std::string(e.what()));
+    } catch (...) {
+        if (db) sqlite3_close(db); // Ensure DB is closed on unknown exception exit
+        LogPrintf("Unknown exception during database creation.\n");
+        throw JSONRPCError(RPC_INTERNAL_ERROR, "An unknown internal error occurred.");
+    }
+
+    UniValue result(UniValue::VOBJ);
+    result.pushKV("blocks_processed", blocks_processed_count);
+    return result;
+},
+    };
+}
 
 void RegisterBlockchainRPCCommands(CRPCTable& t)
 {
@@ -3403,6 +3914,7 @@ void RegisterBlockchainRPCCommands(CRPCTable& t)
         {"blockchain", &scanblocks},
         {"blockchain", &getdescriptoractivity},
         {"blockchain", &getblockfilter},
+        {"blockchain", &createtransactiondatabase},
         {"blockchain", &dumptxoutset},
         {"blockchain", &loadtxoutset},
         {"blockchain", &getchainstates},
