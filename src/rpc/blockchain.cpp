@@ -24,6 +24,7 @@
 #include <index/coinstatsindex.h>
 #include <interfaces/mining.h>
 #include <kernel/coinstats.h>
+#include <key_io.h>
 #include <logging/timer.h>
 #include <net.h>
 #include <net_processing.h>
@@ -3378,6 +3379,408 @@ return RPCHelpMan{
     };
 }
 
+/*static RPCHelpMan createtransactiondatabase()
+{
+    return RPCHelpMan{"createtransactiondatabase",
+        "Iterate over each transaction in the blocks and saves them in a relational database (SQLite).\n"
+        "This call may take several minutes. Make sure to use no RPC timeout (bitcoin-cli -rpcclienttimeout=0)",
+        {
+            scan_action_arg_desc,
+            scan_objects_arg_desc,
+            RPCArg{"start_height", RPCArg::Type::NUM, RPCArg::Default{0}, "Height to start to scan from"},
+            RPCArg{"stop_height", RPCArg::Type::NUM, RPCArg::DefaultHint{"chain tip"}, "Height to stop to scan"}
+        },
+        {
+            scan_result_status_none,
+            RPCResult{"When action=='start'; only returns after scan completes", RPCResult::Type::OBJ, "", "", {
+                {RPCResult::Type::NUM, "from_height", "The height we started the scan from"},
+                {RPCResult::Type::NUM, "to_height", "The height we ended the scan at"},
+                {RPCResult::Type::ARR, "relevant_blocks", "Blocks that may have matched a scanobject.", {
+                    {RPCResult::Type::STR_HEX, "blockhash", "A relevant blockhash"},
+                }},
+                {RPCResult::Type::BOOL, "completed", "true if the scan process was not aborted"}
+            }},
+            RPCResult{"when action=='status' and a scan is currently in progress", RPCResult::Type::OBJ, "", "", {
+                    {RPCResult::Type::NUM, "progress", "Approximate percent complete"},
+                    {RPCResult::Type::NUM, "current_height", "Height of the block currently being scanned"},
+                },
+            },
+            scan_result_abort,
+        },
+        RPCExamples{
+            HelpExampleCli("scanblocks", "start '[\"addr(bcrt1q4u4nsgk6ug0sqz7r3rj9tykjxrsl0yy4d0wwte)\"]' 300000") +
+            HelpExampleCli("scanblocks", "start '[\"addr(bcrt1q4u4nsgk6ug0sqz7r3rj9tykjxrsl0yy4d0wwte)\"]' 100 150 basic") +
+            HelpExampleCli("scanblocks", "status") +
+            HelpExampleRpc("scanblocks", "\"start\", [\"addr(bcrt1q4u4nsgk6ug0sqz7r3rj9tykjxrsl0yy4d0wwte)\"], 300000") +
+            HelpExampleRpc("scanblocks", "\"start\", [\"addr(bcrt1q4u4nsgk6ug0sqz7r3rj9tykjxrsl0yy4d0wwte)\"], 100, 150, \"basic\"") +
+            HelpExampleRpc("scanblocks", "\"status\"")
+        },
+        [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
+{
+    UniValue ret(UniValue::VOBJ);
+    if (request.params[0].get_str() == "status") {
+        BlockFiltersScanReserver reserver;
+        if (reserver.reserve()) {
+            // no scan in progress
+            return NullUniValue;
+        }
+        ret.pushKV("progress", g_scanfilter_progress.load());
+        ret.pushKV("current_height", g_scanfilter_progress_height.load());
+        return ret;
+    } else if (request.params[0].get_str() == "abort") {
+        BlockFiltersScanReserver reserver;
+        if (reserver.reserve()) {
+            // reserve was possible which means no scan was running
+            return false;
+        }
+        // set the abort flag
+        g_scanfilter_should_abort_scan = true;
+        return true;
+    } else if (request.params[0].get_str() == "start") {
+        BlockFiltersScanReserver reserver;
+        if (!reserver.reserve()) {
+            throw JSONRPCError(RPC_INVALID_PARAMETER, "Scan already in progress, use action \"abort\" or \"status\"");
+        }
+
+        const std::string filtertype_name{"basic"};
+
+        BlockFilterType filtertype;
+        if (!BlockFilterTypeByName(filtertype_name, filtertype)) {
+            throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "Unknown filtertype");
+        }
+
+        BlockFilterIndex* index = GetBlockFilterIndex(filtertype);
+        if (!index) {
+            throw JSONRPCError(RPC_MISC_ERROR, "Index is not enabled for filtertype " + filtertype_name);
+        }
+
+        NodeContext& node = EnsureAnyNodeContext(request.context);
+        ChainstateManager& chainman = EnsureChainman(node);
+
+        // set the start-height
+        const CBlockIndex* start_index = nullptr;
+        const CBlockIndex* stop_block = nullptr;
+        {
+            LOCK(cs_main);
+            CChain& active_chain = chainman.ActiveChain();
+            start_index = active_chain.Genesis();
+            stop_block = active_chain.Tip(); // If no stop block is provided, stop at the chain tip.
+            if (!request.params[2].isNull()) {
+                start_index = active_chain[request.params[2].getInt<int>()];
+                if (!start_index) {
+                    throw JSONRPCError(RPC_MISC_ERROR, "Invalid start_height");
+                }
+            }
+            if (!request.params[3].isNull()) {
+                stop_block = active_chain[request.params[3].getInt<int>()];
+                if (!stop_block || stop_block->nHeight < start_index->nHeight) {
+                    throw JSONRPCError(RPC_MISC_ERROR, "Invalid stop_height");
+                }
+            }
+        }
+        CHECK_NONFATAL(start_index);
+        CHECK_NONFATAL(stop_block);
+
+        // loop through the scan objects, add scripts to the needle_set
+        GCSFilter::ElementSet needle_set;
+        for (const UniValue& scanobject : request.params[1].get_array().getValues()) {
+            FlatSigningProvider provider;
+            std::vector<CScript> scripts = EvalDescriptorStringOrObject(scanobject, provider);
+            for (const CScript& script : scripts) {
+                needle_set.emplace(script.begin(), script.end());
+            }
+        }
+        UniValue blocks(UniValue::VARR);
+        const int amount_per_chunk = 10000;
+        std::vector<BlockFilter> filters;
+        int start_block_height = start_index->nHeight; // for progress reporting
+        const int total_blocks_to_process = stop_block->nHeight - start_block_height;
+
+        g_scanfilter_should_abort_scan = false;
+        g_scanfilter_progress = 0;
+        g_scanfilter_progress_height = start_block_height;
+        bool completed = true;
+
+        const CBlockIndex* end_range = nullptr;
+        do {
+            node.rpc_interruption_point(); // allow a clean shutdown
+            if (g_scanfilter_should_abort_scan) {
+                completed = false;
+                break;
+            }
+
+            // split the lookup range in chunks if we are deeper than 'amount_per_chunk' blocks from the stopping block
+            int start_block = !end_range ? start_index->nHeight : start_index->nHeight + 1; // to not include the previous round 'end_range' block
+            end_range = (start_block + amount_per_chunk < stop_block->nHeight) ?
+                    WITH_LOCK(::cs_main, return chainman.ActiveChain()[start_block + amount_per_chunk]) :
+                    stop_block;
+
+            if (index->LookupFilterRange(start_block, end_range, filters)) {
+
+            }
+            start_index = end_range;
+
+            uint256 start_block;
+            bool start = chainman.findFirstBlockWithTimeAndHeight(startTime - TIMESTAMP_WINDOW, 0, interfaces::FoundBlock().hash(start_block).height(start_height));
+
+            // update progress
+            int blocks_processed = end_range->nHeight - start_block_height;
+            if (total_blocks_to_process > 0) { // avoid division by zero
+                g_scanfilter_progress = (int)(100.0 / total_blocks_to_process * blocks_processed);
+            } else {
+                g_scanfilter_progress = 100;
+            }
+            g_scanfilter_progress_height = end_range->nHeight;
+
+        // Finish if we reached the stop block
+        } while (start_index != stop_block);
+
+        ret.pushKV("from_height", start_block_height);
+        ret.pushKV("to_height", start_index->nHeight); // start_index is always the last scanned block here
+        ret.pushKV("relevant_blocks", std::move(blocks));
+        ret.pushKV("completed", completed);
+    }
+    else {
+        throw JSONRPCError(RPC_INVALID_PARAMETER, strprintf("Invalid action '%s'", request.params[0].get_str()));
+    }
+    return ret;
+},
+    };
+}*/
+
+
+static void storeTransactions(CBlock &block) {
+
+    for (size_t posInBlock = 0; posInBlock < block.vtx.size(); ++posInBlock) {
+
+        auto vtx = block.vtx[posInBlock];
+        const Txid& txid = vtx->GetHash();
+        std::cout << "----------------" << std::endl;
+        std::cout << "--> Txid: " << txid.GetHex() << std::endl;
+
+        std::cout << "--> Vin: " << std::endl;
+        for (size_t vinIndex = 0; vinIndex < vtx->vin.size(); ++vinIndex) {
+        }
+
+        std::cout << "--> Vout: " << std::endl;
+        for (size_t voutIndex = 0; voutIndex < vtx->vout.size(); ++voutIndex) {
+            std::cout << "----> Amout: " << vtx->vout[voutIndex].nValue << std::endl;
+
+            auto scriptPubKey = vtx->vout[voutIndex].scriptPubKey;
+
+            std::cout << "----> scriptPubKey: " << HexStr(scriptPubKey) << std::endl;
+
+            CTxDestination address;
+            if (ExtractDestination(scriptPubKey, address)) {
+                std::cout << "----> scriptPubKey: " << EncodeDestination(address) << std::endl;
+            }
+        }
+    }
+
+}
+
+// Help text and metadata for the RPC command
+static RPCHelpMan createtransactiondatabase()
+{
+    return RPCHelpMan{"createtransactiondatabase",
+                "\nIterates over blocks in a given height range and save all transaction in a SQLite database.\n"
+                "Both start_height and end_height are inclusive.\n",
+                {
+                    RPCArg{"start_height", RPCArg::Type::NUM, RPCArg::Default{0}, "Height to start to scan from"},
+                    RPCArg{"end_height", RPCArg::Type::NUM, RPCArg::DefaultHint{"chain tip"}, "Height to stop to scan"},
+                },
+                RPCResult{
+                    RPCResult::Type::ARR, "", "An array of transaction IDs (hex-encoded).",
+                    {
+                        {RPCResult::Type::STR_HEX, "txid", "The transaction id"}
+                    }
+                },
+                RPCExamples{
+                    HelpExampleCli("createtransactiondatabase", "") +
+                    HelpExampleCli("createtransactiondatabase", "1000") +
+                    HelpExampleCli("createtransactiondatabase", "1000 1001") +
+                    HelpExampleRpc("createtransactiondatabase", "") +
+                    HelpExampleRpc("createtransactiondatabase", "1000") +
+                    HelpExampleRpc("createtransactiondatabase", "1000, 1001")
+                },
+                [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
+{
+    NodeContext& node = EnsureAnyNodeContext(request.context);
+    ChainstateManager& chainman = EnsureChainman(node);
+    Chainstate& active_chainstate = chainman.ActiveChainstate();
+
+    // It's crucial to lock cs_main when accessing chain state.
+    // The RPC framework usually takes care of this for read-only commands.
+    // LOCK(active_chainstate.m_cs_main); // Implicitly locked by RPC dispatcher
+
+    const CChain& active_chain = active_chainstate.m_chain;
+    int chain_tip_height = active_chain.Height(); // Max block index on the active chain. -1 if empty.
+
+    int start_height;
+    int end_height;
+
+    // Determine start_height
+    if (request.params.size() > 0 && !request.params[0].isNull()) {
+        start_height = request.params[0].getInt<int>();
+        if (start_height < 0) {
+            throw JSONRPCError(RPC_INVALID_PARAMETER, "Start height must be non-negative.");
+        }
+    } else {
+        start_height = 0; // Default for start_height
+    }
+
+    // Determine end_height
+    if (request.params.size() > 1 && !request.params[1].isNull()) {
+        end_height = request.params[1].getInt<int>();
+        if (end_height < 0) {
+            // User explicitly provided a negative end_height
+            throw JSONRPCError(RPC_INVALID_PARAMETER, "End height, if provided, must be non-negative.");
+        }
+    } else {
+        // Default for end_height: chain_tip_height - 1
+        // If chain_tip_height is 0 (genesis only), default end_height is -1.
+        // If chain_tip_height is -1 (empty chain), default end_height is -2.
+        // This ensures the loop condition `current_height <= end_height` correctly handles these edge cases.
+        end_height = chain_tip_height - 1;
+    }
+
+    // Validate the derived start_height and end_height
+    // Note: chain_tip_height is the *index* of the highest block. If chain_tip_height is 0, block 0 exists.
+    // If chain_tip_height is -1, the chain is empty.
+
+    // 1. Start height cannot be greater than end height, unless end_height is negative due to default on an empty/short chain.
+    if (start_height > end_height && end_height >= 0) {
+        throw JSONRPCError(RPC_INVALID_PARAMETER, strprintf("Start height %d cannot be greater than end height %d when end height is non-negative.", start_height, end_height));
+    }
+
+    // 2. End height must be less than the chain tip height.
+    //    (i.e., end_height <= chain_tip_height - 1)
+    //    This check is only meaningful if the chain is not empty (chain_tip_height >= 0).
+    //    If chain_tip_height is -1 (empty), end_height (default -2) is already < chain_tip_height.
+    if (chain_tip_height >= 0 && end_height >= chain_tip_height) {
+         throw JSONRPCError(RPC_INVALID_PARAMETER, strprintf("End height %d must be less than the current chain tip height %d.", end_height, chain_tip_height));
+    }
+    // Note: If chain_tip_height is 0 (genesis only), this means max end_height is -1.
+    // So, if user specified end_height=0, it would fail this check (0 >= 0 is true).
+    // This strictly adheres to "end parameter should be less than the blockchain tip".
+
+    // 3. start_height should not be excessively large (e.g. > tip), though other checks might catch this.
+    // If start_height > chain_tip_height, and end_height defaulted to (chain_tip_height - 1),
+    // then start_height > end_height condition (already checked) would catch it.
+    // If user provides start_height > chain_tip_height AND end_height > chain_tip_height,
+    // the end_height >= chain_tip_height check would catch it first.
+
+    UniValue result_array(UniValue::VARR);
+
+    const std::string filtertype_name{"basic"};
+
+    BlockFilterType filtertype;
+    if (!BlockFilterTypeByName(filtertype_name, filtertype)) {
+        throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "Unknown filtertype");
+    }
+
+    BlockFilterIndex* index = GetBlockFilterIndex(filtertype);
+    if (!index) {
+        return JSONRPCError(RPC_INVALID_REQUEST, "Index is not enabled for filtertype basic");
+    }
+
+    CBlockIndex* blockindex = active_chain[start_height];
+    int block_height = start_height;
+
+    CBlockIndex* target_index = active_chain[end_height];
+
+    if (!blockindex) {
+        return JSONRPCError(RPC_INVALID_REQUEST, "Start height not found.");
+    }
+
+    /* int current_height = start_height;
+    uint256 start_block;
+    bool found = node.chain->findBlock(blockhash, interfaces::FoundBlock().hash(start_block).height(start_height));
+ */
+    BlockFilter filter;
+    if (!index->LookupFilter(blockindex, filter)) {
+        return JSONRPCError(RPC_INVALID_REQUEST, "Start height not found.");
+    }
+
+    uint256 blockhash = filter.GetBlockHash();
+    
+    //bool found = node.chain->findBlock(blockhash, interfaces::FoundBlock().data(block));
+
+    bool block_still_active;
+    bool next_block_exists;
+    uint256 next_blockhash;
+
+    while (!node.chain->shutdownRequested()) {
+
+        CBlock block;
+        bool found = node.chain->findBlock(
+            blockhash, 
+            interfaces::FoundBlock()
+                .inActiveChain(block_still_active)
+                .data(block)
+                .nextBlock(interfaces::FoundBlock()
+                .inActiveChain(next_block_exists)
+                .hash(next_blockhash)));
+
+        if (found) {
+            // std::cout << "Block hash: " << block.GetHash().GetHex() << " height: " << blockindex->nHeight << std::endl;
+            std::cout << "Block hash: " << block.GetHash().GetHex() << " height: " << block_height << std::endl;
+        } else {
+            std::cout << "NOT FOUND" << std::endl;
+        }
+
+        storeTransactions(block);
+
+        if (block_height >= target_index->nHeight) {
+            break;
+        }
+
+        if (!next_block_exists) {
+            // break successfully when rescan has reached the tip, or
+            // previous block is no longer on the chain due to a reorg
+            break;
+        }
+
+        // increment block and verification progress
+        blockhash = next_blockhash;
+        ++block_height;
+    }
+
+    /* while (!node.chain->shutdownRequested()) {
+
+        CBlockIndex* blockindex = active_chain[current_height];
+
+        if (!blockindex) {
+            LogPrintf("RPC iterateblocktransactions: Block index not found for height %d. Potentially a reorg or stale chain. Skipping.\n", current_height);
+            continue;
+        }
+
+        BlockFilter filter;
+        if (!index->LookupFilter(blockindex, filter)) {
+
+            const uint256 blockhash = filter.GetBlockHash();
+            CBlock block;
+            // bool found = node.chain->findBlock(blockhash, interfaces::FoundBlock().data(block));
+            bool found = node.chain->findBlock(blockhash, interfaces::FoundBlock().inActiveChain(block_still_active).nextBlock(interfaces::FoundBlock().inActiveChain(next_block).hash(next_block_hash)));
+
+            // Handle no found, not active, null block
+
+            if (found) {
+                std::cout << "Block hash: " << block.GetHash().GetHex() << " height: " << blockindex->nHeight << std::endl;
+            }
+
+            // save txs
+
+            
+        }
+    } */
+
+    result_array.push_back("Test");
+
+    return result_array;
+},
+    };
+}
 
 void RegisterBlockchainRPCCommands(CRPCTable& t)
 {
@@ -3403,6 +3806,7 @@ void RegisterBlockchainRPCCommands(CRPCTable& t)
         {"blockchain", &scanblocks},
         {"blockchain", &getdescriptoractivity},
         {"blockchain", &getblockfilter},
+        {"blockchain", &createtransactiondatabase},
         {"blockchain", &dumptxoutset},
         {"blockchain", &loadtxoutset},
         {"blockchain", &getchainstates},
