@@ -173,6 +173,8 @@ static const CRPCConvertParam vRPCConvertParams[] =
     { "descriptorprocesspsbt", 1, "descriptors"},
     { "descriptorprocesspsbt", 3, "bip32derivs" },
     { "descriptorprocesspsbt", 4, "finalize" },
+    { "createtransactiondatabase", 1, "start_height" },
+    { "createtransactiondatabase", 2, "end_height" },
     { "createpsbt", 0, "inputs" },
     { "createpsbt", 1, "outputs" },
     { "createpsbt", 2, "locktime" },
