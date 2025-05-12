@@ -3567,11 +3567,22 @@ static void storeTransactions(CBlock &block) {
             std::cout << "----> prevout.txid : " << prevout.hash.GetHex() << std::endl;
             std::cout << "----> prevout.n: " << prevout.n << std::endl;
 
-            std::cout << "----> scriptSig: " << HexStr(vtx->vin[vinIndex].scriptSig) << std::endl;
+            if (vtx->vin[vinIndex].scriptSig.empty()) {
+                std::cout << "----> scriptSig: Empty" << std::endl;
+            } else {
+                std::cout << "----> scriptSig: " << HexStr(vtx->vin[vinIndex].scriptSig) << std::endl;
+            }
+            
 
             std::cout << "----> nSequence: " << vtx->vin[vinIndex].nSequence << std::endl;
 
-            std::cout << "----> scriptWitness: " << vtx->vin[vinIndex].scriptWitness.ToString() << std::endl;
+            if (vtx->vin[vinIndex].scriptWitness.IsNull()) {
+                std::cout << "----> scriptWitness: Empty" << std::endl;
+            } else {
+                std::cout << "----> scriptWitness: " << vtx->vin[vinIndex].scriptWitness.ToString() << std::endl;
+            }
+
+            
 
         }
 
