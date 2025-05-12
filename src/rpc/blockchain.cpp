@@ -3557,9 +3557,22 @@ static void storeTransactions(CBlock &block) {
         const Txid& txid = vtx->GetHash();
         std::cout << "----------------" << std::endl;
         std::cout << "--> Txid: " << txid.GetHex() << std::endl;
+        std::cout << "--> version: " << vtx->version << std::endl;
+        std::cout << "--> lockTime: " << vtx->nLockTime << std::endl;
 
         std::cout << "--> Vin: " << std::endl;
         for (size_t vinIndex = 0; vinIndex < vtx->vin.size(); ++vinIndex) {
+            
+            COutPoint prevout = vtx->vin[vinIndex].prevout;
+            std::cout << "----> prevout.txid : " << prevout.hash.GetHex() << std::endl;
+            std::cout << "----> prevout.n: " << prevout.n << std::endl;
+
+            std::cout << "----> scriptSig: " << HexStr(vtx->vin[vinIndex].scriptSig) << std::endl;
+
+            std::cout << "----> nSequence: " << vtx->vin[vinIndex].nSequence << std::endl;
+
+            std::cout << "----> scriptWitness: " << vtx->vin[vinIndex].scriptWitness.ToString() << std::endl;
+
         }
 
         std::cout << "--> Vout: " << std::endl;
