@@ -3470,6 +3470,7 @@ static void CreateDatabaseSchema(sqlite3* db) {
             txid TEXT NOT NULL,
             output_index INTEGER NOT NULL,
             value_satoshi INTEGER NOT NULL,
+            address TEXT,
             script_pub_key BLOB NOT NULL,
             FOREIGN KEY (txid) REFERENCES transactions(txid) ON DELETE CASCADE,
             UNIQUE (txid, output_index)
@@ -3577,6 +3578,15 @@ static void storeBlockData(sqlite3* db, int block_height, const CBlock& block,
             sqlite3_bind_int64(insert_output_stmt.get(), 3, txout.nValue); // Use int64 for amount
             sqlite3_bind_blob(insert_output_stmt.get(), 4, txout.scriptPubKey.data(), txout.scriptPubKey.size(), SQLITE_STATIC);
 
+            CTxDestination destination;
+            std::string address_str;
+            if (ExtractDestination(txout.scriptPubKey, destination)) {
+                address_str = EncodeDestination(destination);
+                sqlite3_bind_text(insert_output_stmt.get(), 5, address_str.c_str(), -1, SQLITE_STATIC); // address
+            } else {
+                sqlite3_bind_null(insert_output_stmt.get(), 5); // address
+            }
+
             if (sqlite3_step(insert_output_stmt.get()) != SQLITE_DONE) {
                 throw std::runtime_error("Failed to insert output " + std::to_string(vout_idx) + " for tx " + txid_hex + ": " + std::string(sqlite3_errmsg(db)));
             }
@@ -3584,59 +3594,6 @@ static void storeBlockData(sqlite3* db, int block_height, const CBlock& block,
 
     } // End transaction loop
 }
-
-/*static void storeTransactions(CBlock &block) {
-
-    for (size_t posInBlock = 0; posInBlock < block.vtx.size(); ++posInBlock) {
-
-        auto vtx = block.vtx[posInBlock];
-        const Txid& txid = vtx->GetHash();
-        std::cout << "----------------" << std::endl;
-        std::cout << "--> Txid: " << txid.GetHex() << std::endl;
-        std::cout << "--> version: " << vtx->version << std::endl;
-        std::cout << "--> lockTime: " << vtx->nLockTime << std::endl;
-
-        std::cout << "--> Vin: " << std::endl;
-        for (size_t vinIndex = 0; vinIndex < vtx->vin.size(); ++vinIndex) {
-            
-            COutPoint prevout = vtx->vin[vinIndex].prevout;
-            std::cout << "----> prevout.txid : " << prevout.hash.GetHex() << std::endl;
-            std::cout << "----> prevout.n: " << prevout.n << std::endl;
-
-            if (vtx->vin[vinIndex].scriptSig.empty()) {
-                std::cout << "----> scriptSig: Empty" << std::endl;
-            } else {
-                std::cout << "----> scriptSig: " << HexStr(vtx->vin[vinIndex].scriptSig) << std::endl;
-            }
-            
-
-            std::cout << "----> nSequence: " << vtx->vin[vinIndex].nSequence << std::endl;
-
-            if (vtx->vin[vinIndex].scriptWitness.IsNull()) {
-                std::cout << "----> scriptWitness: Empty" << std::endl;
-            } else {
-                std::cout << "----> scriptWitness: " << vtx->vin[vinIndex].scriptWitness.ToString() << std::endl;
-            }
-
-            
-
-        }
-
-        std::cout << "--> Vout: " << std::endl;
-        for (size_t voutIndex = 0; voutIndex < vtx->vout.size(); ++voutIndex) {
-            std::cout << "----> Amout: " << vtx->vout[voutIndex].nValue << std::endl;
-
-            auto scriptPubKey = vtx->vout[voutIndex].scriptPubKey;
-
-            std::cout << "----> scriptPubKey: " << HexStr(scriptPubKey) << std::endl;
-
-            CTxDestination address;
-            if (ExtractDestination(scriptPubKey, address)) {
-                std::cout << "----> scriptPubKey: " << EncodeDestination(address) << std::endl;
-            }
-        }
-    }
-}*/
 
 // Help text and metadata for the RPC command
 static RPCHelpMan createtransactiondatabase()
@@ -3651,9 +3608,9 @@ static RPCHelpMan createtransactiondatabase()
                     RPCArg{"end_height", RPCArg::Type::NUM, RPCArg::DefaultHint{"chain tip"}, "Height to stop to scan"},
                 },
                 RPCResult{
-                    RPCResult::Type::ARR, "", "An array of transaction IDs (hex-encoded).",
+                    RPCResult::Type::OBJ, "", "Status of the database creation process.",
                     {
-                        {RPCResult::Type::STR_HEX, "txid", "The transaction id"}
+                        {RPCResult::Type::NUM, "blocks_processed", "Number of blocks processed and stored."},
                     }
                 },
                 RPCExamples{
@@ -3672,7 +3629,7 @@ static RPCHelpMan createtransactiondatabase()
 
     // It's crucial to lock cs_main when accessing chain state.
     // The RPC framework usually takes care of this for read-only commands.
-    // LOCK(active_chainstate.m_cs_main); // Implicitly locked by RPC dispatcher
+    LOCK(cs_main);
 
     const CChain& active_chain = active_chainstate.m_chain;
     int chain_tip_height = active_chain.Height(); // Max block index on the active chain. -1 if empty.
@@ -3759,10 +3716,6 @@ static RPCHelpMan createtransactiondatabase()
         return JSONRPCError(RPC_INVALID_REQUEST, "Start height not found.");
     }
 
-    // int current_height = start_height;
-    // uint256 start_block;
-    // bool found = node.chain->findBlock(blockhash, interfaces::FoundBlock().hash(start_block).height(start_height));
- 
     BlockFilter filter;
     if (!index->LookupFilter(blockindex, filter)) {
         return JSONRPCError(RPC_INVALID_REQUEST, "Start height not found.");
@@ -3770,11 +3723,11 @@ static RPCHelpMan createtransactiondatabase()
 
     uint256 blockhash = filter.GetBlockHash();
     
-    //bool found = node.chain->findBlock(blockhash, interfaces::FoundBlock().data(block));
-
     bool block_still_active;
     bool next_block_exists;
     uint256 next_blockhash;
+
+    int blocks_processed_count = 0;
 
     sqlite3* db = nullptr;
     try {
@@ -3790,11 +3743,10 @@ static RPCHelpMan createtransactiondatabase()
         SQLiteStatement insert_block_stmt(db, "INSERT INTO blocks (height, block_hash, timestamp) VALUES (?, ?, ?)");
         SQLiteStatement insert_tx_stmt(db, "INSERT INTO transactions (txid, block_height, tx_index_in_block, version, lock_time) VALUES (?, ?, ?, ?, ?)");
         SQLiteStatement insert_input_stmt(db, "INSERT INTO tx_inputs (txid, input_index, prev_tx_hash, prev_output_index, script_sig, sequence, has_witness) VALUES (?, ?, ?, ?, ?, ?, ?)");
-        SQLiteStatement insert_output_stmt(db, "INSERT INTO tx_outputs (txid, output_index, value_satoshi, script_pub_key) VALUES (?, ?, ?, ?)");
+        SQLiteStatement insert_output_stmt(db, "INSERT INTO tx_outputs (txid, output_index, value_satoshi, script_pub_key, address) VALUES (?, ?, ?, ?, ?)");
         SQLiteStatement insert_witness_stmt(db, "INSERT INTO witness_items (input_id, item_index_in_stack, witness_data) VALUES (?, ?, ?)");
 
         // --- 3. Block Processing Loop ---
-        int blocks_processed_count = 0;
         while (!node.chain->shutdownRequested()) {
 
             CBlock block;
@@ -3806,16 +3758,11 @@ static RPCHelpMan createtransactiondatabase()
                     .nextBlock(interfaces::FoundBlock()
                     .inActiveChain(next_block_exists)
                     .hash(next_blockhash)));
-    
-            if (found) {
-                // std::cout << "Block hash: " << block.GetHash().GetHex() << " height: " << blockindex->nHeight << std::endl;
-                std::cout << "Block hash: " << block.GetHash().GetHex() << " height: " << block_height << std::endl;
-            } else {
-                std::cout << "NOT FOUND" << std::endl;
+
+            if (!found) {
+                throw JSONRPCError(RPC_INTERNAL_ERROR, strprintf("Block not found height: %d hash: %s", block_height, blockhash.GetHex()));
             }
     
-            // storeTransactions(block);
-
             // Process this block within a DB transaction
             ExecSqlOrThrow(db, "BEGIN TRANSACTION;");
             try {
@@ -3864,11 +3811,9 @@ static RPCHelpMan createtransactiondatabase()
         throw JSONRPCError(RPC_INTERNAL_ERROR, "An unknown internal error occurred.");
     }
 
-    UniValue result_array(UniValue::VARR);
-
-    result_array.push_back("Test");
-
-    return result_array;
+    UniValue result(UniValue::VOBJ);
+    result.pushKV("blocks_processed", blocks_processed_count);
+    return result;
 },
     };
 }
