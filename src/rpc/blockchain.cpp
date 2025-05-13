@@ -19,6 +19,7 @@
 #include <deploymentinfo.h>
 #include <deploymentstatus.h>
 #include <flatfile.h>
+#include <index/txindex.h>
 #include <hash.h>
 #include <index/blockfilterindex.h>
 #include <index/coinstatsindex.h>
@@ -3444,6 +3445,7 @@ static void CreateDatabaseSchema(sqlite3* db) {
             tx_index_in_block INTEGER NOT NULL,
             version INTEGER NOT NULL,
             lock_time INTEGER NOT NULL,
+            fee_satoshi INTEGER, 
             FOREIGN KEY (block_height) REFERENCES blocks(height) ON DELETE CASCADE,
             UNIQUE (block_height, tx_index_in_block)
         );
@@ -3498,7 +3500,9 @@ static void storeBlockData(sqlite3* db, int block_height, const CBlock& block,
                            SQLiteStatement& insert_tx_stmt,
                            SQLiteStatement& insert_input_stmt,
                            SQLiteStatement& insert_output_stmt,
-                           SQLiteStatement& insert_witness_stmt)
+                           SQLiteStatement& insert_witness_stmt,
+                           const node::BlockManager& blockman,
+                           const CTxMemPool* const mempool)
 {
     const uint256& block_hash = block.GetHash();
     const std::string block_hash_hex = block_hash.GetHex();
@@ -3518,6 +3522,74 @@ static void storeBlockData(sqlite3* db, int block_height, const CBlock& block,
         const Txid& txid = tx->GetHash();
         const std::string txid_hex = txid.GetHex();
 
+        CAmount nTotalInputValue = 0;
+        CAmount nTotalOutputValue = 0;
+        bool all_inputs_found = true; // Assume true, set to false if any prev tx not found
+
+        if (!tx->IsCoinBase()) {
+            if (!g_txindex) { // Global variable indicating if txindex is enabled
+                all_inputs_found = false; // Cannot calculate fee without txindex
+                /* if (tx_idx > 0 && block_height % 1000 == 0 && tx_idx < 2) { // Log sparsely
+                     LogPrintf("Warning: txindex is not enabled. Fees will be NULL. (tx: %s)\n", txid_hex);
+                } */
+            } else {
+                for (const CTxIn& txin : tx->vin) {
+                    /* if (txin.prevout.IsNull()) continue; // Should not happen for non-coinbase
+
+                    CTransactionRef prev_tx;
+                    uint256 hashBlockOfPrevTx; // We don't strictly need this for value, but GetTransaction provides it
+                    
+                    // Attempt to get the previous transaction using BlockManager
+                    // GetTransaction is in node/blockstorage.h, part of BlockManager
+                    if (!GetTransaction(txin.prevout.hash, prev_tx, consensusParams, hashBlockOfPrevTx)) {
+                        LogPrintf("Warning: Could not find previous transaction %s (for input of tx %s) using txindex for fee calculation. Fee will be NULL.\n",
+                                  txin.prevout.hash.GetHex(), txid_hex);
+                        all_inputs_found = false;
+                        break;
+                    }
+
+                    if (txin.prevout.n >= prev_tx->vout.size()) {
+                        LogPrintf("Error: Previous transaction %s output index %u out of bounds (for input of tx %s). Fee will be NULL.\n",
+                                  txin.prevout.hash.GetHex(), txin.prevout.n, txid_hex);
+                        all_inputs_found = false;
+                        break;
+                    }
+                    nTotalInputValue += prev_tx->vout[txin.prevout.n].nValue;
+                } */
+
+                    if (txin.prevout.IsNull()) continue; // Should not happen for non-coinbase
+
+                    uint256 hashBlock = uint256();
+                    const CTransactionRef previous_tx{GetTransaction(
+                        /*block_index=*/nullptr, 
+                        mempool, 
+                        txin.prevout.hash, 
+                        hashBlock, 
+                        blockman
+                    )};
+
+                    if (!previous_tx) {
+                        LogPrintf("Warning: Could not find previous transaction %s (for input of tx %s) using txindex for fee calculation. Fee will be NULL.\n",
+                                  txin.prevout.hash.GetHex(), txid_hex);
+                        all_inputs_found = false;
+                        break;
+                    }
+
+                    if (txin.prevout.n >= previous_tx->vout.size()) {
+                        LogPrintf("Error: Previous transaction %s output index %u out of bounds (for input of tx %s). Fee will be NULL.\n",
+                                  txin.prevout.hash.GetHex(), txin.prevout.n, txid_hex);
+                        all_inputs_found = false;
+                        break;
+                    }
+                    nTotalInputValue += previous_tx->vout[txin.prevout.n].nValue;
+                }
+            }
+        }
+
+        for (const CTxOut& txout : tx->vout) {
+            nTotalOutputValue += txout.nValue;
+        }
+        
         // Insert Transaction
         sqlite3_reset(insert_tx_stmt.get());
         sqlite3_bind_text(insert_tx_stmt.get(), 1, txid_hex.c_str(), -1, SQLITE_STATIC);
@@ -3525,6 +3597,20 @@ static void storeBlockData(sqlite3* db, int block_height, const CBlock& block,
         sqlite3_bind_int(insert_tx_stmt.get(), 3, static_cast<int>(tx_idx));
         sqlite3_bind_int(insert_tx_stmt.get(), 4, tx->version);
         sqlite3_bind_int(insert_tx_stmt.get(), 5, tx->nLockTime);
+
+        if (tx->IsCoinBase() || !all_inputs_found) {
+            sqlite3_bind_null(insert_tx_stmt.get(), 6); // fee_satoshi
+        } else {
+            CAmount fee = nTotalInputValue - nTotalOutputValue;
+            if (fee < 0) {
+                LogPrintf("Warning: Negative fee calculated for tx %s (Height: %d, Inputs: %lld, Outputs: %lld). Storing fee as NULL.\n",
+                          txid_hex, block_height, nTotalInputValue, nTotalOutputValue);
+                sqlite3_bind_null(insert_tx_stmt.get(), 6);
+            } else {
+                sqlite3_bind_int64(insert_tx_stmt.get(), 6, fee);
+            }
+        }
+
         if (sqlite3_step(insert_tx_stmt.get()) != SQLITE_DONE) {
             throw std::runtime_error("Failed to insert transaction " + txid_hex + ": " + std::string(sqlite3_errmsg(db)));
         }
@@ -3626,6 +3712,9 @@ static RPCHelpMan createtransactiondatabase()
     NodeContext& node = EnsureAnyNodeContext(request.context);
     ChainstateManager& chainman = EnsureChainman(node);
     Chainstate& active_chainstate = chainman.ActiveChainstate();
+    // const node::BlockManager& blockman = EnsureBlockman(node);
+    // const CTxMemPool& mempool = EnsureMemPool(node);
+    EnsureMemPool(node);
 
     // It's crucial to lock cs_main when accessing chain state.
     // The RPC framework usually takes care of this for read-only commands.
@@ -3741,7 +3830,7 @@ static RPCHelpMan createtransactiondatabase()
 
         // Prepare INSERT statements once
         SQLiteStatement insert_block_stmt(db, "INSERT INTO blocks (height, block_hash, timestamp) VALUES (?, ?, ?)");
-        SQLiteStatement insert_tx_stmt(db, "INSERT INTO transactions (txid, block_height, tx_index_in_block, version, lock_time) VALUES (?, ?, ?, ?, ?)");
+        SQLiteStatement insert_tx_stmt(db, "INSERT INTO transactions (txid, block_height, tx_index_in_block, version, lock_time, fee_satoshi) VALUES (?, ?, ?, ?, ?, ?)");
         SQLiteStatement insert_input_stmt(db, "INSERT INTO tx_inputs (txid, input_index, prev_tx_hash, prev_output_index, script_sig, sequence, has_witness) VALUES (?, ?, ?, ?, ?, ?, ?)");
         SQLiteStatement insert_output_stmt(db, "INSERT INTO tx_outputs (txid, output_index, value_satoshi, script_pub_key, address) VALUES (?, ?, ?, ?, ?)");
         SQLiteStatement insert_witness_stmt(db, "INSERT INTO witness_items (input_id, item_index_in_stack, witness_data) VALUES (?, ?, ?)");
@@ -3768,7 +3857,7 @@ static RPCHelpMan createtransactiondatabase()
             try {
                 storeBlockData(db, block_height, block,
                                insert_block_stmt, insert_tx_stmt, insert_input_stmt,
-                               insert_output_stmt, insert_witness_stmt);
+                               insert_output_stmt, insert_witness_stmt, chainman.m_blockman, node.mempool.get());
                 ExecSqlOrThrow(db, "COMMIT;");
                 blocks_processed_count++;
             } catch (const std::exception& e) {
