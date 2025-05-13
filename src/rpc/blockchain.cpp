@@ -3529,33 +3529,11 @@ static void storeBlockData(sqlite3* db, int block_height, const CBlock& block,
         if (!tx->IsCoinBase()) {
             if (!g_txindex) { // Global variable indicating if txindex is enabled
                 all_inputs_found = false; // Cannot calculate fee without txindex
-                /* if (tx_idx > 0 && block_height % 1000 == 0 && tx_idx < 2) { // Log sparsely
+                if (tx_idx > 0 && block_height % 1000 == 0 && tx_idx < 2) { // Log sparsely
                      LogPrintf("Warning: txindex is not enabled. Fees will be NULL. (tx: %s)\n", txid_hex);
-                } */
+                }
             } else {
                 for (const CTxIn& txin : tx->vin) {
-                    /* if (txin.prevout.IsNull()) continue; // Should not happen for non-coinbase
-
-                    CTransactionRef prev_tx;
-                    uint256 hashBlockOfPrevTx; // We don't strictly need this for value, but GetTransaction provides it
-                    
-                    // Attempt to get the previous transaction using BlockManager
-                    // GetTransaction is in node/blockstorage.h, part of BlockManager
-                    if (!GetTransaction(txin.prevout.hash, prev_tx, consensusParams, hashBlockOfPrevTx)) {
-                        LogPrintf("Warning: Could not find previous transaction %s (for input of tx %s) using txindex for fee calculation. Fee will be NULL.\n",
-                                  txin.prevout.hash.GetHex(), txid_hex);
-                        all_inputs_found = false;
-                        break;
-                    }
-
-                    if (txin.prevout.n >= prev_tx->vout.size()) {
-                        LogPrintf("Error: Previous transaction %s output index %u out of bounds (for input of tx %s). Fee will be NULL.\n",
-                                  txin.prevout.hash.GetHex(), txin.prevout.n, txid_hex);
-                        all_inputs_found = false;
-                        break;
-                    }
-                    nTotalInputValue += prev_tx->vout[txin.prevout.n].nValue;
-                } */
 
                     if (txin.prevout.IsNull()) continue; // Should not happen for non-coinbase
 
