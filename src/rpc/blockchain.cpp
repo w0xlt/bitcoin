@@ -3445,7 +3445,10 @@ static void CreateDatabaseSchema(sqlite3* db) {
             tx_index_in_block INTEGER NOT NULL,
             version INTEGER NOT NULL,
             lock_time INTEGER NOT NULL,
-            fee_satoshi INTEGER, 
+            fee_satoshi INTEGER,
+            size_bytes INTEGER NOT NULL,
+            weight_units INTEGER NOT NULL,
+            virtual_size_vbytes INTEGER NOT NULL,
             FOREIGN KEY (block_height) REFERENCES blocks(height) ON DELETE CASCADE,
             UNIQUE (block_height, tx_index_in_block)
         );
@@ -3584,6 +3587,15 @@ static void storeBlockData(sqlite3* db, int block_height, const CBlock& block,
                 sqlite3_bind_int64(insert_tx_stmt.get(), 6, fee);
             }
         }
+
+        // Calculate Size and Weight
+        int64_t tx_size = tx->GetTotalSize();
+        int64_t weight = GetTransactionWeight(*tx);
+        int64_t virtual_size = GetVirtualTransactionSize(*tx);
+
+        sqlite3_bind_int64(insert_tx_stmt.get(), 7, tx_size);
+        sqlite3_bind_int64(insert_tx_stmt.get(), 8, weight);
+        sqlite3_bind_int64(insert_tx_stmt.get(), 9, virtual_size);   
 
         if (sqlite3_step(insert_tx_stmt.get()) != SQLITE_DONE) {
             throw std::runtime_error("Failed to insert transaction " + txid_hex + ": " + std::string(sqlite3_errmsg(db)));
@@ -3804,7 +3816,7 @@ static RPCHelpMan createtransactiondatabase()
 
         // Prepare INSERT statements once
         SQLiteStatement insert_block_stmt(db, "INSERT INTO blocks (height, block_hash, timestamp) VALUES (?, ?, ?)");
-        SQLiteStatement insert_tx_stmt(db, "INSERT INTO transactions (txid, block_height, tx_index_in_block, version, lock_time, fee_satoshi) VALUES (?, ?, ?, ?, ?, ?)");
+        SQLiteStatement insert_tx_stmt(db, "INSERT INTO transactions (txid, block_height, tx_index_in_block, version, lock_time, fee_satoshi, size_bytes, weight_units, virtual_size_vbytes) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)");
         SQLiteStatement insert_input_stmt(db, "INSERT INTO tx_inputs (txid, input_index, prev_tx_hash, prev_output_index, script_sig, sequence, has_witness) VALUES (?, ?, ?, ?, ?, ?, ?)");
         SQLiteStatement insert_output_stmt(db, "INSERT INTO tx_outputs (txid, output_index, value_satoshi, script_pub_key, address) VALUES (?, ?, ?, ?, ?)");
         SQLiteStatement insert_witness_stmt(db, "INSERT INTO witness_items (input_id, item_index_in_stack, witness_data) VALUES (?, ?, ?)");
