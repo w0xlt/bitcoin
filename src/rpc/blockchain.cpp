@@ -3523,7 +3523,6 @@ static void storeBlockData(sqlite3* db, int block_height, const CBlock& block,
         const std::string txid_hex = txid.GetHex();
 
         CAmount nTotalInputValue = 0;
-        CAmount nTotalOutputValue = 0;
         bool all_inputs_found = true; // Assume true, set to false if any prev tx not found
 
         if (!tx->IsCoinBase()) {
@@ -3563,10 +3562,6 @@ static void storeBlockData(sqlite3* db, int block_height, const CBlock& block,
                 }
             }
         }
-
-        for (const CTxOut& txout : tx->vout) {
-            nTotalOutputValue += txout.nValue;
-        }
         
         // Insert Transaction
         sqlite3_reset(insert_tx_stmt.get());
@@ -3579,6 +3574,7 @@ static void storeBlockData(sqlite3* db, int block_height, const CBlock& block,
         if (tx->IsCoinBase() || !all_inputs_found) {
             sqlite3_bind_null(insert_tx_stmt.get(), 6); // fee_satoshi
         } else {
+            CAmount nTotalOutputValue = tx->GetValueOut();
             CAmount fee = nTotalInputValue - nTotalOutputValue;
             if (fee < 0) {
                 LogPrintf("Warning: Negative fee calculated for tx %s (Height: %d, Inputs: %lld, Outputs: %lld). Storing fee as NULL.\n",
