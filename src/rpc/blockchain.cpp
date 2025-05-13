@@ -61,6 +61,7 @@
 #include <mutex>
 #include <optional>
 #include <vector>
+#include <sqlite3.h>
 
 using kernel::CCoinsStats;
 using kernel::CoinStatsHashType;
@@ -3379,177 +3380,212 @@ return RPCHelpMan{
     };
 }
 
-/*static RPCHelpMan createtransactiondatabase()
+// --- SQLite Helper Functions ---
+
+// RAII wrapper for sqlite3_stmt
+class SQLiteStatement {
+    sqlite3_stmt* stmt = nullptr;
+public:
+    SQLiteStatement(sqlite3* db, const char* sql) {
+        if (sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr) != SQLITE_OK) {
+            std::string errMsg = sqlite3_errmsg(db);
+            sqlite3_finalize(stmt); // Finalize even if prepare failed but gave a stmt handle
+            throw std::runtime_error("SQLite prepare failed: " + errMsg);
+        }
+        if (!stmt) {
+             throw std::runtime_error("SQLite prepare failed: returned null statement");
+        }
+    }
+    ~SQLiteStatement() {
+        if (stmt) {
+            sqlite3_finalize(stmt);
+        }
+    }
+    // Getter for the raw statement
+    sqlite3_stmt* get() { return stmt; }
+
+    // Prevent copying
+    SQLiteStatement(const SQLiteStatement&) = delete;
+    SQLiteStatement& operator=(const SQLiteStatement&) = delete;
+};
+
+// Execute simple SQL command, throw on error
+static void ExecSqlOrThrow(sqlite3* db, const char* sql) {
+    char* errMsg = nullptr;
+    if (sqlite3_exec(db, sql, nullptr, nullptr, &errMsg) != SQLITE_OK) {
+        std::string err = "SQLite exec failed: ";
+        if (errMsg) {
+            err += errMsg;
+            sqlite3_free(errMsg);
+        } else {
+            err += "Unknown error";
+        }
+        throw std::runtime_error(err);
+    }
+}
+
+// Function to create the database schema
+static void CreateDatabaseSchema(sqlite3* db) {
+    ExecSqlOrThrow(db, "PRAGMA foreign_keys = ON;");
+    ExecSqlOrThrow(db, "BEGIN TRANSACTION;");
+
+    ExecSqlOrThrow(db, R"(
+        CREATE TABLE blocks (
+            height INTEGER PRIMARY KEY,
+            block_hash TEXT UNIQUE NOT NULL,
+            timestamp INTEGER NOT NULL
+        );
+    )");
+
+    ExecSqlOrThrow(db, R"(
+        CREATE TABLE transactions (
+            txid TEXT PRIMARY KEY,
+            block_height INTEGER NOT NULL,
+            tx_index_in_block INTEGER NOT NULL,
+            version INTEGER NOT NULL,
+            lock_time INTEGER NOT NULL,
+            FOREIGN KEY (block_height) REFERENCES blocks(height) ON DELETE CASCADE,
+            UNIQUE (block_height, tx_index_in_block)
+        );
+    )");
+
+    ExecSqlOrThrow(db, R"(
+        CREATE TABLE tx_inputs (
+            input_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            txid TEXT NOT NULL,
+            input_index INTEGER NOT NULL,
+            prev_tx_hash TEXT,
+            prev_output_index INTEGER,
+            script_sig BLOB,
+            sequence INTEGER NOT NULL,
+            has_witness BOOLEAN NOT NULL,
+            FOREIGN KEY (txid) REFERENCES transactions(txid) ON DELETE CASCADE,
+            UNIQUE (txid, input_index)
+        );
+    )");
+
+     ExecSqlOrThrow(db, R"(
+        CREATE TABLE tx_outputs (
+            output_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            txid TEXT NOT NULL,
+            output_index INTEGER NOT NULL,
+            value_satoshi INTEGER NOT NULL,
+            script_pub_key BLOB NOT NULL,
+            FOREIGN KEY (txid) REFERENCES transactions(txid) ON DELETE CASCADE,
+            UNIQUE (txid, output_index)
+        );
+    )");
+
+    ExecSqlOrThrow(db, R"(
+        CREATE TABLE witness_items (
+            item_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            input_id INTEGER NOT NULL,
+            item_index_in_stack INTEGER NOT NULL,
+            witness_data BLOB NOT NULL,
+            FOREIGN KEY (input_id) REFERENCES tx_inputs(input_id) ON DELETE CASCADE,
+            UNIQUE (input_id, item_index_in_stack)
+        );
+    )");
+
+    ExecSqlOrThrow(db, "COMMIT;");
+}
+
+
+// Function to store data for a single block
+static void storeBlockData(sqlite3* db, int block_height, const CBlock& block,
+                           SQLiteStatement& insert_block_stmt,
+                           SQLiteStatement& insert_tx_stmt,
+                           SQLiteStatement& insert_input_stmt,
+                           SQLiteStatement& insert_output_stmt,
+                           SQLiteStatement& insert_witness_stmt)
 {
-    return RPCHelpMan{"createtransactiondatabase",
-        "Iterate over each transaction in the blocks and saves them in a relational database (SQLite).\n"
-        "This call may take several minutes. Make sure to use no RPC timeout (bitcoin-cli -rpcclienttimeout=0)",
-        {
-            scan_action_arg_desc,
-            scan_objects_arg_desc,
-            RPCArg{"start_height", RPCArg::Type::NUM, RPCArg::Default{0}, "Height to start to scan from"},
-            RPCArg{"stop_height", RPCArg::Type::NUM, RPCArg::DefaultHint{"chain tip"}, "Height to stop to scan"}
-        },
-        {
-            scan_result_status_none,
-            RPCResult{"When action=='start'; only returns after scan completes", RPCResult::Type::OBJ, "", "", {
-                {RPCResult::Type::NUM, "from_height", "The height we started the scan from"},
-                {RPCResult::Type::NUM, "to_height", "The height we ended the scan at"},
-                {RPCResult::Type::ARR, "relevant_blocks", "Blocks that may have matched a scanobject.", {
-                    {RPCResult::Type::STR_HEX, "blockhash", "A relevant blockhash"},
-                }},
-                {RPCResult::Type::BOOL, "completed", "true if the scan process was not aborted"}
-            }},
-            RPCResult{"when action=='status' and a scan is currently in progress", RPCResult::Type::OBJ, "", "", {
-                    {RPCResult::Type::NUM, "progress", "Approximate percent complete"},
-                    {RPCResult::Type::NUM, "current_height", "Height of the block currently being scanned"},
-                },
-            },
-            scan_result_abort,
-        },
-        RPCExamples{
-            HelpExampleCli("scanblocks", "start '[\"addr(bcrt1q4u4nsgk6ug0sqz7r3rj9tykjxrsl0yy4d0wwte)\"]' 300000") +
-            HelpExampleCli("scanblocks", "start '[\"addr(bcrt1q4u4nsgk6ug0sqz7r3rj9tykjxrsl0yy4d0wwte)\"]' 100 150 basic") +
-            HelpExampleCli("scanblocks", "status") +
-            HelpExampleRpc("scanblocks", "\"start\", [\"addr(bcrt1q4u4nsgk6ug0sqz7r3rj9tykjxrsl0yy4d0wwte)\"], 300000") +
-            HelpExampleRpc("scanblocks", "\"start\", [\"addr(bcrt1q4u4nsgk6ug0sqz7r3rj9tykjxrsl0yy4d0wwte)\"], 100, 150, \"basic\"") +
-            HelpExampleRpc("scanblocks", "\"status\"")
-        },
-        [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
-{
-    UniValue ret(UniValue::VOBJ);
-    if (request.params[0].get_str() == "status") {
-        BlockFiltersScanReserver reserver;
-        if (reserver.reserve()) {
-            // no scan in progress
-            return NullUniValue;
-        }
-        ret.pushKV("progress", g_scanfilter_progress.load());
-        ret.pushKV("current_height", g_scanfilter_progress_height.load());
-        return ret;
-    } else if (request.params[0].get_str() == "abort") {
-        BlockFiltersScanReserver reserver;
-        if (reserver.reserve()) {
-            // reserve was possible which means no scan was running
-            return false;
-        }
-        // set the abort flag
-        g_scanfilter_should_abort_scan = true;
-        return true;
-    } else if (request.params[0].get_str() == "start") {
-        BlockFiltersScanReserver reserver;
-        if (!reserver.reserve()) {
-            throw JSONRPCError(RPC_INVALID_PARAMETER, "Scan already in progress, use action \"abort\" or \"status\"");
+    const uint256& block_hash = block.GetHash();
+    const std::string block_hash_hex = block_hash.GetHex();
+
+    // 1. Insert Block
+    sqlite3_reset(insert_block_stmt.get());
+    sqlite3_bind_int(insert_block_stmt.get(), 1, block_height);
+    sqlite3_bind_text(insert_block_stmt.get(), 2, block_hash_hex.c_str(), -1, SQLITE_STATIC);
+    sqlite3_bind_int(insert_block_stmt.get(), 3, block.nTime);
+    if (sqlite3_step(insert_block_stmt.get()) != SQLITE_DONE) {
+        throw std::runtime_error("Failed to insert block: " + std::string(sqlite3_errmsg(db)));
+    }
+
+    // 2. Insert Transactions, Inputs, Outputs, Witness Items
+    for (size_t tx_idx = 0; tx_idx < block.vtx.size(); ++tx_idx) {
+        const CTransactionRef& tx = block.vtx[tx_idx];
+        const Txid& txid = tx->GetHash();
+        const std::string txid_hex = txid.GetHex();
+
+        // Insert Transaction
+        sqlite3_reset(insert_tx_stmt.get());
+        sqlite3_bind_text(insert_tx_stmt.get(), 1, txid_hex.c_str(), -1, SQLITE_STATIC);
+        sqlite3_bind_int(insert_tx_stmt.get(), 2, block_height);
+        sqlite3_bind_int(insert_tx_stmt.get(), 3, static_cast<int>(tx_idx));
+        sqlite3_bind_int(insert_tx_stmt.get(), 4, tx->version);
+        sqlite3_bind_int(insert_tx_stmt.get(), 5, tx->nLockTime);
+        if (sqlite3_step(insert_tx_stmt.get()) != SQLITE_DONE) {
+            throw std::runtime_error("Failed to insert transaction " + txid_hex + ": " + std::string(sqlite3_errmsg(db)));
         }
 
-        const std::string filtertype_name{"basic"};
+        // Insert Inputs
+        for (size_t vin_idx = 0; vin_idx < tx->vin.size(); ++vin_idx) {
+            const CTxIn& txin = tx->vin[vin_idx];
+            const COutPoint& prevout = txin.prevout;
+            const std::string prev_tx_hash_hex = prevout.hash.IsNull() ? "" : prevout.hash.GetHex(); // Handle coinbase
+            bool has_witness = !txin.scriptWitness.IsNull();
 
-        BlockFilterType filtertype;
-        if (!BlockFilterTypeByName(filtertype_name, filtertype)) {
-            throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "Unknown filtertype");
-        }
+            sqlite3_reset(insert_input_stmt.get());
+            sqlite3_bind_text(insert_input_stmt.get(), 1, txid_hex.c_str(), -1, SQLITE_STATIC);
+            sqlite3_bind_int(insert_input_stmt.get(), 2, static_cast<int>(vin_idx));
+            sqlite3_bind_text(insert_input_stmt.get(), 3, prev_tx_hash_hex.c_str(), -1, SQLITE_STATIC);
+            sqlite3_bind_int(insert_input_stmt.get(), 4, prevout.n);
+            sqlite3_bind_blob(insert_input_stmt.get(), 5, txin.scriptSig.data(), txin.scriptSig.size(), SQLITE_STATIC);
+            sqlite3_bind_int(insert_input_stmt.get(), 6, txin.nSequence);
+            sqlite3_bind_int(insert_input_stmt.get(), 7, has_witness ? 1 : 0);
 
-        BlockFilterIndex* index = GetBlockFilterIndex(filtertype);
-        if (!index) {
-            throw JSONRPCError(RPC_MISC_ERROR, "Index is not enabled for filtertype " + filtertype_name);
-        }
+            if (sqlite3_step(insert_input_stmt.get()) != SQLITE_DONE) {
+                 throw std::runtime_error("Failed to insert input " + std::to_string(vin_idx) + " for tx " + txid_hex + ": " + std::string(sqlite3_errmsg(db)));
+            }
 
-        NodeContext& node = EnsureAnyNodeContext(request.context);
-        ChainstateManager& chainman = EnsureChainman(node);
+            sqlite3_int64 last_input_id = sqlite3_last_insert_rowid(db); // Get the ID of the input just inserted
 
-        // set the start-height
-        const CBlockIndex* start_index = nullptr;
-        const CBlockIndex* stop_block = nullptr;
-        {
-            LOCK(cs_main);
-            CChain& active_chain = chainman.ActiveChain();
-            start_index = active_chain.Genesis();
-            stop_block = active_chain.Tip(); // If no stop block is provided, stop at the chain tip.
-            if (!request.params[2].isNull()) {
-                start_index = active_chain[request.params[2].getInt<int>()];
-                if (!start_index) {
-                    throw JSONRPCError(RPC_MISC_ERROR, "Invalid start_height");
+            // Insert Witness Items (if any)
+            if (has_witness) {
+                for (size_t item_idx = 0; item_idx < txin.scriptWitness.stack.size(); ++item_idx) {
+                    const auto& witness_item = txin.scriptWitness.stack[item_idx];
+
+                    sqlite3_reset(insert_witness_stmt.get());
+                    sqlite3_bind_int64(insert_witness_stmt.get(), 1, last_input_id);
+                    sqlite3_bind_int(insert_witness_stmt.get(), 2, static_cast<int>(item_idx));
+                    sqlite3_bind_blob(insert_witness_stmt.get(), 3, witness_item.data(), witness_item.size(), SQLITE_STATIC);
+
+                    if (sqlite3_step(insert_witness_stmt.get()) != SQLITE_DONE) {
+                        throw std::runtime_error("Failed to insert witness item " + std::to_string(item_idx) + " for input " + std::to_string(vin_idx) + " of tx " + txid_hex + ": " + std::string(sqlite3_errmsg(db)));
+                    }
                 }
             }
-            if (!request.params[3].isNull()) {
-                stop_block = active_chain[request.params[3].getInt<int>()];
-                if (!stop_block || stop_block->nHeight < start_index->nHeight) {
-                    throw JSONRPCError(RPC_MISC_ERROR, "Invalid stop_height");
-                }
+        } // End input loop
+
+        // Insert Outputs
+        for (size_t vout_idx = 0; vout_idx < tx->vout.size(); ++vout_idx) {
+            const CTxOut& txout = tx->vout[vout_idx];
+
+            sqlite3_reset(insert_output_stmt.get());
+            sqlite3_bind_text(insert_output_stmt.get(), 1, txid_hex.c_str(), -1, SQLITE_STATIC);
+            sqlite3_bind_int(insert_output_stmt.get(), 2, static_cast<int>(vout_idx));
+            sqlite3_bind_int64(insert_output_stmt.get(), 3, txout.nValue); // Use int64 for amount
+            sqlite3_bind_blob(insert_output_stmt.get(), 4, txout.scriptPubKey.data(), txout.scriptPubKey.size(), SQLITE_STATIC);
+
+            if (sqlite3_step(insert_output_stmt.get()) != SQLITE_DONE) {
+                throw std::runtime_error("Failed to insert output " + std::to_string(vout_idx) + " for tx " + txid_hex + ": " + std::string(sqlite3_errmsg(db)));
             }
-        }
-        CHECK_NONFATAL(start_index);
-        CHECK_NONFATAL(stop_block);
+        } // End output loop
 
-        // loop through the scan objects, add scripts to the needle_set
-        GCSFilter::ElementSet needle_set;
-        for (const UniValue& scanobject : request.params[1].get_array().getValues()) {
-            FlatSigningProvider provider;
-            std::vector<CScript> scripts = EvalDescriptorStringOrObject(scanobject, provider);
-            for (const CScript& script : scripts) {
-                needle_set.emplace(script.begin(), script.end());
-            }
-        }
-        UniValue blocks(UniValue::VARR);
-        const int amount_per_chunk = 10000;
-        std::vector<BlockFilter> filters;
-        int start_block_height = start_index->nHeight; // for progress reporting
-        const int total_blocks_to_process = stop_block->nHeight - start_block_height;
+    } // End transaction loop
+}
 
-        g_scanfilter_should_abort_scan = false;
-        g_scanfilter_progress = 0;
-        g_scanfilter_progress_height = start_block_height;
-        bool completed = true;
-
-        const CBlockIndex* end_range = nullptr;
-        do {
-            node.rpc_interruption_point(); // allow a clean shutdown
-            if (g_scanfilter_should_abort_scan) {
-                completed = false;
-                break;
-            }
-
-            // split the lookup range in chunks if we are deeper than 'amount_per_chunk' blocks from the stopping block
-            int start_block = !end_range ? start_index->nHeight : start_index->nHeight + 1; // to not include the previous round 'end_range' block
-            end_range = (start_block + amount_per_chunk < stop_block->nHeight) ?
-                    WITH_LOCK(::cs_main, return chainman.ActiveChain()[start_block + amount_per_chunk]) :
-                    stop_block;
-
-            if (index->LookupFilterRange(start_block, end_range, filters)) {
-
-            }
-            start_index = end_range;
-
-            uint256 start_block;
-            bool start = chainman.findFirstBlockWithTimeAndHeight(startTime - TIMESTAMP_WINDOW, 0, interfaces::FoundBlock().hash(start_block).height(start_height));
-
-            // update progress
-            int blocks_processed = end_range->nHeight - start_block_height;
-            if (total_blocks_to_process > 0) { // avoid division by zero
-                g_scanfilter_progress = (int)(100.0 / total_blocks_to_process * blocks_processed);
-            } else {
-                g_scanfilter_progress = 100;
-            }
-            g_scanfilter_progress_height = end_range->nHeight;
-
-        // Finish if we reached the stop block
-        } while (start_index != stop_block);
-
-        ret.pushKV("from_height", start_block_height);
-        ret.pushKV("to_height", start_index->nHeight); // start_index is always the last scanned block here
-        ret.pushKV("relevant_blocks", std::move(blocks));
-        ret.pushKV("completed", completed);
-    }
-    else {
-        throw JSONRPCError(RPC_INVALID_PARAMETER, strprintf("Invalid action '%s'", request.params[0].get_str()));
-    }
-    return ret;
-},
-    };
-}*/
-
-
-static void storeTransactions(CBlock &block) {
+/*static void storeTransactions(CBlock &block) {
 
     for (size_t posInBlock = 0; posInBlock < block.vtx.size(); ++posInBlock) {
 
@@ -3600,16 +3636,17 @@ static void storeTransactions(CBlock &block) {
             }
         }
     }
-
-}
+}*/
 
 // Help text and metadata for the RPC command
 static RPCHelpMan createtransactiondatabase()
 {
     return RPCHelpMan{"createtransactiondatabase",
-                "\nIterates over blocks in a given height range and save all transaction in a SQLite database.\n"
-                "Both start_height and end_height are inclusive.\n",
+                "Iterates over blocks in a given height range and saves all transaction data into a new SQLite database.\n"
+                "The database file specified by 'path' must not exist.\n"
+                "Both start_height and end_height are inclusive block heights.\n",
                 {
+                    RPCArg{"path", RPCArg::Type::STR, RPCArg::Optional::NO, "The full path where the SQLite database file will be created. Must not exist."},
                     RPCArg{"start_height", RPCArg::Type::NUM, RPCArg::Default{0}, "Height to start to scan from"},
                     RPCArg{"end_height", RPCArg::Type::NUM, RPCArg::DefaultHint{"chain tip"}, "Height to stop to scan"},
                 },
@@ -3640,12 +3677,19 @@ static RPCHelpMan createtransactiondatabase()
     const CChain& active_chain = active_chainstate.m_chain;
     int chain_tip_height = active_chain.Height(); // Max block index on the active chain. -1 if empty.
 
+    std::string db_path_str = request.params[0].get_str();
+    fs::path db_path = fs::u8path(db_path_str);
+
+    if (fs::exists(db_path)) {
+        throw JSONRPCError(RPC_INVALID_PARAMETER, "Database file already exists at the specified path: " + db_path_str);
+    }
+
     int start_height;
     int end_height;
 
     // Determine start_height
-    if (request.params.size() > 0 && !request.params[0].isNull()) {
-        start_height = request.params[0].getInt<int>();
+    if (request.params.size() > 0 && !request.params[1].isNull()) {
+        start_height = request.params[1].getInt<int>();
         if (start_height < 0) {
             throw JSONRPCError(RPC_INVALID_PARAMETER, "Start height must be non-negative.");
         }
@@ -3654,8 +3698,8 @@ static RPCHelpMan createtransactiondatabase()
     }
 
     // Determine end_height
-    if (request.params.size() > 1 && !request.params[1].isNull()) {
-        end_height = request.params[1].getInt<int>();
+    if (request.params.size() > 1 && !request.params[2].isNull()) {
+        end_height = request.params[2].getInt<int>();
         if (end_height < 0) {
             // User explicitly provided a negative end_height
             throw JSONRPCError(RPC_INVALID_PARAMETER, "End height, if provided, must be non-negative.");
@@ -3694,8 +3738,6 @@ static RPCHelpMan createtransactiondatabase()
     // If user provides start_height > chain_tip_height AND end_height > chain_tip_height,
     // the end_height >= chain_tip_height check would catch it first.
 
-    UniValue result_array(UniValue::VARR);
-
     const std::string filtertype_name{"basic"};
 
     BlockFilterType filtertype;
@@ -3717,10 +3759,10 @@ static RPCHelpMan createtransactiondatabase()
         return JSONRPCError(RPC_INVALID_REQUEST, "Start height not found.");
     }
 
-    /* int current_height = start_height;
-    uint256 start_block;
-    bool found = node.chain->findBlock(blockhash, interfaces::FoundBlock().hash(start_block).height(start_height));
- */
+    // int current_height = start_height;
+    // uint256 start_block;
+    // bool found = node.chain->findBlock(blockhash, interfaces::FoundBlock().hash(start_block).height(start_height));
+ 
     BlockFilter filter;
     if (!index->LookupFilter(blockindex, filter)) {
         return JSONRPCError(RPC_INVALID_REQUEST, "Start height not found.");
@@ -3734,70 +3776,95 @@ static RPCHelpMan createtransactiondatabase()
     bool next_block_exists;
     uint256 next_blockhash;
 
-    while (!node.chain->shutdownRequested()) {
-
-        CBlock block;
-        bool found = node.chain->findBlock(
-            blockhash, 
-            interfaces::FoundBlock()
-                .inActiveChain(block_still_active)
-                .data(block)
-                .nextBlock(interfaces::FoundBlock()
-                .inActiveChain(next_block_exists)
-                .hash(next_blockhash)));
-
-        if (found) {
-            // std::cout << "Block hash: " << block.GetHash().GetHex() << " height: " << blockindex->nHeight << std::endl;
-            std::cout << "Block hash: " << block.GetHash().GetHex() << " height: " << block_height << std::endl;
-        } else {
-            std::cout << "NOT FOUND" << std::endl;
+    sqlite3* db = nullptr;
+    try {
+        if (sqlite3_open(db_path.c_str(), &db) != SQLITE_OK) {
+            std::string errMsg = db ? sqlite3_errmsg(db) : "Cannot open database";
+            if (db) sqlite3_close(db); // Close if handle was obtained but open failed
+            throw JSONRPCError(RPC_DATABASE_ERROR, "Failed to open/create SQLite database: " + errMsg);
         }
 
-        storeTransactions(block);
+        CreateDatabaseSchema(db); // Create tables
 
-        if (block_height >= target_index->nHeight) {
-            break;
+        // Prepare INSERT statements once
+        SQLiteStatement insert_block_stmt(db, "INSERT INTO blocks (height, block_hash, timestamp) VALUES (?, ?, ?)");
+        SQLiteStatement insert_tx_stmt(db, "INSERT INTO transactions (txid, block_height, tx_index_in_block, version, lock_time) VALUES (?, ?, ?, ?, ?)");
+        SQLiteStatement insert_input_stmt(db, "INSERT INTO tx_inputs (txid, input_index, prev_tx_hash, prev_output_index, script_sig, sequence, has_witness) VALUES (?, ?, ?, ?, ?, ?, ?)");
+        SQLiteStatement insert_output_stmt(db, "INSERT INTO tx_outputs (txid, output_index, value_satoshi, script_pub_key) VALUES (?, ?, ?, ?)");
+        SQLiteStatement insert_witness_stmt(db, "INSERT INTO witness_items (input_id, item_index_in_stack, witness_data) VALUES (?, ?, ?)");
+
+        // --- 3. Block Processing Loop ---
+        int blocks_processed_count = 0;
+        while (!node.chain->shutdownRequested()) {
+
+            CBlock block;
+            bool found = node.chain->findBlock(
+                blockhash, 
+                interfaces::FoundBlock()
+                    .inActiveChain(block_still_active)
+                    .data(block)
+                    .nextBlock(interfaces::FoundBlock()
+                    .inActiveChain(next_block_exists)
+                    .hash(next_blockhash)));
+    
+            if (found) {
+                // std::cout << "Block hash: " << block.GetHash().GetHex() << " height: " << blockindex->nHeight << std::endl;
+                std::cout << "Block hash: " << block.GetHash().GetHex() << " height: " << block_height << std::endl;
+            } else {
+                std::cout << "NOT FOUND" << std::endl;
+            }
+    
+            // storeTransactions(block);
+
+            // Process this block within a DB transaction
+            ExecSqlOrThrow(db, "BEGIN TRANSACTION;");
+            try {
+                storeBlockData(db, block_height, block,
+                               insert_block_stmt, insert_tx_stmt, insert_input_stmt,
+                               insert_output_stmt, insert_witness_stmt);
+                ExecSqlOrThrow(db, "COMMIT;");
+                blocks_processed_count++;
+            } catch (const std::exception& e) {
+                 ExecSqlOrThrow(db, "ROLLBACK;"); // Rollback on error within block processing
+                 LogPrintf("Error processing block %d: %s. Rolling back block and stopping.\n", block_height, e.what());
+                 throw JSONRPCError(RPC_DATABASE_ERROR, strprintf("Error processing block %d: %s", block_height, e.what()));
+            }
+    
+            if (block_height >= target_index->nHeight) {
+                break;
+            }
+    
+            if (!next_block_exists) {
+                // break successfully when rescan has reached the tip, or
+                // previous block is no longer on the chain due to a reorg
+                break;
+            }
+    
+            // increment block and verification progress
+            blockhash = next_blockhash;
+            ++block_height;
         }
 
-        if (!next_block_exists) {
-            // break successfully when rescan has reached the tip, or
-            // previous block is no longer on the chain due to a reorg
-            break;
-        }
+        // --- 4. Cleanup and Result ---
+        sqlite3_close(db);
+        db = nullptr; // Prevent double close in catch block
 
-        // increment block and verification progress
-        blockhash = next_blockhash;
-        ++block_height;
+        LogPrintf("Successfully created transaction database at %s. Processed %d blocks.\n", db_path_str, blocks_processed_count);
+
+    } catch (const UniValue& e) {
+        if (db) sqlite3_close(db); // Ensure DB is closed on RPC error exit
+        throw; // Re-throw JSONRPCError
+    } catch (const std::exception& e) {
+        if (db) sqlite3_close(db); // Ensure DB is closed on std::exception exit
+        LogPrintf("Standard exception during database creation: %s\n", e.what());
+        throw JSONRPCError(RPC_INTERNAL_ERROR, "An internal error occurred: " + std::string(e.what()));
+    } catch (...) {
+        if (db) sqlite3_close(db); // Ensure DB is closed on unknown exception exit
+        LogPrintf("Unknown exception during database creation.\n");
+        throw JSONRPCError(RPC_INTERNAL_ERROR, "An unknown internal error occurred.");
     }
 
-    /* while (!node.chain->shutdownRequested()) {
-
-        CBlockIndex* blockindex = active_chain[current_height];
-
-        if (!blockindex) {
-            LogPrintf("RPC iterateblocktransactions: Block index not found for height %d. Potentially a reorg or stale chain. Skipping.\n", current_height);
-            continue;
-        }
-
-        BlockFilter filter;
-        if (!index->LookupFilter(blockindex, filter)) {
-
-            const uint256 blockhash = filter.GetBlockHash();
-            CBlock block;
-            // bool found = node.chain->findBlock(blockhash, interfaces::FoundBlock().data(block));
-            bool found = node.chain->findBlock(blockhash, interfaces::FoundBlock().inActiveChain(block_still_active).nextBlock(interfaces::FoundBlock().inActiveChain(next_block).hash(next_block_hash)));
-
-            // Handle no found, not active, null block
-
-            if (found) {
-                std::cout << "Block hash: " << block.GetHash().GetHex() << " height: " << blockindex->nHeight << std::endl;
-            }
-
-            // save txs
-
-            
-        }
-    } */
+    UniValue result_array(UniValue::VARR);
 
     result_array.push_back("Test");
 
