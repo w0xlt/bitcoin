@@ -3441,7 +3441,7 @@ static void CreateDatabaseSchema(sqlite3* db) {
     ExecSqlOrThrow(db, R"(
         CREATE TABLE transactions (
             txid TEXT PRIMARY KEY,
-            block_height INTEGER NOT NULL,
+            block_hash TEXT NOT NULL,
             tx_index_in_block INTEGER NOT NULL,
             version INTEGER NOT NULL,
             lock_time INTEGER NOT NULL,
@@ -3449,8 +3449,8 @@ static void CreateDatabaseSchema(sqlite3* db) {
             size_bytes INTEGER NOT NULL,
             weight_units INTEGER NOT NULL,
             virtual_size_vbytes INTEGER NOT NULL,
-            FOREIGN KEY (block_height) REFERENCES blocks(height) ON DELETE CASCADE,
-            UNIQUE (block_height, tx_index_in_block)
+            FOREIGN KEY (block_hash) REFERENCES blocks(block_hash) ON DELETE CASCADE,
+            UNIQUE (block_hash, tx_index_in_block)
         );
     )");
 
@@ -3471,7 +3471,6 @@ static void CreateDatabaseSchema(sqlite3* db) {
 
      ExecSqlOrThrow(db, R"(
         CREATE TABLE tx_outputs (
-            output_id INTEGER PRIMARY KEY AUTOINCREMENT,
             txid TEXT NOT NULL,
             output_index INTEGER NOT NULL,
             value_satoshi INTEGER NOT NULL,
@@ -3569,7 +3568,7 @@ static void storeBlockData(sqlite3* db, int block_height, const CBlock& block,
         // Insert Transaction
         sqlite3_reset(insert_tx_stmt.get());
         sqlite3_bind_text(insert_tx_stmt.get(), 1, txid_hex.c_str(), -1, SQLITE_STATIC);
-        sqlite3_bind_int(insert_tx_stmt.get(), 2, block_height);
+        sqlite3_bind_text(insert_tx_stmt.get(), 2, block_hash_hex.c_str(), -1, SQLITE_STATIC);
         sqlite3_bind_int(insert_tx_stmt.get(), 3, static_cast<int>(tx_idx));
         sqlite3_bind_int(insert_tx_stmt.get(), 4, tx->version);
         sqlite3_bind_int(insert_tx_stmt.get(), 5, tx->nLockTime);
@@ -3816,7 +3815,7 @@ static RPCHelpMan createtransactiondatabase()
 
         // Prepare INSERT statements once
         SQLiteStatement insert_block_stmt(db, "INSERT INTO blocks (height, block_hash, timestamp) VALUES (?, ?, ?)");
-        SQLiteStatement insert_tx_stmt(db, "INSERT INTO transactions (txid, block_height, tx_index_in_block, version, lock_time, fee_satoshi, size_bytes, weight_units, virtual_size_vbytes) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)");
+        SQLiteStatement insert_tx_stmt(db, "INSERT INTO transactions (txid, block_hash, tx_index_in_block, version, lock_time, fee_satoshi, size_bytes, weight_units, virtual_size_vbytes) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)");
         SQLiteStatement insert_input_stmt(db, "INSERT INTO tx_inputs (txid, input_index, prev_tx_hash, prev_output_index, script_sig, sequence, has_witness) VALUES (?, ?, ?, ?, ?, ?, ?)");
         SQLiteStatement insert_output_stmt(db, "INSERT INTO tx_outputs (txid, output_index, value_satoshi, script_pub_key, address) VALUES (?, ?, ?, ?, ?)");
         SQLiteStatement insert_witness_stmt(db, "INSERT INTO witness_items (input_id, item_index_in_stack, witness_data) VALUES (?, ?, ?)");
