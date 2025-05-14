@@ -3456,7 +3456,6 @@ static void CreateDatabaseSchema(sqlite3* db) {
 
     ExecSqlOrThrow(db, R"(
         CREATE TABLE tx_inputs (
-            input_id INTEGER PRIMARY KEY AUTOINCREMENT,
             txid TEXT NOT NULL,
             input_index INTEGER NOT NULL,
             prev_tx_hash TEXT,
@@ -3483,12 +3482,12 @@ static void CreateDatabaseSchema(sqlite3* db) {
 
     ExecSqlOrThrow(db, R"(
         CREATE TABLE witness_items (
-            item_id INTEGER PRIMARY KEY AUTOINCREMENT,
-            input_id INTEGER NOT NULL,
+            txid TEXT NOT NULL,
+            input_index INTEGER NOT NULL,
             item_index_in_stack INTEGER NOT NULL,
             witness_data BLOB NOT NULL,
-            FOREIGN KEY (input_id) REFERENCES tx_inputs(input_id) ON DELETE CASCADE,
-            UNIQUE (input_id, item_index_in_stack)
+            FOREIGN KEY (txid, input_index) REFERENCES tx_inputs(txid, input_index) ON DELETE CASCADE,
+            UNIQUE (txid, input_index, item_index_in_stack)
         );
     )");
 
@@ -3620,17 +3619,16 @@ static void storeBlockData(sqlite3* db, int block_height, const CBlock& block,
                  throw std::runtime_error("Failed to insert input " + std::to_string(vin_idx) + " for tx " + txid_hex + ": " + std::string(sqlite3_errmsg(db)));
             }
 
-            sqlite3_int64 last_input_id = sqlite3_last_insert_rowid(db); // Get the ID of the input just inserted
-
             // Insert Witness Items (if any)
             if (has_witness) {
                 for (size_t item_idx = 0; item_idx < txin.scriptWitness.stack.size(); ++item_idx) {
                     const auto& witness_item = txin.scriptWitness.stack[item_idx];
 
                     sqlite3_reset(insert_witness_stmt.get());
-                    sqlite3_bind_int64(insert_witness_stmt.get(), 1, last_input_id);
-                    sqlite3_bind_int(insert_witness_stmt.get(), 2, static_cast<int>(item_idx));
-                    sqlite3_bind_blob(insert_witness_stmt.get(), 3, witness_item.data(), witness_item.size(), SQLITE_STATIC);
+                    sqlite3_bind_text(insert_witness_stmt.get(), 1, txid_hex.c_str(), -1, SQLITE_STATIC); // txid
+                    sqlite3_bind_int(insert_witness_stmt.get(), 2, static_cast<int>(vin_idx));          // input_index
+                    sqlite3_bind_int(insert_witness_stmt.get(), 3, static_cast<int>(item_idx));         // item_index_in_stack
+                    sqlite3_bind_blob(insert_witness_stmt.get(), 4, witness_item.data(), witness_item.size(), SQLITE_STATIC); // witness_data
 
                     if (sqlite3_step(insert_witness_stmt.get()) != SQLITE_DONE) {
                         throw std::runtime_error("Failed to insert witness item " + std::to_string(item_idx) + " for input " + std::to_string(vin_idx) + " of tx " + txid_hex + ": " + std::string(sqlite3_errmsg(db)));
@@ -3818,7 +3816,7 @@ static RPCHelpMan createtransactiondatabase()
         SQLiteStatement insert_tx_stmt(db, "INSERT INTO transactions (txid, block_hash, tx_index_in_block, version, lock_time, fee_satoshi, size_bytes, weight_units, virtual_size_vbytes) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)");
         SQLiteStatement insert_input_stmt(db, "INSERT INTO tx_inputs (txid, input_index, prev_tx_hash, prev_output_index, script_sig, sequence, has_witness) VALUES (?, ?, ?, ?, ?, ?, ?)");
         SQLiteStatement insert_output_stmt(db, "INSERT INTO tx_outputs (txid, output_index, value_satoshi, script_pub_key, address) VALUES (?, ?, ?, ?, ?)");
-        SQLiteStatement insert_witness_stmt(db, "INSERT INTO witness_items (input_id, item_index_in_stack, witness_data) VALUES (?, ?, ?)");
+        SQLiteStatement insert_witness_stmt(db, "INSERT INTO witness_items (txid, input_index, item_index_in_stack, witness_data) VALUES (?, ?, ?, ?)");
 
         // --- 3. Block Processing Loop ---
         while (!node.chain->shutdownRequested()) {
