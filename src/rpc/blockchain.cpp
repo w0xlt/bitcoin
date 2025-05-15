@@ -3475,12 +3475,13 @@ static void CreateDatabaseSchema(sqlite3* db) {
             prev_tx_hash TEXT,
             prev_output_index INTEGER,
             script_sig BLOB,
-            sequence INTEGER NOT NULL,
+            sequence TEXT NOT NULL,
             has_witness BOOLEAN NOT NULL,
             PRIMARY KEY (txid, input_index),
             FOREIGN KEY (txid) REFERENCES transactions(txid) ON DELETE CASCADE
         );
     )");
+    // sequence INTEGER NOT NULL,
 
      ExecSqlOrThrow(db, R"(
         CREATE TABLE tx_outputs (
@@ -3628,13 +3629,18 @@ static void storeBlockData(sqlite3* db, int block_height, const CBlock& block,
             const std::string prev_tx_hash_hex = prevout.hash.IsNull() ? "" : prevout.hash.GetHex(); // Handle coinbase
             bool has_witness = !txin.scriptWitness.IsNull();
 
+            char sequence_hex_str[9]; // 8 hex chars + null terminator
+            snprintf(sequence_hex_str, sizeof(sequence_hex_str), "%08x", txin.nSequence);
+            std::cout << "sequence_hex_str: " << sequence_hex_str << std::endl;
+
             sqlite3_reset(insert_input_stmt.get());
             sqlite3_bind_text(insert_input_stmt.get(), 1, txid_hex.c_str(), -1, SQLITE_STATIC);
             sqlite3_bind_int(insert_input_stmt.get(), 2, static_cast<int>(vin_idx));
             sqlite3_bind_text(insert_input_stmt.get(), 3, prev_tx_hash_hex.c_str(), -1, SQLITE_STATIC);
             sqlite3_bind_int(insert_input_stmt.get(), 4, prevout.n);
             sqlite3_bind_blob(insert_input_stmt.get(), 5, txin.scriptSig.data(), txin.scriptSig.size(), SQLITE_STATIC);
-            sqlite3_bind_int(insert_input_stmt.get(), 6, txin.nSequence);
+            // sqlite3_bind_int(insert_input_stmt.get(), 6, txin.nSequence);
+            sqlite3_bind_text(insert_input_stmt.get(), 6, sequence_hex_str, -1, SQLITE_TRANSIENT); // sequence as hex TEXT
             sqlite3_bind_int(insert_input_stmt.get(), 7, has_witness ? 1 : 0);
 
             if (sqlite3_step(insert_input_stmt.get()) != SQLITE_DONE) {
