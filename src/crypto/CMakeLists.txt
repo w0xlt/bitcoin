@@ -10,6 +10,7 @@ add_library(bitcoin_crypto STATIC EXCLUDE_FROM_ALL
   hkdf_sha256_32.cpp
   hmac_sha256.cpp
   hmac_sha512.cpp
+  hpke.h
   muhash.cpp
   poly1305.cpp
   ripemd160.cpp
