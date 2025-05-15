@@ -3432,27 +3432,41 @@ static void CreateDatabaseSchema(sqlite3* db) {
 
     ExecSqlOrThrow(db, R"(
         CREATE TABLE blocks (
-            height INTEGER PRIMARY KEY,
-            block_hash TEXT UNIQUE NOT NULL,
+            height INTEGER NOT NULL, -- Keep height for ordering/lookup
+            block_hash TEXT PRIMARY KEY, -- block_hash is the true PK
             timestamp INTEGER NOT NULL
+            -- Consider adding is_canonical BOOLEAN later
         );
     )");
+    // Index for faster lookup by height if needed, though PK is block_hash
+    ExecSqlOrThrow(db, "CREATE INDEX IF NOT EXISTS idx_blocks_height ON blocks(height);");
 
     ExecSqlOrThrow(db, R"(
         CREATE TABLE transactions (
             txid TEXT PRIMARY KEY,
-            block_hash TEXT NOT NULL,
-            tx_index_in_block INTEGER NOT NULL,
             version INTEGER NOT NULL,
             lock_time INTEGER NOT NULL,
             fee_satoshi INTEGER,
             size_bytes INTEGER NOT NULL,
             weight_units INTEGER NOT NULL,
-            virtual_size_vbytes INTEGER NOT NULL,
-            FOREIGN KEY (block_hash) REFERENCES blocks(block_hash) ON DELETE CASCADE,
-            UNIQUE (block_hash, tx_index_in_block)
+            virtual_size_vbytes INTEGER NOT NULL
         );
     )");
+
+    // Associative Table: block_transactions
+    ExecSqlOrThrow(db, R"(
+        CREATE TABLE block_transactions (
+            block_hash TEXT NOT NULL,
+            txid TEXT NOT NULL,
+            tx_index_in_block INTEGER NOT NULL,
+            PRIMARY KEY (block_hash, tx_index_in_block),
+            FOREIGN KEY (block_hash) REFERENCES blocks(block_hash) ON DELETE CASCADE,
+            FOREIGN KEY (txid) REFERENCES transactions(txid) ON DELETE CASCADE
+        );
+    )");
+    // Index for querying by txid to find all blocks it's in
+    ExecSqlOrThrow(db, "CREATE INDEX IF NOT EXISTS idx_block_transactions_txid ON block_transactions(txid);");
+
 
     ExecSqlOrThrow(db, R"(
         CREATE TABLE tx_inputs (
@@ -3463,8 +3477,8 @@ static void CreateDatabaseSchema(sqlite3* db) {
             script_sig BLOB,
             sequence INTEGER NOT NULL,
             has_witness BOOLEAN NOT NULL,
-            FOREIGN KEY (txid) REFERENCES transactions(txid) ON DELETE CASCADE,
-            UNIQUE (txid, input_index)
+            PRIMARY KEY (txid, input_index),
+            FOREIGN KEY (txid) REFERENCES transactions(txid) ON DELETE CASCADE
         );
     )");
 
@@ -3475,8 +3489,8 @@ static void CreateDatabaseSchema(sqlite3* db) {
             value_satoshi INTEGER NOT NULL,
             address TEXT,
             script_pub_key BLOB NOT NULL,
-            FOREIGN KEY (txid) REFERENCES transactions(txid) ON DELETE CASCADE,
-            UNIQUE (txid, output_index)
+            PRIMARY KEY (txid, output_index),
+            FOREIGN KEY (txid) REFERENCES transactions(txid) ON DELETE CASCADE
         );
     )");
 
@@ -3486,8 +3500,8 @@ static void CreateDatabaseSchema(sqlite3* db) {
             input_index INTEGER NOT NULL,
             item_index_in_stack INTEGER NOT NULL,
             item_data BLOB NOT NULL,
-            FOREIGN KEY (txid, input_index) REFERENCES tx_inputs(txid, input_index) ON DELETE CASCADE,
-            UNIQUE (txid, input_index, item_index_in_stack)
+            PRIMARY KEY (txid, input_index, item_index_in_stack),
+            FOREIGN KEY (txid, input_index) REFERENCES tx_inputs(txid, input_index) ON DELETE CASCADE
         );
     )");
 
@@ -3497,13 +3511,14 @@ static void CreateDatabaseSchema(sqlite3* db) {
 
 // Function to store data for a single block
 static void storeBlockData(sqlite3* db, int block_height, const CBlock& block,
-                           SQLiteStatement& insert_block_stmt,
-                           SQLiteStatement& insert_tx_stmt,
-                           SQLiteStatement& insert_input_stmt,
-                           SQLiteStatement& insert_output_stmt,
-                           SQLiteStatement& insert_witness_stmt,
-                           const node::BlockManager& blockman,
-                           const CTxMemPool* const mempool)
+                            SQLiteStatement& insert_block_stmt,
+                            SQLiteStatement& insert_tx_or_ignore_stmt,
+                            SQLiteStatement& insert_block_tx_assoc_stmt,
+                            SQLiteStatement& insert_input_stmt,
+                            SQLiteStatement& insert_output_stmt,
+                            SQLiteStatement& insert_witness_stmt,
+                            const node::BlockManager& blockman,
+                            const CTxMemPool* const mempool)
 {
     const uint256& block_hash = block.GetHash();
     const std::string block_hash_hex = block_hash.GetHex();
@@ -3565,24 +3580,22 @@ static void storeBlockData(sqlite3* db, int block_height, const CBlock& block,
         }
         
         // Insert Transaction
-        sqlite3_reset(insert_tx_stmt.get());
-        sqlite3_bind_text(insert_tx_stmt.get(), 1, txid_hex.c_str(), -1, SQLITE_STATIC);
-        sqlite3_bind_text(insert_tx_stmt.get(), 2, block_hash_hex.c_str(), -1, SQLITE_STATIC);
-        sqlite3_bind_int(insert_tx_stmt.get(), 3, static_cast<int>(tx_idx));
-        sqlite3_bind_int(insert_tx_stmt.get(), 4, tx->version);
-        sqlite3_bind_int(insert_tx_stmt.get(), 5, tx->nLockTime);
+        sqlite3_reset(insert_tx_or_ignore_stmt.get());
+        sqlite3_bind_text(insert_tx_or_ignore_stmt.get(), 1, txid_hex.c_str(), -1, SQLITE_STATIC);
+        sqlite3_bind_int(insert_tx_or_ignore_stmt.get(), 2, tx->version);
+        sqlite3_bind_int(insert_tx_or_ignore_stmt.get(), 3, tx->nLockTime);
 
         if (tx->IsCoinBase() || !all_inputs_found) {
-            sqlite3_bind_null(insert_tx_stmt.get(), 6); // fee_satoshi
+            sqlite3_bind_null(insert_tx_or_ignore_stmt.get(), 4); // fee_satoshi
         } else {
             CAmount nTotalOutputValue = tx->GetValueOut();
             CAmount fee = nTotalInputValue - nTotalOutputValue;
             if (fee < 0) {
                 LogPrintf("Warning: Negative fee calculated for tx %s (Height: %d, Inputs: %lld, Outputs: %lld). Storing fee as NULL.\n",
                           txid_hex, block_height, nTotalInputValue, nTotalOutputValue);
-                sqlite3_bind_null(insert_tx_stmt.get(), 6);
+                sqlite3_bind_null(insert_tx_or_ignore_stmt.get(), 4);
             } else {
-                sqlite3_bind_int64(insert_tx_stmt.get(), 6, fee);
+                sqlite3_bind_int64(insert_tx_or_ignore_stmt.get(), 4, fee);
             }
         }
 
@@ -3591,12 +3604,21 @@ static void storeBlockData(sqlite3* db, int block_height, const CBlock& block,
         int64_t weight = GetTransactionWeight(*tx);
         int64_t virtual_size = GetVirtualTransactionSize(*tx);
 
-        sqlite3_bind_int64(insert_tx_stmt.get(), 7, tx_size);
-        sqlite3_bind_int64(insert_tx_stmt.get(), 8, weight);
-        sqlite3_bind_int64(insert_tx_stmt.get(), 9, virtual_size);   
+        sqlite3_bind_int64(insert_tx_or_ignore_stmt.get(), 5, tx_size);
+        sqlite3_bind_int64(insert_tx_or_ignore_stmt.get(), 6, weight);
+        sqlite3_bind_int64(insert_tx_or_ignore_stmt.get(), 7, virtual_size);   
 
-        if (sqlite3_step(insert_tx_stmt.get()) != SQLITE_DONE) {
+        if (sqlite3_step(insert_tx_or_ignore_stmt.get()) != SQLITE_DONE) {
             throw std::runtime_error("Failed to insert transaction " + txid_hex + ": " + std::string(sqlite3_errmsg(db)));
+        }
+
+        // 2. Insert Block-Transaction Association
+        sqlite3_reset(insert_block_tx_assoc_stmt.get());
+        sqlite3_bind_text(insert_block_tx_assoc_stmt.get(), 1, block_hash_hex.c_str(), -1, SQLITE_STATIC); // block_hash
+        sqlite3_bind_text(insert_block_tx_assoc_stmt.get(), 2, txid_hex.c_str(), -1, SQLITE_STATIC);     // txid
+        sqlite3_bind_int(insert_block_tx_assoc_stmt.get(), 3, static_cast<int>(tx_idx));                // tx_index_in_block
+        if (sqlite3_step(insert_block_tx_assoc_stmt.get()) != SQLITE_DONE) {
+            throw std::runtime_error("Failed to insert block-transaction association for tx " + txid_hex + " in block " + block_hash_hex + ": " + std::string(sqlite3_errmsg(db)));
         }
 
         // Insert Inputs
@@ -3813,10 +3835,14 @@ static RPCHelpMan createtransactiondatabase()
 
         // Prepare INSERT statements once
         SQLiteStatement insert_block_stmt(db, "INSERT INTO blocks (height, block_hash, timestamp) VALUES (?, ?, ?)");
-        SQLiteStatement insert_tx_stmt(db, "INSERT INTO transactions (txid, block_hash, tx_index_in_block, version, lock_time, fee_satoshi, size_bytes, weight_units, virtual_size_vbytes) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)");
-        SQLiteStatement insert_input_stmt(db, "INSERT INTO tx_inputs (txid, input_index, prev_tx_hash, prev_output_index, script_sig, sequence, has_witness) VALUES (?, ?, ?, ?, ?, ?, ?)");
-        SQLiteStatement insert_output_stmt(db, "INSERT INTO tx_outputs (txid, output_index, value_satoshi, script_pub_key, address) VALUES (?, ?, ?, ?, ?)");
-        SQLiteStatement insert_witness_stmt(db, "INSERT INTO witness_items (txid, input_index, item_index_in_stack, item_data) VALUES (?, ?, ?, ?)");
+        // Use INSERT OR IGNORE for the main transactions table
+        SQLiteStatement insert_tx_or_ignore_stmt(db, "INSERT OR IGNORE INTO transactions (txid, version, lock_time, fee_satoshi, size_bytes, weight_units, virtual_size_vbytes) VALUES (?, ?, ?, ?, ?, ?, ?)");
+        // New statement for the associative table
+        SQLiteStatement insert_block_tx_assoc_stmt(db, "INSERT INTO block_transactions (block_hash, txid, tx_index_in_block) VALUES (?, ?, ?)");
+        // These can also be INSERT OR IGNORE or rely on their PKs for conflicts
+        SQLiteStatement insert_input_stmt(db, "INSERT OR IGNORE INTO tx_inputs (txid, input_index, prev_tx_hash, prev_output_index, script_sig, sequence, has_witness) VALUES (?, ?, ?, ?, ?, ?, ?)");
+        SQLiteStatement insert_output_stmt(db, "INSERT OR IGNORE INTO tx_outputs (txid, output_index, value_satoshi, script_pub_key, address) VALUES (?, ?, ?, ?, ?)");
+        SQLiteStatement insert_witness_stmt(db, "INSERT OR IGNORE INTO witness_items (txid, input_index, item_index_in_stack, item_data) VALUES (?, ?, ?, ?)");
 
         // --- 3. Block Processing Loop ---
         while (!node.chain->shutdownRequested()) {
@@ -3839,8 +3865,8 @@ static RPCHelpMan createtransactiondatabase()
             ExecSqlOrThrow(db, "BEGIN TRANSACTION;");
             try {
                 storeBlockData(db, block_height, block,
-                               insert_block_stmt, insert_tx_stmt, insert_input_stmt,
-                               insert_output_stmt, insert_witness_stmt, chainman.m_blockman, node.mempool.get());
+                    insert_block_stmt, insert_tx_or_ignore_stmt, insert_block_tx_assoc_stmt,
+                    insert_input_stmt, insert_output_stmt, insert_witness_stmt, chainman.m_blockman, node.mempool.get());
                 ExecSqlOrThrow(db, "COMMIT;");
                 blocks_processed_count++;
             } catch (const std::exception& e) {
