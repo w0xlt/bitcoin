@@ -3493,7 +3493,6 @@ static void CreateDatabaseSchema(sqlite3* db) {
             address TEXT,
             script_pub_key BLOB NOT NULL,
             output_type TEXT NULL,
-            is_op_return BOOLEAN NOT NULL,
             PRIMARY KEY (txid, output_index),
             FOREIGN KEY (txid) REFERENCES transactions(txid) ON DELETE CASCADE
         );
@@ -3674,8 +3673,6 @@ static void storeBlockData(sqlite3* db, int block_height, const CBlock& block,
         for (size_t vout_idx = 0; vout_idx < tx->vout.size(); ++vout_idx) {
             const CTxOut& txout = tx->vout[vout_idx];
 
-            bool is_op_return = txout.scriptPubKey[0] == OP_RETURN;
-
             sqlite3_reset(insert_output_stmt.get());
             sqlite3_bind_text(insert_output_stmt.get(), 1, txid_hex.c_str(), -1, SQLITE_STATIC);
             sqlite3_bind_int(insert_output_stmt.get(), 2, static_cast<int>(vout_idx));
@@ -3683,8 +3680,8 @@ static void storeBlockData(sqlite3* db, int block_height, const CBlock& block,
             sqlite3_bind_blob(insert_output_stmt.get(), 4, txout.scriptPubKey.data(), txout.scriptPubKey.size(), SQLITE_STATIC);
 
             CTxDestination destination;
-            std::string address_str;
             if (ExtractDestination(txout.scriptPubKey, destination)) {
+                std::string address_str;
                 address_str = EncodeDestination(destination);
                 sqlite3_bind_text(insert_output_stmt.get(), 5, address_str.c_str(), -1, SQLITE_STATIC); // address
 
@@ -3695,15 +3692,23 @@ static void storeBlockData(sqlite3* db, int block_height, const CBlock& block,
                     sqlite3_bind_text(insert_output_stmt.get(), 6, formatted_output_type.c_str(), -1, SQLITE_STATIC); // output type
                     
                 } else {
+
                     sqlite3_bind_null(insert_output_stmt.get(), 6); // output type
                 }
-
             } else {
-                sqlite3_bind_null(insert_output_stmt.get(), 5); // address
-                sqlite3_bind_null(insert_output_stmt.get(), 6); // output type
-            }
 
-            sqlite3_bind_int(insert_output_stmt.get(), 7, is_op_return ? 1 : 0);
+                sqlite3_bind_null(insert_output_stmt.get(), 5); // address
+
+                bool is_op_return = txout.scriptPubKey[0] == OP_RETURN;
+
+                if (is_op_return) {
+                    std::string formatted_output_type = "op_return";
+                    sqlite3_bind_text(insert_output_stmt.get(), 6, formatted_output_type.c_str(), -1, SQLITE_STATIC); // output type
+                }
+                else {
+                    sqlite3_bind_null(insert_output_stmt.get(), 6); // output type
+                }
+            }
 
             if (sqlite3_step(insert_output_stmt.get()) != SQLITE_DONE) {
                 throw std::runtime_error("Failed to insert output " + std::to_string(vout_idx) + " for tx " + txid_hex + ": " + std::string(sqlite3_errmsg(db)));
@@ -3868,7 +3873,7 @@ static RPCHelpMan createtransactiondatabase()
         SQLiteStatement insert_block_tx_assoc_stmt(db, "INSERT INTO block_transactions (block_hash, txid, tx_index_in_block) VALUES (?, ?, ?)");
         // These can also be INSERT OR IGNORE or rely on their PKs for conflicts
         SQLiteStatement insert_input_stmt(db, "INSERT OR IGNORE INTO tx_inputs (txid, input_index, prev_tx_hash, prev_output_index, script_sig, sequence, has_witness) VALUES (?, ?, ?, ?, ?, ?, ?)");
-        SQLiteStatement insert_output_stmt(db, "INSERT OR IGNORE INTO tx_outputs (txid, output_index, value_satoshi, script_pub_key, address, output_type, is_op_return) VALUES (?, ?, ?, ?, ?, ?, ?)");
+        SQLiteStatement insert_output_stmt(db, "INSERT OR IGNORE INTO tx_outputs (txid, output_index, value_satoshi, script_pub_key, address, output_type) VALUES (?, ?, ?, ?, ?, ?)");
         SQLiteStatement insert_witness_stmt(db, "INSERT OR IGNORE INTO witness_items (txid, input_index, item_index_in_stack, item_data) VALUES (?, ?, ?, ?)");
 
         // --- 3. Block Processing Loop ---
