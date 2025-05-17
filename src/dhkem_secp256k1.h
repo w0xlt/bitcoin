@@ -26,6 +26,10 @@ static const size_t NENC = 65;           //!< Length of encapsulated key (epheme
 static const size_t NPK = 65;            //!< Length of public key serialization, uncompressed (65 bytes):contentReference[oaicite:5]{index=5}
 static const size_t NSK = 32;            //!< Length of private key serialization (32 bytes):contentReference[oaicite:6]{index=6}
 
+// Labeled prefix "HPKE-v1" and suite ID for KEM(secp256k1, HKDF-SHA256):contentReference[oaicite:20]{index=20}
+static const unsigned char LABEL_PREFIX[] = {'H','P','K','E','-','v','1'};
+static const unsigned char SUITE_ID[]    = {'K','E','M', 0x00, 0x16}; // "KEM\x00\x16"
+
 /**
  * DeriveKeyPair(IKM): Derive a secp256k1 key pair from input keying material.
  * 
@@ -151,6 +155,10 @@ bool AuthEncap(const uint8_t pkR_bytes[NPK], const uint8_t skS_bytes[NSK],
  */
 bool AuthDecap(const uint8_t enc_bytes[NPK], const uint8_t skR_bytes[NSK], const uint8_t pkS_bytes[NPK],
                uint8_t out_shared_secret[NSECRET]);
+
+void HKDF_Extract(const uint8_t* salt, size_t salt_len, const uint8_t* ikm, size_t ikm_len, uint8_t out_prk[32]);
+
+void HKDF_Expand32(const uint8_t prk[32], const uint8_t* info_data, size_t info_len, uint8_t out_okm[], size_t L);
 
 } // namespace dhkem_secp256k1
 #endif // BITCOIN_CRYPTO_DHKEM_SECP256K1_H

@@ -16,10 +16,6 @@ static const unsigned char SECP256K1_ORDER[32] = {
     0xBA,0xAE,0xDC,0xE6,0xAF,0x48,0xA0,0x3B, 0xBF,0xD2,0x5E,0x8C,0xD0,0x36,0x41,0x41
 };
 
-// Labeled prefix "HPKE-v1" and suite ID for KEM(secp256k1, HKDF-SHA256):contentReference[oaicite:20]{index=20}
-static const unsigned char LABEL_PREFIX[] = {'H','P','K','E','-','v','1'};
-static const unsigned char SUITE_ID[]    = {'K','E','M', 0x00, 0x16}; // "KEM\x00\x16"
-
 /** Ensure global secp256k1 context is initialized. */
 /* static void InitCtx() {
     if (g_secp256k1_ctx == nullptr) {
@@ -49,8 +45,7 @@ static bool ECDH_xcoord(const uint8_t priv[NSK], const secp256k1_pubkey& pub, ui
     return true;
 }
 
-/** Internal: Perform HKDF-Extract with HKDF_SHA256 (output 32-byte PRK). */
-static void HKDF_Extract(const uint8_t* salt, size_t salt_len,
+void HKDF_Extract(const uint8_t* salt, size_t salt_len,
                          const uint8_t* ikm, size_t ikm_len,
                          uint8_t out_prk[32]) {
     // If salt is not provided, HMAC_SHA256 will treat empty key as zero-padded:contentReference[oaicite:21]{index=21}.
@@ -59,9 +54,7 @@ static void HKDF_Extract(const uint8_t* salt, size_t salt_len,
     hmac.Finalize(out_prk);
 }
 
-/** Internal: Perform single-step HKDF-Expand with HKDF_SHA256 for length <= 32. 
- *  info_data is concatenated info (includes length of info). */
-static void HKDF_Expand32(const uint8_t prk[32], const uint8_t* info_data, size_t info_len,
+void HKDF_Expand32(const uint8_t prk[32], const uint8_t* info_data, size_t info_len,
                           uint8_t out_okm[], size_t L) {
     // Only one round (L <= 32 bytes)
     unsigned char one = 0x01;
@@ -98,7 +91,7 @@ bool DeriveKeyPair(const uint8_t* ikm, size_t ikm_len, uint8_t out_sk[NSK], uint
 
     // 2. Derive key material until valid scalar found (up to 256 tries):contentReference[oaicite:22]{index=22}
     const char* cand_label = "candidate";
-    for (uint8_t counter = 0; counter != 0; ++counter) {
+    for (uint8_t counter = 0; counter < 255; ++counter) {
         // info = concat("HPKE-v1", suite_id, "candidate", I2OSP(counter,1))
         uint8_t info[sizeof(LABEL_PREFIX) + sizeof(SUITE_ID) + 9]; // "candidate" (9 chars including null) 
         size_t info_len = 0;

@@ -39,6 +39,7 @@ add_executable(test_bitcoin
   dbwrapper_tests.cpp
   denialofservice_tests.cpp
   descriptor_tests.cpp
+  dhkem_secp256k1_tests.cpp
   disconnected_transactions.cpp
   feefrac_tests.cpp
   flatfile_tests.cpp
