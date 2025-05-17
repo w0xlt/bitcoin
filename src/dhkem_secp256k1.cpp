@@ -4,13 +4,10 @@
 #include <crypto/hmac_sha256.h>
 #include <random.h>
 #include <secp256k1.h>
-#include <secp256k1_ellswift.h>
-#include <secp256k1_extrakeys.h>
-#include <secp256k1_recovery.h>
-#include <secp256k1_schnorrsig.h>
 
 // Global secp256k1 context for crypto operations (ensure ECC_Init has been called).
 // static secp256k1_context* g_secp256k1_ctx = nullptr;
+namespace dhkem_secp256k1 {
 
 /** Static secp256k1 curve parameters */
 static const unsigned char SECP256K1_ORDER[32] = {
@@ -421,3 +418,4 @@ bool AuthDecap(const uint8_t enc_bytes[NPK], const uint8_t skR_bytes[NSK], const
     HKDF_Expand32(eae_prk, labeled_info, info_len, out_shared_secret, NSECRET);
     return true;
 }
+} // namespace dhkem_secp256k1

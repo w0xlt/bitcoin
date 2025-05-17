@@ -7,6 +7,7 @@
 
 #include <cstdlib>
 #include <cstdint>
+#include <secp256k1.h>
 
 /** 
  * secp256k1-based DHKEM for HPKE (Hybrid Public Key Encryption)
@@ -15,6 +16,10 @@
  * encapsulation/decapsulation (including authenticated modes) as specified in 
  * draft-wahby-cfrg-hpke-kem-secp256k1-01:contentReference[oaicite:2]{index=2}.
  */
+namespace dhkem_secp256k1 {
+
+using ::secp256k1_pubkey;
+using ::secp256k1_ec_pubkey_serialize;
 
 static const size_t NSECRET = 32;        //!< Length of KEM shared secret (Nsecret = 32 bytes):contentReference[oaicite:3]{index=3} 
 static const size_t NENC = 65;           //!< Length of encapsulated key (ephemeral public key), uncompressed SEC1 (65 bytes):contentReference[oaicite:4]{index=4}
@@ -147,4 +152,5 @@ bool AuthEncap(const uint8_t pkR_bytes[NPK], const uint8_t skS_bytes[NSK],
 bool AuthDecap(const uint8_t enc_bytes[NPK], const uint8_t skR_bytes[NSK], const uint8_t pkS_bytes[NPK],
                uint8_t out_shared_secret[NSECRET]);
 
+} // namespace dhkem_secp256k1
 #endif // BITCOIN_CRYPTO_DHKEM_SECP256K1_H
