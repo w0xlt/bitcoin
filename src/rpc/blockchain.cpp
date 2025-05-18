@@ -335,7 +335,28 @@ static RPCHelpMan getblockcount()
             std::cout << "---> shared3: " << HexStr(*shared) << std::endl;
         }
 
-        // std::optional<std::array<uint8_t, 32>> Decap2(std::span<const uint8_t> enc, std::span<const uint8_t> skR);
+        CKey skR;
+        skR.MakeNewKey(false);
+        CPubKey pkR = skR.GetPubKey();
+        std::vector<uint8_t> pkR_bytes(pkR.begin(), pkR.end());
+        assert(pkR_bytes.size() == 65);
+
+        // Perform encapsulation with the recipient's public key
+        auto maybe_result = dhkem_secp256k1::Encap2(pkR_bytes);
+        assert(maybe_result.has_value()); // Encap should succeed
+
+        std::span<const uint8_t> skR_span(reinterpret_cast<const uint8_t*>(skR.data()), skR.size());
+
+        // Extract shared_secret_enc and enc (ephemeral public key bytes)
+        auto [shared_secret_enc, enc3] = *maybe_result;
+        // Decapsulate using the recipient's private key
+        std::optional<std::array<uint8_t, 32>> maybe_shared_secret_dec = dhkem_secp256k1::Decap2(enc3, skR_span);
+        assert(maybe_shared_secret_dec.has_value());
+
+        std::cout << "---> shared_secret_enc: " << HexStr(shared_secret_enc) << std::endl;
+        std::cout << "---> maybe_shared_secret_dec: " << HexStr(*maybe_shared_secret_dec) << std::endl;
+
+        assert(shared_secret_enc == *maybe_shared_secret_dec);
     }
 
     return chainman.ActiveChain().Height();
