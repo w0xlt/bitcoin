@@ -247,18 +247,46 @@ static RPCHelpMan getblockcount()
     bool ret = dhkem_secp256k1::DeriveKeyPair2(ikmE.data(), ikmE.size(), out_sk, out_pk); */
 
     // Test vector from IETF draft: known IKM -> expected SK and PK:contentReference[oaicite:18]{index=18}.
-    std::vector<unsigned char> ikm = ParseHex(
+    std::vector<unsigned char> ikmE = ParseHex(
         "77caf1617fb3723972a56cd2085081c9f66baae825ce5f363c0a86ec87013fa0"
     );
-    std::array<uint8_t, 32> sk;
-    std::array<uint8_t, 65> pk;
-    bool result = dhkem_secp256k1::DeriveKeyPair_DHKEM_Secp256k1(std::span<const uint8_t>(ikm.data(), ikm.size()), sk, pk);
+    std::array<uint8_t, 32> skEm;
+    std::array<uint8_t, 65> pkEm;
+    bool result = dhkem_secp256k1::DeriveKeyPair_DHKEM_Secp256k1(std::span<const uint8_t>(ikmE.data(), ikmE.size()), skEm, pkEm);
 
     std::cout << "---> " << (result ? "It worked" : "Unexpected") << std::endl;
 
-    std::cout << "---> sk: " << HexStr(sk) << std::endl;
+    std::cout << "---> ikmE: " << HexStr(ikmE) << std::endl;
 
-    std::cout << "---> pk: " << HexStr(pk) << std::endl;
+    std::cout << "---> skEm: " << HexStr(skEm) << std::endl;
+
+    std::cout << "---> skEm: " << HexStr(pkEm) << std::endl;
+
+    /* dhkem_secp256k1::InitContext();
+
+    uint8_t skEm[32], pkEm[65];
+    bool ok = dhkem_secp256k1::DeriveKeyPair(ikm.data(), ikm.size(), skEm, pkEm); // DONT WORK
+
+    std::cout << "---> " << (ok ? "It worked 2" : "Unexpected 2") << std::endl;
+
+    std::cout << "---> skEm: " << HexStr(skEm) << std::endl;
+
+    std::cout << "---> pkEm: " << HexStr(pkEm) << std::endl; */
+
+    std::vector<unsigned char> ikmR = ParseHex(
+        "71b530bed75fc3fa2f8e8bb163203e6ee676565cc61cd59d66352676341c0688"
+    );
+    std::array<uint8_t, 32> skRm;
+    std::array<uint8_t, 65> pkRm;
+    result = dhkem_secp256k1::DeriveKeyPair_DHKEM_Secp256k1(std::span<const uint8_t>(ikmR.data(), ikmR.size()), skRm, pkRm);
+
+    std::cout << "---> " << (result ? "It worked" : "Unexpected") << std::endl;
+
+    std::cout << "---> ikmR: " << HexStr(ikmR) << std::endl;
+
+    std::cout << "---> skRm: " << HexStr(skRm) << std::endl;
+
+    std::cout << "---> pkRm: " << HexStr(pkRm) << std::endl;
 
     return chainman.ActiveChain().Height();
 },

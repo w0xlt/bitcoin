@@ -14,6 +14,8 @@
 // static secp256k1_context* g_secp256k1_ctx = nullptr;
 namespace dhkem_secp256k1 {
 
+static secp256k1_context* g_secp256k1_ctx = nullptr;
+
 /** Static secp256k1 curve parameters */
 static const unsigned char SECP256K1_ORDER[32] = {
     // 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
@@ -22,12 +24,27 @@ static const unsigned char SECP256K1_ORDER[32] = {
 };
 
 /** Ensure global secp256k1 context is initialized. */
-/* static void InitCtx() {
+static void InitCtx() {
     if (g_secp256k1_ctx == nullptr) {
         // Combine flags for both signing (to allow pubkey create) and verification (for pubkey parse)
-        g_secp256k1_ctx = secp256k1_context_create(SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+        // g_secp256k1_ctx = secp256k1_context_create(SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+
+        g_secp256k1_ctx = secp256k1_context_create(SECP256K1_CONTEXT_NONE);
+        assert(g_secp256k1_ctx != nullptr);
+
+        {
+            // Pass in a random blinding seed to the secp256k1 context.
+            std::vector<unsigned char, secure_allocator<unsigned char>> vseed(32);
+            GetRandBytes(vseed);
+            bool ret = secp256k1_context_randomize(g_secp256k1_ctx, vseed.data());
+            assert(ret);
+        }
     }
-} */
+}
+
+void InitContext() {
+    InitCtx();
+}
 
 /** Internal helper: perform ECDH (scalar * pubkey) and output 32-byte X coordinate. 
  *  Returns true on success, false if pubkey or scalar are invalid. */
@@ -116,15 +133,15 @@ bool DeriveKeyPair(const uint8_t* ikm, size_t ikm_len, uint8_t out_sk[NSK], uint
         // Apply bitmask to first byte (0xFF for secp256k1 means no change):contentReference[oaicite:23]{index=23}
         candidate[0] &= 0xFF;
         // Interpret as big-endian and check if in [1, order-1]
-        if (secp256k1_ec_seckey_verify(secp256k1_context_static, candidate) == 1) {
+        if (secp256k1_ec_seckey_verify(g_secp256k1_ctx, candidate) == 1) {
             // Valid secret key
             std::memcpy(out_sk, candidate, 32);
             // Compute public key
             secp256k1_pubkey pub;
-            int ret = secp256k1_ec_pubkey_create(secp256k1_context_static, &pub, out_sk);
+            int ret = secp256k1_ec_pubkey_create(g_secp256k1_ctx, &pub, out_sk);
             assert(ret);
             size_t len = NPK;
-            secp256k1_ec_pubkey_serialize(secp256k1_context_static, out_pk, &len, &pub, SECP256K1_EC_UNCOMPRESSED);
+            secp256k1_ec_pubkey_serialize(g_secp256k1_ctx, out_pk, &len, &pub, SECP256K1_EC_UNCOMPRESSED);
             return true;
         }
     }

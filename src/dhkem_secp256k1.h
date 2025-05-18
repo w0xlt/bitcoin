@@ -182,5 +182,7 @@ bool DeriveKeyPair_DHKEM_Secp256k1(std::span<const uint8_t> ikm,
                                    std::array<uint8_t, 32>& outPrivKey,
                                    std::array<uint8_t, 65>& outPubKey);
 
+void InitContext();
+
 } // namespace dhkem_secp256k1
 #endif // BITCOIN_CRYPTO_DHKEM_SECP256K1_H
