@@ -10,6 +10,7 @@
 #include <secp256k1.h>
 #include <span>
 #include <array>
+#include <optional>
 
 /** 
  * secp256k1-based DHKEM for HPKE (Hybrid Public Key Encryption)
@@ -183,6 +184,8 @@ bool DeriveKeyPair_DHKEM_Secp256k1(std::span<const uint8_t> ikm,
                                    std::array<uint8_t, 65>& outPubKey);
 
 void InitContext();
+
+std::optional<std::array<uint8_t, 32>> Decap2(std::span<const uint8_t> enc, std::span<const uint8_t> skR);
 
 } // namespace dhkem_secp256k1
 #endif // BITCOIN_CRYPTO_DHKEM_SECP256K1_H

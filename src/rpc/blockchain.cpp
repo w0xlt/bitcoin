@@ -246,6 +246,8 @@ static RPCHelpMan getblockcount()
 
     bool ret = dhkem_secp256k1::DeriveKeyPair2(ikmE.data(), ikmE.size(), out_sk, out_pk); */
 
+    dhkem_secp256k1::InitContext();
+
     // Test vector from IETF draft: known IKM -> expected SK and PK:contentReference[oaicite:18]{index=18}.
     std::vector<unsigned char> ikmE = ParseHex(
         "77caf1617fb3723972a56cd2085081c9f66baae825ce5f363c0a86ec87013fa0"
@@ -254,7 +256,7 @@ static RPCHelpMan getblockcount()
     std::array<uint8_t, 65> pkEm;
     bool result = dhkem_secp256k1::DeriveKeyPair_DHKEM_Secp256k1(std::span<const uint8_t>(ikmE.data(), ikmE.size()), skEm, pkEm);
 
-    std::cout << "---> " << (result ? "It worked" : "Unexpected") << std::endl;
+    std::cout << "---> " << (result ? "It worked 1" : "Unexpected 1") << std::endl;
 
     std::cout << "---> ikmE: " << HexStr(ikmE) << std::endl;
 
@@ -262,9 +264,7 @@ static RPCHelpMan getblockcount()
 
     std::cout << "---> skEm: " << HexStr(pkEm) << std::endl;
 
-    /* dhkem_secp256k1::InitContext();
-
-    uint8_t skEm[32], pkEm[65];
+    /* uint8_t skEm[32], pkEm[65];
     bool ok = dhkem_secp256k1::DeriveKeyPair(ikm.data(), ikm.size(), skEm, pkEm); // DONT WORK
 
     std::cout << "---> " << (ok ? "It worked 2" : "Unexpected 2") << std::endl;
@@ -280,13 +280,33 @@ static RPCHelpMan getblockcount()
     std::array<uint8_t, 65> pkRm;
     result = dhkem_secp256k1::DeriveKeyPair_DHKEM_Secp256k1(std::span<const uint8_t>(ikmR.data(), ikmR.size()), skRm, pkRm);
 
-    std::cout << "---> " << (result ? "It worked" : "Unexpected") << std::endl;
+    std::cout << "---> " << (result ? "It worked 2" : "Unexpected 2") << std::endl;
 
     std::cout << "---> ikmR: " << HexStr(ikmR) << std::endl;
 
     std::cout << "---> skRm: " << HexStr(skRm) << std::endl;
 
     std::cout << "---> pkRm: " << HexStr(pkRm) << std::endl;
+
+    /// ---
+    /* uint8_t shared[32];
+    result = dhkem_secp256k1::Decap(pkEm.data(), skRm.data(), shared);
+
+    std::cout << "---> " << (result ? "It worked 3" : "Unexpected 3") << std::endl;
+
+    std::cout << "---> shared: " << HexStr(shared) << std::endl; */
+
+    std::span<const uint8_t> enc2(pkEm.data(), pkEm.size());
+    std::span<const uint8_t> skR2(skRm.data(), skRm.size());
+
+    std::optional<std::array<uint8_t, 32>> shared = dhkem_secp256k1::Decap2(enc2, skR2);
+
+    if (!shared) {
+        std::cout << "---> Empty shared." << std::endl;
+    } else {
+        std::cout << "---> NOT empty shared." << std::endl;
+        std::cout << "---> shared: " << HexStr(*shared) << std::endl;
+    }
 
     return chainman.ActiveChain().Height();
 },

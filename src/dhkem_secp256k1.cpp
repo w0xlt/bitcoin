@@ -4,11 +4,14 @@
 #include <crypto/hmac_sha256.h>
 #include <random.h>
 #include <secp256k1.h>
+#include <secp256k1_ecdh.h>
 #include <span>
 #include <array>
 #include <cassert>
 #include <cstring>
 #include <support/allocators/secure.h>
+#include <optional>
+#include <iostream>
 
 // Global secp256k1 context for crypto operations (ensure ECC_Init has been called).
 // static secp256k1_context* g_secp256k1_ctx = nullptr;
@@ -262,16 +265,16 @@ bool Decap(const uint8_t enc_bytes[NPK], const uint8_t skR_bytes[NSK], uint8_t o
     if (!DeserializePublicKey(enc_bytes, pubE)) {
         return false;
     }
-    if (secp256k1_ec_seckey_verify(secp256k1_context_static, skR_bytes) != 1) {
+    if (secp256k1_ec_seckey_verify(g_secp256k1_ctx, skR_bytes) != 1) {
         return false;
     }
     // Compute pkR (to use in kem_context)
     secp256k1_pubkey pubR;
-    int ret = secp256k1_ec_pubkey_create(secp256k1_context_static, &pubR, skR_bytes);
+    int ret = secp256k1_ec_pubkey_create(g_secp256k1_ctx, &pubR, skR_bytes);
     assert(ret);
     uint8_t pkR_bytes[NPK];
     size_t pkR_len = NPK;
-    secp256k1_ec_pubkey_serialize(secp256k1_context_static, pkR_bytes, &pkR_len, &pubR, SECP256K1_EC_UNCOMPRESSED);
+    secp256k1_ec_pubkey_serialize(g_secp256k1_ctx, pkR_bytes, &pkR_len, &pubR, SECP256K1_EC_UNCOMPRESSED);
     // DH: x-coordinate of (skR * pubE)
     uint8_t dh[32];
     if (!ECDH_xcoord(skR_bytes, pubE, dh)) {
@@ -588,17 +591,6 @@ bool DeriveKeyPair_DHKEM_Secp256k1(std::span<const uint8_t> ikm,
     info_prefix.append(kem_label);
     info_prefix.append(kem_id_bytes, 2);
     info_prefix.append(expand_label);
-
-    secp256k1_context *ctx = secp256k1_context_create(SECP256K1_CONTEXT_NONE);
-    assert(ctx != nullptr);
-
-    {
-        // Pass in a random blinding seed to the secp256k1 context.
-        std::vector<unsigned char, secure_allocator<unsigned char>> vseed(32);
-        GetRandBytes(vseed);
-        bool ret = secp256k1_context_randomize(ctx, vseed.data());
-        assert(ret);
-    }
     
     unsigned char candidate[32];
     for (uint8_t counter = 0; counter < 0x099; ++counter) {
@@ -610,16 +602,16 @@ bool DeriveKeyPair_DHKEM_Secp256k1(std::span<const uint8_t> ikm,
         // Mask the first byte with 0xFF (as required by spec – no-op for 0xFF, included for completeness).
         candidate[0] &= 0xFF;
         // Check if the candidate is a valid secret scalar (0 < key < order).
-        if (secp256k1_ec_seckey_verify(ctx, candidate)) {
+        if (secp256k1_ec_seckey_verify(g_secp256k1_ctx, candidate)) {
             // Derive the corresponding secp256k1 public key.
             secp256k1_pubkey pubkey;
-            if (!secp256k1_ec_pubkey_create(ctx, &pubkey, candidate)) {
+            if (!secp256k1_ec_pubkey_create(g_secp256k1_ctx, &pubkey, candidate)) {
                 // Should not happen if seckey is valid; continue to next in unlikely case.
                 continue;
             }
             // Serialize the public key in uncompressed format: 65 bytes (0x04 | X-coordinate | Y-coordinate).
             size_t pub_len = outPubKey.size();
-            secp256k1_ec_pubkey_serialize(ctx,
+            secp256k1_ec_pubkey_serialize(g_secp256k1_ctx,
                                           outPubKey.data(), &pub_len,
                                           &pubkey, SECP256K1_EC_UNCOMPRESSED);
             assert(pub_len == outPubKey.size());
@@ -631,4 +623,78 @@ bool DeriveKeyPair_DHKEM_Secp256k1(std::span<const uint8_t> ikm,
     // If no valid key found in 256 attempts (negligibly improbable), return false.
     return false;
 }
+
+std::optional<std::array<uint8_t, 32>> Decap2(std::span<const uint8_t> enc, 
+                                            std::span<const uint8_t> skR) 
+// bool Decap(const uint8_t enc_bytes[NPK], const uint8_t skR_bytes[NSK], uint8_t out_shared_secret[NSECRET]) {                                           
+{
+    std::cout << "---> AQUI 1." << std::endl;
+    assert(enc.size() == 65 && skR.size() == 32);
+    // 1. Parse ephemeral public key
+    secp256k1_pubkey pkE;
+    if (!secp256k1_ec_pubkey_parse(g_secp256k1_ctx, &pkE, enc.data(), enc.size())) {
+        return std::nullopt; // invalid enc key
+    }
+    // 2. ECDH (X coordinate only)
+    if (!secp256k1_ec_seckey_verify(g_secp256k1_ctx, skR.data())) {
+        return std::nullopt; // invalid secret key
+    }
+    unsigned char dh[32];
+    // Custom hashfn that copies X coordinate
+    auto copy_x = [](unsigned char *out, const unsigned char *x32, const unsigned char *y32, void*) {
+        memcpy(out, x32, 32);
+        return 1;
+    };
+    if (!secp256k1_ecdh(g_secp256k1_ctx, dh, &pkE, skR.data(), copy_x, nullptr)) {
+        return std::nullopt; // ECDH failed (invalid input)
+    }
+
+    std::cout << "---> AQUI 2." << std::endl;
+    // 3. Compute and serialize pkR
+    secp256k1_pubkey pubR;
+    if (!secp256k1_ec_pubkey_create(g_secp256k1_ctx, &pubR, skR.data())) {
+        return std::nullopt; // skR = 0 or out of range
+    }
+    unsigned char pkR[65]; size_t pkR_len = 65;
+    secp256k1_ec_pubkey_serialize(g_secp256k1_ctx, pkR, &pkR_len, &pubR, SECP256K1_EC_UNCOMPRESSED);
+    // kem_context = enc || pkR
+    uint8_t kem_context[130];
+    memcpy(kem_context, enc.data(), 65);
+    memcpy(kem_context + 65, pkR, 65);
+    // 4a. HKDF-Extract with label "eae_prk"
+    const uint8_t suite_id[5] = { 'K','E','M', 0x00, 0x16 };
+    const char label_eae[] = "eae_prk";
+    // Build labeled IKM = "HPKE-v1" || suite_id || label_eae || dh
+    uint8_t labeled_ikm[7 + 5 + sizeof(label_eae) - 1 + 32]; // "-1" for null terminator of C-string
+    size_t offset = 0;
+    memcpy(labeled_ikm + offset, "HPKE-v1", 7);            offset += 7;
+    memcpy(labeled_ikm + offset, suite_id, 5);             offset += 5;
+    memcpy(labeled_ikm + offset, label_eae, sizeof(label_eae) - 1); offset += sizeof(label_eae) - 1;
+    memcpy(labeled_ikm + offset, dh, 32);
+    // HMAC-Extract (salt is empty => treated as zero key)
+    CHMAC_SHA256 hmac_ext(nullptr, 0);
+    hmac_ext.Write(labeled_ikm, sizeof(labeled_ikm));
+    uint8_t eae_prk[32];
+    hmac_ext.Finalize(eae_prk);
+    // 4b. HKDF-Expand with label "shared_secret"
+    const char label_ss[] = "shared_secret";
+    // Build labeled info = length(2 bytes) || "HPKE-v1" || suite_id || label_ss || kem_context
+    uint8_t length_bytes[2] = {0x00, 0x20};               // 32 in hex
+    uint8_t labeled_info[2 + 7 + 5 + sizeof(label_ss) - 1 + sizeof(kem_context)];
+    offset = 0;
+    memcpy(labeled_info + offset, length_bytes, 2);       offset += 2;
+    memcpy(labeled_info + offset, "HPKE-v1", 7);          offset += 7;
+    memcpy(labeled_info + offset, suite_id, 5);           offset += 5;
+    memcpy(labeled_info + offset, label_ss, sizeof(label_ss) - 1); offset += sizeof(label_ss) - 1;
+    memcpy(labeled_info + offset, kem_context, sizeof(kem_context));
+    // HMAC-Expand (single block, append counter 0x01)
+    CHMAC_SHA256 hmac_exp(eae_prk, 32);
+    hmac_exp.Write(labeled_info, sizeof(labeled_info));
+    uint8_t ctr = 1;
+    hmac_exp.Write(&ctr, 1);
+    std::array<uint8_t, 32> shared_secret;
+    hmac_exp.Finalize(shared_secret.data());
+    return shared_secret;
+}
+
 } // namespace dhkem_secp256k1
