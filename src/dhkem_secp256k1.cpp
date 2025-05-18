@@ -628,7 +628,6 @@ std::optional<std::array<uint8_t, 32>> Decap2(std::span<const uint8_t> enc,
                                             std::span<const uint8_t> skR) 
 // bool Decap(const uint8_t enc_bytes[NPK], const uint8_t skR_bytes[NSK], uint8_t out_shared_secret[NSECRET]) {                                           
 {
-    std::cout << "---> AQUI 1." << std::endl;
     assert(enc.size() == 65 && skR.size() == 32);
     // 1. Parse ephemeral public key
     secp256k1_pubkey pkE;
@@ -649,7 +648,6 @@ std::optional<std::array<uint8_t, 32>> Decap2(std::span<const uint8_t> enc,
         return std::nullopt; // ECDH failed (invalid input)
     }
 
-    std::cout << "---> AQUI 2." << std::endl;
     // 3. Compute and serialize pkR
     secp256k1_pubkey pubR;
     if (!secp256k1_ec_pubkey_create(g_secp256k1_ctx, &pubR, skR.data())) {
@@ -695,6 +693,109 @@ std::optional<std::array<uint8_t, 32>> Decap2(std::span<const uint8_t> enc,
     std::array<uint8_t, 32> shared_secret;
     hmac_exp.Finalize(shared_secret.data());
     return shared_secret;
+}
+
+std::optional<std::pair<std::array<uint8_t, 32>, std::array<uint8_t, 65>>> Encap2(std::span<const uint8_t> pkR) {
+    // Expect recipient public key in uncompressed form (65 bytes: 0x04 || X(32) || Y(32))
+    if (pkR.size() != 65) {
+        return std::nullopt;
+    }
+
+    // 1. Generate ephemeral key pair from 32 bytes of random IKM
+    uint8_t ikm[32];
+    do {
+        GetStrongRandBytes(ikm);
+    } while (secp256k1_ec_seckey_verify(g_secp256k1_ctx, ikm) != 1);
+
+    // DeriveKeyPair returns optional<{skE (32 bytes), pkE (secp256k1_pubkey or bytes)}>
+    std::array<uint8_t, 32> skE;
+    std::array<uint8_t, 65> enc;
+    bool result = DeriveKeyPair_DHKEM_Secp256k1(std::span<const uint8_t>(ikm, sizeof(ikm)), skE, enc);
+    if(!result) {
+        return std::nullopt; // Ephemeral key generation failed (should be rare)
+    }
+
+    /* auto maybe_keypair = DeriveKeyPair(ikm);  
+    if (!maybe_keypair.has_value()) {
+        return std::nullopt; // Ephemeral key generation failed (should be rare)
+    } */
+    // Extract skE and serialized pkE (encapsulation) from the derived key pair
+    // const auto &[skE, pkE_struct] = *maybe_keypair;
+    // If DeriveKeyPair gave us a secp256k1_pubkey object, serialize it to bytes:
+    /* std::array<uint8_t, 65> enc;
+    size_t enc_len = enc.size();
+    if (!secp256k1_ec_pubkey_serialize(g_secp256k1_ctx, enc.data(), &enc_len, &pkE_struct, SECP256K1_EC_UNCOMPRESSED) || enc_len != 65) {
+        return std::nullopt; // Should not fail if pkE_struct is valid
+    } */
+    // If DeriveKeyPair instead provided pkE as bytes directly, we would just assign: enc = pkE_bytes.
+
+    // 2. Parse recipient's public key bytes into secp256k1_pubkey object
+    secp256k1_pubkey pubkeyR;
+    if (!secp256k1_ec_pubkey_parse(g_secp256k1_ctx, &pubkeyR, pkR.data(), pkR.size())) {
+        return std::nullopt; // invalid public key format
+    }
+
+    // 3. Compute ECDH: dh = X-coordinate of (skE * pkR)
+    unsigned char dh[32];
+    // Custom hash function for secp256k1_ecdh that copies X coordinate
+    auto copy_x_only = [](unsigned char *output, const unsigned char *x32, const unsigned char *y32, void *data) {
+        memcpy(output, x32, 32);
+        return 1;
+    };
+    if (!secp256k1_ecdh(g_secp256k1_ctx, dh, &pubkeyR, skE.data(), /**hashfp=*/copy_x_only, /*data=*/nullptr)) {
+        return std::nullopt; // ECDH failed (invalid scalar or other error)
+    }
+    // Now dh contains 32-byte X coordinate shared secret
+
+    // 4. Build kem_context = enc || pkR (130 bytes)
+    uint8_t kem_context[130];
+    memcpy(kem_context, enc.data(), 65);
+    memcpy(kem_context + 65, pkR.data(), 65);
+
+    // 5. HKDF-Extract: eae_prk = LabeledExtract("", "eae_prk", dh)
+    // Construct labeled_ikm = "HPKE-v1" || suite_id || "eae_prk" || dh
+    static const uint8_t LABEL_HPKE_V1[] = {'H','P','K','E','-','v','1'};          // 7 bytes
+    static const uint8_t SUITE_ID[]     = {'K','E','M', 0x00, 0x16};               // "KEM" + 0x0016
+    static const uint8_t LABEL_EAE_PRK[] = {'e','a','e','_','p','r','k'};          // 7 bytes
+    // Assemble the input to HKDF-Extract
+    uint8_t labeled_ikm[7 + 5 + 7 + 32];
+    memcpy(labeled_ikm,               LABEL_HPKE_V1, sizeof(LABEL_HPKE_V1));       // "HPKE-v1"
+    memcpy(labeled_ikm + 7,           SUITE_ID,      sizeof(SUITE_ID));            // "KEM<id>"
+    memcpy(labeled_ikm + 7 + 5,       LABEL_EAE_PRK, sizeof(LABEL_EAE_PRK));       // "eae_prk"
+    memcpy(labeled_ikm + 7 + 5 + 7,   dh,           sizeof(dh));                   // DH shared secret (32 bytes)
+
+    uint8_t eae_prk[32];
+    // Use CHMAC_SHA256 for HKDF-Extract: salt = zero-length (treated as 32 zero bytes)
+    unsigned char zeroSalt[32] = {0};
+    CHMAC_SHA256 hmac_extract(zeroSalt, sizeof(zeroSalt));
+    hmac_extract.Write(labeled_ikm, sizeof(labeled_ikm));
+    hmac_extract.Finalize(eae_prk);  // eae_prk is 32 bytes
+
+    // 6. HKDF-Expand: shared_secret = LabeledExpand(eae_prk, "shared_secret", kem_context, 32)
+    static const uint8_t LABEL_SHARED_SECRET[] = {'s','h','a','r','e','d','_','s','e','c','r','e','t'}; // 13 bytes
+    // Assemble labeled_info = I2OSP(L,2) || "HPKE-v1" || suite_id || "shared_secret" || kem_context
+    uint8_t length_buf[2] = {0x00, 0x20};  // length 32 in big-endian
+    uint8_t labeled_info[2 + 7 + 5 + 13 + 130];
+    memcpy(labeled_info,            length_buf,    2);
+    memcpy(labeled_info + 2,        LABEL_HPKE_V1, sizeof(LABEL_HPKE_V1));         // "HPKE-v1"
+    memcpy(labeled_info + 2 + 7,    SUITE_ID,      sizeof(SUITE_ID));              // "KEM<id>"
+    memcpy(labeled_info + 2 + 7 + 5, LABEL_SHARED_SECRET, sizeof(LABEL_SHARED_SECRET)); // "shared_secret"
+    memcpy(labeled_info + 2 + 7 + 5 + 13, kem_context, sizeof(kem_context));       // kem_context (130 bytes)
+
+    // HKDF-Expand to 32 bytes using one iteration (info || 0x01)
+    unsigned char okm[32];
+    unsigned char ctr = 0x01;
+    CHMAC_SHA256 hmac_expand(eae_prk, sizeof(eae_prk));
+    hmac_expand.Write(labeled_info, sizeof(labeled_info));
+    hmac_expand.Write(&ctr, 1);
+    hmac_expand.Finalize(okm);
+
+    // 7. Prepare output
+    std::array<uint8_t, 32> shared_secret;
+    std::array<uint8_t, 65> encap_pub;
+    memcpy(shared_secret.data(), okm, 32);
+    memcpy(encap_pub.data(), enc.data(), 65);
+    return std::make_pair(shared_secret, encap_pub);
 }
 
 } // namespace dhkem_secp256k1

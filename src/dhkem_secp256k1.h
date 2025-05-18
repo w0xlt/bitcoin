@@ -187,5 +187,7 @@ void InitContext();
 
 std::optional<std::array<uint8_t, 32>> Decap2(std::span<const uint8_t> enc, std::span<const uint8_t> skR);
 
+std::optional<std::pair<std::array<uint8_t, 32>, std::array<uint8_t, 65>>> Encap2(std::span<const uint8_t> pkR);
+
 } // namespace dhkem_secp256k1
 #endif // BITCOIN_CRYPTO_DHKEM_SECP256K1_H

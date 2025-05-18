@@ -308,6 +308,36 @@ static RPCHelpMan getblockcount()
         std::cout << "---> shared: " << HexStr(*shared) << std::endl;
     }
 
+    std::span<const uint8_t> pkRm2(pkRm.data(), pkRm.size());
+
+    std::optional<std::pair<std::array<uint8_t, 32>, std::array<uint8_t, 65>>> shared2 = dhkem_secp256k1::Encap2(pkRm2);
+
+    if (!shared2) {
+        std::cout << "---> Empty shared2." << std::endl;
+    } else {
+        std::cout << "---> NOT empty shared2." << std::endl;
+        //std::cout << "---> shared: " << HexStr(*shared) << std::endl;
+
+        const auto& [skEm2, pkEm2] = *shared2;
+
+        std::cout << "---> skEm2: " << HexStr(skEm2) << std::endl;
+        std::cout << "---> pkEm2: " << HexStr(pkEm2) << std::endl;
+
+        std::span<const uint8_t> pkEm2_s(pkEm2.data(), pkEm2.size());
+        std::span<const uint8_t> skEm2_s(skEm2.data(), skEm2.size());
+
+        std::optional<std::array<uint8_t, 32>> shared3 = dhkem_secp256k1::Decap2(pkEm2_s, skEm2_s);
+
+        if (!shared3) {
+            std::cout << "---> Empty shared3." << std::endl;
+        } else {
+            std::cout << "---> NOT empty shared3." << std::endl;
+            std::cout << "---> shared3: " << HexStr(*shared) << std::endl;
+        }
+
+        // std::optional<std::array<uint8_t, 32>> Decap2(std::span<const uint8_t> enc, std::span<const uint8_t> skR);
+    }
+
     return chainman.ActiveChain().Height();
 },
     };
