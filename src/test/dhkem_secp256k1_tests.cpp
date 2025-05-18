@@ -213,9 +213,7 @@ BOOST_AUTO_TEST_CASE(dhkem_secp256k1_chacha20poly1305_testvectors)
 
         std::optional<std::array<uint8_t, 32>> maybe_shared_secret_dec = dhkem_secp256k1::Decap2(pkEm2, skRm2);
         BOOST_CHECK(maybe_shared_secret_dec.has_value());
-
-        // BOOST_CHECK(ok);
-        // BOOST_CHECK_EQUAL(HexStr(shared), HexStr(exp_shared));
+        BOOST_CHECK_EQUAL(HexStr(*maybe_shared_secret_dec), HexStr(exp_shared));
     }
     /*
 
