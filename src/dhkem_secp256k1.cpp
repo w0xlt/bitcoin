@@ -4,6 +4,11 @@
 #include <crypto/hmac_sha256.h>
 #include <random.h>
 #include <secp256k1.h>
+#include <span>
+#include <array>
+#include <cassert>
+#include <cstring>
+#include <support/allocators/secure.h>
 
 // Global secp256k1 context for crypto operations (ensure ECC_Init has been called).
 // static secp256k1_context* g_secp256k1_ctx = nullptr;
@@ -410,5 +415,203 @@ bool AuthDecap(const uint8_t enc_bytes[NPK], const uint8_t skR_bytes[NSK], const
     info_len += 3 * NPK;
     HKDF_Expand32(eae_prk, labeled_info, info_len, out_shared_secret, NSECRET);
     return true;
+}
+
+
+/**
+ * Implements DeriveKeyPair() for secp256k1 as per RFC 9180 Section 7.1.3 and the 
+ * secp256k1-based DHKEM draft. Uses HKDF-SHA256 and secp256k1 lib for key generation.
+ */
+bool DeriveKeyPair2(const unsigned char* ikm, size_t ikm_len,
+                   unsigned char out_sk[32], unsigned char out_pk[65])
+{
+    // Domain separation constants for HPKE (suite ID for secp256k1 KEM and labels)
+    static constexpr uint16_t KEM_ID_SECP256K1 = 0x0016;
+    static constexpr unsigned char BITMASK = 0xFF; // bitmask = 0xff for secp256k1
+
+    // Construct the labeled IKM: concat("HPKE-v1", suite_id, "dkp_prk", ikm)
+    std::string labeled_ikm;
+    labeled_ikm.reserve(7 /*"HPKE-v1"*/ + 5 /*"KEM"+kem_id*/ + 6 /*"dkp_prk"*/ + ikm_len);
+    labeled_ikm += "HPKE-v1";
+    labeled_ikm += "KEM";
+    labeled_ikm.push_back(static_cast<char>(KEM_ID_SECP256K1 >> 8));      // high byte of kem_id
+    labeled_ikm.push_back(static_cast<char>(KEM_ID_SECP256K1 & 0xFF));   // low byte of kem_id
+    labeled_ikm += "dkp_prk";
+    labeled_ikm.append(reinterpret_cast<const char*>(ikm), ikm_len);
+
+    // HKDF-Extract with salt="", info="dkp_prk" labeling (yield dkp_prk of 32 bytes)
+    const std::string salt_empty;
+    CHKDF_HMAC_SHA256_L32 hkdf_extract(
+        reinterpret_cast<const unsigned char*>(labeled_ikm.data()),
+        labeled_ikm.size(),
+        salt_empty
+    );
+    // Clear sensitive labeled IKM from memory as it's no longer needed
+    // memory_cleanse(labeled_ikm.data(), labeled_ikm.size());
+    memset(labeled_ikm.data(), 0, labeled_ikm.size());
+    labeled_ikm.clear();
+
+    // Prepare base info for HKDF-Expand: I2OSP(Nsk, 2) || "HPKE-v1" || suite_id || "candidate"
+    // Nsk (private key length) = 32 bytes for secp256k1
+    std::string base_info;
+    base_info.reserve(2 + 7 + 3 + 2 + 9); // 23 bytes
+    // I2OSP(32, 2) -> 0x00 0x20
+    base_info.push_back('\x00');
+    base_info.push_back('\x20');
+    base_info += "HPKE-v1";
+    base_info += "KEM";
+    base_info.push_back(static_cast<char>(KEM_ID_SECP256K1 >> 8));
+    base_info.push_back(static_cast<char>(KEM_ID_SECP256K1 & 0xFF));
+    base_info += "candidate";
+
+    unsigned char candidate[32];
+    bool derived = false;
+
+    secp256k1_context *ctx = secp256k1_context_create(SECP256K1_CONTEXT_NONE);
+    assert(ctx != nullptr);
+
+    {
+        // Pass in a random blinding seed to the secp256k1 context.
+        std::vector<unsigned char, secure_allocator<unsigned char>> vseed(32);
+        GetRandBytes(vseed);
+        bool ret = secp256k1_context_randomize(ctx, vseed.data());
+        assert(ret);
+    }
+
+    // Iterate counter from 0 to 255 to derive a valid private key
+    for (unsigned int counter = 0; counter < 256; ++counter) {
+        // Build info = base_info || I2OSP(counter, 1)
+        std::string info = base_info;
+        info.push_back(static_cast<char>(counter));
+
+        // HKDF-Expand to produce 32-byte candidate secret key material
+        hkdf_extract.Expand32(info, candidate);
+        // Apply bitmask to the first byte (0xFF, no-op for secp256k1, included for spec compliance)
+        candidate[0] &= BITMASK;
+        // Check if candidate forms a valid secp256k1 scalar (non-zero, < order)
+        if (secp256k1_ec_seckey_verify(ctx, candidate) == 1) {
+            // Valid key found: copy to output SK and derive corresponding public key
+            memcpy(out_sk, candidate, 32);
+            secp256k1_pubkey pubkey;
+            if (!secp256k1_ec_pubkey_create(ctx, &pubkey, out_sk)) {
+                // Should not happen if seckey is valid; treat as failure
+                // memory_cleanse(out_sk, 32);
+                // memory_cleanse(candidate, 32);
+                memset(out_sk, 0, 32);
+                memset(candidate, 0, 32);
+                return false;
+            }
+            size_t publen = 65;
+            if (!secp256k1_ec_pubkey_serialize(ctx, out_pk, &publen, &pubkey, SECP256K1_EC_UNCOMPRESSED)) {
+                // Unexpected failure in serialization
+                // memory_cleanse(out_sk, 32);
+                // memory_cleanse(candidate, 32);
+                memset(out_sk, 0, 32);
+                memset(candidate, 0, 32);
+                return false;
+            }
+            assert(publen == 65);
+            derived = true;
+            break;
+        }
+        // Otherwise, try the next counter value
+    }
+
+    // Cleanse the candidate buffer and any remaining secret material
+    // memory_cleanse(candidate, sizeof(candidate));
+    memset(candidate, 0, 32);
+    // No valid key found within 256 attempts
+    if (!derived) {
+        // memory_cleanse(out_sk, 32);
+        // memory_cleanse(out_pk, 65);
+        memset(out_sk, 0, 32);
+        memset(out_pk, 0, 32);
+        return false;
+    }
+    return true;
+}
+
+bool DeriveKeyPair_DHKEM_Secp256k1(std::span<const uint8_t> ikm,
+                                   std::array<uint8_t, 32>& outPrivKey,
+                                   std::array<uint8_t, 65>& outPubKey)
+{
+    // KEM context setup: suite ID for secp256k1 (kem_id = 0x0016)
+    const uint16_t kem_id = 0x0016;
+    const char hpke_label[] = "HPKE-v1";
+    const char kem_label[] = "KEM";
+    const char extract_label[] = "dkp_prk";
+
+    // 1. HKDF-Extract with domain separation.
+    // Build the labeled IKM: "HPKE-v1" || "KEM<kem_id>" || "dkp_prk" || IKM.
+    std::string labeled_ikm;
+    labeled_ikm.reserve(strlen(hpke_label) + strlen(kem_label) + 2 + strlen(extract_label) + ikm.size());
+    labeled_ikm.append(hpke_label);
+    labeled_ikm.append(kem_label);
+    // Append kem_id as 2 bytes (big-endian)
+    char kem_id_bytes[2] = {char(kem_id >> 8), char(kem_id & 0xFF)};
+    labeled_ikm.append(kem_id_bytes, 2);
+    labeled_ikm.append(extract_label);
+    labeled_ikm.append(reinterpret_cast<const char*>(ikm.data()), ikm.size());
+
+    // HKDF-Extract with empty salt to derive dkp_prk.
+    std::string empty_salt; // empty salt = "" (treated as zero-length)
+    CHKDF_HMAC_SHA256_L32 hkdf_extract(
+        reinterpret_cast<const unsigned char*>(labeled_ikm.data()), labeled_ikm.size(),
+        empty_salt  // salt as std::string (empty)
+    );
+
+    // 2. HKDF-Expand loop to derive a valid secret key.
+    const char expand_label[] = "candidate";
+    // Pre-build the info prefix for LabeledExpand: length (Nsk=32) + "HPKE-v1" + "KEM<kem_id>" + "candidate".
+    unsigned char length_bytes[2] = {0x00, 0x20};  // I2OSP(32, 2) = 0x0020
+    std::string info_prefix;
+    info_prefix.reserve(2 + strlen(hpke_label) + strlen(kem_label) + 2 + strlen(expand_label));
+    info_prefix.append(reinterpret_cast<const char*>(length_bytes), 2);
+    info_prefix.append(hpke_label);
+    info_prefix.append(kem_label);
+    info_prefix.append(kem_id_bytes, 2);
+    info_prefix.append(expand_label);
+
+    secp256k1_context *ctx = secp256k1_context_create(SECP256K1_CONTEXT_NONE);
+    assert(ctx != nullptr);
+
+    {
+        // Pass in a random blinding seed to the secp256k1 context.
+        std::vector<unsigned char, secure_allocator<unsigned char>> vseed(32);
+        GetRandBytes(vseed);
+        bool ret = secp256k1_context_randomize(ctx, vseed.data());
+        assert(ret);
+    }
+    
+    unsigned char candidate[32];
+    for (uint8_t counter = 0; counter < 0x099; ++counter) {
+        // Construct info = info_prefix || I2OSP(counter, 1).
+        std::string info = info_prefix;
+        info.push_back(static_cast<char>(counter));
+        // HKDF-Expand to produce a 32-byte candidate secret key.
+        hkdf_extract.Expand32(info, candidate);
+        // Mask the first byte with 0xFF (as required by spec – no-op for 0xFF, included for completeness).
+        candidate[0] &= 0xFF;
+        // Check if the candidate is a valid secret scalar (0 < key < order).
+        if (secp256k1_ec_seckey_verify(ctx, candidate)) {
+            // Derive the corresponding secp256k1 public key.
+            secp256k1_pubkey pubkey;
+            if (!secp256k1_ec_pubkey_create(ctx, &pubkey, candidate)) {
+                // Should not happen if seckey is valid; continue to next in unlikely case.
+                continue;
+            }
+            // Serialize the public key in uncompressed format: 65 bytes (0x04 | X-coordinate | Y-coordinate).
+            size_t pub_len = outPubKey.size();
+            secp256k1_ec_pubkey_serialize(ctx,
+                                          outPubKey.data(), &pub_len,
+                                          &pubkey, SECP256K1_EC_UNCOMPRESSED);
+            assert(pub_len == outPubKey.size());
+            // Copy the private key to output.
+            std::memcpy(outPrivKey.data(), candidate, 32);
+            return true;
+        }
+    }
+    // If no valid key found in 256 attempts (negligibly improbable), return false.
+    return false;
 }
 } // namespace dhkem_secp256k1

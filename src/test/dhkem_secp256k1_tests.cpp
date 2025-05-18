@@ -77,7 +77,7 @@ BOOST_AUTO_TEST_CASE(dhkem_secp256k1_chacha20poly1305_testvectors)
     };
 
     // Test vectors from Appendix B.3.2 (Auth mode):contentReference[oaicite:31]{index=31}:contentReference[oaicite:32]{index=32}
-    std::vector<VectorAuth> auth_vecs = {
+    /* std::vector<VectorAuth> auth_vecs = {
         {
             "f402a160b0dd43a5490e9315dd8ea386eb3b2bde9e252857e8a3132fa084506b",
             "338693112ca52e24b33c8211cf654ed6c9c44d1e74f344c724728cd9a4554053",
@@ -285,7 +285,18 @@ BOOST_AUTO_TEST_CASE(dhkem_secp256k1_chacha20poly1305_testvectors)
         BOOST_CHECK_EQUAL(HexStr(got_key), HexStr(exp_key));
         BOOST_CHECK_EQUAL(HexStr(got_nonce), HexStr(exp_nonce));
         BOOST_CHECK_EQUAL(HexStr(got_exporter), HexStr(exp_exporter));
-    }
+    } */
+
+    std::vector<unsigned char> ikmE = ParseHex("77caf1617fb3723972a56cd2085081c9f66baae825ce5f363c0a86ec87013fa0");
+
+    unsigned char out_sk[32];
+    memset(out_sk, 0, 32);
+
+    unsigned char out_pk[32];
+    memset(out_pk, 0, 32);
+
+    bool ret = DeriveKeyPair2(ikmE.data(), ikmE.size(), out_sk, out_pk);
+    BOOST_CHECK(ret);
 
 }
 

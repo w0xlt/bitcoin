@@ -8,6 +8,8 @@
 #include <cstdlib>
 #include <cstdint>
 #include <secp256k1.h>
+#include <span>
+#include <array>
 
 /** 
  * secp256k1-based DHKEM for HPKE (Hybrid Public Key Encryption)
@@ -20,6 +22,8 @@ namespace dhkem_secp256k1 {
 
 using ::secp256k1_pubkey;
 using ::secp256k1_ec_pubkey_serialize;
+using ::secp256k1_context_create;
+using ::secp256k1_context;
 
 static const size_t NSECRET = 32;        //!< Length of KEM shared secret (Nsecret = 32 bytes):contentReference[oaicite:3]{index=3} 
 static const size_t NENC = 65;           //!< Length of encapsulated key (ephemeral public key), uncompressed SEC1 (65 bytes):contentReference[oaicite:4]{index=4}
@@ -53,7 +57,7 @@ bool DeriveKeyPair(const uint8_t* ikm, size_t ikm_len, uint8_t out_sk[NSK], uint
  * @param out65  (output) Buffer of length 65 to receive uncompressed public key bytes.
  * @return true on success.
  */
-bool SerializePublicKey(const struct secp256k1_pubkey& pub, uint8_t out65[NPK]);
+bool SerializePublicKey(const secp256k1_pubkey& pub, uint8_t out65[NPK]);
 
 /**
  * DeserializePublicKey(bytes): Parse a 65-byte uncompressed public key into internal form:contentReference[oaicite:11]{index=11}.
@@ -64,7 +68,7 @@ bool SerializePublicKey(const struct secp256k1_pubkey& pub, uint8_t out65[NPK]);
  * @param pub_out (output) secp256k1_pubkey object.
  * @return true if the input is a valid uncompressed secp256k1 public key.
  */
-bool DeserializePublicKey(const uint8_t in65[NPK], struct secp256k1_pubkey& pub_out);
+bool DeserializePublicKey(const uint8_t in65[NPK], secp256k1_pubkey& pub_out);
 
 /**
  * SerializePrivateKey(priv): Convert a private key integer to 32-byte big-endian octet string:contentReference[oaicite:13]{index=13}.
@@ -159,6 +163,24 @@ bool AuthDecap(const uint8_t enc_bytes[NPK], const uint8_t skR_bytes[NSK], const
 void HKDF_Extract(const uint8_t* salt, size_t salt_len, const uint8_t* ikm, size_t ikm_len, uint8_t out_prk[32]);
 
 void HKDF_Expand32(const uint8_t prk[32], const uint8_t* info_data, size_t info_len, uint8_t out_okm[], size_t L);
+
+
+/** 
+ * Derive a secp256k1 key pair from input keying material (IKM) using the 
+ * secp256k1-based DHKEM (HPKE) specification. 
+ * 
+ * @param[in]  ikm     Pointer to input keying material.
+ * @param[in]  ikm_len Length of the input keying material in bytes.
+ * @param[out] out_sk  Buffer for derived 32-byte private key.
+ * @param[out] out_pk  Buffer for derived 65-byte public key (uncompressed format).
+ * @return true if a valid key pair was derived, false on failure.
+ */
+bool DeriveKeyPair2(const unsigned char* ikm, size_t ikm_len,
+                   unsigned char out_sk[32], unsigned char out_pk[65]);
+
+bool DeriveKeyPair_DHKEM_Secp256k1(std::span<const uint8_t> ikm,
+                                   std::array<uint8_t, 32>& outPrivKey,
+                                   std::array<uint8_t, 65>& outPubKey);
 
 } // namespace dhkem_secp256k1
 #endif // BITCOIN_CRYPTO_DHKEM_SECP256K1_H

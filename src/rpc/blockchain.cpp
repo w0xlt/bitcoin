@@ -17,6 +17,7 @@
 #include <consensus/validation.h>
 #include <core_io.h>
 #include <deploymentinfo.h>
+#include <dhkem_secp256k1.h>
 #include <deploymentstatus.h>
 #include <flatfile.h>
 #include <hash.h>
@@ -233,6 +234,32 @@ static RPCHelpMan getblockcount()
 {
     ChainstateManager& chainman = EnsureAnyChainman(request.context);
     LOCK(cs_main);
+
+
+    /* std::vector<unsigned char> ikmE = ParseHex("77caf1617fb3723972a56cd2085081c9f66baae825ce5f363c0a86ec87013fa0");
+
+    unsigned char out_sk[32];
+    memset(out_sk, 0, 32);
+
+    unsigned char out_pk[32];
+    memset(out_pk, 0, 32);
+
+    bool ret = dhkem_secp256k1::DeriveKeyPair2(ikmE.data(), ikmE.size(), out_sk, out_pk); */
+
+    // Test vector from IETF draft: known IKM -> expected SK and PK:contentReference[oaicite:18]{index=18}.
+    std::vector<unsigned char> ikm = ParseHex(
+        "77caf1617fb3723972a56cd2085081c9f66baae825ce5f363c0a86ec87013fa0"
+    );
+    std::array<uint8_t, 32> sk;
+    std::array<uint8_t, 65> pk;
+    bool result = dhkem_secp256k1::DeriveKeyPair_DHKEM_Secp256k1(std::span<const uint8_t>(ikm.data(), ikm.size()), sk, pk);
+
+    std::cout << "---> " << (result ? "It worked" : "Unexpected") << std::endl;
+
+    std::cout << "---> sk: " << HexStr(sk) << std::endl;
+
+    std::cout << "---> pk: " << HexStr(pk) << std::endl;
+
     return chainman.ActiveChain().Height();
 },
     };
