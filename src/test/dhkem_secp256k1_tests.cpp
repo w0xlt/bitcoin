@@ -164,6 +164,7 @@ BOOST_AUTO_TEST_CASE(dhkem_secp256k1_chacha20poly1305_testvectors)
         HKDF_Expand32(prk.data(), labeled_info.data(), labeled_info.size(), okm.data(), L);
         return okm;
     };
+    */
 
     // Process each Base mode test vector
     for (size_t i = 0; i < base_vecs.size(); ++i) {
@@ -182,22 +183,41 @@ BOOST_AUTO_TEST_CASE(dhkem_secp256k1_chacha20poly1305_testvectors)
         std::vector<unsigned char> exp_exporter = ParseHex(base_vecs[i].exporter_secret);
 
         // DeriveKeyPair for ephemeral (sender) and static (receiver)
-        uint8_t skEm[32], pkEm[65];
-        bool ok = DeriveKeyPair(ikmE.data(), ikmE.size(), skEm, pkEm);
+        // uint8_t skEm[32], pkEm[65];
+        std::array<uint8_t, 32> skEm;
+        std::array<uint8_t, 65> pkEm;
+
+        dhkem_secp256k1::InitContext();
+
+        // bool ok = DeriveKeyPair(ikmE.data(), ikmE.size(), skEm, pkEm);
+        bool ok = dhkem_secp256k1::DeriveKeyPair_DHKEM_Secp256k1(std::span<const uint8_t>(ikmE.data(), ikmE.size()), skEm, pkEm);
+
         BOOST_CHECK(ok);
         BOOST_CHECK_EQUAL(HexStr(skEm), HexStr(exp_skEm));
         BOOST_CHECK_EQUAL(HexStr(pkEm), HexStr(exp_pkEm));
-        uint8_t skRm[32], pkRm[65];
-        ok = DeriveKeyPair(ikmR.data(), ikmR.size(), skRm, pkRm);
+        // uint8_t skRm[32], pkRm[65];
+        std::array<uint8_t, 32> skRm;
+        std::array<uint8_t, 65> pkRm;
+        //ok = DeriveKeyPair(ikmR.data(), ikmR.size(), skRm, pkRm);
+        ok = dhkem_secp256k1::DeriveKeyPair_DHKEM_Secp256k1(std::span<const uint8_t>(ikmR.data(), ikmR.size()), skRm, pkRm);
         BOOST_CHECK(ok);
         BOOST_CHECK_EQUAL(HexStr(skRm), HexStr(exp_skRm));
         BOOST_CHECK_EQUAL(HexStr(pkRm), HexStr(exp_pkRm));
 
         // Test decapsulation: should reproduce shared_secret
-        uint8_t shared[32];
-        ok = Decap(pkEm, skRm, shared);
-        BOOST_CHECK(ok);
-        BOOST_CHECK_EQUAL(HexStr(shared), HexStr(exp_shared));
+        // uint8_t shared[32];
+        // ok = Decap(pkEm, skRm, shared);
+
+        std::span<const uint8_t> pkEm2(pkEm.data(), pkEm.size());
+        std::span<const uint8_t> skRm2(skRm.data(), skRm.size());
+
+        std::optional<std::array<uint8_t, 32>> maybe_shared_secret_dec = dhkem_secp256k1::Decap2(pkEm2, skRm2);
+        BOOST_CHECK(maybe_shared_secret_dec.has_value());
+
+        // BOOST_CHECK(ok);
+        // BOOST_CHECK_EQUAL(HexStr(shared), HexStr(exp_shared));
+    }
+    /*
 
         // Derive HPKE context key, base_nonce, exporter_secret using key schedule (mode 0x00):contentReference[oaicite:33]{index=33}
         uint8_t mode_base = 0x00;
@@ -286,18 +306,31 @@ BOOST_AUTO_TEST_CASE(dhkem_secp256k1_chacha20poly1305_testvectors)
         BOOST_CHECK_EQUAL(HexStr(got_nonce), HexStr(exp_nonce));
         BOOST_CHECK_EQUAL(HexStr(got_exporter), HexStr(exp_exporter));
     } */
+}
 
-    std::vector<unsigned char> ikmE = ParseHex("77caf1617fb3723972a56cd2085081c9f66baae825ce5f363c0a86ec87013fa0");
+BOOST_AUTO_TEST_CASE(dhkem_encap_decap)
+{
+    CKey skR;
+    skR.MakeNewKey(false);
+    CPubKey pkR = skR.GetPubKey();
+    std::vector<uint8_t> pkR_bytes(pkR.begin(), pkR.end());
+    assert(pkR_bytes.size() == 65);
 
-    unsigned char out_sk[32];
-    memset(out_sk, 0, 32);
+    dhkem_secp256k1::InitContext();
 
-    unsigned char out_pk[32];
-    memset(out_pk, 0, 32);
+    // Perform encapsulation with the recipient's public key
+    auto maybe_result = dhkem_secp256k1::Encap2(pkR_bytes);
+    assert(maybe_result.has_value()); // Encap should succeed
 
-    bool ret = DeriveKeyPair2(ikmE.data(), ikmE.size(), out_sk, out_pk);
-    BOOST_CHECK(ret);
+    std::span<const uint8_t> skR_span(reinterpret_cast<const uint8_t*>(skR.data()), skR.size());
 
+    // Extract shared_secret_enc and enc (ephemeral public key bytes)
+    auto [shared_secret_enc, enc3] = *maybe_result;
+    // Decapsulate using the recipient's private key
+    std::optional<std::array<uint8_t, 32>> maybe_shared_secret_dec = dhkem_secp256k1::Decap2(enc3, skR_span);
+    
+    BOOST_CHECK(maybe_shared_secret_dec.has_value());
+    BOOST_CHECK_EQUAL(HexStr(shared_secret_enc), HexStr(*maybe_shared_secret_dec));
 }
 
 BOOST_AUTO_TEST_SUITE_END()

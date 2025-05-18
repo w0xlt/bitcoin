@@ -316,7 +316,7 @@ static RPCHelpMan getblockcount()
         std::cout << "---> Empty shared2." << std::endl;
     } else {
         std::cout << "---> NOT empty shared2." << std::endl;
-        //std::cout << "---> shared: " << HexStr(*shared) << std::endl;
+        //std::cout << "---> shared: " << HexStr(*shared2) << std::endl;
 
         const auto& [skEm2, pkEm2] = *shared2;
 
@@ -324,15 +324,15 @@ static RPCHelpMan getblockcount()
         std::cout << "---> pkEm2: " << HexStr(pkEm2) << std::endl;
 
         std::span<const uint8_t> pkEm2_s(pkEm2.data(), pkEm2.size());
-        std::span<const uint8_t> skEm2_s(skEm2.data(), skEm2.size());
+        std::span<const uint8_t> skRm2_s(skRm.data(), skRm.size());
 
-        std::optional<std::array<uint8_t, 32>> shared3 = dhkem_secp256k1::Decap2(pkEm2_s, skEm2_s);
+        std::optional<std::array<uint8_t, 32>> shared3 = dhkem_secp256k1::Decap2(pkEm2_s, skRm2_s);
 
         if (!shared3) {
             std::cout << "---> Empty shared3." << std::endl;
         } else {
             std::cout << "---> NOT empty shared3." << std::endl;
-            std::cout << "---> shared3: " << HexStr(*shared) << std::endl;
+            std::cout << "---> shared3: " << HexStr(*shared3) << std::endl;
         }
 
         CKey skR;
