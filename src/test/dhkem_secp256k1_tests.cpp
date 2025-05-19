@@ -7,6 +7,31 @@
 
 using namespace dhkem_secp256k1;
 
+    std::vector<uint8_t> LabeledExtract(const std::vector<uint8_t>& salt, const std::vector<uint8_t>& label, const std::vector<uint8_t>& ikm)
+    {
+        // 1. Concatenate label_prefix + suite_id + label + ikm
+        std::vector<uint8_t> labeled_ikm;
+
+        labeled_ikm.insert(labeled_ikm.end(), std::begin((LABEL_PREFIX)), std::end((LABEL_PREFIX)));
+        labeled_ikm.insert(labeled_ikm.end(), std::begin((SUITE_ID)), std::end((SUITE_ID)));
+        labeled_ikm.insert(labeled_ikm.end(), label.begin(), label.end());
+        labeled_ikm.insert(labeled_ikm.end(), ikm.begin(), ikm.end());
+
+        // 2. Print labeled_ikm in hex (for debugging, like the Python print)
+        /* std::cout << "labeled_ikm = ";
+        for (uint8_t b : labeled_ikm) {
+            std::cout << std::hex << std::setw(2) << std::setfill('0') << static_cast<int>(b);
+        }
+        std::cout << std::dec << std::endl; */
+
+        // 3. Call HKDF_Extract to get the PRK
+        uint8_t out_prk[32];
+        HKDF_Extract(salt.data(), salt.size(), labeled_ikm.data(), labeled_ikm.size(), out_prk);
+
+        // 4. Return the PRK as a 32-byte vector
+        return std::vector<uint8_t>(out_prk, out_prk + 32);
+    }
+
 BOOST_FIXTURE_TEST_SUITE(dhkem_secp256k1_tests, BasicTestingSetup)
 
 BOOST_AUTO_TEST_CASE(dhkem_secp256k1_chacha20poly1305_testvectors)
@@ -76,82 +101,22 @@ BOOST_AUTO_TEST_CASE(dhkem_secp256k1_chacha20poly1305_testvectors)
         }
     };
 
-    // Test vectors from Appendix B.3.2 (Auth mode):contentReference[oaicite:31]{index=31}:contentReference[oaicite:32]{index=32}
-    /* std::vector<VectorAuth> auth_vecs = {
-        {
-            "f402a160b0dd43a5490e9315dd8ea386eb3b2bde9e252857e8a3132fa084506b",
-            "338693112ca52e24b33c8211cf654ed6c9c44d1e74f344c724728cd9a4554053",
-            "04de99438fc76aaec2117df2346593c16f0a70ea9695ca7651aff895463b91e3"
-            "f3c846925784ddabd6b00b5094c10ba3b11bb9ff8b11ff2e853ac03373f09d9109",
-            "d574268376eddb281b0dd1a5fda3f073d1b7b070a90387727e7433d87ec80d6d",
-            "38aca581ad6a6a202fa89ac49f89650fac018b7f1d724a72040fea497ed95b84",
-            "04a6e334bb434dcf340fa2a8267ed828b23632de1f346b8acd7a5b8e83b9bc3f"
-            "58bbfabfc27dad4cbc30230de97bada0568c73f1ee877a885f5a3754bfc2287c84",
-            "e9e68de251a00dcf0d91ca20883153bb69b912df0ba9c20938407c787f44ea67",
-            "38aca581ad6a6a202fa89ac49f89650fac018b7f1d724a72040fea497ed95b84",
-            "04a6e334bb434dcf340fa2a8267ed828b23632de1f346b8acd7a5b8e83b9bc3f"
-            "58bbfabfc27dad4cbc30230de97bada0568c73f1ee877a885f5a3754bfc2287c84",
-            "9b61edd3a878a5c4386bd6c42c4f2334a1ad4029e62b4cd24b16b3db41f4cb0f",
-            "f18103a860ae1eee5147aec66c2111ccc937529f9e0ba499038471326daa205e",
-            "a1172b6040d1f7da83916d94",
-            "89125c238053ad3cefb2a0acdb8da1ce89785dba613a0ca83ed78035c51f3667"
-        },
-        {
-            "744f6bf36c108984aab7c03eea5feb427c03f4f3ecc4dca500f70c3a467c5cdd",
-            "3748d1306a790e7f3776fbd17ebaae45c849de2b0f9122cfe9d85779a7923c3f",
-            "04be4687eb1e76e957285a08e4599cf31b4649e99b0b069bbb6f36572a6b366f"
-            "1b835a507ee14d8a6580e25a2e4ae8d7d8f4df9243e801b888953f324b93686527",
-            "d11ebff931558abd86811790816a9163fe2bdb6f3c07e8157510e2bf73d7c3de",
-            "d61a862e6371a00a44b39f96cb754a14f53784c6458ee19f9a3613050a855613",
-            "04bf9683977dc086e89d461f7b34134e5889fbc872faa34121f5c16f304f5532"
-            "506c32882f37c2f7b0391daf6e2343191bc0ac639ff2d87fbedd0c9d71ef533ffa",
-            "ea62965347a6e7dac5787b43623383a8e722f925bb81c88a58508433859847e8",
-            "d61a862e6371a00a44b39f96cb754a14f53784c6458ee19f9a3613050a855613",
-            "04bf9683977dc086e89d461f7b34134e5889fbc872faa34121f5c16f304f5532"
-            "506c32882f37c2f7b0391daf6e2343191bc0ac639ff2d87fbedd0c9d71ef533ffa",
-            "3d648a64012a0dff200489823e2bb9f6b84adedc651f276d2fba82ff45ac12b",
-            "8219ab2ae96460b3de411fd8bb4e68a9cef0c307be1e4564cd8267fb98d204d3",
-            "7b5ae3238d6fabb7ff4b8525",
-            "a93e33fbd26a6fafd97e195432c553d8a08b08993e62d7442e1d44b89acc17cd"
-        },
-        {
-            "682d4606d4d401bce174fd98c88e6a395f79b903216eb8b2a38b7b2081f6709b",
-            "2f53e5ac16cbf332beefd34482c332fa41dc675b2caa616c8dc7e30ecfa4abea",
-            "042624b24f16ad4366b316501472150f58e9d35e9c5e14781a5b7f79b69a7837"
-            "4599c681b0629c35fcecd761424cf234deb2565173dbb3fadb8ad480f4cdbe5b6b",
-            "c92d590379d06dfe53f19c4785248a21efda81f3e2b39acd30dc088e110b86f9",
-            "647400c833f994714a1dea157305117729a832bb81a44748437e59ac2376c027",
-            "044f69b9a4293a1c85504b724b33dcb690890c47d466ce49337942ad4551cc1b"
-            "5c718f2752f8e1beb1de18486caa36eb35cb33b2f462c03a7fad719d39fe65101e",
-            "d4954c6a2ffdd1e7e8a87798abeb92b7133b0813df1fe32d3a04eb048d9e3068",
-            "647400c833f994714a1dea157305117729a832bb81a44748437e59ac2376c027",
-            "044f69b9a4293a1c85504b724b33dcb690890c47d466ce49337942ad4551cc1b"
-            "5c718f2752f8e1beb1de18486caa36eb35cb33b2f462c03a7fad719d39fe65101e",
-            "1a114e3937dc06ca7244dd98ca0a6bf8a5f2670158bab5c5a4f1b405a1070923",
-            "f05d8f2758709dc289c1b927f7962a57ba1f8c357e3ae39f091db11a0661a3ef",
-            "819ca6581c15755e5253500f",
-            "1468983239658659d90f6e257769b5fd561d68f8096496400fb6db635108a210"
-        }
-    };
-
     // Helper lambdas for computing HPKE key schedule (for verification)
-    auto LabeledExtract = [&](const std::vector<unsigned char>& salt, const std::string& label, const std::vector<unsigned char>& ikm) {
-        // salt may be empty = no salt
-        uint8_t prk[32];
-        // Build labeled IKM = "HPKE-v1" || suite_id || label || ikm
+    /* auto LabeledExtract = [&](const std::vector<unsigned char>& salt, const std::string& label, const std::vector<unsigned char>& ikm) {
         std::vector<unsigned char> labeled;
         labeled.insert(labeled.end(), std::begin((LABEL_PREFIX)), std::end((LABEL_PREFIX)));
         labeled.insert(labeled.end(), std::begin((SUITE_ID)), std::end((SUITE_ID)));
         labeled.insert(labeled.end(), label.begin(), label.end());
         labeled.insert(labeled.end(), ikm.begin(), ikm.end());
-        HKDF_Extract(salt.empty()? nullptr: salt.data(), salt.size(), labeled.data(), labeled.size(), prk);
-        return std::array<unsigned char,32> { 
-            prk[0], prk[1], prk[2], prk[3], prk[4], prk[5], prk[6], prk[7],
-            prk[8], prk[9], prk[10], prk[11], prk[12], prk[13], prk[14], prk[15],
-            prk[16], prk[17], prk[18], prk[19], prk[20], prk[21], prk[22], prk[23],
-            prk[24], prk[25], prk[26], prk[27], prk[28], prk[29], prk[30], prk[31]
-        };
-    };
+
+        std::cout << "---> labeled_ikm: " << HexStr(labeled) << std::endl;
+
+        std::array<unsigned char, 32> prk{};
+        HKDF_Extract(salt.empty()? nullptr: salt.data(), salt.size(), labeled.data(), labeled.size(), prk.data());
+        return prk;
+    }; */
+
+    
 
     auto LabeledExpand = [&](const std::array<unsigned char,32>& prk, const std::string& label, const std::vector<unsigned char>& info, size_t L) {
         // labeled info = "HPKE-v1"||suite_id||label||info
@@ -164,13 +129,12 @@ BOOST_AUTO_TEST_CASE(dhkem_secp256k1_chacha20poly1305_testvectors)
         HKDF_Expand32(prk.data(), labeled_info.data(), labeled_info.size(), okm.data(), L);
         return okm;
     };
-    */
 
     // Process each Base mode test vector
     for (size_t i = 0; i < base_vecs.size(); ++i) {
         std::string info_hex = base_vecs[i].ikmE; // Actually the 'info' is stored separately above for each case
         // The "info" hex is given in the base_vecs as the first string (we placed the info hex in ikmE field for convenience)
-        std::vector<unsigned char> info = ParseHex(base_vecs[i].ikmE);
+        std::vector<unsigned char> info = ParseHex(base_vecs[i].info);
         std::vector<unsigned char> ikmE = ParseHex(base_vecs[i].ikmE);
         std::vector<unsigned char> ikmR = ParseHex(base_vecs[i].ikmR);
         std::vector<unsigned char> exp_skEm = ParseHex(base_vecs[i].skEm);
@@ -214,96 +178,48 @@ BOOST_AUTO_TEST_CASE(dhkem_secp256k1_chacha20poly1305_testvectors)
         std::optional<std::array<uint8_t, 32>> maybe_shared_secret_dec = dhkem_secp256k1::Decap2(pkEm2, skRm2);
         BOOST_CHECK(maybe_shared_secret_dec.has_value());
         BOOST_CHECK_EQUAL(HexStr(*maybe_shared_secret_dec), HexStr(exp_shared));
-    }
-    /*
+
+        std::vector<unsigned char> ss_vec;
+        ss_vec.assign(maybe_shared_secret_dec->begin(), maybe_shared_secret_dec->end());
 
         // Derive HPKE context key, base_nonce, exporter_secret using key schedule (mode 0x00):contentReference[oaicite:33]{index=33}
         uint8_t mode_base = 0x00;
         // default psk_id = default_psk = "" in Base mode
-        auto psk_id_hash = LabeledExtract({}, "psk_id_hash", std::vector<unsigned char>());  // empty ikm
-        auto info_hash = LabeledExtract({}, "info_hash", info);
-        // key_schedule_context = mode || psk_id_hash || info_hash
+        std::vector<uint8_t> label_psk_id_hash = {'p', 's', 'k', '_', 'i', 'd', '_', 'h', 'a', 's', 'h'};
+        // auto psk_id_hash = LabeledExtract({}, "psk_id_hash", std::vector<unsigned char>());  // empty ikm
+        auto psk_id_hash = LabeledExtract({}, label_psk_id_hash, std::vector<unsigned char>());  // empty ikm
+
+        std::cout << "---> psk_id_hash: " << HexStr(psk_id_hash) << std::endl;
+
+        std::cout << "---> info: " << HexStr(info) << std::endl;
+
+        std::vector<uint8_t> label_info_hash = {'i', 'n', 'f', 'o', '_', 'h', 'a', 's', 'h'};
+        // auto info_hash = LabeledExtract({}, "info_hash", info);
+        auto info_hash = LabeledExtract({}, label_info_hash, info);
+
+        std::cout << "---> info_hash: " << HexStr(info_hash) << std::endl;
+
+        /*  // key_schedule_context = mode || psk_id_hash || info_hash
         std::vector<unsigned char> context;
         context.push_back(mode_base);
         context.insert(context.end(), psk_id_hash.begin(), psk_id_hash.end());
         context.insert(context.end(), info_hash.begin(), info_hash.end());
-        // secret = LabeledExtract(shared_secret, "secret", psk="")
+
+        // std::cout << "---> context: " << HexStr(context) << std::endl;
+        // std::cout << "---> ss_vec: " << HexStr(ss_vec) << std::endl;
+
         std::vector<unsigned char> psk; // empty
-        std::vector<unsigned char> ss_vec(shared, shared + 32);
-        auto secret = LabeledExtract(ss_vec, "secret", psk);
+        auto secret = LabeledExtract(psk,"secret", ss_vec);
+
+        std::cout << "---> secret: " << HexStr(secret) << std::endl;
         // Derive key, base_nonce, exporter_secret
         std::vector<unsigned char> got_key   = LabeledExpand(secret, "key", context, exp_key.size());
         std::vector<unsigned char> got_nonce = LabeledExpand(secret, "base_nonce", context, exp_nonce.size());
         std::vector<unsigned char> got_exporter = LabeledExpand(secret, "exp", context, exp_exporter.size());
         BOOST_CHECK_EQUAL(HexStr(got_key), HexStr(exp_key));
         BOOST_CHECK_EQUAL(HexStr(got_nonce), HexStr(exp_nonce));
-        BOOST_CHECK_EQUAL(HexStr(got_exporter), HexStr(exp_exporter));
+        BOOST_CHECK_EQUAL(HexStr(got_exporter), HexStr(exp_exporter)); */
     }
-
-    // Process each Auth mode test vector
-    for (size_t i = 0; i < auth_vecs.size(); ++i) {
-        // No separate "info" field provided in Auth vectors (assume default info = "" for these tests)
-        std::vector<unsigned char> ikmE = ParseHex(auth_vecs[i].ikmE);
-        std::vector<unsigned char> ikmR = ParseHex(auth_vecs[i].ikmR);
-        std::vector<unsigned char> ikmS = ParseHex(auth_vecs[i].ikmS);
-        std::vector<unsigned char> exp_skEm = ParseHex(auth_vecs[i].skEm);
-        std::vector<unsigned char> exp_pkEm = ParseHex(auth_vecs[i].pkEm);
-        std::vector<unsigned char> exp_skRm = ParseHex(auth_vecs[i].skRm);
-        std::vector<unsigned char> exp_pkRm = ParseHex(auth_vecs[i].pkRm);
-        std::vector<unsigned char> exp_skSm = ParseHex(auth_vecs[i].skSm);
-        std::vector<unsigned char> exp_pkSm = ParseHex(auth_vecs[i].pkSm);
-        std::vector<unsigned char> exp_shared = ParseHex(auth_vecs[i].shared_secret);
-        std::vector<unsigned char> exp_key = ParseHex(auth_vecs[i].key);
-        std::vector<unsigned char> exp_nonce = ParseHex(auth_vecs[i].base_nonce);
-        std::vector<unsigned char> exp_exporter = ParseHex(auth_vecs[i].exporter_secret);
-
-        // Derive ephemeral, receiver static, sender static keys
-        uint8_t skEm[32], pkEm[65];
-        bool ok = DeriveKeyPair(ikmE.data(), ikmE.size(), skEm, pkEm);
-        BOOST_CHECK(ok);
-        BOOST_CHECK_EQUAL(HexStr(skEm), HexStr(exp_skEm));
-        BOOST_CHECK_EQUAL(HexStr(pkEm), HexStr(exp_pkEm));
-        uint8_t skRm[32], pkRm[65];
-        ok = DeriveKeyPair(ikmR.data(), ikmR.size(), skRm, pkRm);
-        BOOST_CHECK(ok);
-        BOOST_CHECK_EQUAL(HexStr(skRm), HexStr(exp_skRm));
-        BOOST_CHECK_EQUAL(HexStr(pkRm), HexStr(exp_pkRm));
-        uint8_t skSm[32], pkSm[65];
-        ok = DeriveKeyPair(ikmS.data(), ikmS.size(), skSm, pkSm);
-        BOOST_CHECK(ok);
-        BOOST_CHECK_EQUAL(HexStr(skSm), HexStr(exp_skSm));
-        BOOST_CHECK_EQUAL(HexStr(pkSm), HexStr(exp_pkSm));
-
-        // Decapsulate (AuthDecap) and check shared_secret
-        uint8_t shared[32];
-        ok = AuthDecap(pkEm, skRm, pkSm, shared);
-        BOOST_CHECK(ok);
-        BOOST_CHECK_EQUAL(HexStr(shared), HexStr(exp_shared));
-
-        // Compute HPKE key schedule for Auth mode (mode = 0x02):contentReference[oaicite:34]{index=34}
-        uint8_t mode_auth = 0x02;
-        std::vector<unsigned char> info; // default empty info
-        // In Auth mode, no PSK (psk_id_hash and info_hash as in Base)
-        auto psk_id_hash = LabeledExtract({}, "psk_id_hash", std::vector<unsigned char>());
-        auto info_hash = LabeledExtract({}, "info_hash", info);
-        // key_schedule_context = mode_auth || psk_id_hash || info_hash || pkS (only included in context for AuthPSK, but for Auth mode, see RFC9180)
-        // Actually, in HPKE Auth mode (mode=2), the sender's public key is not directly appended in key_schedule_context (it is included via KEM context).
-        // So key_schedule_context formula for mode_auth is same as base except mode byte = 2.
-        std::vector<unsigned char> context;
-        context.push_back(mode_auth);
-        context.insert(context.end(), psk_id_hash.begin(), psk_id_hash.end());
-        context.insert(context.end(), info_hash.begin(), info_hash.end());
-        // secret = LabeledExtract(shared_secret, "secret", psk="")
-        std::vector<unsigned char> ss_vec(shared, shared + 32);
-        auto secret = LabeledExtract(ss_vec, "secret", std::vector<unsigned char>());
-        // Derive key, base_nonce, exporter_secret
-        std::vector<unsigned char> got_key   = LabeledExpand(secret, "key", context, exp_key.size());
-        std::vector<unsigned char> got_nonce = LabeledExpand(secret, "base_nonce", context, exp_nonce.size());
-        std::vector<unsigned char> got_exporter = LabeledExpand(secret, "exp", context, exp_exporter.size());
-        BOOST_CHECK_EQUAL(HexStr(got_key), HexStr(exp_key));
-        BOOST_CHECK_EQUAL(HexStr(got_nonce), HexStr(exp_nonce));
-        BOOST_CHECK_EQUAL(HexStr(got_exporter), HexStr(exp_exporter));
-    } */
 }
 
 BOOST_AUTO_TEST_CASE(dhkem_encap_decap)

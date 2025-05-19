@@ -33,7 +33,8 @@ static const size_t NSK = 32;            //!< Length of private key serializatio
 
 // Labeled prefix "HPKE-v1" and suite ID for KEM(secp256k1, HKDF-SHA256):contentReference[oaicite:20]{index=20}
 static const unsigned char LABEL_PREFIX[] = {'H','P','K','E','-','v','1'};
-static const unsigned char SUITE_ID[]    = {'K','E','M', 0x00, 0x16}; // "KEM\x00\x16"
+// static const unsigned char SUITE_ID[]    = {'K','E','M', 0x00, 0x16}; // "KEM\x00\x16"
+static const unsigned char SUITE_ID[] = {'H','P','K','E', 0x00, 0x16, 0x00, 0x01, 0x00, 0x03}; // example: KEM=0x0016, KDF=0x0001, AEAD=0x0003
 
 /**
  * DeriveKeyPair(IKM): Derive a secp256k1 key pair from input keying material.
