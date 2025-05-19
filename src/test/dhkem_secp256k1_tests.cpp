@@ -7,30 +7,57 @@
 
 using namespace dhkem_secp256k1;
 
-    std::vector<uint8_t> LabeledExtract(const std::vector<uint8_t>& salt, const std::vector<uint8_t>& label, const std::vector<uint8_t>& ikm)
-    {
-        // 1. Concatenate label_prefix + suite_id + label + ikm
-        std::vector<uint8_t> labeled_ikm;
+std::vector<uint8_t> LabeledExpand(const std::vector<uint8_t>& prk, const std::vector<uint8_t>& label, const std::vector<uint8_t>& info, size_t L)
+{
+    // 1. Construct the "labeled_info" as:
+    //    length (2 bytes, big-endian) || label_prefix || suite_id || label || info
+    uint8_t length_bytes[2];
+    length_bytes[0] = static_cast<uint8_t>((L >> 8) & 0xff);
+    length_bytes[1] = static_cast<uint8_t>(L & 0xff);
 
-        labeled_ikm.insert(labeled_ikm.end(), std::begin((LABEL_PREFIX)), std::end((LABEL_PREFIX)));
-        labeled_ikm.insert(labeled_ikm.end(), std::begin((SUITE_ID)), std::end((SUITE_ID)));
-        labeled_ikm.insert(labeled_ikm.end(), label.begin(), label.end());
-        labeled_ikm.insert(labeled_ikm.end(), ikm.begin(), ikm.end());
+    std::vector<uint8_t> labeled_info;
+    // (a) L in 2-byte big-endian form
+    labeled_info.insert(labeled_info.end(), length_bytes, length_bytes + 2);
+    // (b) label_prefix
+    labeled_info.insert(labeled_info.end(), std::begin((LABEL_PREFIX)), std::end((LABEL_PREFIX)));
+    // (c) suite_id
+    labeled_info.insert(labeled_info.end(), std::begin((SUITE_ID)), std::end((SUITE_ID)));
+    // (d) label
+    labeled_info.insert(labeled_info.end(), label.begin(), label.end());
+    // (e) info
+    labeled_info.insert(labeled_info.end(), info.begin(), info.end());
 
-        // 2. Print labeled_ikm in hex (for debugging, like the Python print)
-        /* std::cout << "labeled_ikm = ";
-        for (uint8_t b : labeled_ikm) {
-            std::cout << std::hex << std::setw(2) << std::setfill('0') << static_cast<int>(b);
-        }
-        std::cout << std::dec << std::endl; */
+    // 2. Expand
+    std::vector<uint8_t> out_okm(L, 0);
+    HKDF_Expand32(prk.data(), labeled_info.data(), labeled_info.size(), out_okm.data(), L);
 
-        // 3. Call HKDF_Extract to get the PRK
-        uint8_t out_prk[32];
-        HKDF_Extract(salt.data(), salt.size(), labeled_ikm.data(), labeled_ikm.size(), out_prk);
+    return out_okm;
+}
 
-        // 4. Return the PRK as a 32-byte vector
-        return std::vector<uint8_t>(out_prk, out_prk + 32);
+std::vector<uint8_t> LabeledExtract(const std::vector<uint8_t>& salt, const std::vector<uint8_t>& label, const std::vector<uint8_t>& ikm)
+{
+    // 1. Concatenate label_prefix + suite_id + label + ikm
+    std::vector<uint8_t> labeled_ikm;
+
+    labeled_ikm.insert(labeled_ikm.end(), std::begin((LABEL_PREFIX)), std::end((LABEL_PREFIX)));
+    labeled_ikm.insert(labeled_ikm.end(), std::begin((SUITE_ID)), std::end((SUITE_ID)));
+    labeled_ikm.insert(labeled_ikm.end(), label.begin(), label.end());
+    labeled_ikm.insert(labeled_ikm.end(), ikm.begin(), ikm.end());
+
+    // 2. Print labeled_ikm in hex (for debugging, like the Python print)
+    /* std::cout << "labeled_ikm = ";
+    for (uint8_t b : labeled_ikm) {
+        std::cout << std::hex << std::setw(2) << std::setfill('0') << static_cast<int>(b);
     }
+    std::cout << std::dec << std::endl; */
+
+    // 3. Call HKDF_Extract to get the PRK
+    uint8_t out_prk[32];
+    HKDF_Extract(salt.data(), salt.size(), labeled_ikm.data(), labeled_ikm.size(), out_prk);
+
+    // 4. Return the PRK as a 32-byte vector
+    return std::vector<uint8_t>(out_prk, out_prk + 32);
+}
 
 BOOST_FIXTURE_TEST_SUITE(dhkem_secp256k1_tests, BasicTestingSetup)
 
@@ -114,9 +141,7 @@ BOOST_AUTO_TEST_CASE(dhkem_secp256k1_chacha20poly1305_testvectors)
         std::array<unsigned char, 32> prk{};
         HKDF_Extract(salt.empty()? nullptr: salt.data(), salt.size(), labeled.data(), labeled.size(), prk.data());
         return prk;
-    }; */
-
-    
+    }; 
 
     auto LabeledExpand = [&](const std::array<unsigned char,32>& prk, const std::string& label, const std::vector<unsigned char>& info, size_t L) {
         // labeled info = "HPKE-v1"||suite_id||label||info
@@ -128,7 +153,7 @@ BOOST_AUTO_TEST_CASE(dhkem_secp256k1_chacha20poly1305_testvectors)
         std::vector<unsigned char> okm(L);
         HKDF_Expand32(prk.data(), labeled_info.data(), labeled_info.size(), okm.data(), L);
         return okm;
-    };
+    };*/
 
     // Process each Base mode test vector
     for (size_t i = 0; i < base_vecs.size(); ++i) {
@@ -215,12 +240,25 @@ BOOST_AUTO_TEST_CASE(dhkem_secp256k1_chacha20poly1305_testvectors)
 
         std::cout << "---> secret: " << HexStr(secret) << std::endl;
         // Derive key, base_nonce, exporter_secret
-        /*  std::vector<unsigned char> got_key   = LabeledExpand(secret, "key", context, exp_key.size());
-        std::vector<unsigned char> got_nonce = LabeledExpand(secret, "base_nonce", context, exp_nonce.size());
-        std::vector<unsigned char> got_exporter = LabeledExpand(secret, "exp", context, exp_exporter.size());
+        std::vector<uint8_t> label_key = {'k','e','y'};
+        std::vector<unsigned char> got_key   = LabeledExpand(secret, label_key, context, 32);
+        // std::vector<unsigned char> got_key   = LabeledExpand(secret, "key", context, exp_key.size());
+
+        std::cout << "---> got_key: " << HexStr(got_key) << std::endl;
+
+        std::vector<uint8_t> label_base_nonce = {'b','a','s','e','_','n','o','n','c','e'};
+        std::vector<unsigned char> got_nonce = LabeledExpand(secret, label_base_nonce, context, 12);
+
+        std::cout << "---> got_nonce: " << HexStr(got_nonce) << std::endl;
+        //std::vector<unsigned char> got_nonce = LabeledExpand(secret, "base_nonce", context, exp_nonce.size());
+        
+        std::vector<uint8_t> label_exp = {'e','x','p'};
+        std::vector<unsigned char> got_exporter = LabeledExpand(secret, label_exp, context, exp_exporter.size());
+        
+        // std::vector<unsigned char> got_exporter = LabeledExpand(secret, "exp", context, exp_exporter.size());
         BOOST_CHECK_EQUAL(HexStr(got_key), HexStr(exp_key));
         BOOST_CHECK_EQUAL(HexStr(got_nonce), HexStr(exp_nonce));
-        BOOST_CHECK_EQUAL(HexStr(got_exporter), HexStr(exp_exporter)); */
+        BOOST_CHECK_EQUAL(HexStr(got_exporter), HexStr(exp_exporter));
     }
 }
 
