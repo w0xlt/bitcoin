@@ -199,21 +199,23 @@ BOOST_AUTO_TEST_CASE(dhkem_secp256k1_chacha20poly1305_testvectors)
 
         std::cout << "---> info_hash: " << HexStr(info_hash) << std::endl;
 
-        /*  // key_schedule_context = mode || psk_id_hash || info_hash
+        // key_schedule_context = mode || psk_id_hash || info_hash
         std::vector<unsigned char> context;
         context.push_back(mode_base);
         context.insert(context.end(), psk_id_hash.begin(), psk_id_hash.end());
         context.insert(context.end(), info_hash.begin(), info_hash.end());
 
-        // std::cout << "---> context: " << HexStr(context) << std::endl;
-        // std::cout << "---> ss_vec: " << HexStr(ss_vec) << std::endl;
+        std::cout << "---> context: " << HexStr(context) << std::endl;
+        std::cout << "---> ss_vec: " << HexStr(ss_vec) << std::endl;
 
         std::vector<unsigned char> psk; // empty
-        auto secret = LabeledExtract(psk,"secret", ss_vec);
+        std::vector<uint8_t> label_secret = {'s', 'e', 'c', 'r', 'e', 't'};
+        // auto secret = LabeledExtract(psk,"secret", ss_vec);
+        auto secret = LabeledExtract(ss_vec, label_secret, psk);
 
         std::cout << "---> secret: " << HexStr(secret) << std::endl;
         // Derive key, base_nonce, exporter_secret
-        std::vector<unsigned char> got_key   = LabeledExpand(secret, "key", context, exp_key.size());
+        /*  std::vector<unsigned char> got_key   = LabeledExpand(secret, "key", context, exp_key.size());
         std::vector<unsigned char> got_nonce = LabeledExpand(secret, "base_nonce", context, exp_nonce.size());
         std::vector<unsigned char> got_exporter = LabeledExpand(secret, "exp", context, exp_exporter.size());
         BOOST_CHECK_EQUAL(HexStr(got_key), HexStr(exp_key));
