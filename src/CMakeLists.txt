@@ -108,7 +108,6 @@ add_library(bitcoin_consensus STATIC EXCLUDE_FROM_ALL
   arith_uint256.cpp
   consensus/merkle.cpp
   consensus/tx_check.cpp
-  dhkem_secp256k1.cpp
   hash.cpp
   primitives/block.cpp
   primitives/transaction.cpp
@@ -156,6 +155,7 @@ add_library(bitcoin_common STATIC EXCLUDE_FROM_ALL
   core_read.cpp
   core_write.cpp
   deploymentinfo.cpp
+  dhkem_secp256k1.cpp
   external_signer.cpp
   init/common.cpp
   kernel/chainparams.cpp
