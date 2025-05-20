@@ -1,6 +1,4 @@
-// Copyright (c) 2023-present The Bitcoin Core developers
-// Distributed under the MIT software license, see the accompanying
-// file COPYING or http://www.opensource.org/licenses/mit-license.php.
+// Distributed under the MIT software license (see accompanying file COPYING).
 
 #ifndef BITCOIN_CRYPTO_DHKEM_SECP256K1_H
 #define BITCOIN_CRYPTO_DHKEM_SECP256K1_H
@@ -13,12 +11,12 @@
 #include <optional>
 #include <vector>
 
-/** 
+/**
  * secp256k1-based DHKEM for HPKE (Hybrid Public Key Encryption)
  * 
  * Provides functions for key pair derivation, serialization, and Diffie-Hellman 
  * encapsulation/decapsulation (including authenticated modes) as specified in 
- * draft-wahby-cfrg-hpke-kem-secp256k1-01:contentReference[oaicite:2]{index=2}.
+ * draft-wahby-cfrg-hpke-kem-secp256k1-01【2†】.
  */
 namespace dhkem_secp256k1 {
 
@@ -27,77 +25,116 @@ using ::secp256k1_ec_pubkey_serialize;
 using ::secp256k1_context_create;
 using ::secp256k1_context;
 
-static const size_t NSECRET = 32;        //!< Length of KEM shared secret (Nsecret = 32 bytes):contentReference[oaicite:3]{index=3} 
-static const size_t NENC = 65;           //!< Length of encapsulated key (ephemeral public key), uncompressed SEC1 (65 bytes):contentReference[oaicite:4]{index=4}
-static const size_t NPK = 65;            //!< Length of public key serialization, uncompressed (65 bytes):contentReference[oaicite:5]{index=5}
-static const size_t NSK = 32;            //!< Length of private key serialization (32 bytes):contentReference[oaicite:6]{index=6}
+static const size_t NSECRET = 32;        //!< Length of KEM shared secret (Nsecret = 32 bytes)【3†】 
+static const size_t NENC = 65;           //!< Length of encapsulated key (ephemeral public key), uncompressed SEC1 (65 bytes)【4†】
+static const size_t NPK = 65;            //!< Length of public key serialization, uncompressed (65 bytes)【5†】
+static const size_t NSK = 32;            //!< Length of private key serialization (32 bytes)【6†*/
 
-// Labeled prefix "HPKE-v1" and suite ID for KEM(secp256k1, HKDF-SHA256):contentReference[oaicite:20]{index=20}
+// Labeled prefix "HPKE-v1" and suite ID for KEM(secp256k1, HKDF-SHA256)【20†】
 static const unsigned char LABEL_PREFIX[] = {'H','P','K','E','-','v','1'};
-// static const unsigned char SUITE_ID[]    = {'K','E','M', 0x00, 0x16}; // "KEM\x00\x16"
+/* static const unsigned char SUITE_ID[]    = {'K','E','M', 0x00, 0x16}; // "KEM\x00\x16" */
 static const unsigned char SUITE_ID[] = {'H','P','K','E', 0x00, 0x16, 0x00, 0x01, 0x00, 0x03}; // example: KEM=0x0016, KDF=0x0001, AEAD=0x0003
 
 /**
  * DeriveKeyPair(IKM): Derive a secp256k1 key pair from input keying material.
  * 
- * Follows RFC 9180 Section 7.1.3 algorithm with rejection sampling:contentReference[oaicite:7]{index=7}:contentReference[oaicite:8]{index=8}:
+ * Follows RFC 9180 Section 7.1.3 algorithm with rejection sampling【7†】【8†】:
  *   - HKDF-Extract with salt="", label="dkp_prk"
  *   - Loop: HKDF-Expand labeled "candidate" until a valid scalar in [1, order-1] is found.
- *   - The bitmask 0xff is applied to the first byte (no effective change for secp256k1):contentReference[oaicite:9]{index=9}.
+ *   - The bitmask 0xff is applied to the first byte (no effective change for secp256k1)【9†】.
  * 
- * @param ikm    Input keying material (IKM) bytes.
+ * @param ikm        Input keying material (IKM) bytes.
  * @param outPrivKey (output) Derived private key, 32 bytes.
- * @param outPubKey (output) Derived public key, 65 bytes uncompressed format (0x04 || X || Y).
+ * @param outPubKey  (output) Derived public key, 65 bytes uncompressed format (0x04 || X || Y).
  * @return true on success, false if derivation failed (e.g., after 256 attempts).
  */
-bool DeriveKeyPair(std::span<const uint8_t> ikm, std::array<uint8_t, 32>& outPrivKey, std::array<uint8_t, 65>& outPubKey);
+bool DeriveKeyPair(std::span<const uint8_t> ikm,
+                   std::array<uint8_t, 32>& outPrivKey,
+                   std::array<uint8_t, 65>& outPubKey);
 
 /**
- * Encap(pkR): Perform HPKE KEM encapsulation to recipient's public key (Base mode).
+ * Encap(pkR): Perform HPKE KEM encapsulation to the recipient's public key (Base mode).
  * 
  * Generates a random ephemeral key pair and produces:
- *   - enc: the ephemeral public key (65 bytes, uncompressed).
- *   - shared_secret: 32-byte KEM shared secret.
+ *   - enc: the ephemeral public key (65 bytes, uncompressed)
+ *   - shared_secret: 32-byte KEM shared secret
  * 
  * Implements DHKEM Base mode using secp256k1 ECDH:
- *   dh = x-coordinate of (skE * pkR):contentReference[oaicite:17]{index=17},
+ *   dh = x-coordinate of (skE * pkR)【17†】,
  *   kem_context = enc || pkR,
- *   shared_secret = HKDF-Extract&Expand(dh, "hpke shared secret"):contentReference[oaicite:18]{index=18}.
+ *   shared_secret = HKDF-Extract & Expand(dh, "shared secret")【18†】.
  * 
  * @param pkR  Recipient's public key (65-byte uncompressed).
- * @return 32-byte shared secret and ephemeral public key (65-byte uncompressed) on success.
+ * @return 32-byte shared secret and ephemeral public key (65-byte uncompressed) on success (std::nullopt if failure).
  */
-std::optional<std::pair<std::array<uint8_t, 32>, std::array<uint8_t, 65>>> Encap(std::span<const uint8_t> pkR);
+std::optional<std::pair<std::array<uint8_t, 32>, std::array<uint8_t, 65>>>
+Encap(std::span<const uint8_t> pkR);
 
 /**
- * Decap(enc, skR): Perform HPKE KEM decapsulation using recipient's private key (Base mode).
+ * Decap(enc, skR): Perform HPKE KEM decapsulation using the recipient's private key (Base mode).
  * 
- * Given the encapsulated key (ephemeral pubkey) and recipient's private key, computes the same 32-byte shared secret as Encap().
- * Returns false if input keys are invalid.
+ * Given the encapsulated key (ephemeral public key) and recipient's private key, 
+ * computes the same 32-byte shared secret as Encap(). Returns std::nullopt if input keys are invalid.
  * 
  * @param enc  Ephemeral public key (65-byte uncompressed).
  * @param skR  Recipient's private key (32-byte scalar).
- * @return 32-byte shared secret on success (null if validation fails).
+ * @return 32-byte shared secret on success (std::nullopt if validation fails).
  */
-std::optional<std::array<uint8_t, 32>> Decap(std::span<const uint8_t> enc, std::span<const uint8_t> skR);
+std::optional<std::array<uint8_t, 32>>
+Decap(std::span<const uint8_t> enc, std::span<const uint8_t> skR);
 
-void HKDF_Extract(const uint8_t* salt, size_t salt_len, const uint8_t* ikm, size_t ikm_len, uint8_t out_prk[32]);
-
-void HKDF_Expand32(const uint8_t prk[32], const uint8_t* info_data, size_t info_len, uint8_t out_okm[], size_t L);
-
-bool DeriveKeyPair(std::span<const uint8_t> ikm,
-                                   std::array<uint8_t, 32>& outPrivKey,
-                                   std::array<uint8_t, 65>& outPubKey);
-
+/** Initialize the internal secp256k1 context (must be called before other operations). */
 void InitContext();
 
-std::vector<uint8_t> LabeledExpand(const std::vector<uint8_t>& prk, const std::vector<uint8_t>& label, const std::vector<uint8_t>& info, size_t L);
+/** 
+ * LabeledExpand(prk, label, info, L): HKDF-Expand with a label, per RFC 9180.
+ * Constructs the info as: length (2 bytes) || "HPKE-v1" || suite_id || label || info.
+ * Returns an output keying material of length L bytes.
+ */
+std::vector<uint8_t> LabeledExpand(const std::vector<uint8_t>& prk,
+                                   const std::vector<uint8_t>& label,
+                                   const std::vector<uint8_t>& info,
+                                   size_t L);
 
-std::vector<uint8_t> LabeledExtract(const std::vector<uint8_t>& salt, const std::vector<uint8_t>& label, const std::vector<uint8_t>& ikm);
+/** 
+ * LabeledExtract(salt, label, ikm): HKDF-Extract with a label, per RFC 9180.
+ * Constructs the input keying material as: "HPKE-v1" || suite_id || label || ikm.
+ * Returns the pseudorandom key (PRK) as a 32-byte vector.
+ */
+std::vector<uint8_t> LabeledExtract(const std::vector<uint8_t>& salt,
+                                    const std::vector<uint8_t>& label,
+                                    const std::vector<uint8_t>& ikm);
 
-bool AuthEncap(std::array<uint8_t, 65>& enc, std::array<uint8_t, 32>& shared_secret, const std::array<uint8_t, 65>& pkR, const std::array<uint8_t, 32>& skS);
+/**
+ * AuthEncap(pkR, skS): Authenticated encapsulation using sender's static key.
+ * 
+ * Outputs:
+ *  - enc: ephemeral public key (65 bytes uncompressed)
+ *  - shared_secret: 32-byte KEM shared secret
+ * 
+ * Uses the recipient’s public key (pkR) and sender’s private key (skS). Implements DHKEM in auth mode:
+ *   DH1 = x-coordinate of (skE * pkR)
+ *   DH2 = x-coordinate of (skS * pkR)
+ *   kem_context = enc || pkR || pkS
+ *   shared_secret = HKDF based on DH1 || DH2 and kem_context.
+ */
+bool AuthEncap(std::array<uint8_t, 65>& enc,
+               std::array<uint8_t, 32>& shared_secret,
+               const std::array<uint8_t, 65>& pkR,
+               const std::array<uint8_t, 32>& skS);
 
-bool AuthDecap(std::array<uint8_t, 32>& shared_secret, const std::array<uint8_t, 65>& enc, const std::array<uint8_t, 32>& skR, const std::array<uint8_t, 65>& pkS);
+/**
+ * AuthDecap(enc, skR, pkS): Authenticated decapsulation using sender’s static public key.
+ * 
+ * Given the encapsulated ephemeral public key (enc), receiver’s private key (skR), 
+ * and sender’s static public key (pkS), computes the 32-byte shared secret (matching AuthEncap).
+ * Returns false if any input is invalid.
+ */
+bool AuthDecap(std::array<uint8_t, 32>& shared_secret,
+               const std::array<uint8_t, 65>& enc,
+               const std::array<uint8_t, 32>& skR,
+               const std::array<uint8_t, 65>& pkS);
 
 } // namespace dhkem_secp256k1
+
 #endif // BITCOIN_CRYPTO_DHKEM_SECP256K1_H
