@@ -185,42 +185,43 @@ BOOST_AUTO_TEST_CASE(dhkem_encap_decap)
     BOOST_CHECK_EQUAL(HexStr(shared_secret_enc), HexStr(*maybe_shared_secret_dec));
 }
 
-
 BOOST_AUTO_TEST_CASE(dhkem_auth_encap_decap)
 {
     // 1. Generate sender (skS) and recipient (skR) key pairs
     CKey skS;
     CKey skR;
-    skS.MakeNewKey(/* compressed = */ true);
-    skR.MakeNewKey(/* compressed = */ true);
+    skS.MakeNewKey(/* compressed = */ false);
+    skR.MakeNewKey(/* compressed = */ false);
     CPubKey pkS = skS.GetPubKey();
     CPubKey pkR = skR.GetPubKey();
 
-    // 2. Convert CPubKey to std::vector<uint8_t> for use with AuthEncap/AuthDecap
-    std::vector<uint8_t> pkS_bytes(pkS.begin(), pkS.end());
-    std::vector<uint8_t> pkR_bytes(pkR.begin(), pkR.end());
+    // 2. Convert CPubKey to std::array<uint8_t, 65> for use with AuthEncap/AuthDecap
+    std::array<uint8_t, 65> pkR_array;
+    std::copy(pkR.begin(), pkR.end(), pkR_array.begin());
 
-    // Prepare output containers for shared secrets and encapsulated key
-    std::vector<uint8_t> shared_secret_enc;
-    std::vector<uint8_t> enc_bytes;
-    std::vector<uint8_t> shared_secret_dec;
+    std::array<uint8_t, 65> pkS_array;
+    std::copy(pkS.begin(), pkS.end(), pkS_array.begin());
 
+    // 3. Convert CKey to std::array<uint8_t, 32> for use with AuthEncap/AuthDecap
     std::span<const uint8_t> skS_span(reinterpret_cast<const uint8_t*>(skS.data()), skS.size());
+    std::array<uint8_t, 32> skS_array;
+    std::copy(skS_span.begin(), skS_span.end(), skS_array.begin());
+
     std::span<const uint8_t> skR_span(reinterpret_cast<const uint8_t*>(skR.data()), skR.size());
+    std::array<uint8_t, 32> skR_array;
+    std::copy(skR_span.begin(), skR_span.end(), skR_array.begin());
 
-    // 3. Perform authenticated encapsulation (sender side)
-    BOOST_CHECK(dhkem_secp256k1::AuthEncap2(skS_span, pkR_bytes, shared_secret_enc, enc_bytes));
+    // 4. Prepare output containers for shared secrets and encapsulated key
+    std::array<uint8_t, 65> enc{0};
+    std::array<uint8_t, 32> shared_secret_enc{0};
+    std::array<uint8_t, 32> shared_secret_dec{0};
 
-    // 4. Perform authenticated decapsulation (recipient side)
-    BOOST_CHECK(dhkem_secp256k1::AuthDecap2(skR_span, pkS_bytes, enc_bytes, shared_secret_dec));
+    // 4. Perform authenticated encapsulation (sender side)
+    BOOST_CHECK(dhkem_secp256k1::AuthEncap(enc, shared_secret_enc, pkR_array, skS_array));
 
-    std::cout << "shared_secret_enc: " << HexStr(shared_secret_enc) << std::endl;
-    std::cout << "shared_secret_dec: " << HexStr(shared_secret_dec) << std::endl;
+    // 5. Perform authenticated decapsulation (recipient side)
+    BOOST_CHECK(dhkem_secp256k1::AuthDecap(shared_secret_dec, enc, skR_array, pkS_array));
 
-    // Both functions should produce a shared secret of the same length
-    BOOST_CHECK_EQUAL(shared_secret_enc.size(), shared_secret_dec.size());
-
-    // 5. Compare shared secrets (hex encoded) to ensure they match
     BOOST_CHECK_EQUAL(HexStr(shared_secret_enc), HexStr(shared_secret_dec));
 }
 

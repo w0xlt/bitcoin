@@ -359,6 +359,49 @@ static RPCHelpMan getblockcount()
         assert(shared_secret_enc == *maybe_shared_secret_dec);
     }
 
+
+    /// ---- auth
+
+    // 1. Generate sender (skS) and recipient (skR) key pairs
+    CKey skS;
+    CKey skR;
+    skS.MakeNewKey(/* compressed = */ false);
+    skR.MakeNewKey(/* compressed = */ false);
+    CPubKey pkS = skS.GetPubKey();
+    CPubKey pkR = skR.GetPubKey();
+
+    std::array<uint8_t, 65> pkR_array;
+    std::copy(pkR.begin(), pkR.end(), pkR_array.begin());
+
+    std::array<uint8_t, 65> pkS_array;
+    std::copy(pkS.begin(), pkS.end(), pkS_array.begin());
+
+    std::span<const uint8_t> skS_span(reinterpret_cast<const uint8_t*>(skS.data()), skS.size());
+    std::array<uint8_t, 32> skS_array;
+    std::copy(skS_span.begin(), skS_span.end(), skS_array.begin());
+
+    std::span<const uint8_t> skR_span(reinterpret_cast<const uint8_t*>(skR.data()), skR.size());
+    std::array<uint8_t, 32> skR_array;
+    std::copy(skR_span.begin(), skR_span.end(), skR_array.begin());
+
+    std::array<uint8_t, 65> enc{0};
+    std::array<uint8_t, 32> shared_secret{0};
+
+    bool xxxxx= dhkem_secp256k1::AuthEncap(enc, shared_secret, pkR_array, skS_array);
+
+    std::cout << "xxxxx: " << (xxxxx ? "true" : "false") << std::endl;
+
+    std::cout << "---> enc: " << HexStr(enc) << std::endl;
+    std::cout << "---> shared_secret: " << HexStr(shared_secret) << std::endl;
+
+    std::array<uint8_t, 32> shared_secret2{0};
+
+    xxxxx= dhkem_secp256k1::AuthDecap(shared_secret2, enc, skR_array, pkS_array);
+
+    std::cout << "xxxxx: " << (xxxxx ? "true" : "false") << std::endl;
+
+    std::cout << "---> shared_secret2: " << HexStr(shared_secret2) << std::endl;
+
     return chainman.ActiveChain().Height();
 },
     };

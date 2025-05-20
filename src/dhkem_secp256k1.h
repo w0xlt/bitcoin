@@ -99,11 +99,5 @@ bool AuthEncap(std::array<uint8_t, 65>& enc, std::array<uint8_t, 32>& shared_sec
 
 bool AuthDecap(std::array<uint8_t, 32>& shared_secret, const std::array<uint8_t, 65>& enc, const std::array<uint8_t, 32>& skR, const std::array<uint8_t, 65>& pkS);
 
-bool AuthEncap2(std::span<const uint8_t>& skS, const std::vector<uint8_t>& pkR_bytes, std::vector<uint8_t>& shared_secret, std::vector<uint8_t>& enc);
-
-bool AuthDecap2(std::span<const uint8_t>& skR, const std::vector<uint8_t>& pkS_bytes, const std::vector<uint8_t>& enc_bytes, std::vector<uint8_t>& shared_secret);
-
-
-
 } // namespace dhkem_secp256k1
 #endif // BITCOIN_CRYPTO_DHKEM_SECP256K1_H
