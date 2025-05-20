@@ -100,7 +100,7 @@ BOOST_AUTO_TEST_CASE(dhkem_secp256k1_chacha20poly1305_testvectors)
         dhkem_secp256k1::InitContext();
 
         // bool ok = DeriveKeyPair(ikmE.data(), ikmE.size(), skEm, pkEm);
-        bool ok = dhkem_secp256k1::DeriveKeyPair_DHKEM_Secp256k1(std::span<const uint8_t>(ikmE.data(), ikmE.size()), skEm, pkEm);
+        bool ok = dhkem_secp256k1::DeriveKeyPair(std::span<const uint8_t>(ikmE.data(), ikmE.size()), skEm, pkEm);
 
         BOOST_CHECK(ok);
         BOOST_CHECK_EQUAL(HexStr(skEm), HexStr(exp_skEm));
@@ -109,7 +109,7 @@ BOOST_AUTO_TEST_CASE(dhkem_secp256k1_chacha20poly1305_testvectors)
         std::array<uint8_t, 32> skRm;
         std::array<uint8_t, 65> pkRm;
         
-        ok = dhkem_secp256k1::DeriveKeyPair_DHKEM_Secp256k1(std::span<const uint8_t>(ikmR.data(), ikmR.size()), skRm, pkRm);
+        ok = dhkem_secp256k1::DeriveKeyPair(std::span<const uint8_t>(ikmR.data(), ikmR.size()), skRm, pkRm);
         BOOST_CHECK(ok);
         BOOST_CHECK_EQUAL(HexStr(skRm), HexStr(exp_skRm));
         BOOST_CHECK_EQUAL(HexStr(pkRm), HexStr(exp_pkRm));
@@ -118,7 +118,7 @@ BOOST_AUTO_TEST_CASE(dhkem_secp256k1_chacha20poly1305_testvectors)
         std::span<const uint8_t> pkEm2(pkEm.data(), pkEm.size());
         std::span<const uint8_t> skRm2(skRm.data(), skRm.size());
 
-        std::optional<std::array<uint8_t, 32>> maybe_shared_secret_dec = dhkem_secp256k1::Decap2(pkEm2, skRm2);
+        std::optional<std::array<uint8_t, 32>> maybe_shared_secret_dec = dhkem_secp256k1::Decap(pkEm2, skRm2);
         BOOST_CHECK(maybe_shared_secret_dec.has_value());
         BOOST_CHECK_EQUAL(HexStr(*maybe_shared_secret_dec), HexStr(exp_shared));
 
@@ -171,7 +171,7 @@ BOOST_AUTO_TEST_CASE(dhkem_encap_decap)
     dhkem_secp256k1::InitContext();
 
     // Perform encapsulation with the recipient's public key
-    auto maybe_result = dhkem_secp256k1::Encap2(pkR_bytes);
+    auto maybe_result = dhkem_secp256k1::Encap(pkR_bytes);
     assert(maybe_result.has_value()); // Encap should succeed
 
     std::span<const uint8_t> skR_span(reinterpret_cast<const uint8_t*>(skR.data()), skR.size());
@@ -179,10 +179,50 @@ BOOST_AUTO_TEST_CASE(dhkem_encap_decap)
     // Extract shared_secret_enc and enc (ephemeral public key bytes)
     auto [shared_secret_enc, enc3] = *maybe_result;
     // Decapsulate using the recipient's private key
-    std::optional<std::array<uint8_t, 32>> maybe_shared_secret_dec = dhkem_secp256k1::Decap2(enc3, skR_span);
+    std::optional<std::array<uint8_t, 32>> maybe_shared_secret_dec = dhkem_secp256k1::Decap(enc3, skR_span);
     
     BOOST_CHECK(maybe_shared_secret_dec.has_value());
     BOOST_CHECK_EQUAL(HexStr(shared_secret_enc), HexStr(*maybe_shared_secret_dec));
 }
+
+
+BOOST_AUTO_TEST_CASE(dhkem_auth_encap_decap)
+{
+    // 1. Generate sender (skS) and recipient (skR) key pairs
+    CKey skS;
+    CKey skR;
+    skS.MakeNewKey(/* compressed = */ true);
+    skR.MakeNewKey(/* compressed = */ true);
+    CPubKey pkS = skS.GetPubKey();
+    CPubKey pkR = skR.GetPubKey();
+
+    // 2. Convert CPubKey to std::vector<uint8_t> for use with AuthEncap/AuthDecap
+    std::vector<uint8_t> pkS_bytes(pkS.begin(), pkS.end());
+    std::vector<uint8_t> pkR_bytes(pkR.begin(), pkR.end());
+
+    // Prepare output containers for shared secrets and encapsulated key
+    std::vector<uint8_t> shared_secret_enc;
+    std::vector<uint8_t> enc_bytes;
+    std::vector<uint8_t> shared_secret_dec;
+
+    std::span<const uint8_t> skS_span(reinterpret_cast<const uint8_t*>(skS.data()), skS.size());
+    std::span<const uint8_t> skR_span(reinterpret_cast<const uint8_t*>(skR.data()), skR.size());
+
+    // 3. Perform authenticated encapsulation (sender side)
+    BOOST_CHECK(dhkem_secp256k1::AuthEncap2(skS_span, pkR_bytes, shared_secret_enc, enc_bytes));
+
+    // 4. Perform authenticated decapsulation (recipient side)
+    BOOST_CHECK(dhkem_secp256k1::AuthDecap2(skR_span, pkS_bytes, enc_bytes, shared_secret_dec));
+
+    std::cout << "shared_secret_enc: " << HexStr(shared_secret_enc) << std::endl;
+    std::cout << "shared_secret_dec: " << HexStr(shared_secret_dec) << std::endl;
+
+    // Both functions should produce a shared secret of the same length
+    BOOST_CHECK_EQUAL(shared_secret_enc.size(), shared_secret_dec.size());
+
+    // 5. Compare shared secrets (hex encoded) to ensure they match
+    BOOST_CHECK_EQUAL(HexStr(shared_secret_enc), HexStr(shared_secret_dec));
+}
+
 
 BOOST_AUTO_TEST_SUITE_END()

@@ -50,7 +50,7 @@ static const unsigned char SUITE_ID[] = {'H','P','K','E', 0x00, 0x16, 0x00, 0x01
  * @param outPubKey (output) Derived public key, 65 bytes uncompressed format (0x04 || X || Y).
  * @return true on success, false if derivation failed (e.g., after 256 attempts).
  */
-bool DeriveKeyPair_DHKEM_Secp256k1(std::span<const uint8_t> ikm, std::array<uint8_t, 32>& outPrivKey, std::array<uint8_t, 65>& outPubKey);
+bool DeriveKeyPair(std::span<const uint8_t> ikm, std::array<uint8_t, 32>& outPrivKey, std::array<uint8_t, 65>& outPubKey);
 
 /**
  * Encap(pkR): Perform HPKE KEM encapsulation to recipient's public key (Base mode).
@@ -67,7 +67,7 @@ bool DeriveKeyPair_DHKEM_Secp256k1(std::span<const uint8_t> ikm, std::array<uint
  * @param pkR  Recipient's public key (65-byte uncompressed).
  * @return 32-byte shared secret and ephemeral public key (65-byte uncompressed) on success.
  */
-std::optional<std::pair<std::array<uint8_t, 32>, std::array<uint8_t, 65>>> Encap2(std::span<const uint8_t> pkR);
+std::optional<std::pair<std::array<uint8_t, 32>, std::array<uint8_t, 65>>> Encap(std::span<const uint8_t> pkR);
 
 /**
  * Decap(enc, skR): Perform HPKE KEM decapsulation using recipient's private key (Base mode).
@@ -79,13 +79,13 @@ std::optional<std::pair<std::array<uint8_t, 32>, std::array<uint8_t, 65>>> Encap
  * @param skR  Recipient's private key (32-byte scalar).
  * @return 32-byte shared secret on success (null if validation fails).
  */
-std::optional<std::array<uint8_t, 32>> Decap2(std::span<const uint8_t> enc, std::span<const uint8_t> skR);
+std::optional<std::array<uint8_t, 32>> Decap(std::span<const uint8_t> enc, std::span<const uint8_t> skR);
 
 void HKDF_Extract(const uint8_t* salt, size_t salt_len, const uint8_t* ikm, size_t ikm_len, uint8_t out_prk[32]);
 
 void HKDF_Expand32(const uint8_t prk[32], const uint8_t* info_data, size_t info_len, uint8_t out_okm[], size_t L);
 
-bool DeriveKeyPair_DHKEM_Secp256k1(std::span<const uint8_t> ikm,
+bool DeriveKeyPair(std::span<const uint8_t> ikm,
                                    std::array<uint8_t, 32>& outPrivKey,
                                    std::array<uint8_t, 65>& outPubKey);
 
@@ -94,6 +94,16 @@ void InitContext();
 std::vector<uint8_t> LabeledExpand(const std::vector<uint8_t>& prk, const std::vector<uint8_t>& label, const std::vector<uint8_t>& info, size_t L);
 
 std::vector<uint8_t> LabeledExtract(const std::vector<uint8_t>& salt, const std::vector<uint8_t>& label, const std::vector<uint8_t>& ikm);
+
+bool AuthEncap(std::array<uint8_t, 65>& enc, std::array<uint8_t, 32>& shared_secret, const std::array<uint8_t, 65>& pkR, const std::array<uint8_t, 32>& skS);
+
+bool AuthDecap(std::array<uint8_t, 32>& shared_secret, const std::array<uint8_t, 65>& enc, const std::array<uint8_t, 32>& skR, const std::array<uint8_t, 65>& pkS);
+
+bool AuthEncap2(std::span<const uint8_t>& skS, const std::vector<uint8_t>& pkR_bytes, std::vector<uint8_t>& shared_secret, std::vector<uint8_t>& enc);
+
+bool AuthDecap2(std::span<const uint8_t>& skR, const std::vector<uint8_t>& pkS_bytes, const std::vector<uint8_t>& enc_bytes, std::vector<uint8_t>& shared_secret);
+
+
 
 } // namespace dhkem_secp256k1
 #endif // BITCOIN_CRYPTO_DHKEM_SECP256K1_H

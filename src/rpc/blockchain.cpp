@@ -254,7 +254,7 @@ static RPCHelpMan getblockcount()
     );
     std::array<uint8_t, 32> skEm;
     std::array<uint8_t, 65> pkEm;
-    bool result = dhkem_secp256k1::DeriveKeyPair_DHKEM_Secp256k1(std::span<const uint8_t>(ikmE.data(), ikmE.size()), skEm, pkEm);
+    bool result = dhkem_secp256k1::DeriveKeyPair(std::span<const uint8_t>(ikmE.data(), ikmE.size()), skEm, pkEm);
 
     std::cout << "---> " << (result ? "It worked 1" : "Unexpected 1") << std::endl;
 
@@ -278,7 +278,7 @@ static RPCHelpMan getblockcount()
     );
     std::array<uint8_t, 32> skRm;
     std::array<uint8_t, 65> pkRm;
-    result = dhkem_secp256k1::DeriveKeyPair_DHKEM_Secp256k1(std::span<const uint8_t>(ikmR.data(), ikmR.size()), skRm, pkRm);
+    result = dhkem_secp256k1::DeriveKeyPair(std::span<const uint8_t>(ikmR.data(), ikmR.size()), skRm, pkRm);
 
     std::cout << "---> " << (result ? "It worked 2" : "Unexpected 2") << std::endl;
 
@@ -299,7 +299,7 @@ static RPCHelpMan getblockcount()
     std::span<const uint8_t> enc2(pkEm.data(), pkEm.size());
     std::span<const uint8_t> skR2(skRm.data(), skRm.size());
 
-    std::optional<std::array<uint8_t, 32>> shared = dhkem_secp256k1::Decap2(enc2, skR2);
+    std::optional<std::array<uint8_t, 32>> shared = dhkem_secp256k1::Decap(enc2, skR2);
 
     if (!shared) {
         std::cout << "---> Empty shared." << std::endl;
@@ -310,7 +310,7 @@ static RPCHelpMan getblockcount()
 
     std::span<const uint8_t> pkRm2(pkRm.data(), pkRm.size());
 
-    std::optional<std::pair<std::array<uint8_t, 32>, std::array<uint8_t, 65>>> shared2 = dhkem_secp256k1::Encap2(pkRm2);
+    std::optional<std::pair<std::array<uint8_t, 32>, std::array<uint8_t, 65>>> shared2 = dhkem_secp256k1::Encap(pkRm2);
 
     if (!shared2) {
         std::cout << "---> Empty shared2." << std::endl;
@@ -326,7 +326,7 @@ static RPCHelpMan getblockcount()
         std::span<const uint8_t> pkEm2_s(pkEm2.data(), pkEm2.size());
         std::span<const uint8_t> skRm2_s(skRm.data(), skRm.size());
 
-        std::optional<std::array<uint8_t, 32>> shared3 = dhkem_secp256k1::Decap2(pkEm2_s, skRm2_s);
+        std::optional<std::array<uint8_t, 32>> shared3 = dhkem_secp256k1::Decap(pkEm2_s, skRm2_s);
 
         if (!shared3) {
             std::cout << "---> Empty shared3." << std::endl;
@@ -342,7 +342,7 @@ static RPCHelpMan getblockcount()
         assert(pkR_bytes.size() == 65);
 
         // Perform encapsulation with the recipient's public key
-        auto maybe_result = dhkem_secp256k1::Encap2(pkR_bytes);
+        auto maybe_result = dhkem_secp256k1::Encap(pkR_bytes);
         assert(maybe_result.has_value()); // Encap should succeed
 
         std::span<const uint8_t> skR_span(reinterpret_cast<const uint8_t*>(skR.data()), skR.size());
@@ -350,7 +350,7 @@ static RPCHelpMan getblockcount()
         // Extract shared_secret_enc and enc (ephemeral public key bytes)
         auto [shared_secret_enc, enc3] = *maybe_result;
         // Decapsulate using the recipient's private key
-        std::optional<std::array<uint8_t, 32>> maybe_shared_secret_dec = dhkem_secp256k1::Decap2(enc3, skR_span);
+        std::optional<std::array<uint8_t, 32>> maybe_shared_secret_dec = dhkem_secp256k1::Decap(enc3, skR_span);
         assert(maybe_shared_secret_dec.has_value());
 
         std::cout << "---> shared_secret_enc: " << HexStr(shared_secret_enc) << std::endl;
