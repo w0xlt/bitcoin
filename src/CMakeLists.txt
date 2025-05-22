@@ -230,6 +230,10 @@ add_library(bitcoin_node STATIC EXCLUDE_FROM_ALL
   consensus/tx_verify.cpp
   dbwrapper.cpp
   deploymentstatus.cpp
+  fiber/fec.cpp
+  fiber/open_hash_set.h
+  fiber/udpnet.cpp
+  fiber/udprelay.cpp
   flatfile.cpp
   headerssync.cpp
   httprpc.cpp
@@ -316,6 +320,9 @@ add_library(bitcoin_node STATIC EXCLUDE_FROM_ALL
   $<$<TARGET_EXISTS:bitcoin_wallet>:wallet/init.cpp>
   $<$<NOT:$<TARGET_EXISTS:bitcoin_wallet>>:dummywallet.cpp>
 )
+
+add_subdirectory(fiber/wirehair)
+
 target_link_libraries(bitcoin_node
   PRIVATE
     core_interface
@@ -325,6 +332,7 @@ target_link_libraries(bitcoin_node
     leveldb
     minisketch
     univalue
+    wirehair
     Boost::headers
     $<TARGET_NAME_IF_EXISTS:libevent::core>
     $<TARGET_NAME_IF_EXISTS:libevent::extra>
