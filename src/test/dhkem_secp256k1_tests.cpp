@@ -10,9 +10,11 @@ using namespace dhkem_secp256k1;
 BOOST_FIXTURE_TEST_SUITE(dhkem_secp256k1_tests, BasicTestingSetup)
 
 struct VectorBase {
+        uint8_t mode_base;
         std::string info;
         std::string ikmE, skEm, pkEm;
         std::string ikmR, skRm, pkRm;
+        std::string psk, psk_id;
         std::string shared_secret;
         std::string key, base_nonce, exporter_secret;
     };
@@ -32,6 +34,7 @@ BOOST_AUTO_TEST_CASE(dhkem_secp256k1_chacha20poly1305_testvectors)
     // Test vectors from Appendix B.3.1 (Base mode):contentReference[oaicite:29]{index=29}:contentReference[oaicite:30]{index=30}
     std::vector<VectorBase> base_vecs = {
         {
+            /* mode_base */ 0x00,
             /* info */ "609dcb9844f8412343191f93add1177186c03a36",
             /* ikmE */  "77caf1617fb3723972a56cd2085081c9f66baae825ce5f363c0a86ec87013fa0",
             /* skEm */  "1300156862599d00ecbb066644bf4d4505b56a9b235eae7a8632defc4335d5c0",
@@ -41,12 +44,15 @@ BOOST_AUTO_TEST_CASE(dhkem_secp256k1_chacha20poly1305_testvectors)
             /* skRm */  "4a99cf59fb6af25c324299a39fef2db3931667ee89528e3aacc8b61d591ad643",
             /* pkRm */  "04e660b55a28899c472ca023dce35f23da3cf16677dbdce9ed25353bd8b70cbb"
                         "8bee0abd2cc8936aee263a08d5b2a15d29a16d12b75fda63b9c614c477af165e2d",
+            /* psk */ "",
+            /* psk_id */ "",
             /* shared_secret */ "a81a3ccf56f48c699eb9f393e0701692836f9ac2e06b493ccbf99ac68a792bbe",
             /* key */          "4c260fe82e8c3737e7a70c3223cb16fc205682255389ad4bc3e7fae42c46b062",
             /* base_nonce */   "e035bbf3c39ff5a7196cfe84",
             /* exporter_secret */ "83e82aad90186ddd7e1db090c840ee70eb6cac7531b64dc52a12997462c8d0d8"
         },
         {
+            /* mode_base */ 0x00,
             "325c816adeee49bea410f0db92947892378f6e0c",
             "597ba1fe9a4db02225bbb3e4cd150ceb68636e84d80e728f1be6b22e8aeefcb0",
             "29e4ff54b558f0a5b3c8f7c016736f6b784ed71d1395bbee07ae4320919465d1",
@@ -56,12 +62,15 @@ BOOST_AUTO_TEST_CASE(dhkem_secp256k1_chacha20poly1305_testvectors)
             "dad1397389c4ff7fa014068bcfbf0c2ea2e24d78b0395fa3de9e88802bc8a684",
             "04be3e5d3dfcc77e81f96f90c5fa3ce7f6f7f7005acaf39a2c3d7d47f1ac1cf1"
             "0bcd06191d07366e706a2ca77e2e0571e11bfc2cbd471904ef0d999af757939da1",
+            /* psk */ "",
+            /* psk_id */ "",
             "9edafcdb619dabc578d8f7b7b055ac66d5cfb6219b90f69d13d297ed49f3aaf3",
             "6e771cd99a23e82ddbd972ecc1b7d3bcd5d6f961370ac2ff785e6776b47b2d53",
             "208b33e382b39dfc1ebb2c95",
             "ead4fa0d88885cc36792039cbf75110d57eac32e883395eae3ccdeba0a53b3d4"
         },
         {
+            /* mode_base */ 0x00,
             "5d274e2436d921573ba466fb5ebef86bd5f77f34",
             "149db0ca6bd0bdabbfca4a61c4a6507efff33eedd844d9e1c299cbaab3a1d006",
             "a342069714f97f18a844495779cf41e82ffa7e98c197ffd1276a8d74823c2519",
@@ -71,6 +80,8 @@ BOOST_AUTO_TEST_CASE(dhkem_secp256k1_chacha20poly1305_testvectors)
             "1ef5ec4b4482951fca257b0a0709f376f08c30a647cefa10f9b150a6839385ff",
             "04706fd6e62dbf8a440f9f77bc47eb0703177f0f80275ce4be175c9c86953677"
             "9a64806dff22c83ceb9b4a87302415a161b7d30a55521d181a6d01974c0648773e",
+            /* psk */ "",
+            /* psk_id */ "",
             "fffa60534552d71101540d8022cd1ffe896da801fe55e194b9d71f1ce882b6ff",
             "ebe85898642db23679f83ae4a81efdea5feb4103553b9834cb1f4f602bcef495",
             "ea1e6ce9451d45f9295189c2",
@@ -78,6 +89,7 @@ BOOST_AUTO_TEST_CASE(dhkem_secp256k1_chacha20poly1305_testvectors)
         },
         // PDK test vector
         {
+            /* mode_base */ 0x00,
             /* info */ "4f6465206f6e2061204772656369616e2055726e",
             /* ikmE */ "ea9f11f8dfb0ca08a8810f9ea39c3a6afb780859e8d8c7bc37b78e2f9b8d68d9",
             /* skEm */ "9558390641d55b914bb5543284ff3c24dcf059cacc3a269f471dace8b13b4f4a",
@@ -87,14 +99,13 @@ BOOST_AUTO_TEST_CASE(dhkem_secp256k1_chacha20poly1305_testvectors)
             /* skRm */ "5d516211fd17a8916cbd4ab60cc52104ea8372aac6678220545fbdb542392cb7",
             /* pkRm */ "04fc04c64e4066b7996481f5f5e6e19ff7c6eded59e7fec49602146e4f3c92f6"
                        "c503acfc3ac970c668a48b5137b993319b5851484365ed7f42fdc7b7e3a8283483",
+            /* psk */ "",
+            /* psk_id */ "",
             /* shared_secret */ "64ba1219520c5d1b0450bf71a222b512e70dff05b6539292b5c402ff8e64f707",
             /* key */          "733fb0e7ce630c1712b629ddefb208fcc6572f6bcae5f15d93fc2984b4f325e5",
             /* base_nonce */   "7028e56372041618809a2566",
             /* exporter_secret */ "58732d8b645ec857be9847995103155b6c6276dda44c1e40b68f1463c03aabb7"
-        }
-    };
-
-    std::vector<VectorAuth> auth_vecs = {
+        },
         {
             /* mode_base */ 0x01,
             /* info */ "4f6465206f6e2061204772656369616e2055726e",
@@ -109,10 +120,6 @@ BOOST_AUTO_TEST_CASE(dhkem_secp256k1_chacha20poly1305_testvectors)
             /* pkRm */  "0432799cc0c65413358871f9b934499a0a444e6bc74dae9bf02b76d8d194cb3d"
                         "f7df7abecd7ac259d085e19f9870aee3fd1d9bc150b1ac0a507b3c05b4d8bebbc8",
 
-            /* ikmS */ "",
-            /* skSm */ "",
-            /* pkSm */ "",
-
             /* psk */ "0247fd33b913760fa1fa51e1892d9f307fbe65eb171e8132c2af18555a738b82",
             /* psk_id */ "456e6e796e20447572696e206172616e204d6f726961",
 
@@ -121,6 +128,9 @@ BOOST_AUTO_TEST_CASE(dhkem_secp256k1_chacha20poly1305_testvectors)
             /* base_nonce */   "96b92e10133d4c4342f99795",
             /* exporter_secret */ "8d2b23f021dfc021238609db86f5cf474c328386b475fdfbccc7948b3c63099e"
         },
+    };
+
+    std::vector<VectorAuth> auth_vecs = {
         {
             /* mode_base */ 0x02,
             /* info */ "4f6465206f6e2061204772656369616e2055726e",
@@ -132,7 +142,7 @@ BOOST_AUTO_TEST_CASE(dhkem_secp256k1_chacha20poly1305_testvectors)
 
             /* ikmR */  "50cbce1763d8db5952384e4d1f429372d590cf23b4ce5ccbc44f249531de1a34",
             /* skRm */  "032527c68d81c0ce10727887a9e7f1752390e702ac9458f78ae5c0c7590f3b1c",
-            /* pkRm */  "048ea2360c4ce337676835cc1110015ab2f3b888be2fdbd7296fff7ff4cd1d1d5",
+            /* pkRm */  "048ea2360c4ce337676835cc1110015ab2f3b888be2fdbd7296fff7ff4cd1d1d5"
                         "6fc16fb4addf026d5cee86bcb7e08c0a758c2fd9df3d26e4251561e04114c788a",
 
             /* ikmS */ "a9b766eeb01906ec0f0e106c69a98aded35b46a5b0c11da633a108cfe7868438",
@@ -182,6 +192,7 @@ BOOST_AUTO_TEST_CASE(dhkem_secp256k1_chacha20poly1305_testvectors)
 
     // Process each Base mode test vector
     for (size_t i = 0; i < base_vecs.size(); ++i) {
+        uint8_t mode_base = base_vecs[i].mode_base;
         std::string info_hex = base_vecs[i].ikmE; // Actually the 'info' is stored separately above for each case
         // The "info" hex is given in the base_vecs as the first string (we placed the info hex in ikmE field for convenience)
         std::vector<unsigned char> info = ParseHex(base_vecs[i].info);
@@ -191,6 +202,8 @@ BOOST_AUTO_TEST_CASE(dhkem_secp256k1_chacha20poly1305_testvectors)
         std::vector<unsigned char> exp_pkEm = ParseHex(base_vecs[i].pkEm);
         std::vector<unsigned char> exp_skRm = ParseHex(base_vecs[i].skRm);
         std::vector<unsigned char> exp_pkRm = ParseHex(base_vecs[i].pkRm);
+        std::vector<unsigned char> psk = ParseHex(base_vecs[i].psk);
+        std::vector<unsigned char> psk_id = ParseHex(base_vecs[i].psk_id);
         std::vector<unsigned char> exp_shared = ParseHex(base_vecs[i].shared_secret);
         std::vector<unsigned char> exp_key = ParseHex(base_vecs[i].key);
         std::vector<unsigned char> exp_nonce = ParseHex(base_vecs[i].base_nonce);
@@ -228,10 +241,10 @@ BOOST_AUTO_TEST_CASE(dhkem_secp256k1_chacha20poly1305_testvectors)
         ss_vec.assign(maybe_shared_secret_dec->begin(), maybe_shared_secret_dec->end());
 
         // Derive HPKE context key, base_nonce, exporter_secret using key schedule (mode 0x00):contentReference[oaicite:33]{index=33}
-        uint8_t mode_base = 0x00;
         // default psk_id = default_psk = "" in Base mode
         std::vector<uint8_t> label_psk_id_hash = {'p', 's', 'k', '_', 'i', 'd', '_', 'h', 'a', 's', 'h'};
-        auto psk_id_hash = LabeledExtract({}, label_psk_id_hash, std::vector<unsigned char>());  // empty ikm
+        // auto psk_id_hash = LabeledExtract({}, label_psk_id_hash, std::vector<unsigned char>());psk_id
+        auto psk_id_hash = LabeledExtract({}, label_psk_id_hash, psk_id);
 
         std::vector<uint8_t> label_info_hash = {'i', 'n', 'f', 'o', '_', 'h', 'a', 's', 'h'};
         auto info_hash = LabeledExtract({}, label_info_hash, info);
@@ -242,7 +255,6 @@ BOOST_AUTO_TEST_CASE(dhkem_secp256k1_chacha20poly1305_testvectors)
         context.insert(context.end(), psk_id_hash.begin(), psk_id_hash.end());
         context.insert(context.end(), info_hash.begin(), info_hash.end());
 
-        std::vector<unsigned char> psk; // empty
         std::vector<uint8_t> label_secret = {'s', 'e', 'c', 'r', 'e', 't'};
         auto secret = LabeledExtract(ss_vec, label_secret, psk);
 
@@ -263,6 +275,7 @@ BOOST_AUTO_TEST_CASE(dhkem_secp256k1_chacha20poly1305_testvectors)
 
     for (size_t i = 0; i < auth_vecs.size(); ++i) {
         // 1. Parse all hex inputs from the test vector
+        uint8_t mode_base = base_vecs[i].mode_base;
         std::vector<unsigned char> info      = ParseHex(auth_vecs[i].info);
         std::vector<unsigned char> ikmE      = ParseHex(auth_vecs[i].ikmE);
         std::vector<unsigned char> ikmR      = ParseHex(auth_vecs[i].ikmR);
