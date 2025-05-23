@@ -273,16 +273,17 @@ BOOST_AUTO_TEST_CASE(dhkem_secp256k1_chacha20poly1305_testvectors)
         BOOST_CHECK_EQUAL(HexStr(got_exporter), HexStr(exp_exporter));
     }
 
+    // Process each Auth mode test vector
     for (size_t i = 0; i < auth_vecs.size(); ++i) {
         // 1. Parse all hex inputs from the test vector
-        uint8_t mode_base = base_vecs[i].mode_base;
+        uint8_t mode_base = auth_vecs[i].mode_base;
         std::vector<unsigned char> info      = ParseHex(auth_vecs[i].info);
         std::vector<unsigned char> ikmE      = ParseHex(auth_vecs[i].ikmE);
         std::vector<unsigned char> ikmR      = ParseHex(auth_vecs[i].ikmR);
         std::vector<unsigned char> ikmS      = ParseHex(auth_vecs[i].ikmS);
 
-        std::vector<unsigned char> psk         = ParseHex(auth_vecs[i].psk);
-        std::vector<unsigned char> psk_id      = ParseHex(auth_vecs[i].psk_id);
+        std::vector<unsigned char> psk       = ParseHex(auth_vecs[i].psk);
+        std::vector<unsigned char> psk_id    = ParseHex(auth_vecs[i].psk_id);
 
         std::vector<unsigned char> exp_skEm  = ParseHex(auth_vecs[i].skEm);
         std::vector<unsigned char> exp_pkEm  = ParseHex(auth_vecs[i].pkEm);
@@ -297,7 +298,76 @@ BOOST_AUTO_TEST_CASE(dhkem_secp256k1_chacha20poly1305_testvectors)
         std::vector<unsigned char> exp_key   = ParseHex(auth_vecs[i].key);
         std::vector<unsigned char> exp_nonce = ParseHex(auth_vecs[i].base_nonce);
         std::vector<unsigned char> exp_exporter = ParseHex(auth_vecs[i].exporter_secret);
+
+        // 2. Derive ephemeral, receiver, and sender key pairs from ikm inputs and compare with expected sk/pk values
+        std::array<uint8_t, 32> skEm;
+        std::array<uint8_t, 65> pkEm;
+        bool ok = dhkem_secp256k1::DeriveKeyPair(std::span<const uint8_t>(ikmE.data(), ikmE.size()), skEm, pkEm);
+        BOOST_CHECK(ok);
+        BOOST_CHECK_EQUAL(HexStr(skEm), HexStr(exp_skEm));
+        BOOST_CHECK_EQUAL(HexStr(pkEm), HexStr(exp_pkEm));
+
+        std::array<uint8_t, 32> skRm;
+        std::array<uint8_t, 65> pkRm;
+        ok = dhkem_secp256k1::DeriveKeyPair(std::span<const uint8_t>(ikmR.data(), ikmR.size()), skRm, pkRm);
+        BOOST_CHECK(ok);
+        BOOST_CHECK_EQUAL(HexStr(skRm), HexStr(exp_skRm));
+        BOOST_CHECK_EQUAL(HexStr(pkRm), HexStr(exp_pkRm));
+
+        std::array<uint8_t, 32> skSm;
+        std::array<uint8_t, 65> pkSm;
+        ok = dhkem_secp256k1::DeriveKeyPair(std::span<const uint8_t>(ikmS.data(), ikmS.size()), skSm, pkSm);
+        BOOST_CHECK(ok);
+        BOOST_CHECK_EQUAL(HexStr(skSm), HexStr(exp_skSm));
+        BOOST_CHECK_EQUAL(HexStr(pkSm), HexStr(exp_pkSm));
+
+        // 3. Use dhkem_secp256k1::AuthEncap with pkR and skS to produce enc and shared_secret
+        std::array<uint8_t, 65> enc;
+        std::array<uint8_t, 32> shared_secret_enc;
+        std::array<uint8_t, 32> shared_secret_dec;
+        BOOST_CHECK(dhkem_secp256k1::AuthEncap(enc, shared_secret_enc, pkRm, skSm));
+
+        // 4. Use dhkem_secp256k1::AuthDecap with enc, skR, pkS to decapsulate and get shared_secret
+        BOOST_CHECK(dhkem_secp256k1::AuthDecap(shared_secret_dec, enc, skRm, pkSm));
+        BOOST_CHECK_EQUAL(HexStr(shared_secret_enc), HexStr(shared_secret_dec));
+
+        // 5. Derive psk_id_hash and info_hash via LabeledExtract
+        // (using empty salt as per HPKE spec)
+        std::vector<uint8_t> label_psk_id_hash = {'p','s','k','_','i','d','_','h','a','s','h'};
+        auto psk_id_hash = LabeledExtract({}, label_psk_id_hash, psk_id);
+        std::vector<uint8_t> label_info_hash = {'i','n','f','o','_','h','a','s','h'};
+        auto info_hash = LabeledExtract({}, label_info_hash, info);
+
+        // 6. Construct key schedule context as: mode || psk_id_hash || info_hash
+        std::vector<unsigned char> context;
+        context.push_back(mode_base);
+        context.insert(context.end(), psk_id_hash.begin(), psk_id_hash.end());
+        context.insert(context.end(), info_hash.begin(), info_hash.end());
+
+        // 7. Extract secret from shared_secret and psk using label "secret"
+        // Use the test vector's shared_secret (decapsulated using expected enc)
+        std::array<uint8_t, 32> shared_secret_test;
+        BOOST_CHECK(dhkem_secp256k1::AuthDecap(shared_secret_test, pkEm, skRm, pkSm));
+        BOOST_CHECK_EQUAL(HexStr(shared_secret_test), HexStr(exp_shared));
+        std::vector<unsigned char> ss_vec;
+        ss_vec.assign(shared_secret_test.begin(), shared_secret_test.end());
+        std::vector<uint8_t> label_secret = {'s','e','c','r','e','t'};
+        auto secret = LabeledExtract(ss_vec, label_secret, psk);
+
+        // 8. Expand the secret into key, base_nonce, and exporter_secret using labels "key", "base_nonce", and "exp"
+        std::vector<uint8_t> label_key = {'k','e','y'};
+        std::vector<unsigned char> got_key = dhkem_secp256k1::LabeledExpand(secret, label_key, context, 32);
+        std::vector<uint8_t> label_base_nonce = {'b','a','s','e','_','n','o','n','c','e'};
+        std::vector<unsigned char> got_nonce = dhkem_secp256k1::LabeledExpand(secret, label_base_nonce, context, 12);
+        std::vector<uint8_t> label_exp = {'e','x','p'};
+        std::vector<unsigned char> got_exporter = dhkem_secp256k1::LabeledExpand(secret, label_exp, context, exp_exporter.size());
+
+        // Compare all outputs with expected test vector values
+        BOOST_CHECK_EQUAL(HexStr(got_key), HexStr(exp_key));
+        BOOST_CHECK_EQUAL(HexStr(got_nonce), HexStr(exp_nonce));
+        BOOST_CHECK_EQUAL(HexStr(got_exporter), HexStr(exp_exporter));
     }
+
 }
 
 BOOST_AUTO_TEST_CASE(dhkem_encap_decap)
