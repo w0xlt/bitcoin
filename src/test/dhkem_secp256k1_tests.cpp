@@ -9,9 +9,7 @@ using namespace dhkem_secp256k1;
 
 BOOST_FIXTURE_TEST_SUITE(dhkem_secp256k1_tests, BasicTestingSetup)
 
-BOOST_AUTO_TEST_CASE(dhkem_secp256k1_chacha20poly1305_testvectors)
-{
-    struct VectorBase {
+struct VectorBase {
         std::string info;
         std::string ikmE, skEm, pkEm;
         std::string ikmR, skRm, pkRm;
@@ -26,6 +24,8 @@ BOOST_AUTO_TEST_CASE(dhkem_secp256k1_chacha20poly1305_testvectors)
         std::string key, base_nonce, exporter_secret;
     };
 
+BOOST_AUTO_TEST_CASE(dhkem_secp256k1_chacha20poly1305_testvectors)
+{
     // Test vectors from Appendix B.3.1 (Base mode):contentReference[oaicite:29]{index=29}:contentReference[oaicite:30]{index=30}
     std::vector<VectorBase> base_vecs = {
         {
@@ -73,6 +73,22 @@ BOOST_AUTO_TEST_CASE(dhkem_secp256k1_chacha20poly1305_testvectors)
             "ebe85898642db23679f83ae4a81efdea5feb4103553b9834cb1f4f602bcef495",
             "ea1e6ce9451d45f9295189c2",
             "92ea7629022c39382b333c1dcdc2dbed9cd2de4fe1d57320125577231aa35203"
+        },
+        // PDK test vector
+        {
+            /* info */ "4f6465206f6e2061204772656369616e2055726e",
+            /* ikmE */ "ea9f11f8dfb0ca08a8810f9ea39c3a6afb780859e8d8c7bc37b78e2f9b8d68d9",
+            /* skEm */ "9558390641d55b914bb5543284ff3c24dcf059cacc3a269f471dace8b13b4f4a",
+            /* pkEm */ "0405607e978f274af24b219c1d4866e37213694f1dc050a023cdcf5a7d994b377"
+                       "7be96104361fd8ec62602756edbdbd2a36bf10c93011cbe949cfcb634325a7aea",
+            /* ikmR */ "a22427226377cc867d51ad3f130af08ad13451de7160efa2b23076fd782de967",
+            /* skRm */ "5d516211fd17a8916cbd4ab60cc52104ea8372aac6678220545fbdb542392cb7",
+            /* pkRm */ "04fc04c64e4066b7996481f5f5e6e19ff7c6eded59e7fec49602146e4f3c92f6"
+                       "c503acfc3ac970c668a48b5137b993319b5851484365ed7f42fdc7b7e3a8283483",
+            /* shared_secret */ "64ba1219520c5d1b0450bf71a222b512e70dff05b6539292b5c402ff8e64f707",
+            /* key */          "733fb0e7ce630c1712b629ddefb208fcc6572f6bcae5f15d93fc2984b4f325e5",
+            /* base_nonce */   "7028e56372041618809a2566",
+            /* exporter_secret */ "58732d8b645ec857be9847995103155b6c6276dda44c1e40b68f1463c03aabb7"
         }
     };
 

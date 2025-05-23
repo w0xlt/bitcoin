@@ -235,19 +235,9 @@ static RPCHelpMan getblockcount()
     ChainstateManager& chainman = EnsureAnyChainman(request.context);
     LOCK(cs_main);
 
-
-    /* std::vector<unsigned char> ikmE = ParseHex("77caf1617fb3723972a56cd2085081c9f66baae825ce5f363c0a86ec87013fa0");
-
-    unsigned char out_sk[32];
-    memset(out_sk, 0, 32);
-
-    unsigned char out_pk[32];
-    memset(out_pk, 0, 32);
-
-    bool ret = dhkem_secp256k1::DeriveKeyPair2(ikmE.data(), ikmE.size(), out_sk, out_pk); */
-
     dhkem_secp256k1::InitContext();
 
+    /* 
     // Test vector from IETF draft: known IKM -> expected SK and PK:contentReference[oaicite:18]{index=18}.
     std::vector<unsigned char> ikmE = ParseHex(
         "77caf1617fb3723972a56cd2085081c9f66baae825ce5f363c0a86ec87013fa0"
@@ -264,15 +254,6 @@ static RPCHelpMan getblockcount()
 
     std::cout << "---> skEm: " << HexStr(pkEm) << std::endl;
 
-    /* uint8_t skEm[32], pkEm[65];
-    bool ok = dhkem_secp256k1::DeriveKeyPair(ikm.data(), ikm.size(), skEm, pkEm); // DONT WORK
-
-    std::cout << "---> " << (ok ? "It worked 2" : "Unexpected 2") << std::endl;
-
-    std::cout << "---> skEm: " << HexStr(skEm) << std::endl;
-
-    std::cout << "---> pkEm: " << HexStr(pkEm) << std::endl; */
-
     std::vector<unsigned char> ikmR = ParseHex(
         "71b530bed75fc3fa2f8e8bb163203e6ee676565cc61cd59d66352676341c0688"
     );
@@ -288,13 +269,6 @@ static RPCHelpMan getblockcount()
 
     std::cout << "---> pkRm: " << HexStr(pkRm) << std::endl;
 
-    /// ---
-    /* uint8_t shared[32];
-    result = dhkem_secp256k1::Decap(pkEm.data(), skRm.data(), shared);
-
-    std::cout << "---> " << (result ? "It worked 3" : "Unexpected 3") << std::endl;
-
-    std::cout << "---> shared: " << HexStr(shared) << std::endl; */
 
     std::span<const uint8_t> enc2(pkEm.data(), pkEm.size());
     std::span<const uint8_t> skR2(skRm.data(), skRm.size());
@@ -365,8 +339,8 @@ static RPCHelpMan getblockcount()
     // 1. Generate sender (skS) and recipient (skR) key pairs
     CKey skS;
     CKey skR;
-    skS.MakeNewKey(/* compressed = */ false);
-    skR.MakeNewKey(/* compressed = */ false);
+    skS.MakeNewKey(false);
+    skR.MakeNewKey(false);
     CPubKey pkS = skS.GetPubKey();
     CPubKey pkR = skR.GetPubKey();
 
@@ -401,6 +375,80 @@ static RPCHelpMan getblockcount()
     std::cout << "xxxxx: " << (xxxxx ? "true" : "false") << std::endl;
 
     std::cout << "---> shared_secret2: " << HexStr(shared_secret2) << std::endl;
+
+ */
+    /// --- new tests
+
+    std::vector<unsigned char> info = ParseHex("4f6465206f6e2061204772656369616e2055726e");
+
+    std::vector<unsigned char> ikmE = ParseHex(
+        "ea9f11f8dfb0ca08a8810f9ea39c3a6afb780859e8d8c7bc37b78e2f9b8d68d9"
+    );
+    std::array<uint8_t, 32> skEm;
+    std::array<uint8_t, 65> pkEm;
+    bool result = dhkem_secp256k1::DeriveKeyPair(std::span<const uint8_t>(ikmE.data(), ikmE.size()), skEm, pkEm);
+    assert(result);
+
+    std::cout << "info: " << HexStr(info) << std::endl;
+
+    std::cout << "skEm: " << HexStr(skEm) << std::endl;
+    std::cout << "pkEm: " << HexStr(pkEm) << std::endl;
+
+    std::vector<unsigned char> ikmR = ParseHex(
+        "a22427226377cc867d51ad3f130af08ad13451de7160efa2b23076fd782de967"
+    );
+    std::array<uint8_t, 32> skRm;
+    std::array<uint8_t, 65> pkRm;
+    result = dhkem_secp256k1::DeriveKeyPair(std::span<const uint8_t>(ikmR.data(), ikmR.size()), skRm, pkRm);
+    assert(result);
+
+    std::cout << "skRm: " << HexStr(skRm) << std::endl;
+    std::cout << "pkRm: " << HexStr(pkRm) << std::endl;
+
+    auto maybe_result = dhkem_secp256k1::Encap(pkRm);
+    assert(maybe_result.has_value()); // Encap should succeed
+
+    std::optional<std::array<uint8_t, 32>> shared_secret = dhkem_secp256k1::Decap(pkEm, skRm);
+    assert(shared_secret.has_value());
+    std::cout << "shared_secret: (dec)" << HexStr(*shared_secret) << std::endl;
+
+    std::vector<unsigned char> ss_vec;
+    ss_vec.assign(shared_secret->begin(), shared_secret->end());
+
+    // Derive HPKE context key, base_nonce, exporter_secret using key schedule (mode 0x00):contentReference[oaicite:33]{index=33}
+    uint8_t mode_base = 0x00;
+    // default psk_id = default_psk = "" in Base mode
+    std::vector<uint8_t> label_psk_id_hash = {'p', 's', 'k', '_', 'i', 'd', '_', 'h', 'a', 's', 'h'};
+    auto psk_id_hash = dhkem_secp256k1::LabeledExtract({}, label_psk_id_hash, std::vector<unsigned char>());  // empty ikm
+
+    std::cout << "psk_id_hash: " << HexStr(psk_id_hash) << std::endl;
+
+    std::vector<uint8_t> label_info_hash = {'i', 'n', 'f', 'o', '_', 'h', 'a', 's', 'h'};
+    auto info_hash = dhkem_secp256k1::LabeledExtract({}, label_info_hash, info);
+
+    // key_schedule_context = mode || psk_id_hash || info_hash
+    std::vector<unsigned char> context;
+    context.push_back(mode_base);
+    context.insert(context.end(), psk_id_hash.begin(), psk_id_hash.end());
+    context.insert(context.end(), info_hash.begin(), info_hash.end());
+
+    std::vector<unsigned char> psk; // empty
+    std::vector<uint8_t> label_secret = {'s', 'e', 'c', 'r', 'e', 't'};
+    auto secret = dhkem_secp256k1::LabeledExtract(ss_vec, label_secret, psk);
+
+    // Derive key, base_nonce, exporter_secret
+    std::vector<uint8_t> label_key = {'k','e','y'};
+    std::vector<unsigned char> got_key   = dhkem_secp256k1::LabeledExpand(secret, label_key, context, 32);
+
+    std::vector<uint8_t> label_base_nonce = {'b','a','s','e','_','n','o','n','c','e'};
+    std::vector<unsigned char> got_nonce = dhkem_secp256k1::LabeledExpand(secret, label_base_nonce, context, 12);
+
+    std::vector<uint8_t> label_exp = {'e','x','p'};
+    std::vector<unsigned char> got_exporter = dhkem_secp256k1::LabeledExpand(secret, label_exp, context, 32);
+
+    std::cout << "key: " << HexStr(got_key) << std::endl;
+    std::cout << "base_nonce: " << HexStr(got_nonce) << std::endl;
+    std::cout << "exporter_secret: " << HexStr(got_exporter) << std::endl;
 
     return chainman.ActiveChain().Height();
 },
