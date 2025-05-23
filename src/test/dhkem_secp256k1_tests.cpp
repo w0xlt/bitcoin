@@ -17,6 +17,8 @@ struct VectorBase {
         std::string key, base_nonce, exporter_secret;
     };
     struct VectorAuth {
+        uint8_t mode_base;
+        std::string info;
         std::string ikmE, skEm, pkEm;
         std::string ikmR, skRm, pkRm;
         std::string ikmS, skSm, pkSm;
@@ -29,8 +31,7 @@ BOOST_AUTO_TEST_CASE(dhkem_secp256k1_chacha20poly1305_testvectors)
     // Test vectors from Appendix B.3.1 (Base mode):contentReference[oaicite:29]{index=29}:contentReference[oaicite:30]{index=30}
     std::vector<VectorBase> base_vecs = {
         {
-            /* info (not directly in VectorBase, will use below) */ 
-            "609dcb9844f8412343191f93add1177186c03a36",
+            /* info */ "609dcb9844f8412343191f93add1177186c03a36",
             /* ikmE */  "77caf1617fb3723972a56cd2085081c9f66baae825ce5f363c0a86ec87013fa0",
             /* skEm */  "1300156862599d00ecbb066644bf4d4505b56a9b235eae7a8632defc4335d5c0",
             /* pkEm */  "0471788be0ccf916302c4f2225bba89a0ff3832df1fe50b48d8ccb910be74e30"
@@ -89,6 +90,25 @@ BOOST_AUTO_TEST_CASE(dhkem_secp256k1_chacha20poly1305_testvectors)
             /* key */          "733fb0e7ce630c1712b629ddefb208fcc6572f6bcae5f15d93fc2984b4f325e5",
             /* base_nonce */   "7028e56372041618809a2566",
             /* exporter_secret */ "58732d8b645ec857be9847995103155b6c6276dda44c1e40b68f1463c03aabb7"
+        }
+    };
+
+    std::vector<VectorAuth> auth_vecs = {
+        {
+            /* mode_base */ 0x01,
+            /* info */ "4f6465206f6e2061204772656369616e2055726e",
+            /* ikmE */  "ca2f07a37c4b3903f3d30e29217ced84e4565a767abcde0c1f5583a9c9c77da5",
+            /* skEm */  "89938ff5f0ae9151137de9d897e1cdb777fb4ea79cc0478fd4a15983003a2f3e",
+            /* pkEm */  "0488478b83a7190b1ef0c00d7fa55089b79fbd58b51319895d872633bbd3418d1"
+                        "f7fe30a6370bcf091a24bf1dcb734b91739534974df55a0839a27fe7052408491",
+            /* ikmR */  "52f6d2dd43970164da3fc7b517b61024fcad5acd80e4e585902180d1eb16fd37",
+            /* skRm */  "ae100b7f8a2a8c4b86d5f5d93470e147356ba135159ed0953fb4369c7eb998fb",
+            /* pkRm */  "0432799cc0c65413358871f9b934499a0a444e6bc74dae9bf02b76d8d194cb3d"
+                        "f7df7abecd7ac259d085e19f9870aee3fd1d9bc150b1ac0a507b3c05b4d8bebbc8",
+            /* shared_secret */ "fd01659e153a8df062db1ecaf9441a325eebe074c3d459aa2385641eda410657",
+            /* key */          "ad68a1a1c02abf953c4c05ec0991b9267759af5b5a31ef1c5577fcef7d497074",
+            /* base_nonce */   "96b92e10133d4c4342f99795",
+            /* exporter_secret */ "8d2b23f021dfc021238609db86f5cf474c328386b475fdfbccc7948b3c63099e"
         }
     };
 
