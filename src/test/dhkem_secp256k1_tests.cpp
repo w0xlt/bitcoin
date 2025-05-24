@@ -225,7 +225,7 @@ BOOST_AUTO_TEST_CASE(dhkem_secp256k1_chacha20poly1305_testvectors)
                     /* pt    */ "4265617574792069732074727574682c20747275746820626561757479",
                     /* aad   */ "436f756e742d30",
                     /* nonce */ "9fd1def36fa6a402b1d05775",
-                    /* ct    */ "9fd1def36fa6a402b1d05775",
+                    /* ct    */ "81c7ddd876f161c7968724fc5515e94e4ce2a61fc02c16d404ac82cc129189e943856ee944809f9de7eaeefb07",
                 }
             }
         }
@@ -491,6 +491,87 @@ BOOST_AUTO_TEST_CASE(dhkem_secp256k1_chacha20poly1305_testvectors)
         BOOST_CHECK_EQUAL(HexStr(got_key), HexStr(exp_key));
         BOOST_CHECK_EQUAL(HexStr(got_nonce), HexStr(exp_nonce));
         BOOST_CHECK_EQUAL(HexStr(got_exporter), HexStr(exp_exporter));
+
+        // Verify AEAD encryption/decryption for each Encryption entry (Base mode)
+        for (size_t j = 0; j < auth_vecs[i].encryptions.size(); ++j) {
+
+            const Encryption& enc = auth_vecs[i].encryptions[j];
+            // Parse expected plaintext, AAD, nonce, and ciphertext from hex
+            std::vector<unsigned char> exp_pt   = ParseHex(enc.pt);
+            std::vector<unsigned char> exp_aad  = ParseHex(enc.aad);
+            std::vector<unsigned char> exp_nonce_enc = ParseHex(enc.nonce);
+            std::vector<unsigned char> exp_ct   = ParseHex(enc.ct);
+
+            // Compute nonce = base_nonce XOR I2OSP(seq, Nn) as per RFC 9180 §5.2 (seq = j)
+            std::array<uint8_t, 12> seq_bytes{};            // 12-byte buffer initialized to 0
+            uint64_t seq_num = j + 1;
+            // Fill last 8 bytes of seq_bytes with seq_num in big-endian form
+            seq_bytes[4]  = static_cast<uint8_t>(seq_num >> 56);
+            seq_bytes[5]  = static_cast<uint8_t>(seq_num >> 48);
+            seq_bytes[6]  = static_cast<uint8_t>(seq_num >> 40);
+            seq_bytes[7]  = static_cast<uint8_t>(seq_num >> 32);
+            seq_bytes[8]  = static_cast<uint8_t>(seq_num >> 24);
+            seq_bytes[9]  = static_cast<uint8_t>(seq_num >> 16);
+            seq_bytes[10] = static_cast<uint8_t>(seq_num >> 8);
+            seq_bytes[11] = static_cast<uint8_t>(seq_num >> 0);
+
+            // std::cout << "seq: " << HexStr(seq_bytes) << std::endl;
+
+            std::vector<uint8_t> nonce(12);
+            for (int k = 0; k < 12; ++k) {
+                nonce[k] = got_nonce[k] ^ seq_bytes[k];
+            }
+            // The derived nonce should equal the expected nonce from test vector
+            BOOST_CHECK_EQUAL(HexStr(nonce), HexStr(exp_nonce_enc));
+
+            // Seal: encrypt plaintext and verify ciphertext matches expected ct
+            /* ChaCha20::Nonce96 nonce_val = {
+                // first 64 bits:
+                (static_cast<uint64_t>(nonce[0]) << 56) | (static_cast<uint64_t>(nonce[1]) << 48) |
+                (static_cast<uint64_t>(nonce[2]) << 40) | (static_cast<uint64_t>(nonce[3]) << 32) |
+                (static_cast<uint64_t>(nonce[4]) << 24) | (static_cast<uint64_t>(nonce[5]) << 16) |
+                (static_cast<uint64_t>(nonce[6]) << 8)  | (static_cast<uint64_t>(nonce[7])),
+                // last 32 bits:
+                (static_cast<uint32_t>(nonce[8]) << 24) | (static_cast<uint32_t>(nonce[9]) << 16) |
+                (static_cast<uint32_t>(nonce[10]) << 8) | (static_cast<uint32_t>(nonce[11]))
+            }; */
+
+
+            ChaCha20::Nonce96 nonce_val;
+            nonce_val.first  = ReadLE32(got_nonce.data());       // first 4 bytes as little-endian uint32
+            nonce_val.second = ReadLE64(got_nonce.data() + 4);  
+
+            std::vector<unsigned char> nonce_first(4);
+            WriteLE32(nonce_first.data(), nonce_val.first);
+
+            std::vector<unsigned char> nonce_second(8);
+            WriteLE64(nonce_second.data(), nonce_val.second);
+
+            std::cout << "----------------------------------" << std::endl;
+            std::cout << "j: " << j << std::endl;
+            std::cout << "nonce: " << HexStr(nonce) << std::endl;
+            std::cout << "nonce_first: " << HexStr(nonce_first) << std::endl;
+            std::cout << "nonce_second: " << HexStr(nonce_second) << std::endl;
+
+            auto ciphertext = dhkem_secp256k1::Seal(
+                std::span<const std::byte>(reinterpret_cast<const std::byte*>(got_key.data()), got_key.size()),
+                nonce_val,
+                std::span<const std::byte>(reinterpret_cast<const std::byte*>(exp_aad.data()), exp_aad.size()),
+                std::span<const std::byte>(reinterpret_cast<const std::byte*>(exp_pt.data()), exp_pt.size())
+            );
+            BOOST_CHECK_EQUAL(HexStr(ciphertext), HexStr(exp_ct));
+
+            auto decrypted = dhkem_secp256k1::Open(
+                std::span<const std::byte>(reinterpret_cast<const std::byte*>(got_key.data()), got_key.size()),
+                nonce_val,
+                std::span<const std::byte>(reinterpret_cast<const std::byte*>(exp_aad.data()), exp_aad.size()),
+                std::span<const std::byte>(reinterpret_cast<const std::byte*>(ciphertext.data()), ciphertext.size())
+            );
+            BOOST_CHECK(decrypted.has_value());
+            BOOST_CHECK_EQUAL(HexStr(*decrypted), HexStr(exp_pt));
+
+
+        }
     }
 
 }
