@@ -9,6 +9,7 @@
 #include <cstring>
 #include <support/allocators/secure.h>
 #include <optional>
+#include <crypto/chacha20poly1305.h>  // for AEADChaCha20Poly1305 and Nonce96
 
 namespace dhkem_secp256k1 {
 
@@ -390,6 +391,39 @@ bool AuthDecap(std::array<uint8_t, 32>& shared_secret,
                                                        kem_context, sizeof(kem_context));
     shared_secret = shared;
     return true;
+}
+
+std::vector<uint8_t> Seal(std::span<const std::byte> key, ChaCha20::Nonce96 nonce,
+                                           std::span<const std::byte> aad, std::span<const std::byte> plaintext)
+{
+    assert(key.size() == AEADChaCha20Poly1305::KEYLEN);
+    AEADChaCha20Poly1305 aead(key);  // Initialize AEAD with the 32-byte key
+    // Allocate output: plaintext length + 16-byte tag
+    std::vector<uint8_t> ciphertext(plaintext.size() + AEADChaCha20Poly1305::EXPANSION);
+    // Encrypt plaintext; result = ciphertext || tag
+    std::span<std::byte> cipher_span(reinterpret_cast<std::byte*>(ciphertext.data()), ciphertext.size());
+    aead.Encrypt(plaintext, aad, nonce, cipher_span);
+    return ciphertext;
+}
+
+std::optional<std::vector<uint8_t>> Open(std::span<const std::byte> key, ChaCha20::Nonce96 nonce,
+                                                          std::span<const std::byte> aad, std::span<const std::byte> ciphertext)
+{
+    assert(key.size() == AEADChaCha20Poly1305::KEYLEN);
+    // Ciphertext must include at least the 16-byte tag
+    if (ciphertext.size() < AEADChaCha20Poly1305::EXPANSION) {
+        return std::nullopt;
+    }
+    size_t plaintext_len = ciphertext.size() - AEADChaCha20Poly1305::EXPANSION;
+    std::vector<uint8_t> plaintext(plaintext_len);
+    std::span<std::byte> plain_span(reinterpret_cast<std::byte*>(plaintext.data()), plaintext.size());
+    AEADChaCha20Poly1305 aead(key);
+    // Decrypt and verify tag (Decrypt returns false if authentication fails)
+    bool ok = aead.Decrypt(ciphertext, aad, nonce, plain_span);
+    if (!ok) {
+        return std::nullopt; // Tag mismatch or decryption failure
+    }
+    return plaintext;
 }
 
 } // namespace dhkem_secp256k1

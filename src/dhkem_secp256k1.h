@@ -10,6 +10,7 @@
 #include <array>
 #include <optional>
 #include <vector>
+#include <crypto/chacha20poly1305.h>  // for AEADChaCha20Poly1305 and Nonce96
 
 /**
  * secp256k1-based DHKEM for HPKE (Hybrid Public Key Encryption)
@@ -134,6 +135,25 @@ bool AuthDecap(std::array<uint8_t, 32>& shared_secret,
                const std::array<uint8_t, 65>& enc,
                const std::array<uint8_t, 32>& skR,
                const std::array<uint8_t, 65>& pkS);
+
+/**
+ * Seal(key, nonce, aad, plaintext): AEAD encryption with ChaCha20-Poly1305.
+ * 
+ * Encrypts the plaintext with a 32-byte key, 96-bit nonce, and associated data (AAD).
+ * Returns a vector containing the ciphertext followed by the 16-byte authentication tag.
+ */
+std::vector<uint8_t> Seal(std::span<const std::byte> key, ChaCha20::Nonce96 nonce,
+                          std::span<const std::byte> aad, std::span<const std::byte> plaintext);
+
+/**
+ * Open(key, nonce, aad, ciphertext): AEAD decryption with ChaCha20-Poly1305.
+ * 
+ * Decrypts the ciphertext (including its 16-byte authentication tag) using the given key, nonce, and AAD.
+ * Returns the plaintext on success, or std::nullopt if authentication fails (e.g., if ciphertext or tag are modified).
+ */
+std::optional<std::vector<uint8_t>> Open(std::span<const std::byte> key, ChaCha20::Nonce96 nonce,
+                                         std::span<const std::byte> aad, std::span<const std::byte> ciphertext);
+
 
 } // namespace dhkem_secp256k1
 

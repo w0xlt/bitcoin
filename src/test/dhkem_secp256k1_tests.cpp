@@ -435,5 +435,101 @@ BOOST_AUTO_TEST_CASE(dhkem_auth_encap_decap)
     BOOST_CHECK_EQUAL(HexStr(shared_secret_enc), HexStr(shared_secret_dec));
 }
 
+BOOST_AUTO_TEST_CASE(dhkem_secp256k1_seal_open)
+{
+    // 1. Encryption/decryption with empty plaintext and non-empty AAD
+    std::array<uint8_t, 32> key1 = {0};               // 32-byte key (all zeros)
+    ChaCha20::Nonce96 nonce1 = {0, 0};                // 96-bit nonce = 0x000000000000000000000000
+    std::vector<uint8_t> aad1 = {'T','e','s','t',' ','A','A','D'};  // example AAD
+    std::vector<uint8_t> plaintext1;                  // empty plaintext
+    // Seal: encrypt plaintext1
+    auto ciphertext1 = dhkem_secp256k1::Seal(
+        std::span<const std::byte>(reinterpret_cast<const std::byte*>(key1.data()), key1.size()),
+        nonce1,
+        std::span<const std::byte>(reinterpret_cast<const std::byte*>(aad1.data()), aad1.size()),
+        std::span<const std::byte>(reinterpret_cast<const std::byte*>(plaintext1.data()), plaintext1.size()));
+    // Ciphertext should be just the 16-byte tag (since plaintext is empty)
+    BOOST_CHECK_EQUAL(ciphertext1.size(), AEADChaCha20Poly1305::EXPANSION);
+    // Open: decrypt and check that we get the empty plaintext back
+    auto decrypted1 = dhkem_secp256k1::Open(
+        std::span<const std::byte>(reinterpret_cast<const std::byte*>(key1.data()), key1.size()),
+        nonce1,
+        std::span<const std::byte>(reinterpret_cast<const std::byte*>(aad1.data()), aad1.size()),
+        std::span<const std::byte>(reinterpret_cast<const std::byte*>(ciphertext1.data()), ciphertext1.size()));
+    BOOST_CHECK(decrypted1.has_value());
+    BOOST_CHECK(decrypted1->empty());  // plaintext1 was empty
+
+    // 2. Encryption/decryption with non-empty plaintext and empty AAD
+    std::array<uint8_t, 32> key2;
+    for (size_t i = 0; i < key2.size(); ++i) key2[i] = static_cast<uint8_t>(i);  // key2 = 00 01 02 ... 1F
+    ChaCha20::Nonce96 nonce2 = {1, 0};                // nonce with first part = 1, second = 0
+    std::vector<uint8_t> aad2;                        // empty AAD
+    std::vector<uint8_t> plaintext2 = {'H','e','l','l','o',',',' ','w','o','r','l','d','!'};  // "Hello, world!"
+    auto ciphertext2 = dhkem_secp256k1::Seal(
+        std::span<const std::byte>(reinterpret_cast<const std::byte*>(key2.data()), key2.size()),
+        nonce2,
+        std::span<const std::byte>(reinterpret_cast<const std::byte*>(aad2.data()), aad2.size()),
+        std::span<const std::byte>(reinterpret_cast<const std::byte*>(plaintext2.data()), plaintext2.size()));
+    // Ciphertext length = plaintext length + 16
+    BOOST_CHECK_EQUAL(ciphertext2.size(), plaintext2.size() + AEADChaCha20Poly1305::EXPANSION);
+    auto decrypted2 = dhkem_secp256k1::Open(
+        std::span<const std::byte>(reinterpret_cast<const std::byte*>(key2.data()), key2.size()),
+        nonce2,
+        std::span<const std::byte>(reinterpret_cast<const std::byte*>(aad2.data()), aad2.size()),
+        std::span<const std::byte>(reinterpret_cast<const std::byte*>(ciphertext2.data()), ciphertext2.size()));
+    BOOST_CHECK(decrypted2.has_value());
+    BOOST_CHECK_EQUAL(decrypted2->size(), plaintext2.size());
+    BOOST_CHECK(*decrypted2 == plaintext2);  // verify content matches original
+
+    // 3. Encryption/decryption with non-empty plaintext and non-empty AAD
+    ChaCha20::Nonce96 nonce3 = {0, 1};                // another distinct nonce
+    std::vector<uint8_t> aad3(20);
+    for (size_t i = 0; i < aad3.size(); ++i) aad3[i] = 0xFF - static_cast<uint8_t>(i);  // pattern: 0xFF, 0xFE, ...
+    std::vector<uint8_t> plaintext3(80);
+    for (size_t i = 0; i < plaintext3.size(); ++i) plaintext3[i] = static_cast<uint8_t>(i);  // 0x00, 0x01, ... 0x4F
+    auto ciphertext3 = dhkem_secp256k1::Seal(
+        std::span<const std::byte>(reinterpret_cast<const std::byte*>(key2.data()), key2.size()),
+        nonce3,
+        std::span<const std::byte>(reinterpret_cast<const std::byte*>(aad3.data()), aad3.size()),
+        std::span<const std::byte>(reinterpret_cast<const std::byte*>(plaintext3.data()), plaintext3.size()));
+    BOOST_CHECK_EQUAL(ciphertext3.size(), plaintext3.size() + AEADChaCha20Poly1305::EXPANSION);
+    auto decrypted3 = dhkem_secp256k1::Open(
+        std::span<const std::byte>(reinterpret_cast<const std::byte*>(key2.data()), key2.size()),
+        nonce3,
+        std::span<const std::byte>(reinterpret_cast<const std::byte*>(aad3.data()), aad3.size()),
+        std::span<const std::byte>(reinterpret_cast<const std::byte*>(ciphertext3.data()), ciphertext3.size()));
+    BOOST_CHECK(decrypted3.has_value());
+    BOOST_CHECK_EQUAL(decrypted3->size(), plaintext3.size());
+    BOOST_CHECK(*decrypted3 == plaintext3);  // content matches
+
+    // 4. Tampering tests: modify ciphertext or tag and verify decryption fails
+    std::vector<uint8_t> tampered = ciphertext3;
+    tampered[0] ^= 0x01;  // flip one byte in the ciphertext portion
+    auto dec_fail1 = dhkem_secp256k1::Open(
+        std::span<const std::byte>(reinterpret_cast<const std::byte*>(key2.data()), key2.size()),
+        nonce3,
+        std::span<const std::byte>(reinterpret_cast<const std::byte*>(aad3.data()), aad3.size()),
+        std::span<const std::byte>(reinterpret_cast<const std::byte*>(tampered.data()), tampered.size()));
+    BOOST_CHECK(!dec_fail1.has_value());  // authentication should fail
+
+    tampered = ciphertext3;
+    tampered.back() ^= 0x01;  // flip a byte in the tag (last 16 bytes of ciphertext3)
+    auto dec_fail2 = dhkem_secp256k1::Open(
+        std::span<const std::byte>(reinterpret_cast<const std::byte*>(key2.data()), key2.size()),
+        nonce3,
+        std::span<const std::byte>(reinterpret_cast<const std::byte*>(aad3.data()), aad3.size()),
+        std::span<const std::byte>(reinterpret_cast<const std::byte*>(tampered.data()), tampered.size()));
+    BOOST_CHECK(!dec_fail2.has_value());  // should fail due to tag mismatch
+
+    // Try decrypting with the wrong key (should also fail authentication)
+    std::array<uint8_t, 32> key_wrong = key2;
+    key_wrong[0] ^= 0x01;  // slight modification to key2
+    auto dec_fail3 = dhkem_secp256k1::Open(
+        std::span<const std::byte>(reinterpret_cast<const std::byte*>(key_wrong.data()), key_wrong.size()),
+        nonce3,
+        std::span<const std::byte>(reinterpret_cast<const std::byte*>(aad3.data()), aad3.size()),
+        std::span<const std::byte>(reinterpret_cast<const std::byte*>(ciphertext3.data()), ciphertext3.size()));
+    BOOST_CHECK(!dec_fail3.has_value());
+}
 
 BOOST_AUTO_TEST_SUITE_END()
