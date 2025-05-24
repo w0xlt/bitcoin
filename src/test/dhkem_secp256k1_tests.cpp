@@ -9,25 +9,34 @@ using namespace dhkem_secp256k1;
 
 BOOST_FIXTURE_TEST_SUITE(dhkem_secp256k1_tests, BasicTestingSetup)
 
+struct Encryption {
+    std::string pt;
+    std::string aad;
+    std::string nonce;
+    std::string ct;
+};
+
 struct VectorBase {
-        uint8_t mode_base;
-        std::string info;
-        std::string ikmE, skEm, pkEm;
-        std::string ikmR, skRm, pkRm;
-        std::string psk, psk_id;
-        std::string shared_secret;
-        std::string key, base_nonce, exporter_secret;
-    };
-    struct VectorAuth {
-        uint8_t mode_base;
-        std::string info;
-        std::string ikmE, skEm, pkEm;
-        std::string ikmR, skRm, pkRm;
-        std::string ikmS, skSm, pkSm;
-        std::string psk, psk_id;
-        std::string shared_secret;
-        std::string key, base_nonce, exporter_secret;
-    };
+    uint8_t mode_base;
+    std::string info;
+    std::string ikmE, skEm, pkEm;
+    std::string ikmR, skRm, pkRm;
+    std::string psk, psk_id;
+    std::string shared_secret;
+    std::string key, base_nonce, exporter_secret;
+    std::vector<Encryption> encryptions;
+};
+struct VectorAuth {
+    uint8_t mode_base;
+    std::string info;
+    std::string ikmE, skEm, pkEm;
+    std::string ikmR, skRm, pkRm;
+    std::string ikmS, skSm, pkSm;
+    std::string psk, psk_id;
+    std::string shared_secret;
+    std::string key, base_nonce, exporter_secret;
+    std::vector<Encryption> encryptions;
+};
 
 BOOST_AUTO_TEST_CASE(dhkem_secp256k1_chacha20poly1305_testvectors)
 {
@@ -49,7 +58,8 @@ BOOST_AUTO_TEST_CASE(dhkem_secp256k1_chacha20poly1305_testvectors)
             /* shared_secret */ "a81a3ccf56f48c699eb9f393e0701692836f9ac2e06b493ccbf99ac68a792bbe",
             /* key */          "4c260fe82e8c3737e7a70c3223cb16fc205682255389ad4bc3e7fae42c46b062",
             /* base_nonce */   "e035bbf3c39ff5a7196cfe84",
-            /* exporter_secret */ "83e82aad90186ddd7e1db090c840ee70eb6cac7531b64dc52a12997462c8d0d8"
+            /* exporter_secret */ "83e82aad90186ddd7e1db090c840ee70eb6cac7531b64dc52a12997462c8d0d8",
+            {} // No AEAD tests defined in the draft specification
         },
         {
             /* mode_base */ 0x00,
@@ -67,7 +77,8 @@ BOOST_AUTO_TEST_CASE(dhkem_secp256k1_chacha20poly1305_testvectors)
             "9edafcdb619dabc578d8f7b7b055ac66d5cfb6219b90f69d13d297ed49f3aaf3",
             "6e771cd99a23e82ddbd972ecc1b7d3bcd5d6f961370ac2ff785e6776b47b2d53",
             "208b33e382b39dfc1ebb2c95",
-            "ead4fa0d88885cc36792039cbf75110d57eac32e883395eae3ccdeba0a53b3d4"
+            "ead4fa0d88885cc36792039cbf75110d57eac32e883395eae3ccdeba0a53b3d4",
+            {} // No AEAD tests defined in the draft specification
         },
         {
             /* mode_base */ 0x00,
@@ -85,7 +96,8 @@ BOOST_AUTO_TEST_CASE(dhkem_secp256k1_chacha20poly1305_testvectors)
             "fffa60534552d71101540d8022cd1ffe896da801fe55e194b9d71f1ce882b6ff",
             "ebe85898642db23679f83ae4a81efdea5feb4103553b9834cb1f4f602bcef495",
             "ea1e6ce9451d45f9295189c2",
-            "92ea7629022c39382b333c1dcdc2dbed9cd2de4fe1d57320125577231aa35203"
+            "92ea7629022c39382b333c1dcdc2dbed9cd2de4fe1d57320125577231aa35203",
+            {} // No AEAD tests defined in the draft specification
         },
         // PDK test vector
         {
@@ -104,7 +116,15 @@ BOOST_AUTO_TEST_CASE(dhkem_secp256k1_chacha20poly1305_testvectors)
             /* shared_secret */ "64ba1219520c5d1b0450bf71a222b512e70dff05b6539292b5c402ff8e64f707",
             /* key */          "733fb0e7ce630c1712b629ddefb208fcc6572f6bcae5f15d93fc2984b4f325e5",
             /* base_nonce */   "7028e56372041618809a2566",
-            /* exporter_secret */ "58732d8b645ec857be9847995103155b6c6276dda44c1e40b68f1463c03aabb7"
+            /* exporter_secret */ "58732d8b645ec857be9847995103155b6c6276dda44c1e40b68f1463c03aabb7",
+            {
+                {
+                    /* pt    */ "4265617574792069732074727574682c20747275746820626561757479",
+                    /* aad   */ "436f756e742d30",
+                    /* nonce */ "7028e56372041618809a2567",
+                    /* ct    */ "3c8184bee39d3a9433adae46dfe6a0fadd56beb2901306dd9f9dfcc0eba3e18459bf53b0d09256930a883a5150",
+                }
+            }
         },
         {
             /* mode_base */ 0x01,
@@ -126,7 +146,15 @@ BOOST_AUTO_TEST_CASE(dhkem_secp256k1_chacha20poly1305_testvectors)
             /* shared_secret */ "fd01659e153a8df062db1ecaf9441a325eebe074c3d459aa2385641eda410657",
             /* key */          "ad68a1a1c02abf953c4c05ec0991b9267759af5b5a31ef1c5577fcef7d497074",
             /* base_nonce */   "96b92e10133d4c4342f99795",
-            /* exporter_secret */ "8d2b23f021dfc021238609db86f5cf474c328386b475fdfbccc7948b3c63099e"
+            /* exporter_secret */ "8d2b23f021dfc021238609db86f5cf474c328386b475fdfbccc7948b3c63099e",
+            {
+                {
+                    /* pt    */ "4265617574792069732074727574682c20747275746820626561757479",
+                    /* aad   */ "436f756e742d30",
+                    /* nonce */ "96b92e10133d4c4342f99794",
+                    /* ct    */ "a414e3c8d05b351a8aa8f7a4c9baba9851581dbe57e3e77701bd66378dc52a277b18fb4c0c8f2e83e8d46dddde",
+                }
+            }
         },
     };
 
@@ -156,7 +184,15 @@ BOOST_AUTO_TEST_CASE(dhkem_secp256k1_chacha20poly1305_testvectors)
             /* shared_secret */ "c2a1e848a810e546725aae2b73b58f16c2920c6dd91ea87c56665c729f09fc9f",
             /* key */          "3ebf6debe59ba9b8ee324e5546517c811726b451f2855236a0697097fed07906",
             /* base_nonce */   "37d71b78ec28854c1d10f772",
-            /* exporter_secret */ "4c5e54ba51ba00f5a69f2d9845bc992559e04b323dfc4425249c2a95df8e796f"
+            /* exporter_secret */ "4c5e54ba51ba00f5a69f2d9845bc992559e04b323dfc4425249c2a95df8e796f",
+            {
+                {
+                    /* pt    */ "4265617574792069732074727574682c20747275746820626561757479",
+                    /* aad   */ "436f756e742d30",
+                    /* nonce */ "37d71b78ec28854c1d10f773",
+                    /* ct    */ "efab178d99e993f204553690e792774542de1307c66e95d5773b7c65e2561d751a4ec87aa900e24be47f9b45e0",
+                }
+            }
         },
         {
             /* mode_base */ 0x03,
@@ -183,7 +219,15 @@ BOOST_AUTO_TEST_CASE(dhkem_secp256k1_chacha20poly1305_testvectors)
             /* shared_secret */ "428446620a5fe475e23a36b6b977a658fd4530bd1572b78c1bce1c1e270083fe",
             /* key */          "50fcc3452a70efd3b8b19ce83a81fe8dc310853abe6dc19df909993e8d4370c5",
             /* base_nonce */   "9fd1def36fa6a402b1d05774",
-            /* exporter_secret */ "25236189efcf44b566e8193bc6c790a1e3276bc933d3317735bcbb75af1d6a03"
+            /* exporter_secret */ "25236189efcf44b566e8193bc6c790a1e3276bc933d3317735bcbb75af1d6a03",
+            {
+                {
+                    /* pt    */ "4265617574792069732074727574682c20747275746820626561757479",
+                    /* aad   */ "436f756e742d30",
+                    /* nonce */ "9fd1def36fa6a402b1d05775",
+                    /* ct    */ "9fd1def36fa6a402b1d05775",
+                }
+            }
         }
 
     };
