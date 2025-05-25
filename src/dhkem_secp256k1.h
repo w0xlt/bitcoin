@@ -66,10 +66,12 @@ bool DeriveKeyPair(std::span<const uint8_t> ikm,
  *   shared_secret = HKDF-Extract & Expand(dh, "shared secret")【18†】.
  * 
  * @param pkR  Recipient's public key (65-byte uncompressed).
+ * @param skE  Ephemeral secret key (32-byte secret).
+ * @param enc  ephemeral public key (65-byte uncompressed).
  * @return 32-byte shared secret and ephemeral public key (65-byte uncompressed) on success (std::nullopt if failure).
  */
 std::optional<std::pair<std::array<uint8_t, 32>, std::array<uint8_t, 65>>>
-Encap(std::span<const uint8_t> pkR);
+Encap(std::span<const uint8_t> pkR, const std::array<uint8_t, 32>& skE, const std::array<uint8_t, 65>& enc);
 
 /**
  * Decap(enc, skR): Perform HPKE KEM decapsulation using the recipient's private key (Base mode).

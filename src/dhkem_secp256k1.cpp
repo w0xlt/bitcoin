@@ -183,39 +183,32 @@ bool DeriveKeyPair(std::span<const uint8_t> ikm,
 }
 
 std::optional<std::pair<std::array<uint8_t, 32>, std::array<uint8_t, 65>>>
-Encap(std::span<const uint8_t> pkR) {
+Encap(std::span<const uint8_t> pkR, const std::array<uint8_t, 32>& skE, const std::array<uint8_t, 65>& enc) {
     if (pkR.size() != 65) {
         return std::nullopt; // Recipient public key must be 65 bytes (uncompressed)
     }
     InitCtx();
 
-    // 1. Generate a random ephemeral key pair (skE, enc)
-    std::array<uint8_t, 32> skE;
-    std::array<uint8_t, 65> enc;
-    if (!GenerateKeyPair(skE, enc)) {
-        return std::nullopt; // (Ephemeral key generation failed, highly unlikely)
-    }
-
-    // 2. Parse the recipient's public key bytes into a secp256k1_pubkey object
+    // 1. Parse the recipient's public key bytes into a secp256k1_pubkey object
     secp256k1_pubkey pubR;
     if (!secp256k1_ec_pubkey_parse(g_secp256k1_ctx, &pubR, pkR.data(), pkR.size())) {
         return std::nullopt; // Invalid recipient public key format
     }
 
-    // 3. Compute ECDH shared secret: dh = x-coordinate of (skE * pkR)
+    // 2. Compute ECDH shared secret: dh = x-coordinate of (skE * pkR)
     uint8_t dh[32];
     if (!EcdhXCoordinate(pubR, skE.data(), dh)) {
         return std::nullopt; // ECDH failed (unexpected if inputs are valid)
     }
 
-    // 4. Build KEM context = enc || pkR (130 bytes)
+    // 3. Build KEM context = enc || pkR (130 bytes)
     uint8_t kem_context[130];
     BuildKemContext(enc.data(), pkR.data(), kem_context);
 
-    // 5. Derive the 32-byte shared secret via HKDF (Extract "eae_prk", then Expand "shared_secret")
+    // 6. Derive the 32-byte shared secret via HKDF (Extract "eae_prk", then Expand "shared_secret")
     std::array<uint8_t, 32> shared_secret = DeriveSharedSecret(dh, sizeof(dh), kem_context, sizeof(kem_context));
 
-    // 6. Return the shared secret and encapsulated key (ephemeral public key)
+    // 7. Return the shared secret and encapsulated key (ephemeral public key)
     return std::make_pair(shared_secret, enc);
 }
 

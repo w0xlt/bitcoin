@@ -1,9 +1,12 @@
 #include <boost/test/unit_test.hpp>
 #include <dhkem_secp256k1.h>
-#include <util/strencodings.h>
 #include <key.h>  // for ECC context management
-#include <vector>
+#include <test/util/json.h>
+#include <test/data/dhkem_secp256k1_test_vectors.json.h>
 #include <test/util/setup_common.h>
+#include <univalue.h>
+#include <util/strencodings.h>
+#include <vector>
 
 using namespace dhkem_secp256k1;
 
@@ -40,6 +43,98 @@ struct VectorAuth {
 
 BOOST_AUTO_TEST_CASE(dhkem_secp256k1_chacha20poly1305_testvectors)
 {
+    UniValue test_vectors = read_json(json_tests::dhkem_secp256k1_test_vectors);
+    BOOST_REQUIRE(test_vectors.isArray());
+
+    dhkem_secp256k1::InitContext();
+
+    for (size_t i = 0; i < test_vectors.size(); ++i) {
+
+        const UniValue& tv = test_vectors[i];
+        BOOST_REQUIRE(tv.isObject());
+        uint8_t mode = tv["mode"].getInt<uint8_t>();
+
+        // Parse hex inputs from JSON
+        std::vector<unsigned char> info    = ParseHex(tv["info"].get_str());
+        std::vector<unsigned char> ikmE    = ParseHex(tv["ikmE"].get_str());
+        std::vector<unsigned char> ikmR    = ParseHex(tv["ikmR"].get_str());
+        std::vector<unsigned char> exp_skEm = ParseHex(tv["skEm"].get_str());
+        std::vector<unsigned char> exp_pkEm = ParseHex(tv["pkEm"].get_str());
+        std::vector<unsigned char> exp_skRm = ParseHex(tv["skRm"].get_str());
+        std::vector<unsigned char> exp_pkRm = ParseHex(tv["pkRm"].get_str());
+        std::vector<unsigned char> psk, psk_id;
+        if (mode == 0x01 || mode == 0x03) {
+            psk    = ParseHex(tv["psk"].get_str());
+            psk_id = ParseHex(tv["psk_id"].get_str());
+        }
+        std::vector<unsigned char> ikmS, exp_skSm, exp_pkSm;
+        if (mode == 0x02 || mode == 0x03) {
+            ikmS     = ParseHex(tv["ikmS"].get_str());
+            exp_skSm = ParseHex(tv["skSm"].get_str());
+            exp_pkSm = ParseHex(tv["pkSm"].get_str());
+        }
+        std::vector<unsigned char> exp_shared   = ParseHex(tv["shared_secret"].get_str());
+        std::vector<unsigned char> exp_key      = ParseHex(tv["key"].get_str());
+        std::vector<unsigned char> exp_nonce    = ParseHex(tv["base_nonce"].get_str());
+        std::vector<unsigned char> exp_exporter = ParseHex(tv["exporter_secret"].get_str());
+        
+        // Derive key pairs and verify against expected (uses dhkem_secp256k1::DeriveKeyPair)
+        std::array<uint8_t, 32> skEm;
+        std::array<uint8_t, 65> pkEm;
+        bool ok = dhkem_secp256k1::DeriveKeyPair(std::span<const uint8_t>(ikmE.data(), ikmE.size()), skEm, pkEm);
+        BOOST_CHECK(ok);
+        BOOST_CHECK_EQUAL(HexStr(skEm), HexStr(exp_skEm));
+        BOOST_CHECK_EQUAL(HexStr(pkEm), HexStr(exp_pkEm));
+        
+        std::array<uint8_t, 32> skRm;
+        std::array<uint8_t, 65> pkRm;
+        ok = dhkem_secp256k1::DeriveKeyPair(std::span<const uint8_t>(ikmR.data(), ikmR.size()), skRm, pkRm);
+        BOOST_CHECK(ok);
+        BOOST_CHECK_EQUAL(HexStr(skRm), HexStr(exp_skRm));
+        BOOST_CHECK_EQUAL(HexStr(pkRm), HexStr(exp_pkRm));
+
+        std::span<const uint8_t> pkEm2(pkEm.data(), pkEm.size());
+        std::span<const uint8_t> skRm2(skRm.data(), skRm.size());
+
+        std::vector<unsigned char> ss_vec;
+
+        // Perform KEM encapsulation/decapsulation depending on mode
+        if (mode < 0x02) {
+
+            auto result_enc = dhkem_secp256k1::Encap(pkRm, skEm, pkEm);
+            BOOST_CHECK(result_enc.has_value());
+
+            auto [shared_secret_enc, ss_pk_enc] = *result_enc;
+
+            // Base mode: use Decap with recipient's SK and ephemeral PK
+            std::optional<std::array<uint8_t,32>> shared_secret_dec = 
+                dhkem_secp256k1::Decap(std::span(pkEm), std::span(skRm));
+            BOOST_CHECK(shared_secret_dec.has_value());
+
+            BOOST_CHECK_EQUAL(HexStr(*shared_secret_dec), HexStr(shared_secret_enc));
+            BOOST_CHECK_EQUAL(HexStr(*shared_secret_dec), HexStr(exp_shared));
+            // Convert shared secret to vector for KDF input
+            ss_vec.assign(shared_secret_dec->begin(), shared_secret_dec->end());
+        } else {
+
+            /* std::array<uint8_t, 32> skSm;
+            std::array<uint8_t, 65> pkSm;
+            ok = dhkem_secp256k1::DeriveKeyPair(std::span<const uint8_t>(ikmS.data(), ikmS.size()), skSm, pkSm);
+            BOOST_CHECK(ok);
+            BOOST_CHECK_EQUAL(HexStr(skSm), HexStr(exp_skSm));
+            BOOST_CHECK_EQUAL(HexStr(pkSm), HexStr(exp_pkSm));
+
+            // Auth mode: use AuthEncap/AuthDecap
+            std::array<uint8_t,65> enc;
+            std::array<uint8_t,32> ss_enc, ss_dec;
+            BOOST_CHECK(dhkem_secp256k1::AuthEncap(enc, ss_enc, pkRm, skSm));
+            BOOST_CHECK(dhkem_secp256k1::AuthDecap(ss_dec, enc, skRm, pkSm));
+            BOOST_CHECK_EQUAL(HexStr(ss_enc), HexStr(ss_dec));
+            BOOST_CHECK_EQUAL(HexStr(ss_dec), HexStr(exp_shared));
+            ss_vec.assign(ss_dec.begin(), ss_dec.end()); */
+        }
+    }
+
     // Test vectors from Appendix B.3.1 (Base mode):contentReference[oaicite:29]{index=29}:contentReference[oaicite:30]{index=30}
     std::vector<VectorBase> base_vecs = {
         {
@@ -582,13 +677,28 @@ BOOST_AUTO_TEST_CASE(dhkem_encap_decap)
     skR.MakeNewKey(false);
     CPubKey pkR = skR.GetPubKey();
     std::vector<uint8_t> pkR_bytes(pkR.begin(), pkR.end());
-    assert(pkR_bytes.size() == 65);
+    BOOST_CHECK(pkR_bytes.size() == 65);
+
+    CKey skE;
+    skE.MakeNewKey(false);
+    CPubKey pkE = skE.GetPubKey();
+    // Sanity‐check at compile/run time
+    static_assert(65 == 65, "PK size must be 65 bytes");
+    assert(pkE.size() == 65);
+
+    // Make a std::array and copy the bytes in
+    std::array<uint8_t, 65> pkE_bytes;
+    std::copy(pkE.begin(), pkE.end(), pkE_bytes.begin());
 
     dhkem_secp256k1::InitContext();
 
+    std::span<const uint8_t> skE_span(reinterpret_cast<const uint8_t*>(skE.data()), skE.size());
+    std::array<uint8_t, 32>  skE_array;
+    std::copy(skE_span.begin(), skE_span.end(), skE_array.begin());
+
     // Perform encapsulation with the recipient's public key
-    auto maybe_result = dhkem_secp256k1::Encap(pkR_bytes);
-    assert(maybe_result.has_value()); // Encap should succeed
+    auto maybe_result = dhkem_secp256k1::Encap(pkR_bytes, skE_array, pkE_bytes);
+    BOOST_CHECK(maybe_result.has_value()); // Encap should succeed
 
     std::span<const uint8_t> skR_span(reinterpret_cast<const uint8_t*>(skR.data()), skR.size());
 
