@@ -88,7 +88,7 @@ static bool ComputePublicKey(const uint8_t priv_key[32], uint8_t out_pubkey[65])
     return true;
 }
 
-// Generate a random valid secp256k1 key pair (private key and corresponding public key)
+/* // Generate a random valid secp256k1 key pair (private key and corresponding public key)
 static bool GenerateKeyPair(std::array<uint8_t, 32>& priv_out, std::array<uint8_t, 65>& pub_out) {
     for (int attempt = 0; attempt < 256; ++attempt) {
         GetStrongRandBytes({ priv_out.data(), priv_out.size() });
@@ -98,7 +98,7 @@ static bool GenerateKeyPair(std::array<uint8_t, 32>& priv_out, std::array<uint8_
     }
     // (Failure after 256 attempts is virtually impossible for uniform random input)
     return false;
-}
+} */
 
 // Build KEM context for Base mode: kem_context = enc || pkR (130 bytes total)
 static void BuildKemContext(const uint8_t enc[65], const uint8_t pkR[65], uint8_t out_context[130]) {
@@ -290,8 +290,9 @@ std::vector<uint8_t> LabeledExtract(const std::vector<uint8_t>& salt,
     return std::vector<uint8_t>(out_prk, out_prk + 32);
 }
 
-bool AuthEncap(std::array<uint8_t, 65>& enc,
-               std::array<uint8_t, 32>& shared_secret,
+bool AuthEncap(std::array<uint8_t, 32>& shared_secret,
+               const std::array<uint8_t, 32>& skE,
+               const std::array<uint8_t, 65>& enc,
                const std::array<uint8_t, 65>& pkR,
                const std::array<uint8_t, 32>& skS)
 {
@@ -307,12 +308,6 @@ bool AuthEncap(std::array<uint8_t, 65>& enc,
     std::array<uint8_t, 65> pkS_bytes;
     if (!ComputePublicKey(skS.data(), pkS_bytes.data())) {
         return false; // Invalid sender private key
-    }
-
-    // 3. Generate a random ephemeral key pair (skE, enc)
-    std::array<uint8_t, 32> skE;
-    if (!GenerateKeyPair(skE, enc)) {
-        return false; // Ephemeral key generation failed (very unlikely)
     }
 
     // 4. Compute two ECDH shared secrets:

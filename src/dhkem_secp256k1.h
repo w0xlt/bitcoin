@@ -112,7 +112,6 @@ std::vector<uint8_t> LabeledExtract(const std::vector<uint8_t>& salt,
  * AuthEncap(pkR, skS): Authenticated encapsulation using sender's static key.
  * 
  * Outputs:
- *  - enc: ephemeral public key (65 bytes uncompressed)
  *  - shared_secret: 32-byte KEM shared secret
  * 
  * Uses the recipient’s public key (pkR) and sender’s private key (skS). Implements DHKEM in auth mode:
@@ -121,8 +120,9 @@ std::vector<uint8_t> LabeledExtract(const std::vector<uint8_t>& salt,
  *   kem_context = enc || pkR || pkS
  *   shared_secret = HKDF based on DH1 || DH2 and kem_context.
  */
-bool AuthEncap(std::array<uint8_t, 65>& enc,
-               std::array<uint8_t, 32>& shared_secret,
+bool AuthEncap(std::array<uint8_t, 32>& shared_secret,
+               const std::array<uint8_t, 32>& skE,
+               const std::array<uint8_t, 65>& enc,
                const std::array<uint8_t, 65>& pkR,
                const std::array<uint8_t, 32>& skS);
 
