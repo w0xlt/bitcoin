@@ -25,6 +25,8 @@ BOOST_AUTO_TEST_CASE(dhkem_secp256k1_chacha20poly1305_testvectors)
         BOOST_REQUIRE(tv.isObject());
         uint8_t mode = tv["mode"].getInt<uint8_t>();
 
+        BOOST_CHECK(mode <= 0x03);
+
         // Parse hex inputs from JSON
         std::vector<unsigned char> info    = ParseHex(tv["info"].get_str());
         std::vector<unsigned char> ikmE    = ParseHex(tv["ikmE"].get_str());
@@ -104,40 +106,14 @@ BOOST_AUTO_TEST_CASE(dhkem_secp256k1_chacha20poly1305_testvectors)
             ss_vec.assign(ss_dec.begin(), ss_dec.end());
         }
 
-        // Derive HPKE context key, base_nonce, exporter_secret using key schedule (mode 0x00):contentReference[oaicite:33]{index=33}
-        // default psk_id = default_psk = "" in Base mode
-        std::vector<uint8_t> label_psk_id_hash = {'p', 's', 'k', '_', 'i', 'd', '_', 'h', 'a', 's', 'h'};
-        // auto psk_id_hash = LabeledExtract({}, label_psk_id_hash, std::vector<unsigned char>());psk_id
-        auto psk_id_hash = LabeledExtract({}, label_psk_id_hash, psk_id);
+        Context key_schedule = KeySchedule(mode, ss_vec, info, psk, psk_id);
 
-        std::vector<uint8_t> label_info_hash = {'i', 'n', 'f', 'o', '_', 'h', 'a', 's', 'h'};
-        auto info_hash = LabeledExtract({}, label_info_hash, info);
-
-        // key_schedule_context = mode || psk_id_hash || info_hash
-        std::vector<unsigned char> context;
-        context.push_back(mode);
-        context.insert(context.end(), psk_id_hash.begin(), psk_id_hash.end());
-        context.insert(context.end(), info_hash.begin(), info_hash.end());
-
-        std::vector<uint8_t> label_secret = {'s', 'e', 'c', 'r', 'e', 't'};
-        auto secret = LabeledExtract(ss_vec, label_secret, psk);
-
-        // Derive key, base_nonce, exporter_secret
-        std::vector<uint8_t> label_key = {'k','e','y'};
-        std::vector<unsigned char> got_key   = dhkem_secp256k1::LabeledExpand(secret, label_key, context, 32);
-
-        std::vector<uint8_t> label_base_nonce = {'b','a','s','e','_','n','o','n','c','e'};
-        std::vector<unsigned char> got_nonce = dhkem_secp256k1::LabeledExpand(secret, label_base_nonce, context, 12);
-
-        std::vector<uint8_t> label_exp = {'e','x','p'};
-        std::vector<unsigned char> got_exporter = dhkem_secp256k1::LabeledExpand(secret, label_exp, context, exp_exporter.size());
-
-        BOOST_CHECK_EQUAL(HexStr(got_key), HexStr(exp_key));
-        BOOST_CHECK_EQUAL(HexStr(got_nonce), HexStr(exp_nonce));
-        BOOST_CHECK_EQUAL(HexStr(got_exporter), HexStr(exp_exporter));
+        BOOST_CHECK_EQUAL(HexStr(key_schedule.key), HexStr(exp_key));
+        BOOST_CHECK_EQUAL(HexStr(key_schedule.base_nonce), HexStr(exp_nonce));
+        BOOST_CHECK_EQUAL(HexStr(key_schedule.exporter_secret), HexStr(exp_exporter));
 
         std::vector<uint8_t> nonce(12);
-        std::copy(got_nonce.begin(), got_nonce.end(), nonce.begin());
+        std::copy(key_schedule.base_nonce.begin(), key_schedule.base_nonce.end(), nonce.begin());
 
         // AEAD encryption/decryption tests for each entry in tv["encryptions"]
         const UniValue& encryptions = tv["encryptions"];
@@ -155,7 +131,7 @@ BOOST_AUTO_TEST_CASE(dhkem_secp256k1_chacha20poly1305_testvectors)
             nonce_val.second = ReadLE64(nonce.data() + 4);  
 
             auto ciphertext = dhkem_secp256k1::Seal(
-                std::span<const std::byte>(reinterpret_cast<const std::byte*>(got_key.data()), got_key.size()),
+                std::span<const std::byte>(reinterpret_cast<const std::byte*>(key_schedule.key.data()), key_schedule.key.size()),
                 nonce_val,
                 std::span<const std::byte>(reinterpret_cast<const std::byte*>(exp_aad.data()), exp_aad.size()),
                 std::span<const std::byte>(reinterpret_cast<const std::byte*>(exp_pt.data()), exp_pt.size())
@@ -163,7 +139,7 @@ BOOST_AUTO_TEST_CASE(dhkem_secp256k1_chacha20poly1305_testvectors)
             BOOST_CHECK_EQUAL(HexStr(ciphertext), HexStr(exp_ct));
 
             auto decrypted = dhkem_secp256k1::Open(
-                std::span<const std::byte>(reinterpret_cast<const std::byte*>(got_key.data()), got_key.size()),
+                std::span<const std::byte>(reinterpret_cast<const std::byte*>(key_schedule.key.data()), key_schedule.key.size()),
                 nonce_val,
                 std::span<const std::byte>(reinterpret_cast<const std::byte*>(exp_aad.data()), exp_aad.size()),
                 std::span<const std::byte>(reinterpret_cast<const std::byte*>(ciphertext.data()), ciphertext.size())
@@ -173,7 +149,7 @@ BOOST_AUTO_TEST_CASE(dhkem_secp256k1_chacha20poly1305_testvectors)
 
             // Compute nonce = base_nonce XOR I2OSP(seq, Nn) as per RFC 9180 §5.2 (seq = j)
             uint64_t seq_num = j + 1;
-            nonce = dhkem_secp256k1::mix_nonce(got_nonce, seq_num);
+            nonce = dhkem_secp256k1::mix_nonce(key_schedule.base_nonce, seq_num);
 
             // The derived nonce should equal the expected nonce from test vector
             BOOST_CHECK_EQUAL(HexStr(nonce), HexStr(exp_nonce_enc));

@@ -440,4 +440,83 @@ std::vector<uint8_t> mix_nonce(const std::vector<uint8_t>& base_nonce, size_t se
     return out;
 }
 
+//---------------------------------------------------------------------------
+// VerifyPSKInputs  (RFC 9180 §7.1)
+//---------------------------------------------------------------------------
+//   got_psk    := (psk    != default_psk)
+//   got_psk_id := (psk_id != default_psk_id)
+//   if got_psk != got_psk_id: error “Inconsistent PSK inputs”
+//   if got_psk    AND mode in {base, auth}:       error “PSK input provided when not needed”
+//   if NOT got_psk AND mode in {psk, auth_psk}:   error “Missing required PSK input”
+inline void VerifyPSKInputs(
+    uint8_t mode,
+    const std::vector<unsigned char>& psk,
+    const std::vector<unsigned char>& psk_id)
+{
+    bool got_psk    = !psk.empty();
+    bool got_psk_id = !psk_id.empty();
+
+    if (got_psk != got_psk_id) {
+        throw std::runtime_error("Inconsistent PSK inputs");
+    }
+
+    uint8_t mode_base = 0x00;
+    uint8_t mode_psk = 0x01;
+    uint8_t mode_auth = 0x02;
+    uint8_t mode_auth_psk = 0x03;
+
+    // PSK was provided where it shouldn't be
+    if (got_psk && (mode == mode_base || mode == mode_auth)) {
+        throw std::runtime_error("PSK input provided when not needed");
+    }
+    // PSK omitted where it is required
+    if (!got_psk && (mode == mode_psk || mode == mode_auth_psk)) {
+        throw std::runtime_error("Missing required PSK input");
+    }
+}
+
+Context KeySchedule(
+    uint8_t mode,
+    const std::vector<unsigned char>& shared_secret,
+    const std::vector<unsigned char>& info,
+    const std::vector<unsigned char>& psk,
+    const std::vector<unsigned char>& psk_id)
+{
+    // 1. Validate PSK inputs
+    VerifyPSKInputs(mode, psk, psk_id);
+
+    // 2. psk_id_hash = LabeledExtract("", "psk_id_hash", psk_id)
+    const std::vector<uint8_t> label_psk_id_hash{'p','s','k','_','i','d','_','h','a','s','h'};
+    auto psk_id_hash = LabeledExtract({}, label_psk_id_hash, psk_id);
+
+    // 3. info_hash = LabeledExtract("", "info_hash", info)
+    const std::vector<unsigned char> label_info_hash{'i','n','f','o','_','h','a','s','h'};
+    auto info_hash = LabeledExtract({}, label_info_hash, info);
+
+    // 4. key_schedule_context = mode || psk_id_hash || info_hash
+    std::vector<unsigned char> key_schedule_context;
+    key_schedule_context.push_back(mode);
+    key_schedule_context.insert(key_schedule_context.end(), psk_id_hash.begin(), psk_id_hash.end());
+    key_schedule_context.insert(key_schedule_context.end(), info_hash.begin(), info_hash.end());
+
+    // 5. secret = LabeledExtract(shared_secret, "secret", psk)
+    const std::vector<unsigned char> label_secret{'s','e','c','r','e','t'};
+    auto secret = LabeledExtract(shared_secret, label_secret, psk);
+
+    // 6. Derive key, base_nonce, exporter_secret with LabeledExpand
+    const size_t Nk = 32;                    // typically 32
+    const size_t Nn = 12;                    // typically 12
+    const size_t Nh = 32;                    // hash output length
+
+    static const std::vector<unsigned char> label_key{'k','e','y'};
+    static const std::vector<unsigned char> label_base_nonce{'b','a','s','e','_','n','o','n','c','e'};
+    static const std::vector<unsigned char> label_exp{'e','x','p'};
+
+    auto got_key      = LabeledExpand(secret, label_key, key_schedule_context, Nk);
+    auto got_nonce    = LabeledExpand(secret, label_base_nonce, key_schedule_context, Nn);
+    auto got_exporter = LabeledExpand(secret, label_exp, key_schedule_context, Nh);
+
+    return Context(got_key, got_nonce, got_exporter);
+}
+
 } // namespace dhkem_secp256k1

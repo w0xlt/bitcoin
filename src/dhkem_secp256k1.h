@@ -161,6 +161,36 @@ std::optional<std::vector<uint8_t>> Open(std::span<const std::byte> key, ChaCha2
 ///  - seq is written big-endian into the last sizeof(size_t) bytes
 std::vector<uint8_t> mix_nonce(const std::vector<uint8_t>& base_nonce, size_t seq);
 
+//---------------------------------------------------------------------------
+// Context
+//   Holds the three secrets derived by KeySchedule: key, base_nonce,
+//   and exporter_secret (plus a running sequence counter).
+//---------------------------------------------------------------------------
+struct Context
+{
+    std::vector<unsigned char> key;
+    std::vector<unsigned char> base_nonce;
+    std::vector<unsigned char> exporter_secret;
+
+    Context(const std::vector<unsigned char>& _key,
+            const std::vector<unsigned char>& _nonce,
+            const std::vector<unsigned char>& _exp)
+      : key(_key)
+      , base_nonce(_nonce)
+      , exporter_secret(_exp)
+    {}
+};
+
+// ----------------------------------------------------------------------------
+// Helper: KeySchedule<ROLE> as specified in RFC 9180 §7.1
+// ----------------------------------------------------------------------------
+Context KeySchedule(
+    uint8_t mode,
+    const std::vector<unsigned char>& shared_secret,
+    const std::vector<unsigned char>& info,
+    const std::vector<unsigned char>& psk,
+    const std::vector<unsigned char>& psk_id);
+
 
 } // namespace dhkem_secp256k1
 
