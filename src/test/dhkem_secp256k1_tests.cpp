@@ -99,7 +99,7 @@ BOOST_AUTO_TEST_CASE(dhkem_secp256k1_chacha20poly1305_testvectors)
 
             // Auth mode: use AuthEncap/AuthDecap
             std::array<uint8_t,32> ss_enc, ss_dec;
-            BOOST_CHECK(dhkem_secp256k1::AuthEncap(ss_enc, skEm, pkEm, pkRm, skSm));
+            BOOST_CHECK(dhkem_secp256k1::AuthEncap(ss_enc, pkRm, skSm, skEm, pkEm));
             BOOST_CHECK(dhkem_secp256k1::AuthDecap(ss_dec, pkEm, skRm, pkSm));
             BOOST_CHECK_EQUAL(HexStr(ss_enc), HexStr(ss_dec));
             BOOST_CHECK_EQUAL(HexStr(ss_dec), HexStr(exp_shared));
@@ -240,7 +240,7 @@ BOOST_AUTO_TEST_CASE(dhkem_auth_encap_decap)
     std::array<uint8_t, 32> shared_secret_dec{0};
 
     // 6. Perform authenticated encapsulation (sender side)
-    BOOST_CHECK(dhkem_secp256k1::AuthEncap(shared_secret_enc, skE_array, enc, pkR_array, skS_array));
+    BOOST_CHECK(dhkem_secp256k1::AuthEncap(shared_secret_enc, pkR_array, skS_array, skE_array, enc));
 
     // 7. Perform authenticated decapsulation (recipient side)
     BOOST_CHECK(dhkem_secp256k1::AuthDecap(shared_secret_dec, enc, skR_array, pkS_array));

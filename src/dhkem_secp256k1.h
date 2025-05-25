@@ -121,10 +121,10 @@ std::vector<uint8_t> LabeledExtract(const std::vector<uint8_t>& salt,
  *   shared_secret = HKDF based on DH1 || DH2 and kem_context.
  */
 bool AuthEncap(std::array<uint8_t, 32>& shared_secret,
-               const std::array<uint8_t, 32>& skE,
-               const std::array<uint8_t, 65>& enc,
                const std::array<uint8_t, 65>& pkR,
-               const std::array<uint8_t, 32>& skS);
+               const std::array<uint8_t, 32>& skS,
+               const std::array<uint8_t, 32>& skE,
+               const std::array<uint8_t, 65>& enc);
 
 /**
  * AuthDecap(enc, skR, pkS): Authenticated decapsulation using sender’s static public key.

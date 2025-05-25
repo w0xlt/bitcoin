@@ -291,10 +291,10 @@ std::vector<uint8_t> LabeledExtract(const std::vector<uint8_t>& salt,
 }
 
 bool AuthEncap(std::array<uint8_t, 32>& shared_secret,
-               const std::array<uint8_t, 32>& skE,
-               const std::array<uint8_t, 65>& enc,
                const std::array<uint8_t, 65>& pkR,
-               const std::array<uint8_t, 32>& skS)
+               const std::array<uint8_t, 32>& skS,
+               const std::array<uint8_t, 32>& skE,
+               const std::array<uint8_t, 65>& enc)
 {
     InitCtx();
 
