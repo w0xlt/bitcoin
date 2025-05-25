@@ -417,7 +417,7 @@ std::optional<std::vector<uint8_t>> Open(std::span<const std::byte> key, ChaCha2
     return plaintext;
 }
 
-std::vector<uint8_t> mix_nonce(const std::vector<uint8_t>& base_nonce, size_t seq) {
+std::vector<uint8_t> ComputeNonce(const std::vector<uint8_t>& base_nonce, size_t seq) {
     const size_t nonce_size = base_nonce.size();
     const size_t seq_size   = sizeof(seq);
 

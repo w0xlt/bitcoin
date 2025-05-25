@@ -149,7 +149,7 @@ BOOST_AUTO_TEST_CASE(dhkem_secp256k1_chacha20poly1305_testvectors)
 
             // Compute nonce = base_nonce XOR I2OSP(seq, Nn) as per RFC 9180 §5.2 (seq = j)
             uint64_t seq_num = j + 1;
-            nonce = dhkem_secp256k1::mix_nonce(key_schedule.base_nonce, seq_num);
+            nonce = dhkem_secp256k1::ComputeNonce(key_schedule.base_nonce, seq_num);
 
             // The derived nonce should equal the expected nonce from test vector
             BOOST_CHECK_EQUAL(HexStr(nonce), HexStr(exp_nonce_enc));

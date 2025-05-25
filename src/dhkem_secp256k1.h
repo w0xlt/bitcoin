@@ -159,7 +159,7 @@ std::optional<std::vector<uint8_t>> Open(std::span<const std::byte> key, ChaCha2
 /// Derives a nonce from the base nonce and a sequence number.
 ///  - base_nonce must be at least sizeof(size_t) bytes long (e.g. 12 for a 96-bit ChaCha20 nonce)
 ///  - seq is written big-endian into the last sizeof(size_t) bytes
-std::vector<uint8_t> mix_nonce(const std::vector<uint8_t>& base_nonce, size_t seq);
+std::vector<uint8_t> ComputeNonce(const std::vector<uint8_t>& base_nonce, size_t seq);
 
 //---------------------------------------------------------------------------
 // Context
