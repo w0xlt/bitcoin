@@ -37,8 +37,11 @@ void InitContext() {
 void HKDF_Extract(const uint8_t* salt, size_t salt_len,
                   const uint8_t* ikm, size_t ikm_len,
                   uint8_t out_prk[32]) {
-    // If salt is not provided, HMAC_SHA256 treats a null key as zero-length (all zeros)【21†】.
-    CHMAC_SHA256 hmac((salt_len > 0 ? salt : nullptr), salt_len);
+    // If no salt, use a 32-byte array of zeroes (per RFC5869) instead of nullptr.
+    static const uint8_t zero_salt[32] = {0};
+    const uint8_t*  hmac_key   = salt_len > 0 ? salt : zero_salt;
+    size_t          hmac_keylen= salt_len > 0 ? salt_len : 32;
+    CHMAC_SHA256 hmac(hmac_key, hmac_keylen);
     hmac.Write(ikm, ikm_len);
     hmac.Finalize(out_prk);
 }
