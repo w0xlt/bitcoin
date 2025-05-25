@@ -41,32 +41,6 @@ struct VectorAuth {
     std::vector<Encryption> encryptions;
 };
 
-/// Derives a nonce from the base nonce and a sequence number.
-///  - base_nonce must be at least sizeof(size_t) bytes long (e.g. 12 for a 96-bit ChaCha20 nonce)
-///  - seq is written big-endian into the last sizeof(size_t) bytes
-std::vector<uint8_t> mix_nonce(const std::vector<uint8_t>& base_nonce, size_t seq) {
-    const size_t nonce_size = base_nonce.size();
-    const size_t seq_size   = sizeof(seq);
-
-    // 1) Build a zero-initialized buffer the same length as the nonce
-    std::vector<uint8_t> seq_buf(nonce_size, 0);
-
-    // 2) Write seq in big-endian into the last seq_size bytes
-    for (size_t i = 0; i < seq_size; ++i) {
-        // take the (seq_size-1-i)th byte of seq
-        seq_buf[nonce_size - seq_size + i] =
-            static_cast<uint8_t>((seq >> ((seq_size - 1 - i) * 8)) & 0xFF);
-    }
-
-    // 3) XOR base_nonce with seq_buf byte-wise
-    std::vector<uint8_t> out(nonce_size);
-    for (size_t i = 0; i < nonce_size; ++i) {
-        out[i] = base_nonce[i] ^ seq_buf[i];
-    }
-
-    return out;
-}
-
 BOOST_AUTO_TEST_CASE(dhkem_secp256k1_chacha20poly1305_testvectors)
 {
     UniValue test_vectors = read_json(json_tests::dhkem_secp256k1_test_vectors);
@@ -227,7 +201,7 @@ BOOST_AUTO_TEST_CASE(dhkem_secp256k1_chacha20poly1305_testvectors)
             BOOST_CHECK_EQUAL(HexStr(*decrypted), HexStr(exp_pt));
 
             // Compute nonce = base_nonce XOR I2OSP(seq, Nn) as per RFC 9180 §5.2 (seq = j)
-            std::array<uint8_t, 12> seq_bytes{};            // 12-byte buffer initialized to 0
+            /* std::array<uint8_t, 12> seq_bytes{};            // 12-byte buffer initialized to 0
             uint64_t seq_num = j + 1;
             // Fill last 8 bytes of seq_bytes with seq_num in big-endian form
             seq_bytes[4]  = static_cast<uint8_t>(seq_num >> 56);
@@ -241,9 +215,11 @@ BOOST_AUTO_TEST_CASE(dhkem_secp256k1_chacha20poly1305_testvectors)
 
             for (int k = 0; k < 12; ++k) {
                 nonce[k] = got_nonce[k] ^ seq_bytes[k];
-            }
+            } */
 
-            std::vector<uint8_t> mixed = mix_nonce(got_nonce, 0);
+            // Compute nonce = base_nonce XOR I2OSP(seq, Nn) as per RFC 9180 §5.2 (seq = j)
+            uint64_t seq_num = j + 1;
+            nonce = dhkem_secp256k1::mix_nonce(got_nonce, seq_num);
 
             // The derived nonce should equal the expected nonce from test vector
             BOOST_CHECK_EQUAL(HexStr(nonce), HexStr(exp_nonce_enc));

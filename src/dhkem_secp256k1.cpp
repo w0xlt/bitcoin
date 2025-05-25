@@ -417,4 +417,27 @@ std::optional<std::vector<uint8_t>> Open(std::span<const std::byte> key, ChaCha2
     return plaintext;
 }
 
+std::vector<uint8_t> mix_nonce(const std::vector<uint8_t>& base_nonce, size_t seq) {
+    const size_t nonce_size = base_nonce.size();
+    const size_t seq_size   = sizeof(seq);
+
+    // 1) Build a zero-initialized buffer the same length as the nonce
+    std::vector<uint8_t> seq_buf(nonce_size, 0);
+
+    // 2) Write seq in big-endian into the last seq_size bytes
+    for (size_t i = 0; i < seq_size; ++i) {
+        // take the (seq_size-1-i)th byte of seq
+        seq_buf[nonce_size - seq_size + i] =
+            static_cast<uint8_t>((seq >> ((seq_size - 1 - i) * 8)) & 0xFF);
+    }
+
+    // 3) XOR base_nonce with seq_buf byte-wise
+    std::vector<uint8_t> out(nonce_size);
+    for (size_t i = 0; i < nonce_size; ++i) {
+        out[i] = base_nonce[i] ^ seq_buf[i];
+    }
+
+    return out;
+}
+
 } // namespace dhkem_secp256k1
