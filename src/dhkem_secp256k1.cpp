@@ -135,7 +135,8 @@ static void LabeledExpand(const uint8_t prk[32], const char* label, const uint8_
     HKDF_Expand32(prk, labeled_info.data(), labeled_info.size(), out, out_len);
 }
 
-// DeriveSharedSecret: derive the 32-byte KEM shared secret from ECDH output and kem_context
+// DeriveSharedSecret: derive the 32-byte KEM shared secret from ECDH output and kem_context 
+// (uses HKDF-Extract "eae_prk" and HKDF-Expand "shared_secret" as defined in RFC 9180)
 static std::array<uint8_t, 32> DeriveSharedSecret(const uint8_t* dh, size_t dh_len,
                                                  const uint8_t* kem_context, size_t kem_context_len) {
     uint8_t prk_eae[32];
@@ -151,17 +152,18 @@ bool DeriveKeyPair(std::span<const uint8_t> ikm,
                    std::array<uint8_t, 32>& outPrivKey,
                    std::array<uint8_t, 65>& outPubKey)
 {
-    // Domain-separate the input keying material and derive a valid secp256k1 key pair
+    // Domain-separate the input keying material (label "dkp_prk") and derive a valid secp256k1 key pair (RFC 9180 §7.1.3)
     uint8_t prk[32];
     LabeledExtract("dkp_prk", ikm.data(), ikm.size(), prk);
     const char* candidate_label = "candidate";
     uint8_t candidate[32];
+    // Try up to 256 candidates by expanding "candidate" with a counter until a valid secret scalar is found (rejection sampling)
     for (int counter = 0; counter < 256; ++counter) {
         uint8_t ctr = static_cast<uint8_t>(counter);
         LabeledExpand(prk, candidate_label, &ctr, 1, candidate, 32);
         candidate[0] &= 0xFF; // Masking (no effect for 0xFF, included for spec completeness)
         if (ComputePublicKey(candidate, outPubKey.data())) {
-            // Found a valid secret scalar; output private key and corresponding public key
+            // Found a valid secret scalar; output the private key and corresponding public key
             std::memcpy(outPrivKey.data(), candidate, 32);
             return true;
         }
@@ -176,6 +178,7 @@ Encap(std::span<const uint8_t> pkR, const std::array<uint8_t, 32>& skE, const st
         return std::nullopt; // Recipient public key must be 65 bytes (uncompressed)
     }
     InitCtx();
+    // Note: Using provided ephemeral key pair (skE, enc); no new random key is generated here.
 
     // 1. Parse the recipient's public key bytes into a secp256k1_pubkey object
     secp256k1_pubkey pubR;
@@ -285,6 +288,7 @@ bool AuthEncap(std::array<uint8_t, 32>& shared_secret,
                const std::array<uint8_t, 65>& enc)
 {
     InitCtx();
+    // Authenticated KEM Encapsulation (Auth mode) - uses static sender key and ephemeral key
 
     // 1. Parse recipient's public key (pkR) into secp256k1_pubkey
     secp256k1_pubkey pubR;
@@ -297,6 +301,8 @@ bool AuthEncap(std::array<uint8_t, 32>& shared_secret,
     if (!ComputePublicKey(skS.data(), pkS_bytes.data())) {
         return false; // Invalid sender private key
     }
+
+    // (Ephemeral key pair skE and enc are provided by caller; skip generating new ephemeral here)
 
     // 4. Compute two ECDH shared secrets:
     //    DH1 = x-coordinate of (skE * pkR), DH2 = x-coordinate of (skS * pkR)
@@ -330,6 +336,7 @@ bool AuthDecap(std::array<uint8_t, 32>& shared_secret,
                const std::array<uint8_t, 65>& pkS)
 {
     InitCtx();
+    // Authenticated KEM Decapsulation (Auth mode) - uses sender's static public key    
 
     // 1. Parse sender's static public key (pkS) and encapsulated ephemeral public key (enc)
     secp256k1_pubkey pubS, pubE;
@@ -396,7 +403,7 @@ std::optional<std::vector<uint8_t>> Open(std::span<const std::byte> key, ChaCha2
     size_t plaintext_len = ciphertext.size() - AEADChaCha20Poly1305::EXPANSION;
     std::vector<uint8_t> plaintext(plaintext_len);
     std::span<std::byte> plain_span(reinterpret_cast<std::byte*>(plaintext.data()), plaintext.size());
-    AEADChaCha20Poly1305 aead(key);
+    AEADChaCha20Poly1305 aead(key); // Initialize AEAD with the 32-byte key
     // Decrypt and verify tag (Decrypt returns false if authentication fails)
     bool ok = aead.Decrypt(ciphertext, aad, nonce, plain_span);
     if (!ok) {

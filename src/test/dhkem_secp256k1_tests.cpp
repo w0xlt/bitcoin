@@ -14,18 +14,21 @@ BOOST_FIXTURE_TEST_SUITE(dhkem_secp256k1_tests, BasicTestingSetup)
 
 BOOST_AUTO_TEST_CASE(dhkem_secp256k1_chacha20poly1305_testvectors)
 {
+    // Use test vectors to verify DHKEM and KeySchedule outputs against expected values
     UniValue test_vectors = read_json(json_tests::dhkem_secp256k1_test_vectors);
     BOOST_REQUIRE(test_vectors.isArray());
 
+    // Initialize secp256k1 context
     dhkem_secp256k1::InitContext();
 
+    // Loop through each test case in the vector list
     for (size_t i = 0; i < test_vectors.size(); ++i) {
 
         const UniValue& tv = test_vectors[i];
         BOOST_REQUIRE(tv.isObject());
         uint8_t mode = tv["mode"].getInt<uint8_t>();
 
-        BOOST_CHECK(mode <= 0x03);
+        BOOST_CHECK(mode <= 0x03); // (0=Base, 1=PSK, 2=Auth, 3=AuthPSK)
 
         // Parse hex inputs from JSON
         std::vector<unsigned char> info    = ParseHex(tv["info"].get_str());
@@ -37,11 +40,13 @@ BOOST_AUTO_TEST_CASE(dhkem_secp256k1_chacha20poly1305_testvectors)
         std::vector<unsigned char> exp_pkRm = ParseHex(tv["pkRm"].get_str());
         std::vector<unsigned char> psk, psk_id;
         if (mode == 0x01 || mode == 0x03) {
+            // If PSK mode, extract PSK and PSK_ID values
             psk    = ParseHex(tv["psk"].get_str());
             psk_id = ParseHex(tv["psk_id"].get_str());
         }
         std::vector<unsigned char> ikmS, exp_skSm, exp_pkSm;
         if (mode == 0x02 || mode == 0x03) {
+            // If Auth mode, extract sender's static key material
             ikmS     = ParseHex(tv["ikmS"].get_str());
             exp_skSm = ParseHex(tv["skSm"].get_str());
             exp_pkSm = ParseHex(tv["pkSm"].get_str());
@@ -73,6 +78,7 @@ BOOST_AUTO_TEST_CASE(dhkem_secp256k1_chacha20poly1305_testvectors)
 
         // Perform KEM encapsulation/decapsulation depending on mode
         if (mode < 0x02) {
+            // Base mode (mode 0x00 or 0x01): use Encap/Decap
 
             auto result_enc = dhkem_secp256k1::Encap(pkRm, skEm, pkEm);
             BOOST_CHECK(result_enc.has_value());
@@ -89,7 +95,9 @@ BOOST_AUTO_TEST_CASE(dhkem_secp256k1_chacha20poly1305_testvectors)
             // Convert shared secret to vector for KDF input
             ss_vec.assign(shared_secret_dec->begin(), shared_secret_dec->end());
         } else {
+            // Auth mode (mode 0x02 or 0x03): use AuthEncap/AuthDecap
 
+            // Derive sender's static key pair (skSm, pkSm) for authentication
             std::array<uint8_t, 32> skSm;
             std::array<uint8_t, 65> pkSm;
             ok = dhkem_secp256k1::DeriveKeyPair(std::span<const uint8_t>(ikmS.data(), ikmS.size()), skSm, pkSm);
@@ -106,12 +114,14 @@ BOOST_AUTO_TEST_CASE(dhkem_secp256k1_chacha20poly1305_testvectors)
             ss_vec.assign(ss_dec.begin(), ss_dec.end());
         }
 
+        // Derive the HPKE context (key, base_nonce, exporter_secret) using KeySchedule
         Context key_schedule = KeySchedule(mode, ss_vec, info, psk, psk_id);
 
         BOOST_CHECK_EQUAL(HexStr(key_schedule.key), HexStr(exp_key));
         BOOST_CHECK_EQUAL(HexStr(key_schedule.base_nonce), HexStr(exp_nonce));
         BOOST_CHECK_EQUAL(HexStr(key_schedule.exporter_secret), HexStr(exp_exporter));
 
+        // Initialize nonce buffer with base_nonce
         std::vector<uint8_t> nonce(12);
         std::copy(key_schedule.base_nonce.begin(), key_schedule.base_nonce.end(), nonce.begin());
 
@@ -126,10 +136,12 @@ BOOST_AUTO_TEST_CASE(dhkem_secp256k1_chacha20poly1305_testvectors)
             std::vector<unsigned char> exp_nonce_enc = ParseHex(encObj["nonce"].get_str());
             std::vector<unsigned char> exp_ct   = ParseHex(encObj["ct"].get_str());
 
+            // Construct a ChaCha20 Nonce96 from the 12-byte nonce vector
             ChaCha20::Nonce96 nonce_val;
             nonce_val.first  = ReadLE32(nonce.data());       // first 4 bytes as little-endian uint32
-            nonce_val.second = ReadLE64(nonce.data() + 4);  
+            nonce_val.second = ReadLE64(nonce.data() + 4);   // last 8 bytes as little-endian uint64
 
+            // Encrypt the plaintext and compare with expected ciphertext
             auto ciphertext = dhkem_secp256k1::Seal(
                 std::span<const std::byte>(reinterpret_cast<const std::byte*>(key_schedule.key.data()), key_schedule.key.size()),
                 nonce_val,
@@ -138,6 +150,7 @@ BOOST_AUTO_TEST_CASE(dhkem_secp256k1_chacha20poly1305_testvectors)
             );
             BOOST_CHECK_EQUAL(HexStr(ciphertext), HexStr(exp_ct));
 
+            // Decrypt the ciphertext and verify the plaintext matches
             auto decrypted = dhkem_secp256k1::Open(
                 std::span<const std::byte>(reinterpret_cast<const std::byte*>(key_schedule.key.data()), key_schedule.key.size()),
                 nonce_val,
@@ -159,6 +172,7 @@ BOOST_AUTO_TEST_CASE(dhkem_secp256k1_chacha20poly1305_testvectors)
 
 BOOST_AUTO_TEST_CASE(dhkem_encap_decap)
 {
+    // Test Base mode KEM (unauthenticated encapsulation/decapsulation)
     CKey skR;
     skR.MakeNewKey(false);
     CPubKey pkR = skR.GetPubKey();
@@ -170,33 +184,38 @@ BOOST_AUTO_TEST_CASE(dhkem_encap_decap)
     CPubKey pkE = skE.GetPubKey();
     assert(pkE.size() == 65);
 
-    // Make a std::array and copy the bytes in
+    // 1. Generate receiver (skR) and ephemeral sender (skE) key pairs
+    // 2. Convert ephemeral public key to std::array for API
     std::array<uint8_t, 65> pkE_bytes;
     std::copy(pkE.begin(), pkE.end(), pkE_bytes.begin());
 
+    // 3. Convert ephemeral private key to std::array for API
     std::span<const uint8_t> skE_span(reinterpret_cast<const uint8_t*>(skE.data()), skE.size());
     std::array<uint8_t, 32>  skE_array;
     std::copy(skE_span.begin(), skE_span.end(), skE_array.begin());
 
+    // 4. Initialize the secp256k1 context
     dhkem_secp256k1::InitContext();
 
-    // Perform encapsulation with the recipient's public key
+    // 5. Perform encapsulation with the recipient's public key
     auto maybe_result = dhkem_secp256k1::Encap(pkR_bytes, skE_array, pkE_bytes);
     BOOST_CHECK(maybe_result.has_value()); // Encap should succeed
 
     std::span<const uint8_t> skR_span(reinterpret_cast<const uint8_t*>(skR.data()), skR.size());
 
-    // Extract shared_secret_enc and enc (ephemeral public key bytes)
+    // 6. Get the shared secret and ephemeral public key from Encap result
     auto [shared_secret_enc, enc3] = *maybe_result;
-    // Decapsulate using the recipient's private key
+    // 7. Perform decapsulation using the recipient's private key
     std::optional<std::array<uint8_t, 32>> maybe_shared_secret_dec = dhkem_secp256k1::Decap(enc3, skR_span);
     
     BOOST_CHECK(maybe_shared_secret_dec.has_value());
+    // 8. Verify that both derived shared secrets are identical
     BOOST_CHECK_EQUAL(HexStr(shared_secret_enc), HexStr(*maybe_shared_secret_dec));
 }
 
 BOOST_AUTO_TEST_CASE(dhkem_auth_encap_decap)
 {
+    // Test Auth mode KEM (authenticated encapsulation/decapsulation)
     // 1. Generate sender (skS) and recipient (skR) key pairs
     CKey skS;
     CKey skR;
@@ -211,7 +230,7 @@ BOOST_AUTO_TEST_CASE(dhkem_auth_encap_decap)
     CPubKey pkE = skE.GetPubKey();
     assert(pkE.size() == 65);
 
-    // Make a std::array and copy the bytes in
+    // 3. Prepare ephemeral public key bytes for AuthEncap
     std::array<uint8_t, 65> enc;
     std::copy(pkE.begin(), pkE.end(), enc.begin());
 
@@ -219,14 +238,14 @@ BOOST_AUTO_TEST_CASE(dhkem_auth_encap_decap)
     std::array<uint8_t, 32>  skE_array;
     std::copy(skE_span.begin(), skE_span.end(), skE_array.begin());
 
-    // 3. Convert CPubKey to std::array<uint8_t, 65> for use with AuthEncap/AuthDecap
+    // 4. Convert CPubKey to std::array<uint8_t, 65> for use with AuthEncap/AuthDecap
     std::array<uint8_t, 65> pkR_array;
     std::copy(pkR.begin(), pkR.end(), pkR_array.begin());
 
     std::array<uint8_t, 65> pkS_array;
     std::copy(pkS.begin(), pkS.end(), pkS_array.begin());
 
-    // 4. Convert CKey to std::array<uint8_t, 32> for use with AuthEncap/AuthDecap
+    // 5. Convert CKey objects to std::array (skS and skR for AuthEncap/AuthDecap)
     std::span<const uint8_t> skS_span(reinterpret_cast<const uint8_t*>(skS.data()), skS.size());
     std::array<uint8_t, 32> skS_array;
     std::copy(skS_span.begin(), skS_span.end(), skS_array.begin());
@@ -235,21 +254,24 @@ BOOST_AUTO_TEST_CASE(dhkem_auth_encap_decap)
     std::array<uint8_t, 32> skR_array;
     std::copy(skR_span.begin(), skR_span.end(), skR_array.begin());
 
-    // 5. Prepare output containers for shared secrets and encapsulated key
+    // 6. Prepare output containers for shared secrets and encapsulated key
     std::array<uint8_t, 32> shared_secret_enc{0};
     std::array<uint8_t, 32> shared_secret_dec{0};
 
-    // 6. Perform authenticated encapsulation (sender side)
+    // 7. Perform authenticated encapsulation (sender side)
     BOOST_CHECK(dhkem_secp256k1::AuthEncap(shared_secret_enc, pkR_array, skS_array, skE_array, enc));
 
-    // 7. Perform authenticated decapsulation (recipient side)
+    // 8. Perform authenticated decapsulation (recipient side)
     BOOST_CHECK(dhkem_secp256k1::AuthDecap(shared_secret_dec, enc, skR_array, pkS_array));
 
+    // 9. Verify shared secrets match
     BOOST_CHECK_EQUAL(HexStr(shared_secret_enc), HexStr(shared_secret_dec));
 }
 
 BOOST_AUTO_TEST_CASE(dhkem_secp256k1_seal_open)
 {
+    // Test AEAD sealing and opening (ChaCha20-Poly1305) with various plaintext/AAD cases
+
     // 1. Encryption/decryption with empty plaintext and non-empty AAD
     std::array<uint8_t, 32> key1 = {0};               // 32-byte key (all zeros)
     ChaCha20::Nonce96 nonce1 = {0, 0};                // 96-bit nonce = 0x000000000000000000000000
