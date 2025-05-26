@@ -9,24 +9,27 @@
 #include <cstring>
 #include <support/allocators/secure.h>
 #include <optional>
-#include <crypto/chacha20poly1305.h>  // for AEADChaCha20Poly1305 and Nonce96
+#include <crypto/chacha20poly1305.h>
+#include <mutex>
+#include <support/cleanse.h>
 
 namespace dhkem_secp256k1 {
 
 static secp256k1_context* g_secp256k1_ctx = nullptr;
+static std::once_flag g_ctx_init_flag;
 
 /** Ensure global secp256k1 context is initialized (call InitContext() before use). */
 static void InitCtx() {
-    if (g_secp256k1_ctx == nullptr) {
+    std::call_once(g_ctx_init_flag, [](){
         // Create context (no need for signing in this usage, verification is implicit in pubkey parsing)
         g_secp256k1_ctx = secp256k1_context_create(SECP256K1_CONTEXT_NONE);
         assert(g_secp256k1_ctx != nullptr);
         // Randomize the secp256k1 context with a blinding seed
-        std::vector<unsigned char, secure_allocator<unsigned char>> vseed(32);
+        std::vector<uint8_t, secure_allocator<uint8_t>> vseed(32);
         GetRandBytes(vseed);
         bool ret = secp256k1_context_randomize(g_secp256k1_ctx, vseed.data());
         assert(ret);
-    }
+    });
 }
 
 void InitContext() {
@@ -39,8 +42,8 @@ void HKDF_Extract(const uint8_t* salt, size_t salt_len,
                   uint8_t out_prk[32]) {
     // If no salt, use a 32-byte array of zeroes (per RFC5869) instead of nullptr.
     static const uint8_t zero_salt[32] = {0};
-    const uint8_t*  hmac_key   = salt_len > 0 ? salt : zero_salt;
-    size_t          hmac_keylen= salt_len > 0 ? salt_len : 32;
+    const uint8_t*  hmac_key    = salt_len > 0 ? salt : zero_salt;
+    size_t          hmac_keylen = salt_len > 0 ? salt_len : 32;
     CHMAC_SHA256 hmac(hmac_key, hmac_keylen);
     hmac.Write(ikm, ikm_len);
     hmac.Finalize(out_prk);
@@ -90,15 +93,15 @@ static bool ComputePublicKey(const uint8_t priv_key[32], uint8_t out_pubkey[65])
 
 // Build KEM context for Base mode: kem_context = enc || pkR (130 bytes total)
 static void BuildKemContext(const uint8_t enc[65], const uint8_t pkR[65], uint8_t out_context[130]) {
-    memcpy(out_context, enc, 65);
-    memcpy(out_context + 65, pkR, 65);
+    memcpy(out_context,       enc, 65);
+    memcpy(out_context + 65,  pkR, 65);
 }
 
 // Build KEM context for Auth modes: kem_context = enc || pkR || pkS (195 bytes total)
 static void BuildKemContext(const uint8_t enc[65], const uint8_t pkR[65], const uint8_t pkS[65], uint8_t out_context[195]) {
-    memcpy(out_context, enc, 65);
-    memcpy(out_context + 65, pkR, 65);
-    memcpy(out_context + 130, pkS, 65);
+    memcpy(out_context,        enc, 65);
+    memcpy(out_context + 65,   pkR, 65);
+    memcpy(out_context + 130,  pkS, 65);
 }
 
 // LabeledExtract: HKDF-Extract with salt="", labeled IKM = "HPKE-v1" || KEM_SUITE_ID || label || ikm
@@ -143,6 +146,7 @@ static std::array<uint8_t, 32> DeriveSharedSecret(const uint8_t* dh, size_t dh_l
     LabeledExtract("eae_prk", dh, dh_len, prk_eae);
     std::array<uint8_t, 32> shared;
     LabeledExpand(prk_eae, "shared_secret", kem_context, kem_context_len, shared.data(), shared.size());
+    memory_cleanse(prk_eae, 32);
     return shared;
 }
 
@@ -158,6 +162,7 @@ bool DeriveKeyPair(std::span<const uint8_t> ikm,
     const char* candidate_label = "candidate";
     uint8_t candidate[32];
     // Try up to 256 candidates by expanding "candidate" with a counter until a valid secret scalar is found (rejection sampling)
+    bool success = false;
     for (int counter = 0; counter < 256; ++counter) {
         uint8_t ctr = static_cast<uint8_t>(counter);
         LabeledExpand(prk, candidate_label, &ctr, 1, candidate, 32);
@@ -165,16 +170,18 @@ bool DeriveKeyPair(std::span<const uint8_t> ikm,
         if (ComputePublicKey(candidate, outPubKey.data())) {
             // Found a valid secret scalar; output the private key and corresponding public key
             std::memcpy(outPrivKey.data(), candidate, 32);
-            return true;
+            success = true;
+            break;
         }
     }
-    // (Unreachable in practice; would indicate no valid key found in 256 attempts)
-    return false;
+    memory_cleanse(prk, 32);
+    memory_cleanse(candidate, 32);
+    return success;
 }
 
-std::optional<std::pair<std::array<uint8_t, 32>, std::array<uint8_t, 65>>>
+std::optional<std::array<uint8_t, 32>>
 Encap(std::span<const uint8_t> pkR, const std::array<uint8_t, 32>& skE, const std::array<uint8_t, 65>& enc) {
-    if (pkR.size() != 65) {
+    if (pkR.size() != NPK) {
         return std::nullopt; // Recipient public key must be 65 bytes (uncompressed)
     }
     InitCtx();
@@ -186,9 +193,18 @@ Encap(std::span<const uint8_t> pkR, const std::array<uint8_t, 32>& skE, const st
         return std::nullopt; // Invalid recipient public key format
     }
 
+    // 1.5. Validate that enc corresponds to skE
+    std::array<uint8_t, 65> comp_enc;
+    if (!ComputePublicKey(skE.data(), comp_enc.data())) {
+        return std::nullopt; // Invalid ephemeral private key
+    }
+    if (std::memcmp(comp_enc.data(), enc.data(), NENC) != 0) {
+        return std::nullopt; // Ephemeral pubkey mismatch
+    }
+
     // 2. Compute ECDH shared secret: dh = x-coordinate of (skE * pkR)
-    uint8_t dh[32];
-    if (!EcdhXCoordinate(pubR, skE.data(), dh)) {
+    std::array<uint8_t, 32> dh;
+    if (!EcdhXCoordinate(pubR, skE.data(), dh.data())) {
         return std::nullopt; // ECDH failed (unexpected if inputs are valid)
     }
 
@@ -196,16 +212,17 @@ Encap(std::span<const uint8_t> pkR, const std::array<uint8_t, 32>& skE, const st
     uint8_t kem_context[130];
     BuildKemContext(enc.data(), pkR.data(), kem_context);
 
-    // 6. Derive the 32-byte shared secret via HKDF (Extract "eae_prk", then Expand "shared_secret")
-    std::array<uint8_t, 32> shared_secret = DeriveSharedSecret(dh, sizeof(dh), kem_context, sizeof(kem_context));
-
-    // 7. Return the shared secret and encapsulated key (ephemeral public key)
-    return std::make_pair(shared_secret, enc);
+    // 4. Derive the 32-byte shared secret via HKDF
+    std::array<uint8_t, 32> shared_secret = DeriveSharedSecret(dh.data(), dh.size(), kem_context, sizeof(kem_context));
+    memory_cleanse(dh.data(), dh.size());
+    return shared_secret;
 }
 
 std::optional<std::array<uint8_t, 32>>
 Decap(std::span<const uint8_t> enc, std::span<const uint8_t> skR) {
-    assert(enc.size() == 65 && skR.size() == 32);
+    if (enc.size() != NENC || skR.size() != NSK) {
+        return std::nullopt; // Inputs must be 65-byte enc and 32-byte skR
+    }
     InitCtx();
 
     // 1. Parse the encapsulated ephemeral public key
@@ -214,29 +231,30 @@ Decap(std::span<const uint8_t> enc, std::span<const uint8_t> skR) {
         return std::nullopt; // Invalid ephemeral public key
     }
 
-    // 2. Verify and use recipient's private key (skR) for ECDH
+    // 2. Verify recipient's private key (skR) is valid
     if (secp256k1_ec_seckey_verify(g_secp256k1_ctx, skR.data()) != 1) {
         return std::nullopt; // Invalid recipient private key
     }
 
-    // 3. Compute ECDH shared secret: dh = x-coordinate of (skR * pkE)
-    uint8_t dh[32];
-    if (!EcdhXCoordinate(pubE, skR.data(), dh)) {
+    // 3. Compute ECDH shared secret: dh = x-coordinate of (skR * pubE)
+    std::array<uint8_t, 32> dh;
+    if (!EcdhXCoordinate(pubE, skR.data(), dh.data())) {
         return std::nullopt; // ECDH failed (invalid inputs)
     }
 
     // 4. Derive pkR (recipient's public key) from skR for KEM context
-    uint8_t pkR_bytes[65];
-    if (!ComputePublicKey(skR.data(), pkR_bytes)) {
+    std::array<uint8_t, 65> pkR_bytes;
+    if (!ComputePublicKey(skR.data(), pkR_bytes.data())) {
         return std::nullopt; // Should not happen if skR is valid
     }
 
     // 5. Build KEM context = enc || pkR (130 bytes total)
     uint8_t kem_context[130];
-    BuildKemContext(enc.data(), pkR_bytes, kem_context);
+    BuildKemContext(enc.data(), pkR_bytes.data(), kem_context);
 
     // 6. Derive the 32-byte shared secret via HKDF
-    std::array<uint8_t, 32> shared_secret = DeriveSharedSecret(dh, sizeof(dh), kem_context, sizeof(kem_context));
+    std::array<uint8_t, 32> shared_secret = DeriveSharedSecret(dh.data(), dh.size(), kem_context, sizeof(kem_context));
+    memory_cleanse(dh.data(), dh.size());
     return shared_secret;
 }
 
@@ -281,11 +299,11 @@ std::vector<uint8_t> LabeledExtract(const std::vector<uint8_t>& salt,
     return std::vector<uint8_t>(out_prk, out_prk + 32);
 }
 
-bool AuthEncap(std::array<uint8_t, 32>& shared_secret,
-               const std::array<uint8_t, 65>& pkR,
-               const std::array<uint8_t, 32>& skS,
-               const std::array<uint8_t, 32>& skE,
-               const std::array<uint8_t, 65>& enc)
+std::optional<std::array<uint8_t, 32>>
+AuthEncap(const std::array<uint8_t, 65>& pkR,
+          const std::array<uint8_t, 32>& skS,
+          const std::array<uint8_t, 32>& skE,
+          const std::array<uint8_t, 65>& enc)
 {
     InitCtx();
     // Authenticated KEM Encapsulation (Auth mode) - uses static sender key and ephemeral key
@@ -293,25 +311,32 @@ bool AuthEncap(std::array<uint8_t, 32>& shared_secret,
     // 1. Parse recipient's public key (pkR) into secp256k1_pubkey
     secp256k1_pubkey pubR;
     if (!secp256k1_ec_pubkey_parse(g_secp256k1_ctx, &pubR, pkR.data(), pkR.size())) {
-        return false; // Invalid recipient public key
+        return std::nullopt; // Invalid recipient public key
     }
 
     // 2. Compute sender's public key (pkS) from sender's private key (skS)
     std::array<uint8_t, 65> pkS_bytes;
     if (!ComputePublicKey(skS.data(), pkS_bytes.data())) {
-        return false; // Invalid sender private key
+        return std::nullopt; // Invalid sender private key
     }
 
-    // (Ephemeral key pair skE and enc are provided by caller; skip generating new ephemeral here)
+    // 2.5. Verify that enc matches skE
+    std::array<uint8_t, 65> comp_enc;
+    if (!ComputePublicKey(skE.data(), comp_enc.data())) {
+        return std::nullopt;
+    }
+    if (std::memcmp(comp_enc.data(), enc.data(), NENC) != 0) {
+        return std::nullopt; // Provided enc does not correspond to skE
+    }
 
     // 4. Compute two ECDH shared secrets:
     //    DH1 = x-coordinate of (skE * pkR), DH2 = x-coordinate of (skS * pkR)
     std::array<uint8_t, 32> dh1, dh2;
     if (!EcdhXCoordinate(pubR, skE.data(), dh1.data())) {
-        return false;
+        return std::nullopt;
     }
     if (!EcdhXCoordinate(pubR, skS.data(), dh2.data())) {
-        return false;
+        return std::nullopt;
     }
 
     // 5. Concatenate DH1 || DH2 (64 bytes total)
@@ -319,42 +344,48 @@ bool AuthEncap(std::array<uint8_t, 32>& shared_secret,
     std::memcpy(dh_concat,      dh1.data(), 32);
     std::memcpy(dh_concat + 32, dh2.data(), 32);
 
-    // 6. Assemble HPKE KEM context: concat(enc, pkR, pkS) as uncompressed bytes【1†】
+    // 6. Assemble HPKE KEM context: enc || pkR || pkS (195 bytes)
     uint8_t kem_context[65 * 3];
     BuildKemContext(enc.data(), pkR.data(), pkS_bytes.data(), kem_context);
 
     // 7. Derive the shared secret via HKDF (using dh_concat and kem_context)
-    std::array<uint8_t, 32> shared = DeriveSharedSecret(dh_concat, sizeof(dh_concat),
-                                                       kem_context, sizeof(kem_context));
-    shared_secret = shared;
-    return true;
+    std::array<uint8_t, 32> shared = DeriveSharedSecret(dh_concat, sizeof(dh_concat), kem_context, sizeof(kem_context));
+    memory_cleanse(dh1.data(), dh1.size());
+    memory_cleanse(dh2.data(), dh2.size());
+    memory_cleanse(dh_concat, 64);
+    return shared;
 }
 
-bool AuthDecap(std::array<uint8_t, 32>& shared_secret,
-               const std::array<uint8_t, 65>& enc,
-               const std::array<uint8_t, 32>& skR,
-               const std::array<uint8_t, 65>& pkS)
+std::optional<std::array<uint8_t, 32>>
+AuthDecap(const std::array<uint8_t, 65>& enc,
+          const std::array<uint8_t, 32>& skR,
+          const std::array<uint8_t, 65>& pkS)
 {
     InitCtx();
-    // Authenticated KEM Decapsulation (Auth mode) - uses sender's static public key    
+    // Authenticated KEM Decapsulation (Auth mode) - uses sender's static public key
 
     // 1. Parse sender's static public key (pkS) and encapsulated ephemeral public key (enc)
     secp256k1_pubkey pubS, pubE;
     if (!secp256k1_ec_pubkey_parse(g_secp256k1_ctx, &pubS, pkS.data(), pkS.size())) {
-        return false; // Invalid sender public key
+        return std::nullopt; // Invalid sender public key
     }
     if (!secp256k1_ec_pubkey_parse(g_secp256k1_ctx, &pubE, enc.data(), enc.size())) {
-        return false; // Invalid encapsulated public key
+        return std::nullopt; // Invalid encapsulated public key
+    }
+
+    // 2. Verify receiver's private key (skR) is valid
+    if (secp256k1_ec_seckey_verify(g_secp256k1_ctx, skR.data()) != 1) {
+        return std::nullopt; // Invalid receiver private key
     }
 
     // 2. Perform two ECDH operations with receiver's private key (skR):
     //    DH1 = x-coordinate of (skR * pubE), DH2 = x-coordinate of (skR * pubS)
     std::array<uint8_t, 32> dh1, dh2;
     if (!EcdhXCoordinate(pubE, skR.data(), dh1.data())) {
-        return false;
+        return std::nullopt;
     }
     if (!EcdhXCoordinate(pubS, skR.data(), dh2.data())) {
-        return false;
+        return std::nullopt;
     }
 
     // 3. Concatenate DH1 || DH2 (64 bytes)
@@ -365,7 +396,7 @@ bool AuthDecap(std::array<uint8_t, 32>& shared_secret,
     // 4. Derive receiver's public key (pkR) from skR for KEM context
     std::array<uint8_t, 65> pkR_bytes;
     if (!ComputePublicKey(skR.data(), pkR_bytes.data())) {
-        return false; // Invalid receiver private key
+        return std::nullopt; // Invalid receiver private key
     }
 
     // 5. Build KEM context = enc || pkR || pkS (195 bytes)
@@ -373,14 +404,15 @@ bool AuthDecap(std::array<uint8_t, 32>& shared_secret,
     BuildKemContext(enc.data(), pkR_bytes.data(), pkS.data(), kem_context);
 
     // 6. Derive the 32-byte shared secret via HKDF
-    std::array<uint8_t, 32> shared = DeriveSharedSecret(dh_concat, sizeof(dh_concat),
-                                                       kem_context, sizeof(kem_context));
-    shared_secret = shared;
-    return true;
+    std::array<uint8_t, 32> shared = DeriveSharedSecret(dh_concat, sizeof(dh_concat), kem_context, sizeof(kem_context));
+    memory_cleanse(dh1.data(), dh1.size());
+    memory_cleanse(dh2.data(), dh2.size());
+    memory_cleanse(dh_concat, 64);
+    return shared;
 }
 
 std::vector<uint8_t> Seal(std::span<const std::byte> key, ChaCha20::Nonce96 nonce,
-                                           std::span<const std::byte> aad, std::span<const std::byte> plaintext)
+                          std::span<const std::byte> aad, std::span<const std::byte> plaintext)
 {
     assert(key.size() == AEADChaCha20Poly1305::KEYLEN);
     AEADChaCha20Poly1305 aead(key);  // Initialize AEAD with the 32-byte key
@@ -393,7 +425,7 @@ std::vector<uint8_t> Seal(std::span<const std::byte> key, ChaCha20::Nonce96 nonc
 }
 
 std::optional<std::vector<uint8_t>> Open(std::span<const std::byte> key, ChaCha20::Nonce96 nonce,
-                                                          std::span<const std::byte> aad, std::span<const std::byte> ciphertext)
+                                        std::span<const std::byte> aad, std::span<const std::byte> ciphertext)
 {
     assert(key.size() == AEADChaCha20Poly1305::KEYLEN);
     // Ciphertext must include at least the 16-byte tag
@@ -436,81 +468,60 @@ std::vector<uint8_t> ComputeNonce(const std::vector<uint8_t>& base_nonce, size_t
 }
 
 //---------------------------------------------------------------------------
-// VerifyPSKInputs  (RFC 9180 §7.1)
+// KeySchedule(mode, shared_secret, info, psk, psk_id)  (RFC 9180 §7.1)
 //---------------------------------------------------------------------------
-//   got_psk    := (psk    != default_psk)
-//   got_psk_id := (psk_id != default_psk_id)
-//   if got_psk != got_psk_id: error “Inconsistent PSK inputs”
-//   if got_psk    AND mode in {base, auth}:       error “PSK input provided when not needed”
-//   if NOT got_psk AND mode in {psk, auth_psk}:   error “Missing required PSK input”
-inline void VerifyPSKInputs(
+
+std::optional<Context> KeySchedule(
     uint8_t mode,
-    const std::vector<unsigned char>& psk,
-    const std::vector<unsigned char>& psk_id)
-{
-    bool got_psk    = !psk.empty();
-    bool got_psk_id = !psk_id.empty();
-
-    if (got_psk != got_psk_id) {
-        throw std::runtime_error("Inconsistent PSK inputs");
-    }
-
-    uint8_t mode_base = 0x00;
-    uint8_t mode_psk = 0x01;
-    uint8_t mode_auth = 0x02;
-    uint8_t mode_auth_psk = 0x03;
-
-    // PSK was provided where it shouldn't be
-    if (got_psk && (mode == mode_base || mode == mode_auth)) {
-        throw std::runtime_error("PSK input provided when not needed");
-    }
-    // PSK omitted where it is required
-    if (!got_psk && (mode == mode_psk || mode == mode_auth_psk)) {
-        throw std::runtime_error("Missing required PSK input");
-    }
-}
-
-Context KeySchedule(
-    uint8_t mode,
-    const std::vector<unsigned char>& shared_secret,
-    const std::vector<unsigned char>& info,
-    const std::vector<unsigned char>& psk,
-    const std::vector<unsigned char>& psk_id)
+    const std::vector<uint8_t>& shared_secret,
+    const std::vector<uint8_t>& info,
+    const std::vector<uint8_t>& psk,
+    const std::vector<uint8_t>& psk_id)
 {
     // 1. Validate PSK inputs
-    VerifyPSKInputs(mode, psk, psk_id);
+    bool got_psk    = !psk.empty();
+    bool got_psk_id = !psk_id.empty();
+    if (got_psk != got_psk_id) {
+        return std::nullopt; // Inconsistent PSK inputs
+    }
+    if (got_psk && (mode == 0x00 || mode == 0x02)) {
+        return std::nullopt; // PSK input provided when not needed
+    }
+    if (!got_psk && (mode == 0x01 || mode == 0x03)) {
+        return std::nullopt; // Missing required PSK input
+    }
 
     // 2. psk_id_hash = LabeledExtract("", "psk_id_hash", psk_id)
     const std::vector<uint8_t> label_psk_id_hash{'p','s','k','_','i','d','_','h','a','s','h'};
     auto psk_id_hash = LabeledExtract({}, label_psk_id_hash, psk_id);
 
     // 3. info_hash = LabeledExtract("", "info_hash", info)
-    const std::vector<unsigned char> label_info_hash{'i','n','f','o','_','h','a','s','h'};
+    const std::vector<uint8_t> label_info_hash{'i','n','f','o','_','h','a','s','h'};
     auto info_hash = LabeledExtract({}, label_info_hash, info);
 
     // 4. key_schedule_context = mode || psk_id_hash || info_hash
-    std::vector<unsigned char> key_schedule_context;
+    std::vector<uint8_t> key_schedule_context;
     key_schedule_context.push_back(mode);
     key_schedule_context.insert(key_schedule_context.end(), psk_id_hash.begin(), psk_id_hash.end());
     key_schedule_context.insert(key_schedule_context.end(), info_hash.begin(), info_hash.end());
 
     // 5. secret = LabeledExtract(shared_secret, "secret", psk)
-    const std::vector<unsigned char> label_secret{'s','e','c','r','e','t'};
+    const std::vector<uint8_t> label_secret{'s','e','c','r','e','t'};
     auto secret = LabeledExtract(shared_secret, label_secret, psk);
 
     // 6. Derive key, base_nonce, exporter_secret with LabeledExpand
-    const size_t Nk = 32;                    // typically 32
-    const size_t Nn = 12;                    // typically 12
-    const size_t Nh = 32;                    // hash output length
-
-    static const std::vector<unsigned char> label_key{'k','e','y'};
-    static const std::vector<unsigned char> label_base_nonce{'b','a','s','e','_','n','o','n','c','e'};
-    static const std::vector<unsigned char> label_exp{'e','x','p'};
+    const size_t Nk = 32;
+    const size_t Nn = 12;
+    const size_t Nh = 32;
+    static const std::vector<uint8_t> label_key{'k','e','y'};
+    static const std::vector<uint8_t> label_base_nonce{'b','a','s','e','_','n','o','n','c','e'};
+    static const std::vector<uint8_t> label_exp{'e','x','p'};
 
     auto got_key      = LabeledExpand(secret, label_key, key_schedule_context, Nk);
     auto got_nonce    = LabeledExpand(secret, label_base_nonce, key_schedule_context, Nn);
     auto got_exporter = LabeledExpand(secret, label_exp, key_schedule_context, Nh);
 
+    memory_cleanse(secret.data(), secret.size());
     return Context(got_key, got_nonce, got_exporter);
 }
 

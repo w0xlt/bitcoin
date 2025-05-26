@@ -21,20 +21,14 @@
  */
 namespace dhkem_secp256k1 {
 
-using ::secp256k1_pubkey;
-using ::secp256k1_ec_pubkey_serialize;
-using ::secp256k1_context_create;
-using ::secp256k1_context;
-
-static const size_t NSECRET = 32;        //!< Length of KEM shared secret (Nsecret = 32 bytes)
-static const size_t NENC = 65;           //!< Length of encapsulated key (ephemeral public key), uncompressed SEC1 (65 bytes)
-static const size_t NPK = 65;            //!< Length of public key serialization, uncompressed (65 bytes)
-static const size_t NSK = 32;            //!< Length of private key serialization (32 bytes)
+static const size_t NSECRET = 32;        //!< Length of KEM shared secret (32 bytes)
+static const size_t NENC    = 65;        //!< Length of encapsulated key (ephemeral public key), uncompressed SEC1 (65 bytes)
+static const size_t NPK     = 65;        //!< Length of public key serialization, uncompressed (65 bytes)
+static const size_t NSK     = 32;        //!< Length of private key serialization (32 bytes)
 
 // Labeled prefix "HPKE-v1" and suite ID for KEM(secp256k1, HKDF-SHA256)
 static const unsigned char LABEL_PREFIX[] = {'H','P','K','E','-','v','1'};
-
-static const unsigned char SUITE_ID[] = {'H','P','K','E', 0x00, 0x16, 0x00, 0x01, 0x00, 0x03}; // example: KEM=0x0016, KDF=0x0001, AEAD=0x0003
+static const unsigned char SUITE_ID[]    = {'H','P','K','E', 0x00, 0x16, 0x00, 0x01, 0x00, 0x03}; // e.g., KEM=0x0016, KDF=0x0001, AEAD=0x0003
 
 /**
  * DeriveKeyPair(IKM): Derive a secp256k1 key pair from input keying material.
@@ -56,7 +50,7 @@ bool DeriveKeyPair(std::span<const uint8_t> ikm,
 /**
  * Encap(pkR): Perform HPKE KEM encapsulation to the recipient's public key (Base mode).
  * 
- * Uses an ephemeral key pair to produce:
+ * Uses an ephemeral key pair provided by the caller to produce:
  *   - enc: the ephemeral public key (65 bytes, uncompressed)
  *   - shared_secret: 32-byte KEM shared secret
  * 
@@ -65,20 +59,21 @@ bool DeriveKeyPair(std::span<const uint8_t> ikm,
  *   kem_context = enc || pkR,
  *   shared_secret = HKDF-Extract & Expand(dh, "shared secret")^18.
  * 
- * Note: Unlike the RFC 9180 interface, this implementation expects the caller to provide the ephemeral private key (`skE`) and corresponding public key (`enc`) rather than generating a random ephemeral key internally.
+ * Note: Unlike the RFC 9180 interface, the caller must supply the ephemeral private key (`skE`) 
+ * and corresponding public key (`enc`) rather than the function generating a random ephemeral key.
  * 
  * @param pkR  Recipient's public key (65-byte uncompressed).
- * @param skE  Ephemeral private key (32-byte secret scalar).
+ * @param skE  Ephemeral private key (32-byte scalar).
  * @param enc  Ephemeral public key corresponding to skE (65-byte uncompressed).
- * @return Optional pair of {32-byte shared secret, 65-byte ephemeral public key} on success, or std::nullopt on failure.
+ * @return 32-byte shared secret on success, or std::nullopt on failure.
  */
-std::optional<std::pair<std::array<uint8_t, 32>, std::array<uint8_t, 65>>>
+std::optional<std::array<uint8_t, 32>>
 Encap(std::span<const uint8_t> pkR, const std::array<uint8_t, 32>& skE, const std::array<uint8_t, 65>& enc);
 
 /**
  * Decap(enc, skR): Perform HPKE KEM decapsulation using the recipient's private key (Base mode).
  * 
- * Given the encapsulated key (ephemeral public key `enc`) and the recipient's private key `skR`, 
+ * Given the encapsulated key (ephemeral public key `enc`) and the recipient's private key `skR`,
  * computes the same 32-byte shared secret as Encap(). Returns std::nullopt if input keys are invalid.
  * 
  * @param enc  Encapsulated ephemeral public key (65-byte uncompressed).
@@ -122,46 +117,41 @@ std::vector<uint8_t> LabeledExtract(const std::vector<uint8_t>& salt,
 /**
  * AuthEncap(pkR, skS, skE): Authenticated encapsulation using sender's static key.
  * 
- * Outputs:
- *  - shared_secret: 32-byte KEM shared secret
- * 
- * Uses the recipient’s public key (pkR), the sender’s static private key (skS), 
- * and an ephemeral key pair (skE and its public key enc). Implements DHKEM in auth mode:
+ * Computes a shared secret using the recipient’s public key (pkR), the sender’s static private key (skS),
+ * and an ephemeral key pair (skE with its public key enc). Implements DHKEM in auth mode:
  *   DH1 = x-coordinate of (skE * pkR)
  *   DH2 = x-coordinate of (skS * pkR)
  *   kem_context = enc || pkR || pkS
- *   shared_secret = HKDF-Extract & Expand based on DH1 || DH2 and kem_context.
+ *   shared_secret = HKDF-Extract & Expand(DH1 || DH2, "shared secret")
  * 
- * @param shared_secret (output) Buffer to receive the 32-byte shared secret.
  * @param pkR  Recipient’s public key (65-byte uncompressed).
  * @param skS  Sender’s static private key (32-byte scalar).
  * @param skE  Ephemeral private key (32-byte scalar).
  * @param enc  Ephemeral public key corresponding to skE (65-byte uncompressed).
- * @return true on success (shared_secret is filled), false if any input key is invalid.
+ * @return 32-byte shared secret on success, or std::nullopt if any input key is invalid.
  */
-bool AuthEncap(std::array<uint8_t, 32>& shared_secret,
-               const std::array<uint8_t, 65>& pkR,
-               const std::array<uint8_t, 32>& skS,
-               const std::array<uint8_t, 32>& skE,
-               const std::array<uint8_t, 65>& enc);
+std::optional<std::array<uint8_t, 32>>
+AuthEncap(const std::array<uint8_t, 65>& pkR,
+          const std::array<uint8_t, 32>& skS,
+          const std::array<uint8_t, 32>& skE,
+          const std::array<uint8_t, 65>& enc);
 
 /**
  * AuthDecap(enc, skR, pkS): Authenticated decapsulation using sender’s static public key.
  * 
- * Given the encapsulated ephemeral public key (enc), the receiver’s private key (skR), 
- * and the sender’s static public key (pkS), computes the 32-byte shared secret 
- * (matching the output of AuthEncap). Returns false if any input is invalid.
+ * Given the encapsulated ephemeral public key (enc), the receiver’s private key (skR),
+ * and the sender’s static public key (pkS), computes the 32-byte shared secret matching AuthEncap’s output.
+ * Returns std::nullopt if decapsulation fails (e.g., invalid key inputs).
  * 
- * @param shared_secret (output) Buffer to receive the 32-byte shared secret.
  * @param enc  Encapsulated ephemeral public key from AuthEncap (65-byte uncompressed).
  * @param skR  Receiver’s private key (32-byte scalar).
  * @param pkS  Sender’s static public key (65-byte uncompressed).
- * @return true on success, false if decapsulation fails (e.g., invalid key inputs).
+ * @return 32-byte shared secret on success, or std::nullopt if decapsulation fails.
  */
-bool AuthDecap(std::array<uint8_t, 32>& shared_secret,
-               const std::array<uint8_t, 65>& enc,
-               const std::array<uint8_t, 32>& skR,
-               const std::array<uint8_t, 65>& pkS);
+std::optional<std::array<uint8_t, 32>>
+AuthDecap(const std::array<uint8_t, 65>& enc,
+          const std::array<uint8_t, 32>& skR,
+          const std::array<uint8_t, 65>& pkS);
 
 /**
  * Seal(key, nonce, aad, plaintext): AEAD encryption with ChaCha20-Poly1305.
@@ -190,7 +180,7 @@ std::vector<uint8_t> Seal(std::span<const std::byte> key, ChaCha20::Nonce96 nonc
  * @return The decrypted plaintext on success, or std::nullopt if authentication fails (tag mismatch or corrupted data).
  */
 std::optional<std::vector<uint8_t>> Open(std::span<const std::byte> key, ChaCha20::Nonce96 nonce,
-                                         std::span<const std::byte> aad, std::span<const std::byte> ciphertext);
+                                        std::span<const std::byte> aad, std::span<const std::byte> ciphertext);
 
 /**
  * Derives a new nonce from a base nonce and a sequence number.
@@ -212,44 +202,42 @@ std::vector<uint8_t> ComputeNonce(const std::vector<uint8_t>& base_nonce, size_t
  * - `base_nonce` : the base nonce for AEAD (used to derive per-message nonces via ComputeNonce).
  * - `exporter_secret` : the exporter secret (for use with the HPKE exporter interface).
  * 
- * *Note:* The sequence number (for encryption operations) is not stored in this struct; it must be managed externally by incrementing for each encryption and used with ComputeNonce().
+ * *Note:* The sequence number (for encryption operations) is not stored in this struct; it must be managed externally.
  */
 struct Context
 {
-    std::vector<unsigned char> key;
-    std::vector<unsigned char> base_nonce;
-    std::vector<unsigned char> exporter_secret;
+    std::vector<uint8_t> key;
+    std::vector<uint8_t> base_nonce;
+    std::vector<uint8_t> exporter_secret;
 
-    Context(const std::vector<unsigned char>& _key,
-            const std::vector<unsigned char>& _nonce,
-            const std::vector<unsigned char>& _exp)
-      : key(_key)
-      , base_nonce(_nonce)
-      , exporter_secret(_exp)
-    {}
+    Context(const std::vector<uint8_t>& _key,
+            const std::vector<uint8_t>& _nonce,
+            const std::vector<uint8_t>& _exp)
+      : key(_key), base_nonce(_nonce), exporter_secret(_exp) {}
 };
 
 /**
- * KeySchedule(mode, shared_secret, info, psk, psk_id): Derive the Context (key, base_nonce, exporter_secret) from a shared secret and optional inputs.
+ * KeySchedule(mode, shared_secret, info, psk, psk_id): Derive the Context (key, base_nonce, exporter_secret) 
+ * from a shared secret and optional inputs.
  * 
- * Implements the HPKE key schedule as specified in RFC 9180 §7.1. Depending on the `mode` byte (0x00 = Base, 0x01 = PSK, 0x02 = Auth, 0x03 = AuthPSK), 
- * it incorporates the presence of a pre-shared key and/or authentication. This function computes hash values of `psk_id` and `info`, constructs the key schedule context, 
+ * Implements the HPKE key schedule as specified in RFC 9180 §7.1. Depending on the `mode` byte 
+ * (0x00 = Base, 0x01 = PSK, 0x02 = Auth, 0x03 = AuthPSK), it incorporates the presence of a pre-shared key 
+ * and/or authentication. This function computes hash values of `psk_id` and `info`, constructs the key schedule context, 
  * extracts a `secret` value from the `shared_secret` and `psk`, and then expands that into the `key`, `base_nonce`, and `exporter_secret`.
  * 
- * @param mode       HPKE mode (0x00 for Base, 0x01 for PSK, 0x02 for Auth, 0x03 for AuthPSK).
+ * @param mode       HPKE mode (0x00=Base, 0x01=PSK, 0x02=Auth, 0x03=AuthPSK).
  * @param shared_secret The KEM shared secret (e.g., output of Encap/AuthEncap, 32 bytes).
  * @param info       Application-supplied info bytes (can be empty).
  * @param psk        Pre-shared key bytes (if mode includes a PSK, otherwise empty vector).
  * @param psk_id     Identifier for the PSK (if applicable, otherwise empty vector).
- * @return A Context struct containing the derived `key`, `base_nonce`, and `exporter_secret`.
+ * @return A Context struct containing the derived `key`, `base_nonce`, and `exporter_secret`, or std::nullopt on invalid PSK inputs.
  */
-Context KeySchedule(
+std::optional<Context> KeySchedule(
     uint8_t mode,
-    const std::vector<unsigned char>& shared_secret,
-    const std::vector<unsigned char>& info,
-    const std::vector<unsigned char>& psk,
-    const std::vector<unsigned char>& psk_id);
-
+    const std::vector<uint8_t>& shared_secret,
+    const std::vector<uint8_t>& info,
+    const std::vector<uint8_t>& psk,
+    const std::vector<uint8_t>& psk_id);
 
 } // namespace dhkem_secp256k1
 
