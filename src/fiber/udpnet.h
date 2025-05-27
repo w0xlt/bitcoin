@@ -113,7 +113,7 @@ struct PartialBlockData {
     std::map<CService, std::pair<uint32_t, uint32_t> > nodesWithChunksAvailableSet;
 
     bool Init(const UDPMessage& msg);
-    ReadStatus ProvideHeaderData(const CBlockHeaderAndShortTxIDs header);
+    ReadStatus ProvideHeaderData(const CBlockHeaderAndLengthShortTxIDs& header);
     PartialBlockData(const CService& node, const UDPMessage& header_msg, const std::chrono::steady_clock::time_point& packet_recv); // Must be a MSG_TYPE_BLOCK_HEADER
     void ReconstructBlockFromDecoder();
 };

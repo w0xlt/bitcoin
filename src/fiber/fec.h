@@ -14,6 +14,7 @@
 #define CM256_MAX_CHUNKS 27
 
 #include <fiber/wirehair/include/wirehair/wirehair.h>
+#include <fiber/wirehair/cm256.h>
 #include <random.h>
 #include <fiber/open_hash_set.h>
 

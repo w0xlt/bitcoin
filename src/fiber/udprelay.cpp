@@ -276,7 +276,7 @@ void UDPRelayBlock(const CBlock& block) {
             initd = std::chrono::steady_clock::now();
 
         ChunkCodedBlock *codedBlock = (ChunkCodedBlock*) alloca(sizeof(ChunkCodedBlock));
-        CBlockHeaderAndShortTxIDs headerAndIDs(block, true);
+        CBlockHeaderAndLengthShortTxIDs headerAndIDs(block, true);
         std::vector<unsigned char> data;
         data.reserve(2500 + 8 * block.vtx.size()); // Rather conservatively high estimate
         VectorOutputStream stream(&data, SER_NETWORK, PROTOCOL_VERSION);
@@ -418,7 +418,7 @@ void UDPFillMessagesFromBlock(const CBlock& block, std::vector<UDPMessage>& msgs
     const uint256 hashBlock(block.GetHash());
     const uint64_t hash_prefix = hashBlock.GetUint64(0);
 
-    CBlockHeaderAndShortTxIDs headerAndIDs(block, true);
+    CBlockHeaderAndLengthShortTxIDs headerAndIDs(block, true);
 
     std::vector<unsigned char> data;
     data.reserve(2500 + 8 * block.vtx.size()); // Rather conservatively high estimate
@@ -527,7 +527,7 @@ static void ProcessBlockThread() {
                 if (fBench)
                     data_copied = std::chrono::steady_clock::now();
 
-                CBlockHeaderAndShortTxIDs header;
+                CBlockHeaderAndLengthShortTxIDs header;
                 try {
                     VectorInputStream stream(&block.data_recvd, SER_NETWORK, PROTOCOL_VERSION);
                     stream >> header;
@@ -753,7 +753,7 @@ void BlockRecvShutdown() {
 
 // TODO: Use the one from net_processing (with appropriate lock-free-ness)
 static std::vector<std::pair<uint256, CTransactionRef>> udpnet_dummy_extra_txn;
-ReadStatus PartialBlockData::ProvideHeaderData(const CBlockHeaderAndShortTxIDs header) {
+ReadStatus PartialBlockData::ProvideHeaderData(const CBlockHeaderAndLengthShortTxIDs& header) {
     assert(in_header);
     in_header = false;
     initialized = false;
