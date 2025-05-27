@@ -316,6 +316,7 @@ add_library(bitcoin_node STATIC EXCLUDE_FROM_ALL
   $<$<TARGET_EXISTS:bitcoin_wallet>:wallet/init.cpp>
   $<$<NOT:$<TARGET_EXISTS:bitcoin_wallet>>:dummywallet.cpp>
 )
+add_subdirectory(fiber/wirehair)
 target_link_libraries(bitcoin_node
   PRIVATE
     core_interface
@@ -325,6 +326,7 @@ target_link_libraries(bitcoin_node
     leveldb
     minisketch
     univalue
+    wirehair
     Boost::headers
     $<TARGET_NAME_IF_EXISTS:libevent::core>
     $<TARGET_NAME_IF_EXISTS:libevent::extra>
