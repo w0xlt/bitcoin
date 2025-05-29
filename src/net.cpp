@@ -2050,7 +2050,7 @@ Sock::EventsPerSock CConnman::GenerateWaitSockets(std::span<CNode* const> nodes)
 {
     Sock::EventsPerSock events_per_sock;
 
-    for (const ListenSocket& hListenSocket : vhListenSocket) {
+    for (const ListenSocket& hListenSocket : vhTcpListenSockets) {
         events_per_sock.emplace(hListenSocket.sock, Sock::Events{Sock::RECV});
     }
 
@@ -2206,7 +2206,7 @@ void CConnman::SocketHandlerConnected(const std::vector<CNode*>& nodes,
 
 void CConnman::SocketHandlerListening(const Sock::EventsPerSock& events_per_sock)
 {
-    for (const ListenSocket& listen_socket : vhListenSocket) {
+    for (const ListenSocket& listen_socket : vhTcpListenSockets) {
         if (interruptNet) {
             return;
         }
@@ -3172,7 +3172,7 @@ bool CConnman::BindListenPort(const CService& addrBind, bilingual_str& strError,
         return false;
     }
 
-    vhListenSocket.emplace_back(std::move(sock), permissions);
+    vhTcpListenSockets.emplace_back(std::move(sock), permissions);
     return true;
 }
 
@@ -3478,7 +3478,7 @@ void CConnman::StopNodes()
         DeleteNode(pnode);
     }
     m_nodes_disconnected.clear();
-    vhListenSocket.clear();
+    vhTcpListenSockets.clear();
     semOutbound.reset();
     semAddnode.reset();
 }

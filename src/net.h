@@ -1458,7 +1458,7 @@ private:
     unsigned int nSendBufferMaxSize{0};
     unsigned int nReceiveFloodSize{0};
 
-    std::vector<ListenSocket> vhListenSocket;
+    std::vector<ListenSocket> vhTcpListenSockets;
     std::atomic<bool> fNetworkActive{true};
     bool fAddressesInitialized{false};
     AddrMan& addrman;
