@@ -1049,6 +1049,33 @@ protected:
     ~NetEventsInterface() = default;
 };
 
+/* struct UDPPeer {
+    CService addr;
+    bool high_bandwidth_compact_blocks{true};
+    std::chrono::seconds last_send{0};
+    std::chrono::seconds last_recv{0};
+};
+
+class UDPManager {
+    std::atomic<bool> udp_enabled{false};
+    uint16_t udp_port{0};
+    // SOCKET udp_socket{INVALID_SOCKET};
+
+    std::unique_ptr<Sock> m_sock;
+
+    mutable Mutex m_udp_peers_mutex;
+    std::vector<UDPPeer> m_udp_peers GUARDED_BY(m_udp_peers_mutex);
+
+    // UDP-related methods
+    bool BindUDP(uint16_t port);
+    bool AddUDPPeer(const CService& addr) EXCLUSIVE_LOCKS_REQUIRED(!m_udp_peers_mutex);;
+    bool RemoveUDPPeer(const CService& addr) EXCLUSIVE_LOCKS_REQUIRED(!m_udp_peers_mutex);;
+    std::vector<CService> GetUDPPeers() const EXCLUSIVE_LOCKS_REQUIRED(!m_udp_peers_mutex);;
+    // void SendUDPMessage(const CService& addr, const CSerializedNetMsg& msg);
+}; */
+
+
+
 class CConnman
 {
 public:

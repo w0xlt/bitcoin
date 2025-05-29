@@ -4012,3 +4012,117 @@ std::function<void(const CAddress& addr,
                    std::span<const unsigned char> data,
                    bool is_incoming)>
     CaptureMessage = CaptureMessageToFile;
+
+/*bool UDPManager::AddUDPPeer(const CService& addr)
+{
+    AssertLockNotHeld(m_udp_peers_mutex);
+    LOCK(m_udp_peers_mutex);
+    // don't add duplicates
+    auto it = std::find_if(m_udp_peers.begin(), m_udp_peers.end(),
+        [&addr](const UDPPeer& p) { return p.addr == addr; });
+    if (it != m_udp_peers.end()) return false;
+
+    UDPPeer peer;
+    peer.addr = addr;
+    // other fields (high_bandwidth_compact_blocks, last_send, last_recv)
+    // are already default-initialized
+    m_udp_peers.push_back(std::move(peer));
+    return true;
+}
+
+bool UDPManager::RemoveUDPPeer(const CService& addr)
+{
+    AssertLockNotHeld(m_udp_peers_mutex);
+    LOCK(m_udp_peers_mutex);
+    auto it = std::find_if(m_udp_peers.begin(), m_udp_peers.end(),
+        [&addr](const UDPPeer& p) { return p.addr == addr; });
+    if (it == m_udp_peers.end()) return false;
+
+    m_udp_peers.erase(it);
+    return true;
+}
+
+std::vector<CService> UDPManager::GetUDPPeers() const
+{
+    AssertLockNotHeld(m_udp_peers_mutex);
+    LOCK(m_udp_peers_mutex);
+    std::vector<CService> addrs;
+    addrs.reserve(m_udp_peers.size());
+    for (const auto& p : m_udp_peers) {
+        addrs.push_back(p.addr);
+    }
+    return addrs;
+}
+
+bool UDPManager::BindUDP(uint16_t port)
+{
+    int nOne = 1;
+
+    assert(this->m_sock == nullptr);  // Only bind once
+
+    // 1. Create an IPv6 UDP socket (will also handle IPv4 if supported)
+    std::unique_ptr<Sock> sock = CreateSock(AF_INET6, SOCK_DGRAM, IPPROTO_UDP);
+    if (!sock) {
+        LogPrintLevel(BCLog::NET, BCLog::Level::Error, 
+                      "socket(AF_INET6, UDP) failed: %s\n", NetworkErrorString(errno));
+        return false;
+    }
+
+    // 2. Set socket options: reuse address and dual-stack mode
+
+    // Allow binding if the port is still in TIME_WAIT state after
+    // the program was closed and restarted.
+    if (sock->SetSockOpt(SOL_SOCKET, SO_REUSEADDR, (sockopt_arg_type)&nOne, sizeof(int)) == SOCKET_ERROR) {
+        strError = Untranslated(strprintf("Error setting SO_REUSEADDR on socket: %s, continuing anyway", NetworkErrorString(WSAGetLastError())));
+        LogPrintf("%s\n", strError.original);
+    }
+
+     // some systems don't have IPV6_V6ONLY but are always v6only; others do have the option
+    // and enable it by default or not. Try to enable it, if possible.
+    if (addrBind.IsIPv6()) {
+#ifdef IPV6_V6ONLY
+        if (sock->SetSockOpt(IPPROTO_IPV6, IPV6_V6ONLY, (sockopt_arg_type)&nOne, sizeof(int)) == SOCKET_ERROR) {
+            strError = Untranslated(strprintf("Error setting IPV6_V6ONLY on socket: %s, continuing anyway", NetworkErrorString(WSAGetLastError())));
+            LogPrintf("%s\n", strError.original);
+        }
+#endif
+#ifdef WIN32
+        int nProtLevel = PROTECTION_LEVEL_UNRESTRICTED;
+        if (sock->SetSockOpt(IPPROTO_IPV6, IPV6_PROTECTION_LEVEL, (const char*)&nProtLevel, sizeof(int)) == SOCKET_ERROR) {
+            strError = Untranslated(strprintf("Error setting IPV6_PROTECTION_LEVEL on socket: %s, continuing anyway", NetworkErrorString(WSAGetLastError())));
+            LogPrintf("%s\n", strError.original);
+        }
+#endif
+    }
+
+    // 3. Set the non-blocking option on the socket.
+
+    if (!sock->SetNonBlocking()) {
+        LogPrintf("Error setting socket to non-blocking: %s\n", NetworkErrorString(WSAGetLastError()));
+        return nullptr;
+    }
+
+    // 3. Bind to all addresses (any IPv6 address, port)
+    if (sock->Bind(reinterpret_cast<struct sockaddr*>(&sockaddr), len) == SOCKET_ERROR) {
+        int nErr = WSAGetLastError();
+        if (nErr == WSAEADDRINUSE)
+            strError = strprintf(_("Unable to bind to %s on this computer. %s is probably already running."), addrBind.ToStringAddrPort(), CLIENT_NAME);
+        else
+            strError = strprintf(_("Unable to bind to %s on this computer (bind returned error %s)"), addrBind.ToStringAddrPort(), NetworkErrorString(nErr));
+        LogPrintLevel(BCLog::NET, BCLog::Level::Error, "%s\n", strError.original);
+        return false;
+    }
+    LogPrintf("Bound to %s\n", addrBind.ToStringAddrPort());
+
+    // Listen for incoming connections
+    if (sock->Listen(SOMAXCONN) == SOCKET_ERROR)
+    {
+        strError = strprintf(_("Listening for incoming connections failed (listen returned error %s)"), NetworkErrorString(WSAGetLastError()));
+        LogPrintLevel(BCLog::NET, BCLog::Level::Error, "%s\n", strError.original);
+        return false;
+    }
+
+    // 4. Store the socket and return success
+    m_sock = std::move(sock);
+    return true; 
+}*/
