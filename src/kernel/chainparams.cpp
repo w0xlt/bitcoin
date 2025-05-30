@@ -131,6 +131,7 @@ public:
         pchMessageStart[2] = 0xb4;
         pchMessageStart[3] = 0xd9;
         nDefaultPort = 8333;
+        nDefaultUDPPort = 9333;
         nPruneAfterHeight = 100000;
         m_assumed_blockchain_size = 720;
         m_assumed_chain_state_size = 14;
@@ -240,6 +241,7 @@ public:
         pchMessageStart[2] = 0x09;
         pchMessageStart[3] = 0x07;
         nDefaultPort = 18333;
+        nDefaultUDPPort = 19333;
         nPruneAfterHeight = 1000;
         m_assumed_blockchain_size = 200;
         m_assumed_chain_state_size = 19;
@@ -336,6 +338,7 @@ public:
         pchMessageStart[2] = 0x3f;
         pchMessageStart[3] = 0x28;
         nDefaultPort = 48333;
+        nDefaultUDPPort = 49333;
         nPruneAfterHeight = 1000;
         m_assumed_blockchain_size = 11;
         m_assumed_chain_state_size = 1;
@@ -469,6 +472,7 @@ public:
         std::copy_n(hash.begin(), 4, pchMessageStart.begin());
 
         nDefaultPort = 38333;
+        nDefaultUDPPort = 39333;
         nPruneAfterHeight = 1000;
 
         genesis = CreateGenesisBlock(1598918400, 52613770, 0x1e0377ae, 1, 50 * COIN);
@@ -547,6 +551,7 @@ public:
         pchMessageStart[2] = 0xb5;
         pchMessageStart[3] = 0xda;
         nDefaultPort = 18444;
+        nDefaultUDPPort = 19444;
         nPruneAfterHeight = opts.fastprune ? 100 : 1000;
         m_assumed_blockchain_size = 0;
         m_assumed_chain_state_size = 0;

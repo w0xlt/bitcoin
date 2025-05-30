@@ -522,6 +522,7 @@ void SetupServerArgs(ArgsManager& argsman, bool can_listen_ipc)
     argsman.AddArg("-asmap=<file>", strprintf("Specify asn mapping used for bucketing of the peers (default: %s). Relative paths will be prefixed by the net-specific datadir location.", DEFAULT_ASMAP_FILENAME), ArgsManager::ALLOW_ANY, OptionsCategory::CONNECTION);
     argsman.AddArg("-bantime=<n>", strprintf("Default duration (in seconds) of manually configured bans (default: %u)", DEFAULT_MISBEHAVING_BANTIME), ArgsManager::ALLOW_ANY, OptionsCategory::CONNECTION);
     argsman.AddArg("-bind=<addr>[:<port>][=onion]", strprintf("Bind to given address and always listen on it (default: 0.0.0.0). Use [host]:port notation for IPv6. Append =onion to tag any incoming connections to that address and port as incoming Tor connections (default: 127.0.0.1:%u=onion, testnet3: 127.0.0.1:%u=onion, testnet4: 127.0.0.1:%u=onion, signet: 127.0.0.1:%u=onion, regtest: 127.0.0.1:%u=onion)", defaultChainParams->GetDefaultPort() + 1, testnetChainParams->GetDefaultPort() + 1, testnet4ChainParams->GetDefaultPort() + 1, signetChainParams->GetDefaultPort() + 1, regtestChainParams->GetDefaultPort() + 1), ArgsManager::ALLOW_ANY | ArgsManager::NETWORK_ONLY, OptionsCategory::CONNECTION);
+    argsman.AddArg("-udpbind=<addr>[:<port>]", strprintf("Bind to given address for UDP protocol services (experimental). Use [host]:port notation for IPv6. If not specified, UDP services are disabled. (mainnet default port: %u, testnet3: %u, testnet4: %u, signet: %u, regtest: %u)", defaultChainParams->GetDefaultUDPPort() + 1000, testnetChainParams->GetDefaultUDPPort() + 1000, testnet4ChainParams->GetDefaultUDPPort() + 1000, signetChainParams->GetDefaultUDPPort() + 1000, regtestChainParams->GetDefaultUDPPort() + 1000), ArgsManager::ALLOW_ANY | ArgsManager::NETWORK_ONLY, OptionsCategory::CONNECTION);
     argsman.AddArg("-cjdnsreachable", "If set, then this host is configured for CJDNS (connecting to fc00::/8 addresses would lead us to the CJDNS network, see doc/cjdns.md) (default: 0)", ArgsManager::ALLOW_ANY, OptionsCategory::CONNECTION);
     argsman.AddArg("-connect=<ip>", "Connect only to the specified node; -noconnect disables automatic connections (the rules for this peer are the same as for -addnode). This option can be specified multiple times to connect to multiple nodes.", ArgsManager::ALLOW_ANY | ArgsManager::NETWORK_ONLY, OptionsCategory::CONNECTION);
     argsman.AddArg("-discover", "Discover own IP addresses (default: 1 when listening and no -externalip or -proxy)", ArgsManager::ALLOW_ANY, OptionsCategory::CONNECTION);
@@ -1491,6 +1492,15 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
         }
     }
 
+    for (const std::string& socket_addr : args.GetArgs("-udpbind")) {
+        std::string host_out;
+        uint16_t port_out{0};
+        std::string bind_socket_addr = socket_addr.substr(0, socket_addr.rfind('='));
+        if (!SplitHostPort(bind_socket_addr, port_out, host_out)) {
+            return InitError(InvalidPortErrMsg("-udpbind", socket_addr));
+        }
+    }
+
     // sanitize comments per BIP-0014, format user agent and check total size
     std::vector<std::string> uacomments;
     for (const std::string& cmt : args.GetArgs("-uacomment")) {
@@ -1926,6 +1936,34 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
             }
         }
         return InitError(ResolveErrMsg("bind", bind_arg));
+    }
+
+    const uint16_t default_udp_port =
+        static_cast<uint16_t>(args.GetIntArg("-port", Params().GetDefaultUDPPort()));
+
+    for (const std::string& udp_bind_arg : args.GetArgs("-udpbind")) {
+        std::optional<CService> udp_bind_addr;
+        const size_t index = udp_bind_arg.rfind('=');
+        if (index == std::string::npos) {
+            // No network type specified - treat as regular UDP bind
+            udp_bind_addr = Lookup(udp_bind_arg, default_udp_port, /*fAllowLookup=*/false);
+            if (udp_bind_addr.has_value()) {
+                connOptions.updBinds.push_back(udp_bind_addr.value());
+                if (IsBadPort(udp_bind_addr.value().GetPort())) {
+                    InitWarning(BadPortWarning("-udpbind", udp_bind_addr.value().GetPort()));
+                }
+                continue;
+            }
+        } else {
+            // Network type specified - UDP bind does not support network types
+            const std::string network_type = udp_bind_arg.substr(index + 1);
+            if (network_type == "onion") {
+                return InitError(strprintf(_("-udpbind does not support onion addresses. Use -bind=<addr>=onion for onion services.")));
+            } else {
+                return InitError(strprintf(_("-udpbind does not support network type '%s'. Use -udpbind=<addr> without network specifiers."), network_type));
+            }
+        }
+        return InitError(ResolveErrMsg("udpbind", udp_bind_arg));
     }
 
     for (const std::string& strBind : args.GetArgs("-whitebind")) {

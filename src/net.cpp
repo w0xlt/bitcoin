@@ -1755,6 +1755,82 @@ void CConnman::AcceptConnection(const ListenSocket& hListenSocket) {
     CreateNodeFromAcceptedSocket(std::move(sock), permission_flags, addr_bind, addr);
 }
 
+void CConnman::HandleUdpMessage(const CService& peer_addr, std::span<const uint8_t> data)
+{
+    LogDebug(BCLog::NET, "HandleUdpMessage: Received UDP packet from %s, size=%zu bytes\n", 
+             peer_addr.ToStringAddrPort(), data.size());
+    
+    // Log first 32 bytes as hex for debugging (or entire message if smaller)
+    const size_t hex_dump_size = std::min(data.size(), size_t{32});
+    if (hex_dump_size > 0) {
+        LogDebug(BCLog::NET, "HandleUdpMessage: First %zu bytes: %s%s\n", 
+                 hex_dump_size, 
+                 HexStr(data.subspan(0, hex_dump_size)),
+                 data.size() > hex_dump_size ? "..." : "");
+    }
+    
+    // For now, just log and do nothing else
+    // TODO: Parse and process actual UDP protocol messages
+    LogDebug(BCLog::NET, "HandleUdpMessage: UDP message processing not yet implemented\n");
+}
+
+void CConnman::ProcessUdpPacket(const ListenSocket& listen_socket)
+{
+    AssertLockNotHeld(m_total_bytes_sent_mutex);
+    
+    uint8_t buffer[65536]; // UDP max packet size
+    struct sockaddr_storage from_sockaddr;
+    socklen_t from_len = sizeof(from_sockaddr);
+    
+    size_t bytes_received = listen_socket.sock->RecvFrom(buffer, sizeof(buffer), 0, 
+                                                         reinterpret_cast<sockaddr*>(&from_sockaddr), 
+                                                         &from_len);
+
+    std::cout << "---> bytes_received: " << util::ToString(bytes_received) << std::endl;
+
+    if (bytes_received > 0) {
+        CService peer_addr;
+        if (peer_addr.SetSockAddr((struct sockaddr*)&from_sockaddr, from_len)) {
+            // Process the UDP message
+            HandleUdpMessage(peer_addr, {buffer, static_cast<size_t>(bytes_received)});
+        }
+    } else {
+        int err = WSAGetLastError();
+        // EAGAIN/EWOULDBLOCK is normal for non-blocking sockets
+        if (err != WSAEWOULDBLOCK && err != WSAEINTR) {
+            LogDebug(BCLog::NET, "UDP recv error: %s\n", NetworkErrorString(err));
+        } else {
+            LogDebug(BCLog::NET, "Unexpected UDP recv error.\n");
+        }
+    }
+}
+
+bool CConnman::SendUdpMessage(const CService& peer_addr, const CSerializedNetMsg& msg)
+{
+    if (vhUdpListenSockets.empty()) return false;
+    
+    // Convert high-level CService to low-level sockaddr (reverse of above)
+    struct sockaddr_storage to_sockaddr;
+    socklen_t to_len = sizeof(to_sockaddr);
+    if (!peer_addr.GetSockAddr(reinterpret_cast<sockaddr*>(&to_sockaddr), &to_len)) {
+        return false; // Invalid address
+    }
+    
+    // Use low-level Sock method
+    const auto& udp_socket = vhUdpListenSockets[0].sock;
+    ssize_t bytes_sent = udp_socket->SendTo(msg.data.data(), msg.data.size(), 0,
+                                           reinterpret_cast<const sockaddr*>(&to_sockaddr), to_len);
+    
+    if (bytes_sent > 0) {
+        LogDebug(BCLog::NET, "Sent UDP message %s to %s (%zd bytes)\n", 
+                 msg.m_type, peer_addr.ToStringAddrPort(), bytes_sent);
+        RecordBytesSent(bytes_sent);
+        return true;
+    }
+    
+    return false;
+}
+
 void CConnman::CreateNodeFromAcceptedSocket(std::unique_ptr<Sock>&& sock,
                                             NetPermissionFlags permission_flags,
                                             const CService& addr_bind,
@@ -2054,6 +2130,10 @@ Sock::EventsPerSock CConnman::GenerateWaitSockets(std::span<CNode* const> nodes)
         events_per_sock.emplace(hListenSocket.sock, Sock::Events{Sock::RECV});
     }
 
+    for (const ListenSocket& hListenSocket : vhUdpListenSockets) {
+        events_per_sock.emplace(hListenSocket.sock, Sock::Events{Sock::RECV});
+    }
+
     for (CNode* pnode : nodes) {
         bool select_recv = !pnode->fPauseRecv;
         bool select_send;
@@ -2213,6 +2293,15 @@ void CConnman::SocketHandlerListening(const Sock::EventsPerSock& events_per_sock
         const auto it = events_per_sock.find(listen_socket.sock);
         if (it != events_per_sock.end() && it->second.occurred & Sock::RECV) {
             AcceptConnection(listen_socket);
+        }
+    }
+
+    // Handle UDP listening sockets  
+    for (const ListenSocket& listen_socket : vhUdpListenSockets) {
+        if (interruptNet) return;
+        const auto it = events_per_sock.find(listen_socket.sock);
+        if (it != events_per_sock.end() && it->second.occurred & Sock::RECV) {
+            ProcessUdpPacket(listen_socket);  // UDP: process incoming packets
         }
     }
 }
@@ -3107,7 +3196,7 @@ void CConnman::ThreadI2PAcceptIncoming()
     }
 }
 
-bool CConnman::BindListenPort(const CService& addrBind, bilingual_str& strError, NetPermissionFlags permissions)
+bool CConnman::BindListenPort(const CService& addrBind, bilingual_str& strError, NetPermissionFlags permissions, int type, int protocol, std::vector<ListenSocket>& vhListenSockets)
 {
     int nOne = 1;
 
@@ -3121,7 +3210,7 @@ bool CConnman::BindListenPort(const CService& addrBind, bilingual_str& strError,
         return false;
     }
 
-    std::unique_ptr<Sock> sock = CreateSock(addrBind.GetSAFamily(), SOCK_STREAM, IPPROTO_TCP);
+    std::unique_ptr<Sock> sock = CreateSock(addrBind.GetSAFamily(), type, protocol);
     if (!sock) {
         strError = Untranslated(strprintf("Couldn't open socket for incoming connections (socket returned error %s)", NetworkErrorString(WSAGetLastError())));
         LogPrintLevel(BCLog::NET, BCLog::Level::Error, "%s\n", strError.original);
@@ -3165,14 +3254,19 @@ bool CConnman::BindListenPort(const CService& addrBind, bilingual_str& strError,
     LogPrintf("Bound to %s\n", addrBind.ToStringAddrPort());
 
     // Listen for incoming connections
-    if (sock->Listen(SOMAXCONN) == SOCKET_ERROR)
-    {
-        strError = strprintf(_("Listening for incoming connections failed (listen returned error %s)"), NetworkErrorString(WSAGetLastError()));
-        LogPrintLevel(BCLog::NET, BCLog::Level::Error, "%s\n", strError.original);
-        return false;
+    if (protocol == IPPROTO_TCP) {  // Only for TCP
+        if (sock->Listen(SOMAXCONN) == SOCKET_ERROR)
+        {
+            strError = strprintf(_("Listening for incoming connections failed (listen returned error %s)"), NetworkErrorString(WSAGetLastError()));
+            LogPrintLevel(BCLog::NET, BCLog::Level::Error, "%s\n", strError.original);
+            return false;
+        }
+        LogPrintf("Listening on %s\n", addrBind.ToStringAddrPort());
+    } else {
+        LogPrintf("Bound UDP socket to %s\n", addrBind.ToStringAddrPort());
     }
 
-    vhTcpListenSockets.emplace_back(std::move(sock), permissions);
+    vhListenSockets.emplace_back(std::move(sock), permissions);
     return true;
 }
 
@@ -3233,12 +3327,12 @@ uint16_t CConnman::GetDefaultPort(const std::string& addr) const
     return a.SetSpecial(addr) ? GetDefaultPort(a.GetNetwork()) : m_params.GetDefaultPort();
 }
 
-bool CConnman::Bind(const CService& addr_, unsigned int flags, NetPermissionFlags permissions)
+bool CConnman::Bind(const CService& addr_, unsigned int flags, NetPermissionFlags permissions, int type, int protocol, std::vector<ListenSocket>& vhListenSockets)
 {
     const CService addr{MaybeFlipIPv6toCJDNS(addr_)};
 
     bilingual_str strError;
-    if (!BindListenPort(addr, strError, permissions)) {
+    if (!BindListenPort(addr, strError, permissions, type, protocol, vhListenSockets)) {
         if ((flags & BF_REPORT_ERROR) && m_client_interface) {
             m_client_interface->ThreadSafeMessageBox(strError, "", CClientUIInterface::MSG_ERROR);
         }
@@ -3255,17 +3349,17 @@ bool CConnman::Bind(const CService& addr_, unsigned int flags, NetPermissionFlag
 bool CConnman::InitBinds(const Options& options)
 {
     for (const auto& addrBind : options.vBinds) {
-        if (!Bind(addrBind, BF_REPORT_ERROR, NetPermissionFlags::None)) {
+        if (!Bind(addrBind, BF_REPORT_ERROR, NetPermissionFlags::None, SOCK_STREAM, IPPROTO_TCP, vhTcpListenSockets)) {
             return false;
         }
     }
     for (const auto& addrBind : options.vWhiteBinds) {
-        if (!Bind(addrBind.m_service, BF_REPORT_ERROR, addrBind.m_flags)) {
+        if (!Bind(addrBind.m_service, BF_REPORT_ERROR, addrBind.m_flags, SOCK_STREAM, IPPROTO_TCP, vhTcpListenSockets)) {
             return false;
         }
     }
     for (const auto& addr_bind : options.onion_binds) {
-        if (!Bind(addr_bind, BF_REPORT_ERROR | BF_DONT_ADVERTISE, NetPermissionFlags::None)) {
+        if (!Bind(addr_bind, BF_REPORT_ERROR | BF_DONT_ADVERTISE, NetPermissionFlags::None, SOCK_STREAM, IPPROTO_TCP, vhTcpListenSockets)) {
             return false;
         }
     }
@@ -3274,12 +3368,17 @@ bool CConnman::InitBinds(const Options& options)
         // may not have IPv6 support and the user did not explicitly ask us to
         // bind on that.
         const CService ipv6_any{in6_addr(IN6ADDR_ANY_INIT), GetListenPort()}; // ::
-        Bind(ipv6_any, BF_NONE, NetPermissionFlags::None);
+        Bind(ipv6_any, BF_NONE, NetPermissionFlags::None, SOCK_STREAM, IPPROTO_TCP, vhTcpListenSockets);
 
         struct in_addr inaddr_any;
         inaddr_any.s_addr = htonl(INADDR_ANY);
         const CService ipv4_any{inaddr_any, GetListenPort()}; // 0.0.0.0
-        if (!Bind(ipv4_any, BF_REPORT_ERROR, NetPermissionFlags::None)) {
+        if (!Bind(ipv4_any, BF_REPORT_ERROR, NetPermissionFlags::None, SOCK_STREAM, IPPROTO_TCP, vhTcpListenSockets)) {
+            return false;
+        }
+    }
+    for (const auto& addrBind : options.updBinds) {
+        if (!Bind(addrBind, BF_REPORT_ERROR, NetPermissionFlags::None, SOCK_DGRAM, IPPROTO_UDP, vhUdpListenSockets)) {
             return false;
         }
     }
@@ -3479,6 +3578,7 @@ void CConnman::StopNodes()
     }
     m_nodes_disconnected.clear();
     vhTcpListenSockets.clear();
+    vhUdpListenSockets.clear();
     semOutbound.reset();
     semAddnode.reset();
 }

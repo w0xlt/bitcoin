@@ -96,6 +96,19 @@ public:
      */
     [[nodiscard]] virtual std::unique_ptr<Sock> Accept(sockaddr* addr, socklen_t* addr_len) const;
 
+    // ADD: UDP operations using same low-level types as Accept()
+    /**
+     * recvfrom(2) wrapper. Equivalent to `recvfrom(m_socket, buf, len, flags, addr, addr_len)`.
+     * Code that uses this wrapper can be unit tested if this method is overridden by a mock Sock implementation.
+     */
+    [[nodiscard]] virtual ssize_t RecvFrom(void* buf, size_t len, int flags, sockaddr* addr, socklen_t* addr_len) const;
+    
+    /**
+     * sendto(2) wrapper. Equivalent to `sendto(m_socket, data, len, flags, addr, addr_len)`.
+     * Code that uses this wrapper can be unit tested if this method is overridden by a mock Sock implementation.
+     */
+    [[nodiscard]] virtual ssize_t SendTo(const void* data, size_t len, int flags, const sockaddr* addr, socklen_t addr_len) const;
+
     /**
      * getsockopt(2) wrapper. Equivalent to
      * `getsockopt(m_socket, level, opt_name, opt_val, opt_len)`. Code that uses this

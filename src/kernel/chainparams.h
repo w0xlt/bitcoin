@@ -81,6 +81,7 @@ public:
     const Consensus::Params& GetConsensus() const { return consensus; }
     const MessageStartChars& MessageStart() const { return pchMessageStart; }
     uint16_t GetDefaultPort() const { return nDefaultPort; }
+    uint16_t GetDefaultUDPPort() const { return nDefaultUDPPort; }
     std::vector<int> GetAvailableSnapshotHeights() const;
 
     const CBlock& GenesisBlock() const { return genesis; }
@@ -157,6 +158,7 @@ protected:
     Consensus::Params consensus;
     MessageStartChars pchMessageStart;
     uint16_t nDefaultPort;
+    uint16_t nDefaultUDPPort;
     uint64_t nPruneAfterHeight;
     uint64_t m_assumed_blockchain_size;
     uint64_t m_assumed_chain_state_size;
