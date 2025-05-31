@@ -1309,11 +1309,17 @@ public:
         std::chrono::seconds last_recv{0};
     };
 
+    struct UDPBroadcastResult {
+        int sent{0};
+        int failed{0};
+        std::vector<std::pair<CService, bool>> peer_results;
+    };
+    
     bool AddUDPPeer(const CService& addr) EXCLUSIVE_LOCKS_REQUIRED(!m_udp_peers_mutex);
     bool RemoveUDPPeer(const CService& addr) EXCLUSIVE_LOCKS_REQUIRED(!m_udp_peers_mutex);
     std::vector<UDPPeer> GetUDPPeers() const EXCLUSIVE_LOCKS_REQUIRED(!m_udp_peers_mutex);
     bool SendUDPMessage(const CService& peer_addr, const std::string& message) EXCLUSIVE_LOCKS_REQUIRED(!m_total_bytes_sent_mutex, !m_udp_peers_mutex);
-
+    UDPBroadcastResult BroadcastUDPMessage(const std::string& message) EXCLUSIVE_LOCKS_REQUIRED(!m_udp_peers_mutex, !m_total_bytes_sent_mutex);
 
 private:
     struct ListenSocket {

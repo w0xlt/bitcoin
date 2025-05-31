@@ -1851,6 +1851,63 @@ bool CConnman::SendUdpMessage(const CService& peer_addr, const CSerializedNetMsg
     return false;
 }
 
+bool CConnman::SendUDPMessage(const CService& peer_addr, const std::string& message)
+{
+    if (vhUdpListenSockets.empty()) {
+        LogPrintf("Cannot send UDP message: UDP is not enabled (use -udpbind)\n");
+        return false;
+    }
+    
+    // Create a simple message (you can modify this to use proper Bitcoin protocol messages)
+    std::vector<unsigned char> data(message.begin(), message.end());
+    CSerializedNetMsg msg;
+    msg.data = std::move(data);
+    msg.m_type = "udpmsg"; // Custom message type for UDP
+    
+    bool result = SendUdpMessage(peer_addr, msg);
+    
+    if (result) {
+        // Update last send time
+        LOCK(m_udp_peers_mutex);
+        auto it = std::find_if(m_udp_peers.begin(), m_udp_peers.end(),
+            [&peer_addr](const UDPPeer& p) { return p.addr == peer_addr; });
+        if (it != m_udp_peers.end()) {
+            it->last_send = GetTime<std::chrono::seconds>();
+        }
+    }
+    
+    return result;
+}
+
+CConnman::UDPBroadcastResult CConnman::BroadcastUDPMessage(const std::string& message)
+{
+    UDPBroadcastResult result;
+    
+    // Get copy of peers to avoid holding lock during sends
+    std::vector<UDPPeer> peers_copy;
+    {
+        LOCK(m_udp_peers_mutex);
+        peers_copy = m_udp_peers;
+    }
+    
+    // Send to each peer
+    for (const auto& peer : peers_copy) {
+        bool success = SendUDPMessage(peer.addr, message);
+        result.peer_results.emplace_back(peer.addr, success);
+        
+        if (success) {
+            result.sent++;
+        } else {
+            result.failed++;
+        }
+    }
+    
+    LogDebug(BCLog::NET, "UDP broadcast: sent to %d peers, %d failed\n", 
+             result.sent, result.failed);
+
+    return result;
+}
+
 bool CConnman::AddUDPPeer(const CService& addr)
 {
     AssertLockNotHeld(m_udp_peers_mutex);
@@ -1900,34 +1957,6 @@ std::vector<CConnman::UDPPeer> CConnman::GetUDPPeers() const
     AssertLockNotHeld(m_udp_peers_mutex);
     LOCK(m_udp_peers_mutex);
     return m_udp_peers;
-}
-
-bool CConnman::SendUDPMessage(const CService& peer_addr, const std::string& message)
-{
-    if (vhUdpListenSockets.empty()) {
-        LogPrintf("Cannot send UDP message: UDP is not enabled (use -udpbind)\n");
-        return false;
-    }
-    
-    // Create a simple message (you can modify this to use proper Bitcoin protocol messages)
-    std::vector<unsigned char> data(message.begin(), message.end());
-    CSerializedNetMsg msg;
-    msg.data = std::move(data);
-    msg.m_type = "udpmsg"; // Custom message type for UDP
-    
-    bool result = SendUdpMessage(peer_addr, msg);
-    
-    if (result) {
-        // Update last send time
-        LOCK(m_udp_peers_mutex);
-        auto it = std::find_if(m_udp_peers.begin(), m_udp_peers.end(),
-            [&peer_addr](const UDPPeer& p) { return p.addr == peer_addr; });
-        if (it != m_udp_peers.end()) {
-            it->last_send = GetTime<std::chrono::seconds>();
-        }
-    }
-    
-    return result;
 }
 
 void CConnman::CreateNodeFromAcceptedSocket(std::unique_ptr<Sock>&& sock,
