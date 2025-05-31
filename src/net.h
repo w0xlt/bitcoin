@@ -1151,7 +1151,7 @@ public:
 
     ~CConnman();
 
-    bool Start(CScheduler& scheduler, const Options& options) EXCLUSIVE_LOCKS_REQUIRED(!m_total_bytes_sent_mutex, !m_added_nodes_mutex, !m_addr_fetches_mutex, !mutexMsgProc);
+    bool Start(CScheduler& scheduler, const Options& options) EXCLUSIVE_LOCKS_REQUIRED(!m_total_bytes_sent_mutex, !m_added_nodes_mutex, !m_addr_fetches_mutex, !mutexMsgProc, !m_udp_peers_mutex);
 
     void StopThreads();
     void StopNodes();
@@ -1301,6 +1301,20 @@ public:
 
     bool MultipleManualOrFullOutboundConns(Network net) const EXCLUSIVE_LOCKS_REQUIRED(m_nodes_mutex);
 
+    public:
+    // UDP peer management
+    struct UDPPeer {
+        CService addr;
+        std::chrono::seconds last_send{0};
+        std::chrono::seconds last_recv{0};
+    };
+
+    bool AddUDPPeer(const CService& addr) EXCLUSIVE_LOCKS_REQUIRED(!m_udp_peers_mutex);
+    bool RemoveUDPPeer(const CService& addr) EXCLUSIVE_LOCKS_REQUIRED(!m_udp_peers_mutex);
+    std::vector<UDPPeer> GetUDPPeers() const EXCLUSIVE_LOCKS_REQUIRED(!m_udp_peers_mutex);
+    bool SendUDPMessage(const CService& peer_addr, const std::string& message) EXCLUSIVE_LOCKS_REQUIRED(!m_total_bytes_sent_mutex, !m_udp_peers_mutex);
+
+
 private:
     struct ListenSocket {
     public:
@@ -1331,8 +1345,8 @@ private:
     void ThreadI2PAcceptIncoming();
     void AcceptConnection(const ListenSocket& hListenSocket);
 
-    void HandleUdpMessage(const CService& peer_addr, std::span<const uint8_t> data);
-    void ProcessUdpPacket(const ListenSocket& listen_socket) EXCLUSIVE_LOCKS_REQUIRED(!m_total_bytes_sent_mutex);
+    void HandleUdpMessage(const CService& peer_addr, std::span<const uint8_t> data) EXCLUSIVE_LOCKS_REQUIRED(!m_udp_peers_mutex);
+    void ProcessUdpPacket(const ListenSocket& listen_socket) EXCLUSIVE_LOCKS_REQUIRED(!m_total_bytes_sent_mutex, !m_udp_peers_mutex);
     bool SendUdpMessage(const CService& peer_addr, const CSerializedNetMsg& msg) EXCLUSIVE_LOCKS_REQUIRED(!m_total_bytes_sent_mutex);
 
     /**
@@ -1363,7 +1377,7 @@ private:
     /**
      * Check connected and listening sockets for IO readiness and process them accordingly.
      */
-    void SocketHandler() EXCLUSIVE_LOCKS_REQUIRED(!m_total_bytes_sent_mutex, !mutexMsgProc);
+    void SocketHandler() EXCLUSIVE_LOCKS_REQUIRED(!m_total_bytes_sent_mutex, !mutexMsgProc, !m_udp_peers_mutex);
 
     /**
      * Do the read/write for connected sockets that are ready for IO.
@@ -1378,9 +1392,9 @@ private:
      * Accept incoming connections, one from each read-ready listening socket.
      * @param[in] events_per_sock Sockets that are ready for IO.
      */
-    void SocketHandlerListening(const Sock::EventsPerSock& events_per_sock) EXCLUSIVE_LOCKS_REQUIRED(!m_total_bytes_sent_mutex);
+    void SocketHandlerListening(const Sock::EventsPerSock& events_per_sock) EXCLUSIVE_LOCKS_REQUIRED(!m_total_bytes_sent_mutex, !m_udp_peers_mutex);
 
-    void ThreadSocketHandler() EXCLUSIVE_LOCKS_REQUIRED(!m_total_bytes_sent_mutex, !mutexMsgProc, !m_nodes_mutex, !m_reconnections_mutex);
+    void ThreadSocketHandler() EXCLUSIVE_LOCKS_REQUIRED(!m_total_bytes_sent_mutex, !mutexMsgProc, !m_nodes_mutex, !m_reconnections_mutex, !m_udp_peers_mutex);
     void ThreadDNSAddressSeed() EXCLUSIVE_LOCKS_REQUIRED(!m_addr_fetches_mutex, !m_nodes_mutex);
 
     uint64_t CalculateKeyedNetGroup(const CNetAddr& ad) const;
@@ -1624,6 +1638,10 @@ private:
      * and manual peers with default permissions.
      */
     bool whitelist_relay;
+
+    
+    mutable Mutex m_udp_peers_mutex;
+    std::vector<UDPPeer> m_udp_peers GUARDED_BY(m_udp_peers_mutex);
 
     /**
      * Mutex protecting m_i2p_sam_sessions.

@@ -1769,9 +1769,29 @@ void CConnman::HandleUdpMessage(const CService& peer_addr, std::span<const uint8
                  data.size() > hex_dump_size ? "..." : "");
     }
     
-    // For now, just log and do nothing else
+    // Update last received time for known peers
+    {
+        AssertLockNotHeld(m_udp_peers_mutex);
+        LOCK(m_udp_peers_mutex);
+        auto it = std::find_if(m_udp_peers.begin(), m_udp_peers.end(),
+            [&peer_addr](const UDPPeer& p) { return p.addr == peer_addr; });
+        if (it != m_udp_peers.end()) {
+            it->last_recv = GetTime<std::chrono::seconds>();
+            LogDebug(BCLog::NET, "Updated last_recv for known UDP peer %s\n", 
+                     peer_addr.ToStringAddrPort());
+        } else {
+            LogDebug(BCLog::NET, "Received UDP message from unknown peer %s\n", 
+                     peer_addr.ToStringAddrPort());
+        }
+    }
+    
     // TODO: Parse and process actual UDP protocol messages
-    LogDebug(BCLog::NET, "HandleUdpMessage: UDP message processing not yet implemented\n");
+    // For FIBER, this would include:
+    // - Compact block announcements
+    // - Transaction relay
+    // - Other high-priority network messages
+    
+    LogDebug(BCLog::NET, "HandleUdpMessage: UDP message processing not yet fully implemented\n");
 }
 
 void CConnman::ProcessUdpPacket(const ListenSocket& listen_socket)
@@ -1829,6 +1849,85 @@ bool CConnman::SendUdpMessage(const CService& peer_addr, const CSerializedNetMsg
     }
     
     return false;
+}
+
+bool CConnman::AddUDPPeer(const CService& addr)
+{
+    AssertLockNotHeld(m_udp_peers_mutex);
+    LOCK(m_udp_peers_mutex);
+    
+    // Check if UDP is enabled
+    if (vhUdpListenSockets.empty()) {
+        LogPrintf("Cannot add UDP peer: UDP is not enabled (use -udpbind)\n");
+        return false;
+    }
+    
+    // Don't add duplicates
+    auto it = std::find_if(m_udp_peers.begin(), m_udp_peers.end(),
+        [&addr](const UDPPeer& p) { return p.addr == addr; });
+    if (it != m_udp_peers.end()) {
+        LogPrintf("UDP peer %s already exists\n", addr.ToStringAddrPort());
+        return false;
+    }
+
+    UDPPeer peer;
+    peer.addr = addr;
+    m_udp_peers.push_back(std::move(peer));
+    
+    LogPrintf("Added UDP peer %s\n", addr.ToStringAddrPort());
+    return true;
+}
+
+bool CConnman::RemoveUDPPeer(const CService& addr)
+{
+    AssertLockNotHeld(m_udp_peers_mutex);
+    LOCK(m_udp_peers_mutex);
+    
+    auto it = std::find_if(m_udp_peers.begin(), m_udp_peers.end(),
+        [&addr](const UDPPeer& p) { return p.addr == addr; });
+    if (it == m_udp_peers.end()) {
+        LogPrintf("UDP peer %s not found\n", addr.ToStringAddrPort());
+        return false;
+    }
+
+    m_udp_peers.erase(it);
+    LogPrintf("Removed UDP peer %s\n", addr.ToStringAddrPort());
+    return true;
+}
+
+std::vector<CConnman::UDPPeer> CConnman::GetUDPPeers() const
+{
+    AssertLockNotHeld(m_udp_peers_mutex);
+    LOCK(m_udp_peers_mutex);
+    return m_udp_peers;
+}
+
+bool CConnman::SendUDPMessage(const CService& peer_addr, const std::string& message)
+{
+    if (vhUdpListenSockets.empty()) {
+        LogPrintf("Cannot send UDP message: UDP is not enabled (use -udpbind)\n");
+        return false;
+    }
+    
+    // Create a simple message (you can modify this to use proper Bitcoin protocol messages)
+    std::vector<unsigned char> data(message.begin(), message.end());
+    CSerializedNetMsg msg;
+    msg.data = std::move(data);
+    msg.m_type = "udpmsg"; // Custom message type for UDP
+    
+    bool result = SendUdpMessage(peer_addr, msg);
+    
+    if (result) {
+        // Update last send time
+        LOCK(m_udp_peers_mutex);
+        auto it = std::find_if(m_udp_peers.begin(), m_udp_peers.end(),
+            [&peer_addr](const UDPPeer& p) { return p.addr == peer_addr; });
+        if (it != m_udp_peers.end()) {
+            it->last_send = GetTime<std::chrono::seconds>();
+        }
+    }
+    
+    return result;
 }
 
 void CConnman::CreateNodeFromAcceptedSocket(std::unique_ptr<Sock>&& sock,
