@@ -2054,6 +2054,12 @@ Sock::EventsPerSock CConnman::GenerateWaitSockets(std::span<CNode* const> nodes)
         events_per_sock.emplace(hListenSocket.sock, Sock::Events{Sock::RECV});
     }
 
+    if (m_udp_manager) {
+        for (const auto& listen_socket : m_udp_manager->GetListenSockets()) {
+            events_per_sock.emplace(listen_socket.sock, Sock::Events{Sock::RECV});
+        }
+    }
+
     for (CNode* pnode : nodes) {
         bool select_recv = !pnode->fPauseRecv;
         bool select_send;
@@ -2213,6 +2219,19 @@ void CConnman::SocketHandlerListening(const Sock::EventsPerSock& events_per_sock
         const auto it = events_per_sock.find(listen_socket.sock);
         if (it != events_per_sock.end() && it->second.occurred & Sock::RECV) {
             AcceptConnection(listen_socket);
+        }
+    }
+
+    // Handle UDP sockets
+    if (m_udp_manager) {
+        for (const auto& listen_socket : m_udp_manager->GetListenSockets()) {
+            if (interruptNet) {
+                return;
+            }
+            const auto it = events_per_sock.find(listen_socket.sock);
+            if (it != events_per_sock.end() && it->second.occurred & Sock::RECV) {
+                m_udp_manager->ProcessPacket(listen_socket);
+            }
         }
     }
 }
@@ -3215,6 +3234,8 @@ CConnman::CConnman(uint64_t nSeed0In, uint64_t nSeed1In, AddrMan& addrman_in,
     Options connOptions;
     Init(connOptions);
     SetNetworkActive(network_active);
+
+    m_udp_manager = std::make_unique<UDPManager>();
 }
 
 NodeId CConnman::GetNewNodeId()
@@ -3283,6 +3304,18 @@ bool CConnman::InitBinds(const Options& options)
             return false;
         }
     }
+
+    // UDP binding
+    if (m_udp_manager) {
+        for (const auto& addrBind : options.updBinds) {
+            if (!m_udp_manager->BindListenPort(addrBind)) {
+                return false;
+            }
+        }
+        // Set the callback for byte counting
+        m_udp_manager->SetRecordBytesSentFn([this](uint64_t bytes) { RecordBytesSent(bytes); });
+    }
+
     return true;
 }
 
@@ -4012,3 +4045,244 @@ std::function<void(const CAddress& addr,
                    std::span<const unsigned char> data,
                    bool is_incoming)>
     CaptureMessage = CaptureMessageToFile;
+
+void UDPManager::HandleUdpMessage(const CService& peer_addr, std::span<const uint8_t> data)
+{
+    LogDebug(BCLog::NET, "HandleUdpMessage: Received UDP packet from %s, size=%zu bytes\n", 
+             peer_addr.ToStringAddrPort(), data.size());
+    
+    // Log first 32 bytes as hex for debugging
+    const size_t hex_dump_size = std::min(data.size(), size_t{32});
+    if (hex_dump_size > 0) {
+        LogDebug(BCLog::NET, "HandleUdpMessage: First %zu bytes: %s%s\n", 
+                 hex_dump_size, 
+                 HexStr(data.subspan(0, hex_dump_size)),
+                 data.size() > hex_dump_size ? "..." : "");
+    }
+    
+    // Update last received time for known peers
+    {
+        LOCK(m_udp_peers_mutex);
+        auto it = std::find_if(m_udp_peers.begin(), m_udp_peers.end(),
+            [&peer_addr](const UDPPeer& p) { return p.addr == peer_addr; });
+        if (it != m_udp_peers.end()) {
+            it->last_recv = GetTime<std::chrono::seconds>();
+            LogDebug(BCLog::NET, "Updated last_recv for known UDP peer %s\n", 
+                     peer_addr.ToStringAddrPort());
+        } else {
+            LogDebug(BCLog::NET, "Received UDP message from unknown peer %s\n", 
+                     peer_addr.ToStringAddrPort());
+        }
+    }
+    
+    // TODO: Parse and process actual UDP protocol messages
+    LogDebug(BCLog::NET, "HandleUdpMessage: UDP message processing not yet fully implemented\n");
+}
+
+void UDPManager::ProcessPacket(const ListenSocket& listen_socket)
+{
+    uint8_t buffer[65536]; // UDP max packet size
+    struct sockaddr_storage from_sockaddr;
+    socklen_t from_len = sizeof(from_sockaddr);
+    
+    ssize_t bytes_received = listen_socket.sock->RecvFrom(buffer, sizeof(buffer), 0, 
+                                                          reinterpret_cast<sockaddr*>(&from_sockaddr), 
+                                                          &from_len);
+
+    if (bytes_received > 0) {
+        CService peer_addr;
+        if (peer_addr.SetSockAddr((struct sockaddr*)&from_sockaddr, from_len)) {
+            HandleUdpMessage(peer_addr, {buffer, static_cast<size_t>(bytes_received)});
+        }
+    } else {
+        int err = WSAGetLastError();
+        if (err != WSAEWOULDBLOCK && err != WSAEINTR) {
+            LogDebug(BCLog::NET, "UDP recv error: %s\n", NetworkErrorString(err));
+        }
+    }
+}
+
+bool UDPManager::SendUdpMessage(const CService& peer_addr, const CSerializedNetMsg& msg)
+{
+    if (m_listen_sockets.empty()) return false;
+    
+    struct sockaddr_storage to_sockaddr;
+    socklen_t to_len = sizeof(to_sockaddr);
+    if (!peer_addr.GetSockAddr(reinterpret_cast<sockaddr*>(&to_sockaddr), &to_len)) {
+        return false;
+    }
+    
+    const auto& udp_socket = m_listen_sockets[0].sock;
+    ssize_t bytes_sent = udp_socket->SendTo(msg.data.data(), msg.data.size(), 0,
+                                           reinterpret_cast<const sockaddr*>(&to_sockaddr), to_len);
+    
+    if (bytes_sent > 0) {
+        LogDebug(BCLog::NET, "Sent UDP message %s to %s (%zd bytes)\n", 
+                 msg.m_type, peer_addr.ToStringAddrPort(), bytes_sent);
+        if (m_record_bytes_sent_fn) {
+            m_record_bytes_sent_fn(bytes_sent);
+        }
+        return true;
+    }
+    
+    return false;
+}
+
+bool UDPManager::SendMessage(const CService& peer_addr, const std::string& message)
+{
+    if (!IsEnabled()) {
+        LogPrintf("Cannot send UDP message: UDP is not enabled (use -udpbind)\n");
+        return false;
+    }
+    
+    std::vector<unsigned char> data(message.begin(), message.end());
+    CSerializedNetMsg msg;
+    msg.data = std::move(data);
+    msg.m_type = "udpmsg";
+    
+    bool result = SendUdpMessage(peer_addr, msg);
+    
+    if (result) {
+        LOCK(m_udp_peers_mutex);
+        auto it = std::find_if(m_udp_peers.begin(), m_udp_peers.end(),
+            [&peer_addr](const UDPPeer& p) { return p.addr == peer_addr; });
+        if (it != m_udp_peers.end()) {
+            it->last_send = GetTime<std::chrono::seconds>();
+        }
+    }
+    
+    return result;
+}
+
+UDPManager::UDPBroadcastResult UDPManager::BroadcastMessage(const std::string& message)
+{
+    UDPBroadcastResult result;
+    
+    std::vector<UDPPeer> peers_copy;
+    {
+        LOCK(m_udp_peers_mutex);
+        peers_copy = m_udp_peers;
+    }
+    
+    for (const auto& peer : peers_copy) {
+        bool success = SendMessage(peer.addr, message);
+        result.peer_results.emplace_back(peer.addr, success);
+        
+        if (success) {
+            result.sent++;
+        } else {
+            result.failed++;
+        }
+    }
+    
+    LogDebug(BCLog::NET, "UDP broadcast: sent to %d peers, %d failed\n", 
+             result.sent, result.failed);
+
+    return result;
+}
+
+bool UDPManager::AddPeer(const CService& addr)
+{
+    LOCK(m_udp_peers_mutex);
+    
+    if (!IsEnabled()) {
+        LogPrintf("Cannot add UDP peer: UDP is not enabled (use -udpbind)\n");
+        return false;
+    }
+    
+    auto it = std::find_if(m_udp_peers.begin(), m_udp_peers.end(),
+        [&addr](const UDPPeer& p) { return p.addr == addr; });
+    if (it != m_udp_peers.end()) {
+        LogPrintf("UDP peer %s already exists\n", addr.ToStringAddrPort());
+        return false;
+    }
+
+    UDPPeer peer;
+    peer.addr = addr;
+    m_udp_peers.push_back(std::move(peer));
+    
+    LogPrintf("Added UDP peer %s\n", addr.ToStringAddrPort());
+    return true;
+}
+
+bool UDPManager::RemovePeer(const CService& addr)
+{
+    LOCK(m_udp_peers_mutex);
+    
+    auto it = std::find_if(m_udp_peers.begin(), m_udp_peers.end(),
+        [&addr](const UDPPeer& p) { return p.addr == addr; });
+    if (it == m_udp_peers.end()) {
+        LogPrintf("UDP peer %s not found\n", addr.ToStringAddrPort());
+        return false;
+    }
+
+    m_udp_peers.erase(it);
+    LogPrintf("Removed UDP peer %s\n", addr.ToStringAddrPort());
+    return true;
+}
+
+std::vector<UDPManager::UDPPeer> UDPManager::GetPeers() const
+{
+    LOCK(m_udp_peers_mutex);
+    return m_udp_peers;
+}
+
+bool UDPManager::BindListenPort(const CService& addr)
+{
+    struct sockaddr_storage sockaddr;
+    socklen_t len = sizeof(sockaddr);
+    if (!addr.GetSockAddr((struct sockaddr*)&sockaddr, &len)) {
+        LogPrintLevel(BCLog::NET, BCLog::Level::Error, 
+                     "UDP bind address family for %s not supported\n", addr.ToStringAddrPort());
+        return false;
+    }
+
+    std::unique_ptr<Sock> sock = CreateSock(addr.GetSAFamily(), SOCK_DGRAM, IPPROTO_UDP);
+    if (!sock) {
+        LogPrintLevel(BCLog::NET, BCLog::Level::Error, 
+                     "Couldn't open UDP socket (error %s)\n", NetworkErrorString(WSAGetLastError()));
+        return false;
+    }
+
+    // Set socket options
+    int nOne = 1;
+    if (sock->SetSockOpt(SOL_SOCKET, SO_REUSEADDR, (sockopt_arg_type)&nOne, sizeof(int)) == SOCKET_ERROR) {
+        LogPrintLevel(BCLog::NET, BCLog::Level::Error, 
+            "Error setting SO_REUSEADDR on socket: %s, continuing anyway\n",
+            NetworkErrorString(WSAGetLastError()));
+    }
+
+    if (addr.IsIPv6()) {
+#ifdef IPV6_V6ONLY
+        if (sock->SetSockOpt(IPPROTO_IPV6, IPV6_V6ONLY, (sockopt_arg_type)&nOne, sizeof(int)) == SOCKET_ERROR) {
+            LogPrintLevel(BCLog::NET, BCLog::Level::Error, 
+                     "Error setting IPV6_V6ONLY on socket: %s, continuing anyway\n", 
+                     NetworkErrorString(WSAGetLastError()));
+        }
+#endif
+#ifdef WIN32
+        int nProtLevel = PROTECTION_LEVEL_UNRESTRICTED;
+        if (sock->SetSockOpt(IPPROTO_IPV6, IPV6_PROTECTION_LEVEL, (const char*)&nProtLevel, sizeof(int)) == SOCKET_ERROR) {
+            LogPrintLevel(BCLog::NET, BCLog::Level::Error, 
+                     "Error setting IPV6_PROTECTION_LEVEL on socket: %s, continuing anyway\n", 
+                     NetworkErrorString(WSAGetLastError()));
+        }
+#endif
+    }
+
+    if (sock->Bind(reinterpret_cast<struct sockaddr*>(&sockaddr), len) == SOCKET_ERROR) {
+        LogPrintLevel(BCLog::NET, BCLog::Level::Error, 
+                     "Unable to bind UDP to %s (error %s)\n", 
+                     addr.ToStringAddrPort(), NetworkErrorString(WSAGetLastError()));
+        return false;
+    }
+
+    LogPrintf("Bound UDP socket to %s\n", addr.ToStringAddrPort());
+    m_listen_sockets.emplace_back(std::move(sock));
+    return true;
+}
+
+void UDPManager::CloseAllSockets()
+{
+    m_listen_sockets.clear();
+}

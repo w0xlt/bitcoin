@@ -1049,9 +1049,90 @@ protected:
     ~NetEventsInterface() = default;
 };
 
+class UDPManager
+{
+public:
+    struct UDPPeer {
+        CService addr;
+        std::chrono::seconds last_send{0};
+        std::chrono::seconds last_recv{0};
+    };
+
+    struct UDPBroadcastResult {
+        int sent{0};
+        int failed{0};
+        std::vector<std::pair<CService, bool>> peer_results;
+    };
+
+    // Socket wrapper for UDP listening
+    struct ListenSocket {
+        std::shared_ptr<Sock> sock;
+        ListenSocket(std::shared_ptr<Sock> sock_) : sock{sock_} {}
+    };
+
+private:
+    mutable Mutex m_udp_peers_mutex;
+    std::vector<UDPPeer> m_udp_peers GUARDED_BY(m_udp_peers_mutex);
+    
+    std::vector<ListenSocket> m_listen_sockets;
+    
+    // For byte counting (injected from CConnman)
+    std::function<void(uint64_t)> m_record_bytes_sent_fn;
+
+    void HandleUdpMessage(const CService& peer_addr, std::span<const uint8_t> data) EXCLUSIVE_LOCKS_REQUIRED(!m_udp_peers_mutex);
+    bool SendUdpMessage(const CService& peer_addr, const CSerializedNetMsg& msg);
+
+public:
+    UDPManager() = default;
+    ~UDPManager() = default;
+
+    // Bind UDP sockets
+    bool BindListenPort(const CService& addr);
+    
+    // Peer management
+    bool AddPeer(const CService& addr) EXCLUSIVE_LOCKS_REQUIRED(!m_udp_peers_mutex);
+    bool RemovePeer(const CService& addr) EXCLUSIVE_LOCKS_REQUIRED(!m_udp_peers_mutex);
+    std::vector<UDPPeer> GetPeers() const EXCLUSIVE_LOCKS_REQUIRED(!m_udp_peers_mutex);
+    
+    // Message sending
+    bool SendMessage(const CService& peer_addr, const std::string& message) EXCLUSIVE_LOCKS_REQUIRED(!m_udp_peers_mutex);
+    UDPBroadcastResult BroadcastMessage(const std::string& message) EXCLUSIVE_LOCKS_REQUIRED(!m_udp_peers_mutex);
+    
+    // Socket handling
+    void ProcessPacket(const ListenSocket& listen_socket) EXCLUSIVE_LOCKS_REQUIRED(!m_udp_peers_mutex);
+    const std::vector<ListenSocket>& GetListenSockets() const { return m_listen_sockets; }
+    
+    // Set callback for recording bytes sent
+    void SetRecordBytesSentFn(std::function<void(uint64_t)> fn) { m_record_bytes_sent_fn = fn; }
+    
+    // Check if UDP is enabled
+    bool IsEnabled() const { return !m_listen_sockets.empty(); }
+    
+    // Close all sockets
+    void CloseAllSockets();
+};
+
 class CConnman
 {
 public:
+
+    std::unique_ptr<UDPManager> m_udp_manager;
+
+    bool AddUDPPeer(const CService& addr) {
+        return m_udp_manager ? m_udp_manager->AddPeer(addr) : false;
+    }
+    bool RemoveUDPPeer(const CService& addr) {
+        return m_udp_manager ? m_udp_manager->RemovePeer(addr) : false;
+    }
+    std::vector<UDPManager::UDPPeer> GetUDPPeers() const {
+        return m_udp_manager ? m_udp_manager->GetPeers() : std::vector<UDPManager::UDPPeer>{};
+    }
+    bool SendUDPMessage(const CService& addr, const std::string& msg) {
+        return m_udp_manager ? m_udp_manager->SendMessage(addr, msg) : false;
+    }
+    UDPManager::UDPBroadcastResult BroadcastUDPMessage(const std::string& msg) {
+        return m_udp_manager ? m_udp_manager->BroadcastMessage(msg) : UDPManager::UDPBroadcastResult{};
+    }
 
     struct Options
     {
@@ -1070,6 +1151,7 @@ public:
         std::vector<NetWhitebindPermissions> vWhiteBinds;
         std::vector<CService> vBinds;
         std::vector<CService> onion_binds;
+        std::vector<CService> updBinds;
         /// True if the user did not specify -bind= or -whitebind= and thus
         /// we should bind on `0.0.0.0` (IPv4) and `::` (IPv6).
         bool bind_on_any;

@@ -1192,9 +1192,262 @@ static RPCHelpMan getrawaddrman()
     };
 }
 
+static RPCHelpMan addudppeer()
+{
+    return RPCHelpMan{"addudppeer",
+        "\nAdd a UDP peer for compact block relay.\n"
+        "Note: UDP must be enabled with -udpbind\n",
+        {
+            {"address", RPCArg::Type::STR, RPCArg::Optional::NO, "The IP address and port of the peer (e.g., '192.168.1.1:9333')"},
+        },
+        RPCResult{
+            RPCResult::Type::OBJ, "", "",
+            {
+                {RPCResult::Type::BOOL, "success", "Whether the peer was successfully added"},
+                {RPCResult::Type::STR, "error", /*optional=*/true, "Error message if the operation failed"},
+            }
+        },
+        RPCExamples{
+            HelpExampleCli("addudppeer", "\"192.168.1.1:9333\"")
+            + HelpExampleRpc("addudppeer", "\"192.168.1.1:9333\"")
+        },
+        [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
+        {
+            NodeContext& node = EnsureAnyNodeContext(request.context);
+            CConnman& connman = EnsureConnman(node);
+
+            const std::string& strAddress = request.params[0].get_str();
+
+            const uint16_t default_udp_port = Params().GetDefaultUDPPort();
+
+            std::optional<CService> udp_peer_addr = Lookup(strAddress, default_udp_port, /*fAllowLookup=*/false);
+            
+            if (!udp_peer_addr.has_value()) {
+                UniValue result(UniValue::VOBJ);
+                result.pushKV("success", false);
+                result.pushKV("error", "Invalid address format");
+                return result;
+            }
+
+            bool success = connman.AddUDPPeer(udp_peer_addr.value());
+            
+            UniValue result(UniValue::VOBJ);
+            result.pushKV("success", success);
+            if (!success) {
+                result.pushKV("error", "Failed to add UDP peer (already exists or UDP not enabled)");
+            }
+            return result;
+        },
+    };
+}
+
+static RPCHelpMan removeudppeer()
+{
+    return RPCHelpMan{"removeudppeer",
+        "\nRemove a UDP peer.\n",
+        {
+            {"address", RPCArg::Type::STR, RPCArg::Optional::NO, "The IP address and port of the peer"},
+        },
+        RPCResult{
+            RPCResult::Type::OBJ, "", "",
+            {
+                {RPCResult::Type::BOOL, "success", "Whether the peer was successfully removed"},
+                {RPCResult::Type::STR, "error", /*optional=*/true, "Error message if the operation failed"},
+            }
+        },
+        RPCExamples{
+            HelpExampleCli("removeudppeer", "\"192.168.1.1:9333\"")
+            + HelpExampleRpc("removeudppeer", "\"192.168.1.1:9333\"")
+        },
+        [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
+        {
+            NodeContext& node = EnsureAnyNodeContext(request.context);
+            CConnman& connman = EnsureConnman(node);
+
+            const std::string& strAddress = request.params[0].get_str();
+
+            const uint16_t default_udp_port = Params().GetDefaultUDPPort();
+
+            std::optional<CService> udp_peer_addr = Lookup(strAddress, default_udp_port, /*fAllowLookup=*/false);
+            
+            if (!udp_peer_addr.has_value()) {
+                UniValue result(UniValue::VOBJ);
+                result.pushKV("success", false);
+                result.pushKV("error", "Invalid address format");
+                return result;
+            }
+
+            bool success = connman.RemoveUDPPeer(udp_peer_addr.value());
+            
+            UniValue result(UniValue::VOBJ);
+            result.pushKV("success", success);
+            if (!success) {
+                result.pushKV("error", "Failed to remove UDP peer (not found)");
+            }
+            return result;
+        },
+    };
+}
+
+static RPCHelpMan listudppeers()
+{
+    return RPCHelpMan{"listudppeers",
+        "\nList all UDP peers.\n",
+        {},
+        RPCResult{
+            RPCResult::Type::ARR, "", "Array of UDP peer objects",
+            {
+                {RPCResult::Type::OBJ, "", "",
+                {
+                    {RPCResult::Type::STR, "address", "The peer's address and port"},
+                    {RPCResult::Type::NUM_TIME, "last_send", "Unix timestamp of last message sent"},
+                    {RPCResult::Type::NUM_TIME, "last_recv", "Unix timestamp of last message received"},
+                }},
+            }
+        },
+        RPCExamples{
+            HelpExampleCli("listudppeers", "")
+            + HelpExampleRpc("listudppeers", "")
+        },
+        [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
+        {
+            NodeContext& node = EnsureAnyNodeContext(request.context);
+            CConnman& connman = EnsureConnman(node);
+
+            UniValue result(UniValue::VARR);
+            
+            std::vector<UDPManager::UDPPeer> peers = connman.GetUDPPeers();
+            for (const auto& peer : peers) {
+                UniValue obj(UniValue::VOBJ);
+                obj.pushKV("address", peer.addr.ToStringAddrPort());
+                obj.pushKV("last_send", peer.last_send.count());
+                obj.pushKV("last_recv", peer.last_recv.count());
+                result.push_back(obj);
+            }
+            
+            return result;
+        },
+    };
+}
+
+static RPCHelpMan sendudpmessageto()
+{
+    return RPCHelpMan{"sendudpmessageto",
+        "\nSend a UDP message to a peer.\n"
+        "Note: This is for testing. In production, UDP messages would be sent automatically.\n",
+        {
+            {"address", RPCArg::Type::STR, RPCArg::Optional::NO, "The peer's address and port"},
+            {"message", RPCArg::Type::STR, RPCArg::Optional::NO, "The message to send"},
+        },
+        RPCResult{
+            RPCResult::Type::OBJ, "", "",
+            {
+                {RPCResult::Type::BOOL, "success", "Whether the message was successfully sent"},
+                {RPCResult::Type::STR, "error", /*optional=*/true, "Error message if send failed"},
+            }
+        },
+        RPCExamples{
+            HelpExampleCli("sendudpmessageto", "\"192.168.1.1:9333\" \"Hello UDP\"")
+            + HelpExampleRpc("sendudpmessageto", "\"192.168.1.1:9333\", \"Hello UDP\"")
+        },
+        [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
+        {
+            NodeContext& node = EnsureAnyNodeContext(request.context);
+            CConnman& connman = EnsureConnman(node);
+
+            const std::string& strAddress = request.params[0].get_str();
+
+            const uint16_t default_udp_port = Params().GetDefaultUDPPort();
+
+            const std::string& message = request.params[1].get_str();
+
+            std::optional<CService> udp_peer_addr = Lookup(strAddress, default_udp_port, /*fAllowLookup=*/false);
+            
+            if (!udp_peer_addr.has_value()) {
+                UniValue result(UniValue::VOBJ);
+                result.pushKV("success", false);
+                result.pushKV("error", "Invalid address format");
+                return result;
+            }
+
+            bool success = connman.SendUDPMessage(udp_peer_addr.value(), message);
+            
+            UniValue result(UniValue::VOBJ);
+            result.pushKV("success", success);
+            if (!success) {
+                result.pushKV("error", "Failed to send UDP message");
+            }
+            return result;
+        },
+    };
+}
+
+static RPCHelpMan broadcastudpmessage()
+{
+    return RPCHelpMan{"broadcastudpmessage",
+        "\nBroadcast a UDP message to all configured UDP peers.\n"
+        "Note: This is for testing. In production, UDP messages would be sent automatically.\n",
+        {
+            {"message", RPCArg::Type::STR, RPCArg::Optional::NO, "The message to broadcast"},
+        },
+        RPCResult{
+            RPCResult::Type::OBJ, "", "",
+            {
+                {RPCResult::Type::NUM, "sent", "Number of peers the message was sent to"},
+                {RPCResult::Type::NUM, "failed", "Number of peers where send failed"},
+                {RPCResult::Type::ARR, "results", "Detailed results per peer",
+                {
+                    {RPCResult::Type::OBJ, "", "",
+                    {
+                        {RPCResult::Type::STR, "address", "The peer's address"},
+                        {RPCResult::Type::BOOL, "success", "Whether the send was successful"},
+                        {RPCResult::Type::STR, "error", /*optional=*/true, "Error message if failed"},
+                    }},
+                }},
+            }
+        },
+        RPCExamples{
+            HelpExampleCli("broadcastudpmessage", "\"Hello UDP broadcast\"")
+            + HelpExampleRpc("broadcastudpmessage", "\"Hello UDP broadcast\"")
+        },
+        [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
+        {
+            NodeContext& node = EnsureAnyNodeContext(request.context);
+            CConnman& connman = EnsureConnman(node);
+
+            const std::string& message = request.params[0].get_str();
+            
+            auto broadcast_result = connman.BroadcastUDPMessage(message);
+
+            UniValue result(UniValue::VOBJ);
+            UniValue results_array(UniValue::VARR);
+
+            for (const auto& [addr, success] : broadcast_result.peer_results) {
+                UniValue peer_result(UniValue::VOBJ);
+                peer_result.pushKV("address", addr.ToStringAddrPort());
+                peer_result.pushKV("success", success);
+                if (!success) {
+                    peer_result.pushKV("error", "Failed to send UDP message");
+                }
+                results_array.push_back(peer_result);
+            }
+
+            result.pushKV("sent", broadcast_result.sent);
+            result.pushKV("failed", broadcast_result.failed);
+            result.pushKV("results", results_array);
+            return result;
+        },
+    };
+}
+
 void RegisterNetRPCCommands(CRPCTable& t)
 {
     static const CRPCCommand commands[]{
+        {"network", &addudppeer},
+        {"network", &removeudppeer},
+        {"network", &listudppeers},
+        {"network", &sendudpmessageto},
+        {"network", &broadcastudpmessage},
         {"network", &getconnectioncount},
         {"network", &ping},
         {"network", &getpeerinfo},

@@ -93,6 +93,16 @@ std::unique_ptr<Sock> Sock::Accept(sockaddr* addr, socklen_t* addr_len) const
     return sock;
 }
 
+ssize_t Sock::RecvFrom(void* buf, size_t len, int flags, sockaddr* addr, socklen_t* addr_len) const
+{
+    return recvfrom(m_socket, static_cast<char*>(buf), len, flags, addr, addr_len);
+}
+
+ssize_t Sock::SendTo(const void* data, size_t len, int flags, const sockaddr* addr, socklen_t addr_len) const
+{
+    return sendto(m_socket, static_cast<const char*>(data), len, flags, addr, addr_len);
+}
+
 int Sock::GetSockOpt(int level, int opt_name, void* opt_val, socklen_t* opt_len) const
 {
     return getsockopt(m_socket, level, opt_name, static_cast<char*>(opt_val), opt_len);
