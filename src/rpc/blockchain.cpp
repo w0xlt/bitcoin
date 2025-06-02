@@ -55,6 +55,7 @@
 #include <cstdint>
 
 #include <condition_variable>
+#include <fstream>
 #include <iterator>
 #include <memory>
 #include <mutex>
@@ -832,6 +833,347 @@ static RPCHelpMan getblock()
     }
 
     return blockToJSON(chainman.m_blockman, block, *tip, *pblockindex, tx_verbosity, chainman.GetConsensus().powLimit);
+},
+    };
+}
+
+float blockMetrics(const CBlock& block) EXCLUSIVE_LOCKS_REQUIRED(cs_main)
+{
+    AssertLockHeld(cs_main);
+    std::vector<uint64_t> statistics (2, 0);
+    DataStream txstream;
+    for (const auto& tx : block.vtx)
+    {
+        statistics[0] += (uint64_t)tx->GetTotalSize();
+        txstream << CTxCompressor(*tx, codec_version_t::default_version);
+        statistics[1] += txstream.size();
+        CMutableTransaction baretx;
+        txstream >> CTxCompressor(baretx, codec_version_t::default_version);
+        txstream.clear();
+    }
+    float txsavings = (float)1 - ((float)statistics[1] / (float)statistics[0]);
+    return txsavings;
+}
+
+RPCHelpMan getblocksize()
+{
+    return RPCHelpMan{"getblocksize",
+        "\nReturns the average space saving achieved with compression on each analyzed block.\n"
+        "More specifically, computes the \"savings\" metric by avaraging out the individual\n"
+        "space saving achieved for each txn in a particular block.\n\n"
+        "If a block height is not provided, chooses a uniform sample of historical blocks.\n"
+        "Otherwise, analyzes the specified block chosen by height.\n",
+        {
+            {"height", RPCArg::Type::NUM, RPCArg::Optional::OMITTED, "Block height"}
+        },
+        {
+            RPCResult{
+                "when the height is specified",
+                RPCResult::Type::OBJ,
+                "",
+                "",
+                {
+                    {RPCResult::Type::NUM, "savings", "Average space saving"},
+                }
+            },
+            RPCResult{
+                "when the height is omitted",
+                RPCResult::Type::OBJ,
+                "",
+                "",
+                {
+                    {RPCResult::Type::ARR, "blocks", "",
+                    {
+                        {RPCResult::Type::NUM, "savings", "Average space saving"},
+                    }}
+                }
+            }
+        },
+        RPCExamples{
+            HelpExampleCli("getblocksize", "600000") +
+            HelpExampleRpc("getblocksize", "600000")
+        },
+        [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
+{
+    ChainstateManager& chainman = EnsureAnyChainman(request.context);
+    LOCK(cs_main);
+
+    int tipheight = chainman.ActiveHeight();
+    CBlock block;
+    int initialheight = 0;
+    int interval = 1000;
+    UniValue result(UniValue::VOBJ);
+
+    if (!request.params[0].isNull()) {
+        int userint = request.params[0].getInt<int>();
+        if (userint % 10 == 0 && userint < interval) {
+            interval = userint;
+        } else {
+            initialheight = userint;
+        }
+    }
+
+    if (initialheight == 0) {
+        int blocktotal = tipheight / interval;
+
+        UniValue blocksizes(UniValue::VARR);
+
+        for (int index = initialheight; index <= blocktotal; ++index)
+        {
+            int height = index * interval;
+
+            const CBlockIndex* height_index{chainman.ActiveChain()[height]};
+            if (!chainman.m_blockman.ReadBlock(block, *height_index))
+                throw JSONRPCError(RPC_MISC_ERROR, "Block not found on disk.");
+
+            blocksizes.push_back(UniValue(blockMetrics(block)));
+        }
+
+        result.pushKV("blocks", blocksizes);
+    } else {
+        if (initialheight > tipheight)
+            throw JSONRPCError(RPC_MISC_ERROR, "Block not yet seen by node.");
+
+        const CBlockIndex* height_index{chainman.ActiveChain()[initialheight]};
+        if (!chainman.m_blockman.ReadBlock(block, *height_index))
+            throw JSONRPCError(RPC_MISC_ERROR, "Block not found on disk.");
+
+        result.pushKV("savings", blockMetrics(block));
+    }
+
+    return result;
+},
+    };
+}
+
+void blockAnalyzer(const CBlock& block, std::vector<std::array<uint64_t, 3>>& statistics, stattype multisigstats) EXCLUSIVE_LOCKS_REQUIRED(cs_main)
+{
+    AssertLockHeld(cs_main);
+    uint8_t const nomulticutoff = 9;
+    uint8_t const othercutoff = 4;
+    uint16_t kncval = 0;
+    std::array<uint64_t, 5> statistic = {0, 0, 0, 0, 0};
+    for (size_t i = 1; i < block.vtx.size(); ++i)
+    {
+        for (size_t j = 0; j < block.vtx[i]->vin.size(); ++j)
+        {
+            auto const scriptSigType = AnalyzeScriptSig(j, block.vtx[i]->vin[j], std::span{statistic});
+            auto const idx = static_cast<uint8_t>(scriptSigType);
+            statistics[idx][0] += statistic[0];
+            statistics[idx][1] += statistic[1];
+            if (idx >= othercutoff) {
+                if (idx < nomulticutoff) {
+                    statistics[idx][2] += statistic[2];
+                    statistics[idx][3] += statistic[3];
+                } else {
+                    kncval += ((statistic[2] + (21 * statistic[3])));
+                    multisigstats[kncval]++;
+                    kncval = 0;
+                }
+            }
+            statistic.fill(0);
+        }
+    }
+}
+
+RPCHelpMan getblockanalysis()
+{
+    return RPCHelpMan{"getblockanalysis",
+        "Returns an object with information about transaction input scripts.\n"
+        "Accepts a height argument to define the starting block for the analysis.\n"
+        "Otherwise, analyzes all blocks in the chain.",
+        {
+            {"height", RPCArg::Type::NUM, RPCArg::Optional::OMITTED, "Height to start scanning from."}
+        },
+        RPCResult{RPCResult::Type::OBJ, "", "Compression analysis",
+            {
+                {RPCResult::Type::NUM, "starting block", "Starting block height"},
+                {RPCResult::Type::NUM, "total", "Final total"},
+                {RPCResult::Type::ARR, "blocks", "Block analysis",
+                    {
+                        {RPCResult::Type::ELISION, "info", "Info such as k, n, frequency, "}, // FIXME
+                    }
+                }
+            }
+        },
+        RPCExamples{
+            HelpExampleCli("getblockanalysis", "600000") +
+            HelpExampleRpc("getblockanalysis", "600000")
+        },
+        [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
+{
+    ChainstateManager& chainman = EnsureAnyChainman(request.context);
+    LOCK(cs_main);
+
+    int tipheight = chainman.ActiveHeight();
+    CBlock block;
+    UniValue result(UniValue::VOBJ);
+    UniValue blockanalysis(UniValue::VARR);
+    uint8_t const templatecount = 13;
+    uint8_t const nomulticutoff = 9;
+    uint8_t const othercutoff = 4;
+    std::vector<std::array<uint64_t, 3>> finalstatistics(templatecount);
+    std::array<uint64_t, 500> finalmultisigstats;
+    finalmultisigstats.fill(0);
+    int baseheight = 0;
+    if (!request.params[0].isNull())
+        baseheight = request.params[0].getInt<int>();
+
+    if (baseheight > tipheight)
+        throw JSONRPCError(RPC_MISC_ERROR, "Block not yet seen by node.");
+
+    for (int index = baseheight; index <= tipheight; ++index) {
+        const CBlockIndex* current_height{chainman.ActiveChain()[index]};
+        if (!chainman.m_blockman.ReadBlock(block, *current_height))
+            throw JSONRPCError(RPC_MISC_ERROR, "Block not found on disk.");
+
+        blockAnalyzer(block, finalstatistics, std::span{finalmultisigstats});
+    }
+
+    uint64_t finaltotal = 0;
+    uint64_t multisigtotal = 0;
+
+    uint16_t multisigcode = 0;
+    for (uint64_t const val : finalmultisigstats) {
+        ++multisigcode;
+        if (val == 0) continue;
+        multisigtotal += val;
+        uint8_t const k = (multisigcode - 1) % 21;
+        uint8_t const n = (multisigcode - 1) / 21;
+        blockanalysis.push_back(UniValue("k"));
+        blockanalysis.push_back(UniValue(k));
+        blockanalysis.push_back(UniValue("n"));
+        blockanalysis.push_back(UniValue(n));
+        blockanalysis.push_back(UniValue("frequency"));
+        blockanalysis.push_back(UniValue(val));
+    }
+
+    blockanalysis.push_back(UniValue("multisigtotal"));
+    blockanalysis.push_back(UniValue(multisigtotal));
+
+    int idx = 0;
+    for (auto const& stats : finalstatistics) {
+        blockanalysis.push_back(UniValue("type"));
+        blockanalysis.push_back(UniValue(scriptSigTemplateNames[idx]));
+        blockanalysis.push_back(UniValue("total"));
+        blockanalysis.push_back(UniValue(stats[1]));
+        finaltotal += stats[1];
+        if (idx >= othercutoff) {
+            blockanalysis.push_back(UniValue("sighashnotall"));
+            blockanalysis.push_back(UniValue(stats[0]));
+            if (idx != 0 && idx < nomulticutoff) {
+                blockanalysis.push_back(UniValue("notcompressed"));
+                blockanalysis.push_back(UniValue(stats[2]));
+            }
+        } else {
+            blockanalysis.push_back(UniValue("average stack size"));
+            if (stats[0] != 0 && stats[1] != 0) {
+                blockanalysis.push_back(UniValue(double(stats[0]) / double(stats[1])));
+            } else {
+                blockanalysis.push_back(UniValue(0));
+            }
+        }
+        ++idx;
+    }
+
+    result.pushKV("starting block", baseheight);
+    result.pushKV("total", finaltotal);
+    result.pushKV("blocks", blockanalysis);
+
+    return result;
+},
+    };
+}
+
+RPCHelpMan testcompression()
+{
+    return RPCHelpMan{"testcompression",
+               "Test round-trip compression of all transactions in all blocks within the selected range.\n"
+               "\nAccepts start and end block heights as arguments to define the range of blocks to test.\n"
+               "If the start height is not defined, start from height 0. If the end height is undefined,\n"
+               "end at the current tip of the chain. If both are undefined, test the entire blockchain.\n",
+               {
+                   {"start_height", RPCArg::Type::NUM, RPCArg::Optional::OMITTED, "Starting height of the block range to be tested."},
+                   {"end_height", RPCArg::Type::NUM, RPCArg::Optional::OMITTED, "Ending height of the block range to be tested."},
+               },
+               RPCResult{RPCResult::Type::NONE, "", ""},
+               RPCExamples{
+                   HelpExampleCli("testcompression", "600000 600005") +
+                   HelpExampleRpc("testcompression", "600000, 600005")},
+               [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
+{
+    ChainstateManager& chainman = EnsureAnyChainman(request.context);
+    LOCK(cs_main);
+
+    int tipheight = chainman.ActiveHeight();
+    int baseheight = 0;
+    if (!request.params[0].isNull())
+        baseheight = request.params[0].getInt<int>();
+
+    if (!request.params[1].isNull())
+        tipheight = request.params[1].getInt<int>();
+
+    if (baseheight > tipheight)
+        throw JSONRPCError(RPC_MISC_ERROR, "Block not yet seen by node.");
+
+    int txcount = 0;
+    int height_span = (tipheight - baseheight);
+    int ten_percent_span = height_span / 10;
+    int next_progress_print = baseheight + ten_percent_span;
+
+    for (int index = baseheight; index <= tipheight; ++index) {
+        CBlock block;
+        const CBlockIndex* current_height{chainman.ActiveChain()[index]};
+        if (!chainman.m_blockman.ReadBlock(block, *current_height))
+            throw JSONRPCError(RPC_MISC_ERROR, "Block not found on disk.");
+
+        if (!IsRPCRunning())
+            break;
+
+        if (index >= next_progress_print) {
+            LogPrintf("testcompression: progress = %.2f %%\n",
+                100.0 * ((double)(index - baseheight)) / height_span);
+            next_progress_print += ten_percent_span;
+        }
+
+        DataStream stream;
+        for (size_t i = 1; i < block.vtx.size(); ++i) try
+        {
+            stream.clear();
+            auto const& ctx = *block.vtx[i];
+            stream << CTxCompressor(ctx, codec_version_t::default_version);
+            CMutableTransaction identity;
+            stream >> CTxCompressor(identity, codec_version_t::default_version);
+
+            if (ctx.version != identity.version
+                || ctx.vin != identity.vin
+                || ctx.vout != identity.vout
+                || ctx.nLockTime != identity.nLockTime)
+            {
+                LogPrintf("testcompression: failure to compress/decompress transaction %d (%s) in block %d\n",
+                    int(i), ctx.GetHash().ToString().c_str(), index);
+                throw std::runtime_error("round-trip failed");
+            }
+        }
+        catch (std::exception const& e)
+        {
+            fprintf(stderr, "TxCompression failure: %s\n", e.what());
+            auto const& ctx = *block.vtx[i];
+            DataStream str;
+            str << TX_WITH_WITNESS(ctx);
+            std::array<char, 50> name;
+            snprintf(name.data(), name.size(), "./test-tx/tx-%05d", txcount);
+            {
+                std::vector<unsigned char> data;
+                str >> data;
+                std::ofstream f(name.data());
+                f.write((char *)data.data(), data.size());
+            }
+            ++txcount;
+        }
+    }
+
+    return NullUniValue;
 },
     };
 }
@@ -3436,6 +3778,9 @@ void RegisterBlockchainRPCCommands(CRPCTable& t)
         {"hidden", &waitforblock},
         {"hidden", &waitforblockheight},
         {"hidden", &syncwithvalidationinterfacequeue},
+        {"hidden", &getblocksize},
+        {"hidden", &getblockanalysis},
+        {"hidden", &testcompression},
     };
     for (const auto& c : commands) {
         t.appendCommand(c.name, &c);
