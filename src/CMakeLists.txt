@@ -341,10 +341,12 @@ if(BUILD_DAEMON)
   )
   add_windows_resources(bitcoind bitcoind-res.rc)
   add_windows_application_manifest(bitcoind)
+  add_subdirectory(fec)
   target_link_libraries(bitcoind
     core_interface
     bitcoin_node
     $<TARGET_NAME_IF_EXISTS:bitcoin_wallet>
+    bitcoin_fec
   )
   install_binary_component(bitcoind HAS_MANPAGE)
 endif()
