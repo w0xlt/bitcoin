@@ -310,6 +310,17 @@ static const CRPCConvertParam vRPCConvertParams[] =
     { "stop", 0, "wait" },
     { "addnode", 2, "v2transport" },
     { "addconnection", 2, "v2transport" },
+    { "getblocksize", 0, "height"},
+    { "getblockanalysis", 0, "height"},
+    { "testcompression", 0, "start_height"},
+    { "testcompression", 1, "end_height"},
+    { "getchunkstats", 0, "height" },
+    { "gettxwindowinfo", 0, "physical_idx" },
+    { "gettxwindowinfo", 1, "logical_idx" },
+    { "txblock", 0, "height" },
+    { "txblock", 1, "codec" },
+    { "addudpnode", 3, "ultimately_trusted" },
+    { "addudpnode", 5, "group" },
 };
 // clang-format on
 

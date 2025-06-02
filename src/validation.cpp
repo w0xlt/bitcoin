@@ -32,6 +32,7 @@
 #include <logging/timer.h>
 #include <node/blockstorage.h>
 #include <node/utxo_snapshot.h>
+#include <outoforder.h>
 #include <policy/ephemeral_policy.h>
 #include <policy/policy.h>
 #include <policy/rbf.h>
@@ -47,6 +48,7 @@
 #include <tinyformat.h>
 #include <txdb.h>
 #include <txmempool.h>
+#include <udpapi.h>
 #include <uint256.h>
 #include <undo.h>
 #include <util/check.h>
@@ -4517,6 +4519,12 @@ bool ChainstateManager::AcceptBlock(const std::shared_ptr<const CBlock>& pblock,
 
     // Header is valid/has work, merkle tree and segwit merkle tree are good...RELAY NOW
     // (but if it does not build on our best tip, let the SendMessages loop relay it)
+    if (!IsInitialBlockDownload() && fHasMoreOrSameWork) {
+        UDPRelayBlock(block, pindex->nHeight); // TODO: Do this via NewPoWValidBlock!
+    }
+
+    // Header is valid/has work, merkle tree and segwit merkle tree are good...RELAY NOW
+    // (but if it does not build on our best tip, let the SendMessages loop relay it)
     if (!IsInitialBlockDownload() && ActiveTip() == pindex->pprev && m_options.signals) {
         m_options.signals->NewPoWValidBlock(pindex, pblock);
     }
@@ -4554,7 +4562,7 @@ bool ChainstateManager::AcceptBlock(const std::shared_ptr<const CBlock>& pblock,
     return true;
 }
 
-bool ChainstateManager::ProcessNewBlock(const std::shared_ptr<const CBlock>& block, bool force_processing, bool min_pow_checked, bool* new_block)
+bool ChainstateManager::ProcessNewBlock(const std::shared_ptr<const CBlock>& block, bool force_processing, bool min_pow_checked, bool* new_block, const FlatFilePos* dbp, const bool do_ooob)
 {
     AssertLockNotHeld(cs_main);
 
@@ -4575,7 +4583,7 @@ bool ChainstateManager::ProcessNewBlock(const std::shared_ptr<const CBlock>& blo
         bool ret = CheckBlock(*block, state, GetConsensus());
         if (ret) {
             // Store to disk
-            ret = AcceptBlock(block, state, &pindex, force_processing, nullptr, new_block, min_pow_checked);
+            ret = AcceptBlock(block, state, &pindex, force_processing, dbp, new_block, min_pow_checked);
         }
         if (!ret) {
             if (m_options.signals) {
@@ -4600,6 +4608,11 @@ bool ChainstateManager::ProcessNewBlock(const std::shared_ptr<const CBlock>& blo
         LogError("%s: [background] ActivateBestChain failed (%s)\n", __func__, bg_state.ToString());
         return false;
      }
+
+    if (do_ooob) {
+        // Check if we have any other blocks to process waiting on this one
+	    ProcessSuccessorOoOBlocks(*this, GetConsensus(), block->GetHash(), force_processing);
+    }
 
     return true;
 }

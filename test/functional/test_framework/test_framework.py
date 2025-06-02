@@ -925,7 +925,9 @@ class BitcoinTestFramework(metaclass=BitcoinTestMetaClass):
 
             os.rmdir(cache_path('wallets'))  # Remove empty wallets dir
             for entry in os.listdir(cache_path()):
-                if entry not in ['chainstate', 'blocks', 'indexes']:  # Only indexes, chainstate and blocks folders
+                # TODO: Adding 'future_blocks' should not be necessary here
+                #       At least, this does not exist in the Bitcoin Satellite code.
+                if entry not in ['chainstate', 'blocks', 'indexes', 'future_blocks']:  # Only indexes, chainstate and blocks folders
                     os.remove(cache_path(entry))
 
         for i in range(self.num_nodes):
