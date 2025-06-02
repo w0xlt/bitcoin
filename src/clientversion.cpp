@@ -48,9 +48,9 @@ const std::string UA_NAME("Satoshi");
     #endif
 #endif
 
-static std::string FormatVersion(int nVersion)
+static std::string FormatVersion(int version)
 {
-    return strprintf("%d.%d.%d", nVersion / 10000, (nVersion / 100) % 100, nVersion % 100);
+    return strprintf("%d.%d.%d", version / 10000, (version / 100) % 100, version % 100);
 }
 
 std::string FormatFullVersion()

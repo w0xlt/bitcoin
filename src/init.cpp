@@ -72,6 +72,7 @@
 #include <torcontrol.h>
 #include <txdb.h>
 #include <txmempool.h>
+#include <udpapi.h>
 #include <util/asmap.h>
 #include <util/batchpriority.h>
 #include <util/chaintype.h>
@@ -299,6 +300,7 @@ void Shutdown(NodeContext& node)
     StopRPC();
     StopHTTPServer();
     StopMapPort();
+    StopUDPConnections();
 
     // Because these depend on each-other, we make sure that neither can be
     // using the other before destroying them.
@@ -480,7 +482,7 @@ void SetupServerArgs(ArgsManager& argsman, bool can_listen_ipc)
     argsman.AddArg("-blocknotify=<cmd>", "Execute command when the best block changes (%s in cmd is replaced by block hash)", ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
 #endif
     argsman.AddArg("-blockreconstructionextratxn=<n>", strprintf("Extra transactions to keep in memory for compact block reconstructions (default: %u)", DEFAULT_BLOCK_RECONSTRUCTION_EXTRA_TXN), ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
-    argsman.AddArg("-blocksonly", strprintf("Whether to reject transactions from network peers. Disables automatic broadcast and rebroadcast of transactions, unless the source peer has the 'forcerelay' permission. RPC transactions are not affected. (default: %u)", DEFAULT_BLOCKSONLY), ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
+    argsman.AddArg("-blocksonly", strprintf("Whether to reject transactions from network peers. Disables automatic broadcast and rebroadcast of transactions, unless the source peer has the 'forcerelay' permission. RPC transactions and transactions received from udpmulticast peers are not affected. (default: %u)", DEFAULT_BLOCKSONLY), ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
     argsman.AddArg("-coinstatsindex", strprintf("Maintain coinstats index used by the gettxoutsetinfo RPC (default: %u)", DEFAULT_COINSTATSINDEX), ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
     argsman.AddArg("-conf=<file>", strprintf("Specify path to read-only configuration file. Relative paths will be prefixed by datadir location (only useable from command line, not configuration file) (default: %s)", BITCOIN_CONF_FILENAME), ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
     argsman.AddArg("-datadir=<dir>", "Specify data directory", ArgsManager::ALLOW_ANY | ArgsManager::DISALLOW_NEGATION, OptionsCategory::OPTIONS);
@@ -519,6 +521,8 @@ void SetupServerArgs(ArgsManager& argsman, bool can_listen_ipc)
                  ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
 
     argsman.AddArg("-addnode=<ip>", strprintf("Add a node to connect to and attempt to keep the connection open (see the addnode RPC help for more info). This option can be specified multiple times to add multiple nodes; connections are limited to %u at a time and are counted separately from the -maxconnections limit.", MAX_ADDNODE_CONNECTIONS), ArgsManager::ALLOW_ANY | ArgsManager::NETWORK_ONLY, OptionsCategory::CONNECTION);
+    argsman.AddArg("-addudpnode=<ip/host>:<port>,<local_magic>,<remote_magic>[,<group>]", "Add a persistent UDP node, see RPC addudpnode for detailed description", ArgsManager::ALLOW_ANY | ArgsManager::NETWORK_ONLY, OptionsCategory::CONNECTION);
+    argsman.AddArg("-addtrustedudpnode=<ip/host>:<port>,<local_magic>,<remote_magic>[,<group>]", "Add a trusted, persistent UDP node, see RPC addudpnode for detailed description", ArgsManager::ALLOW_ANY | ArgsManager::NETWORK_ONLY, OptionsCategory::CONNECTION);
     argsman.AddArg("-asmap=<file>", strprintf("Specify asn mapping used for bucketing of the peers (default: %s). Relative paths will be prefixed by the net-specific datadir location.", DEFAULT_ASMAP_FILENAME), ArgsManager::ALLOW_ANY, OptionsCategory::CONNECTION);
     argsman.AddArg("-bantime=<n>", strprintf("Default duration (in seconds) of manually configured bans (default: %u)", DEFAULT_MISBEHAVING_BANTIME), ArgsManager::ALLOW_ANY, OptionsCategory::CONNECTION);
     argsman.AddArg("-bind=<addr>[:<port>][=onion]", strprintf("Bind to given address and always listen on it (default: 0.0.0.0). Use [host]:port notation for IPv6. Append =onion to tag any incoming connections to that address and port as incoming Tor connections (default: 127.0.0.1:%u=onion, testnet3: 127.0.0.1:%u=onion, testnet4: 127.0.0.1:%u=onion, signet: 127.0.0.1:%u=onion, regtest: 127.0.0.1:%u=onion)", defaultChainParams->GetDefaultPort() + 1, testnetChainParams->GetDefaultPort() + 1, testnet4ChainParams->GetDefaultPort() + 1, signetChainParams->GetDefaultPort() + 1, regtestChainParams->GetDefaultPort() + 1), ArgsManager::ALLOW_ANY | ArgsManager::NETWORK_ONLY, OptionsCategory::CONNECTION);
@@ -586,6 +590,11 @@ void SetupServerArgs(ArgsManager& argsman, bool can_listen_ipc)
         "-whitebind. "
         "Additional flags \"in\" and \"out\" control whether permissions apply to incoming connections and/or manual (default: incoming only). "
         "Can be specified multiple times.", ArgsManager::ALLOW_ANY, OptionsCategory::CONNECTION);
+    
+    argsman.AddArg("-udpport=<port>,<group>[,<bw>]", "Accepts UDP connections on <port> (default: bw=1024 =1024Mbps)", ArgsManager::ALLOW_ANY, OptionsCategory::CONNECTION);
+    argsman.AddArg("-udpmulticast=<if>,<dst_ip>:<port>,<src_ip>,<trusted>[,<label>]", "Listen to multicast-addressed UDP messages sent by <src_ip> towards <dst_ip>:<port> using interface <if>. Set <trusted> to 1 if sender is a trusted node. An optional <label> may be defined for the multicast group in order to facilitate inspection of logs.", ArgsManager::ALLOW_ANY, OptionsCategory::UDP);
+    argsman.AddArg("-udpmulticasttx=<if>,<ip/host>:<port>,<bw>,<txn_per_sec>[,<ttl>,<depth>,<offset>,<dscp>,<interleave>]", "Transmit multicast-addressed messages to <ip/host>:<port> through interface <if> with bandwidth <bw> in bps and TTL <ttl> (3 by default). If <txn_per_sec> is non-zero, send this number of mempool txns per second in addition to FEC-coded blocks. Iteratively transmit the past <depth> blocks with FEC coding. If <depth> is set to 0, iterate over the full chain. Start by transmitting a block height with offset <offset> relative to the bottom of the specified depth. Optionally define a DSCP for marking IP packets. Send <interleave> FEC-coded blocks in parallel while interleaving their FEC chunks. If <interleave> is set to 1, do not interleave the blocks and instead send only one FEC-coded block a time. If <interleave> is set to 0, completely disable the transmission of FEC-coded blocks.", ArgsManager::ALLOW_ANY, OptionsCategory::UDP);
+    argsman.AddArg("-udpmulticastloginterval=<interval>", "Change periodicity of multicast bit rate logs that are activated by option debug=udpmulticast. Set <interval> in seconds.", ArgsManager::ALLOW_ANY, OptionsCategory::UDP);
 
     g_wallet_init_interface.AddWalletOptions(argsman);
 
@@ -2083,6 +2092,13 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
 
     if (!node.connman->Start(scheduler, connOptions)) {
         return false;
+    }
+
+    // Start UDP at the very end since it has no concept of whether the res of the code is already up or not
+
+    if (GetUDPInboundPorts().size() || gArgs.GetArg("-udpmulticast", "") != "" || gArgs.GetArg("-udpmulticasttx", "") != "") {
+        if (!InitializeUDPConnections(&node))
+            return InitError(_("Failed to initialize UDP connections"));
     }
 
     // ********************************************************* Step 13: finished

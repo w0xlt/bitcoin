@@ -40,6 +40,7 @@ add_executable(test_bitcoin
   denialofservice_tests.cpp
   descriptor_tests.cpp
   disconnected_transactions.cpp
+  fec_tests.cpp
   feefrac_tests.cpp
   flatfile_tests.cpp
   fs_tests.cpp
@@ -112,6 +113,8 @@ add_executable(test_bitcoin
   txrequest_tests.cpp
   txvalidation_tests.cpp
   txvalidationcache_tests.cpp
+  udpmulticasttx_tests.cpp
+  udprelay_tests.cpp
   uint256_tests.cpp
   util_string_tests.cpp
   util_tests.cpp
@@ -140,6 +143,7 @@ target_json_data_sources(test_bitcoin
 )
 target_raw_data_sources(test_bitcoin NAMESPACE test::data
   data/asmap.raw
+  data/block413567.raw
 )
 
 add_windows_application_manifest(test_bitcoin)
@@ -154,6 +158,7 @@ target_link_libraries(test_bitcoin
   secp256k1
   Boost::headers
   libevent::extra
+  bitcoin_fec
 )
 
 if(ENABLE_WALLET)
