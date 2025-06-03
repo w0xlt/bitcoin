@@ -305,6 +305,7 @@ add_library(bitcoin_node STATIC EXCLUDE_FROM_ALL
   rpc/txoutproof.cpp
   script/sigcache.cpp
   signet.cpp
+  throttle.cpp
   torcontrol.cpp
   txdb.cpp
   txgraph.cpp
@@ -313,6 +314,7 @@ add_library(bitcoin_node STATIC EXCLUDE_FROM_ALL
   txrequest.cpp
   udpmulticasttx.cpp
   udpmulticasttxdb.cpp
+  # udpnet.cpp
   validation.cpp
   validationinterface.cpp
   versionbits.cpp
