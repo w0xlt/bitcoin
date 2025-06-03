@@ -152,4 +152,7 @@ public:
     ReadStatus FillBlock(CBlock& block, const std::vector<CTransactionRef>& vtx_missing);
 };
 
+// Valid options for the SIZE_FACTOR are 1 or 2, see cpp for more info
+#define MAX_CHUNK_CODED_BLOCK_SIZE_FACTOR 1
+
 #endif // BITCOIN_BLOCKENCODINGS_H
