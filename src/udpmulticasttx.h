@@ -2,6 +2,7 @@
 #ifndef BITCOIN_UDPMULTICASTTX_H
 #define BITCOIN_UDPMULTICASTTX_H
 
+#include <node/blockstorage.h>
 #include <sync.h>
 #include <udpmulticasttxdb.h>
 #include <udpnet.h>

@@ -14,6 +14,7 @@
 
 #include <bitcoin-build-config.h>
 #include <chainparams.h>
+#include <common/args.h>
 #include <common/bloom.h>
 #include <compat/endian.h>
 #include <consensus/validation.h>
@@ -32,6 +33,7 @@
 #include <util/time.h>
 #include <validation.h>
 
+#include <span.h>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
 
@@ -50,6 +52,19 @@
 #include <pthread.h>
 #include <sched.h>
 #include <unistd.h>
+#include <ifaddrs.h>
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#endif
+
+#ifdef _WIN32
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <iphlpapi.h>
+#pragma comment(lib, "iphlpapi.lib")
+#pragma comment(lib, "ws2_32.lib")
 #endif
 
 #define to_millis_double(t) (std::chrono::duration_cast<std::chrono::duration<double, std::chrono::milliseconds::period>>(t).count())
@@ -107,14 +122,19 @@ static void FillChecksum(uint64_t magic, UDPMessage& msg, const unsigned int len
 {
     assert(length <= sizeof(UDPMessage));
 
-    uint8_t key[POLY1305_KEYLEN]; // (32 bytes)
+    uint8_t key[Poly1305::KEYLEN]; // (32 bytes)
     memcpy(key, &magic, sizeof(magic));
     memcpy(key + 8, &magic, sizeof(magic));
     memcpy(key + 16, &magic, sizeof(magic));
     memcpy(key + 24, &magic, sizeof(magic));
 
-    uint8_t hash[POLY1305_TAGLEN]; // (16 bytes)
-    poly1305_auth(hash, (unsigned char*)&msg.header.msg_type, length - 16, key);
+    uint8_t hash[Poly1305::TAGLEN]; // (16 bytes)
+    
+    // Create Poly1305 object with key and compute hash
+    Poly1305 poly1305{std::span<const std::byte>{reinterpret_cast<const std::byte*>(key), Poly1305::KEYLEN}};
+    poly1305.Update(std::span<const std::byte>{reinterpret_cast<const std::byte*>(&msg.header.msg_type), length - 16});
+    poly1305.Finalize(std::span<std::byte>{reinterpret_cast<std::byte*>(hash), Poly1305::TAGLEN});
+    
     memcpy(&msg.header.chk1, hash, sizeof(msg.header.chk1));
     memcpy(&msg.header.chk2, hash + 8, sizeof(msg.header.chk2));
 
@@ -124,6 +144,7 @@ static void FillChecksum(uint64_t magic, UDPMessage& msg, const unsigned int len
         }
     }
 }
+
 static bool CheckChecksum(uint64_t magic, UDPMessage& msg, const unsigned int length)
 {
     assert(length <= sizeof(UDPMessage));
@@ -133,14 +154,19 @@ static bool CheckChecksum(uint64_t magic, UDPMessage& msg, const unsigned int le
         }
     }
 
-    uint8_t key[POLY1305_KEYLEN]; // (32 bytes)
+    uint8_t key[Poly1305::KEYLEN]; // (32 bytes)
     memcpy(key, &magic, sizeof(magic));
     memcpy(key + 8, &magic, sizeof(magic));
     memcpy(key + 16, &magic, sizeof(magic));
     memcpy(key + 24, &magic, sizeof(magic));
 
-    uint8_t hash[POLY1305_TAGLEN]; // (16 bytes)
-    poly1305_auth(hash, (unsigned char*)&msg.header.msg_type, length - 16, key);
+    uint8_t hash[Poly1305::TAGLEN]; // (16 bytes)
+    
+    // Create Poly1305 object with key and compute hash
+    Poly1305 poly1305{std::span<const std::byte>{reinterpret_cast<const std::byte*>(key), Poly1305::KEYLEN}};
+    poly1305.Update(std::span<const std::byte>{reinterpret_cast<const std::byte*>(&msg.header.msg_type), length - 16});
+    poly1305.Finalize(std::span<std::byte>{reinterpret_cast<std::byte*>(hash), Poly1305::TAGLEN});
+    
     return !memcmp(&msg.header.chk1, hash, sizeof(msg.header.chk1)) && !memcmp(&msg.header.chk2, hash + 8, sizeof(msg.header.chk2));
 }
 
@@ -247,8 +273,8 @@ static void AddConnectionFromString(const std::string& node, bool fTrust)
     }
 
     std::string host_port = node.substr(0, host_port_end);
-    CService addr;
-    if (!Lookup(host_port.c_str(), addr, -1, true) || !addr.IsValid()) {
+    std::optional<CService> addr = Lookup(host_port.c_str(), -1, true);
+    if (!addr.has_value()) {
         LogPrintf("UDP: Failed to lookup hostname for -add[trusted]udpnode: %s\n", host_port);
         return;
     }
@@ -269,7 +295,7 @@ static void AddConnectionFromString(const std::string& node, bool fTrust)
         group = LocaleIndependentAtoi<int>(group_str);
     }
 
-    OpenPersistentUDPConnectionTo(addr, local_magic, remote_magic, fTrust, UDP_CONNECTION_TYPE_NORMAL, group, udp_mode_t::unicast);
+    OpenPersistentUDPConnectionTo(addr.value(), local_magic, remote_magic, fTrust, UDP_CONNECTION_TYPE_NORMAL, group, udp_mode_t::unicast);
 }
 
 static void AddConfAddedConnections()
@@ -299,10 +325,69 @@ static void CloseSocketsAndReadEvents()
 /* Find the IPv4 address corresponding to a given interface name */
 static struct in_addr GetIfIpAddr(const char* const ifname)
 {
-    struct ifaddrs* myaddrs;
     struct in_addr res_sin_addr;
     bool if_ip_found = false;
 
+#ifdef _WIN32
+    // Windows implementation using GetAdaptersAddresses
+    ULONG bufferSize = 15000;
+    PIP_ADAPTER_ADDRESSES pAddresses = nullptr;
+    ULONG retVal = 0;
+    
+    // Allocate buffer
+    pAddresses = (IP_ADAPTER_ADDRESSES*)malloc(bufferSize);
+    if (pAddresses == nullptr) {
+        throw std::runtime_error("Memory allocation failed");
+    }
+    
+    // Get adapter information
+    retVal = GetAdaptersAddresses(AF_INET, GAA_FLAG_INCLUDE_PREFIX, nullptr, 
+                                  pAddresses, &bufferSize);
+    
+    if (retVal == ERROR_BUFFER_OVERFLOW) {
+        free(pAddresses);
+        pAddresses = (IP_ADAPTER_ADDRESSES*)malloc(bufferSize);
+        if (pAddresses == nullptr) {
+            throw std::runtime_error("Memory allocation failed");
+        }
+        retVal = GetAdaptersAddresses(AF_INET, GAA_FLAG_INCLUDE_PREFIX, nullptr, 
+                                     pAddresses, &bufferSize);
+    }
+    
+    if (retVal == NO_ERROR) {
+        PIP_ADAPTER_ADDRESSES pCurrAddresses = pAddresses;
+        
+        while (pCurrAddresses) {
+            // Check if this is the interface we're looking for
+            // Windows can use either AdapterName or FriendlyName
+            if (strcmp(pCurrAddresses->AdapterName, ifname) == 0 ||
+                wcscmp(pCurrAddresses->FriendlyName, 
+                       std::wstring(ifname, ifname + strlen(ifname)).c_str()) == 0) {
+                
+                // Get the first IPv4 address
+                PIP_ADAPTER_UNICAST_ADDRESS pUnicast = pCurrAddresses->FirstUnicastAddress;
+                while (pUnicast) {
+                    if (pUnicast->Address.lpSockaddr->sa_family == AF_INET) {
+                        struct sockaddr_in* sa_in = (struct sockaddr_in*)pUnicast->Address.lpSockaddr;
+                        res_sin_addr = sa_in->sin_addr;
+                        if_ip_found = true;
+                        break;
+                    }
+                    pUnicast = pUnicast->Next;
+                }
+                
+                if (if_ip_found) break;
+            }
+            pCurrAddresses = pCurrAddresses->Next;
+        }
+    }
+    
+    if (pAddresses) {
+        free(pAddresses);
+    }
+    
+#else
+    struct ifaddrs* myaddrs;
     if (getifaddrs(&myaddrs) == 0) {
         for (struct ifaddrs* ifa = myaddrs; ifa != nullptr; ifa = ifa->ifa_next) {
             if (ifa->ifa_addr == nullptr) continue;
@@ -319,6 +404,7 @@ static struct in_addr GetIfIpAddr(const char* const ifname)
         }
         freeifaddrs(myaddrs);
     }
+#endif
 
     if (!if_ip_found) {
         LogPrintf("UDP: find IP address of interface %s\n", ifname);
@@ -326,6 +412,42 @@ static struct in_addr GetIfIpAddr(const char* const ifname)
     }
 
     return res_sin_addr;
+}
+
+static void ListNetworkInterfaces()
+{
+#ifdef _WIN32
+    ULONG bufferSize = 15000;
+    PIP_ADAPTER_ADDRESSES pAddresses = (IP_ADAPTER_ADDRESSES*)malloc(bufferSize);
+    
+    if (GetAdaptersAddresses(AF_UNSPEC, GAA_FLAG_INCLUDE_PREFIX, nullptr, 
+                            pAddresses, &bufferSize) == NO_ERROR) {
+        PIP_ADAPTER_ADDRESSES pCurrAddresses = pAddresses;
+        
+        LogPrintf("Available network interfaces on Windows:\n");
+        while (pCurrAddresses) {
+            LogPrintf("  Adapter Name: %s\n", pCurrAddresses->AdapterName);
+            char friendlyName[256];
+            wcstombs(friendlyName, pCurrAddresses->FriendlyName, sizeof(friendlyName));
+            LogPrintf("  Friendly Name: %s\n", friendlyName);
+            pCurrAddresses = pCurrAddresses->Next;
+        }
+    }
+    
+    free(pAddresses);
+#else
+    struct ifaddrs* myaddrs;
+    
+    LogPrintf("Available network interfaces:\n");
+    if (getifaddrs(&myaddrs) == 0) {
+        for (struct ifaddrs* ifa = myaddrs; ifa != nullptr; ifa = ifa->ifa_next) {
+            if (ifa->ifa_addr && ifa->ifa_addr->sa_family == AF_INET) {
+                LogPrintf("  Interface: %s\n", ifa->ifa_name);
+            }
+        }
+        freeifaddrs(myaddrs);
+    }
+#endif
 }
 
 static void DumpUdpMulticastTxConfig(const UDPMulticastInfo& info)
@@ -635,7 +757,7 @@ UniValue UdpMulticastRxInfoToJson()
         info.pushKV("port", node.second.port);
         info.pushKV("rcvd_bytes", stats.rcvd_bytes);
         info.pushKV("trusted", node.second.trusted);
-        ret.__pushKV(std::get<0>(node.first).ToStringAddrPort(), info);
+        ret.pushKV(std::get<0>(node.first).ToStringAddrPort(), info);
     }
     return ret;
 }
@@ -734,12 +856,13 @@ bool InitializeUDPConnections(node::NodeContext* const node_context)
     /* Multicast transmission threads */
     LaunchMulticastBackfillThreads();
 
-    BlockRecvInit(node_context->chainman.get());
+    // TODO: Uncomment after adding udprealy.{cpp,h}
+    /* BlockRecvInit(node_context->chainman.get());
 
     partial_block_load_thread.reset(new std::thread(&util::TraceThread,
                                                     "udploadpartialblks",
                                                     std::bind(LoadPartialBlocks, node_context->mempool.get())));
-
+ */
     udp_read_thread.reset(new std::thread(&util::TraceThread, "udpread", &ThreadRunReadEventLoop));
 
     return true;
@@ -750,7 +873,8 @@ void StopUDPConnections()
     if (!udp_read_thread)
         return;
 
-    StopLoadPartialBlocks();
+    // TODO: Uncomment after adding udprealy.{cpp,h}
+    // StopLoadPartialBlocks();
     partial_block_load_thread->join();
     partial_block_load_thread.reset();
 
@@ -758,7 +882,8 @@ void StopUDPConnections()
     udp_read_thread->join();
     udp_read_thread.reset();
 
-    BlockRecvShutdown();
+    // TODO: Uncomment after adding udprealy.{cpp,h}
+    // BlockRecvShutdown();
 
     std::unique_lock<std::recursive_mutex> lock(cs_mapUDPNodes);
     UDPMessage msg;
@@ -801,7 +926,7 @@ static std::map<CService, UDPConnectionState>::iterator send_and_disconnect(cons
     msg.header.msg_type = MSG_TYPE_DISCONNECT;
     SendMessage(msg, sizeof(UDPMessageHeader), false, *it);
 
-    int64_t now = GetTimeMillis();
+    int64_t now = TicksSinceEpoch<std::chrono::milliseconds>(SystemClock::now());;
     while (!nodesToRepeatDisconnect.insert(std::make_pair(now + 1000, std::make_tuple(it->first, it->second.connection.remote_magic, it->second.connection.group))).second)
         now++;
     assert(nodesToRepeatDisconnect.insert(std::make_pair(now + 10000, std::make_tuple(it->first, it->second.connection.remote_magic, it->second.connection.group))).second);
@@ -827,7 +952,7 @@ static void UpdateUdpMulticastRxBytes(const UDPMulticastInfo& mcast_info, const 
     const double elapsed = to_millis_double(t_now - stats.t_last_print);
     if (elapsed > (1000 * g_mcast_log_interval)) {
         uint64_t new_bytes = stats.rcvd_bytes - stats.last_rcvd_bytes_print;
-        LogPrint(BCLog::UDPMCAST, "UDP multicast group %zu: Average bit rate %7.2f Mbit/sec (%s)\n",
+        LogDebug(BCLog::UDPMCAST, "UDP multicast group %zu: Average bit rate %7.2f Mbit/sec (%s)\n",
                  mcast_info.group,
                  (double)(new_bytes * 8) / (1000 * elapsed),
                  mcast_info.groupname);
@@ -904,20 +1029,22 @@ static void read_socket_func(evutil_socket_t fd, short event, void* arg)
         }
         const UDPMulticastInfo& mcast_info = itm->second;
 
-        if (msg_type_masked == MSG_TYPE_BLOCK_HEADER_AND_TXIDS ||
+        // TODO: Uncomment after adding udprealy.{cpp,h}
+        /* if (msg_type_masked == MSG_TYPE_BLOCK_HEADER_AND_TXIDS ||
             msg_type_masked == MSG_TYPE_BLOCK_CONTENTS ||
             msg_type_masked == MSG_TYPE_TX_CONTENTS) {
             if (!HandleBlockTxMessage(msg, sizeof(UDPMessage) - 1, it->first, it->second, start, g_node_context))
                 send_and_disconnect(it);
             else
                 UpdateUdpMulticastRxBytes(mcast_info, res);
-        } else
+        } else 
             LogPrintf("UDP: Unexpected message from %s!\n", it->first.ToStringAddrPort());
+        } */
 
         return;
     }
 
-    state.lastRecvTime = GetTimeMillis();
+    state.lastRecvTime = TicksSinceEpoch<std::chrono::milliseconds>(SystemClock::now());;
     if (msg_type_masked == MSG_TYPE_SYN) {
         if (res != sizeof(UDPMessageHeader) + 8) {
             LogPrintf("UDP: Got invalidly-sized SYN message from %s\n", it->first.ToStringAddrPort());
@@ -941,7 +1068,7 @@ static void read_socket_func(evutil_socket_t fd, short event, void* arg)
             return;
         }
         if ((state.state & STATE_INIT_COMPLETE) != STATE_INIT_COMPLETE)
-            LogPrint(BCLog::UDPNET, "UDP: Successfully connected to %s!\n", it->first.ToStringAddrPort());
+            LogDebug(BCLog::UDPNET, "UDP: Successfully connected to %s!\n", it->first.ToStringAddrPort());
 
         // If we get a SYNACK without a SYN, that probably means we were restarted, but the other side wasn't
         // ...this means the other side thinks we're fully connected, so just switch to that mode
@@ -956,10 +1083,11 @@ static void read_socket_func(evutil_socket_t fd, short event, void* arg)
         return;
 
     if (msg_type_masked == MSG_TYPE_BLOCK_HEADER_AND_TXIDS || msg_type_masked == MSG_TYPE_BLOCK_CONTENTS) {
-        if (!HandleBlockTxMessage(msg, res, it->first, it->second, start, g_node_context)) {
+        // TODO: Uncomment after adding udprealy.{cpp,h}
+        /* if (!HandleBlockTxMessage(msg, res, it->first, it->second, start, g_node_context)) {
             send_and_disconnect(it);
             return;
-        }
+        } */
     } else if (msg_type_masked == MSG_TYPE_TX_CONTENTS) {
         LogPrintf("UDP: Got tx message over the wire from %s, this isn't supposed to happen!\n", it->first.ToStringAddrPort());
         /* NOTE Only the multicast service sends tx messages. */
@@ -986,7 +1114,8 @@ static void read_socket_func(evutil_socket_t fd, short event, void* arg)
         if (nonceit == state.ping_times.end()) // Possibly duplicated packet
             LogPrintf("UDP: Got PONG message without PING from %s\n", it->first.ToStringAddrPort());
         else {
-            double rtt = (GetTimeMicros() - nonceit->second) / 1000.0;
+            int64_t timeMicros = TicksSinceEpoch<std::chrono::microseconds>(SystemClock::now());
+            double rtt = (timeMicros - nonceit->second) / 1000.0;
             LogPrintf("UDP: RTT to %s is %lf ms\n", it->first.ToStringAddrPort(), rtt);
             state.ping_times.erase(nonceit);
             state.last_pings[state.last_ping_location] = rtt;
@@ -1004,10 +1133,11 @@ static void read_socket_func(evutil_socket_t fd, short event, void* arg)
 static void OpenUDPConnectionTo(const CService& addr, const UDPConnectionInfo& info);
 static void timer_func(evutil_socket_t fd, short event, void* arg)
 {
-    ProcessDownloadTimerEvents();
+    // TODO: Uncomment after adding udprealy.{cpp,h}
+    // ProcessDownloadTimerEvents();
 
     UDPMessage msg;
-    const int64_t now = GetTimeMillis();
+    const int64_t now = TicksSinceEpoch<std::chrono::milliseconds>(SystemClock::now());;
 
     std::unique_lock<std::recursive_mutex> lock(cs_mapUDPNodes);
 
@@ -1031,7 +1161,7 @@ static void timer_func(evutil_socket_t fd, short event, void* arg)
         int64_t origLastSendTime = state.lastSendTime;
 
         if (state.lastRecvTime < now - 1000 * 60 * 10) {
-            LogPrint(BCLog::UDPNET, "UDP: Peer %s timed out\n", it->first.ToStringAddrPort());
+            LogDebug(BCLog::UDPNET, "UDP: Peer %s timed out\n", it->first.ToStringAddrPort());
             it = send_and_disconnect(it); // Removes it from mapUDPNodes
             continue;
         }
@@ -1050,11 +1180,12 @@ static void timer_func(evutil_socket_t fd, short event, void* arg)
         }
 
         if ((state.state & STATE_INIT_COMPLETE) == STATE_INIT_COMPLETE && state.lastPingTime < now - 1000 * 60 * 15) {
-            uint64_t pingnonce = GetRand(std::numeric_limits<uint64_t>::max());
+            uint64_t pingnonce = FastRandomContext().rand64();
             msg.header.msg_type = MSG_TYPE_PING;
             msg.payload.longint = htole64(pingnonce);
             SendMessage(msg, sizeof(UDPMessageHeader) + 8, false, *it);
-            state.ping_times[pingnonce] = GetTimeMicros();
+            int64_t timeMicros = TicksSinceEpoch<std::chrono::microseconds>(SystemClock::now());
+            state.ping_times[pingnonce] = timeMicros;
             state.lastPingTime = now;
         }
 
@@ -1395,9 +1526,9 @@ UniValue TxQueueInfoToJSON()
             auto stats = q.second.buffs[i].GetStats();
             b_info.pushKV("tx_bytes", stats.rd_bytes);
             b_info.pushKV("tx_pkts", stats.rd_count);
-            q_info.__pushKV("Buffer " + std::to_string(i), b_info);
+            q_info.pushKV("Buffer " + std::to_string(i), b_info);
         }
-        ret.__pushKV("Group " + std::to_string(q.first), q_info);
+        ret.pushKV("Group " + std::to_string(q.first), q_info);
     }
     return ret;
 }
@@ -1417,6 +1548,8 @@ static size_t AddBlocksFromProgressMapRange(BackfillBlockWindow* pblock_window,
                                             const std::pair<uint16_t, uint16_t>& tx_idx,
                                             const FecOverhead& overhead)
 {
+    const node::BlockManager& blockman = g_node_context->chainman->ActiveChainstate().m_blockman;
+
     const CBlockIndex* pindex;
     size_t n_success = 0;
     for (auto it = first; it != last; it++) {
@@ -1431,7 +1564,7 @@ static size_t AddBlocksFromProgressMapRange(BackfillBlockWindow* pblock_window,
                       tx_idx.first, tx_idx.second, it->first);
             continue;
         }
-        if (pblock_window->Add(pindex, overhead, it->second))
+        if (pblock_window->Add(blockman, pindex, overhead, it->second))
             n_success++;
     }
     return n_success;
@@ -1501,8 +1634,11 @@ static void AdvanceBlockIndex(const CBlockIndex*& pindex, int backfill_depth)
 static void MulticastBackfillThread(const CService& mcastNode,
                                     const UDPMulticastInfo* info)
 {
+
+    const node::BlockManager& blockman = g_node_context->chainman->ActiveChainstate().m_blockman;
+
     /* Start only after the initial sync */
-    while (g_node_context->chainman->ActiveChainstate().IsInitialBlockDownload() && !send_messages_break)
+    while (g_node_context->chainman->ActiveChainstate().m_chainman.IsInitialBlockDownload() && !send_messages_break)
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
 
     if (send_messages_break) return;
@@ -1516,7 +1652,7 @@ static void MulticastBackfillThread(const CService& mcastNode,
         assert(pindex);
 
         const int chain_height = g_node_context->chainman->ActiveHeight();
-        LogPrint(BCLog::UDPMCAST, "UDP: Multicast Tx %lu-%lu - chain height: %d\n",
+        LogDebug(BCLog::UDPMCAST, "UDP: Multicast Tx %lu-%lu - chain height: %d\n",
                  info->physical_idx, info->logical_idx, chain_height);
 
         /* The starting block height is the bottom height of the backfill window
@@ -1527,7 +1663,7 @@ static void MulticastBackfillThread(const CService& mcastNode,
         else
             height = chain_height - backfill_depth + 1 + (info->offset % backfill_depth);
 
-        LogPrint(BCLog::UDPMCAST, "UDP: Multicast Tx %lu-%lu - starting height: %d\n",
+        LogDebug(BCLog::UDPMCAST, "UDP: Multicast Tx %lu-%lu - starting height: %d\n",
                  info->physical_idx, info->logical_idx, height);
         pindex = g_node_context->chainman->ActiveChain()[height];
         assert(pindex->nHeight == height);
@@ -1573,7 +1709,7 @@ static void MulticastBackfillThread(const CService& mcastNode,
     while (!send_messages_break) {
         /* Fill blocks within the FEC chunk interleaving window */
         while ((pblock_window->Size() < info->interleave_len) && (!send_messages_break)) {
-            pblock_window->Add(pindex, info->overhead_rep_blks);
+            pblock_window->Add(blockman, pindex, info->overhead_rep_blks);
             AdvanceBlockIndex(pindex, backfill_depth);
         }
 
@@ -1601,7 +1737,7 @@ UniValue TxWindowInfoToJSON(int phy_idx, int log_idx)
         for (const auto& w : block_window_map) {
             const std::string key = std::to_string(w.first.first) + "-" +
                                     std::to_string(w.first.second);
-            ret.__pushKV(key, w.second->ShortInfoToJSON());
+            ret.pushKV(key, w.second->ShortInfoToJSON());
         }
         return ret;
     } else {
@@ -1619,7 +1755,7 @@ static void MulticastTxnThread(const CService& mcastNode,
     assert(info->txn_per_sec > 0);
 
     /* Start only after the initial sync */
-    while (g_node_context->chainman->ActiveChainstate().IsInitialBlockDownload() && !send_messages_break)
+    while (g_node_context->chainman->ActiveChainstate().m_chainman.IsInitialBlockDownload() && !send_messages_break)
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
 
     if (send_messages_break) return;
@@ -1635,7 +1771,8 @@ static void MulticastTxnThread(const CService& mcastNode,
 
     auto it = mapTxQueues.find(info->group);
     assert(it != mapTxQueues.end());
-    PerGroupMessageQueue& queue = it->second;
+    // TODO: Uncomment after adding udprealy.{cpp,h}
+    // PerGroupMessageQueue& queue = it->second;
 
     /* Rate-limit the txn transmissions */
     Throttle throttle(info->txn_per_sec);
@@ -1666,7 +1803,7 @@ static void MulticastTxnThread(const CService& mcastNode,
             for (const auto& iter : mempool.mapTx.get<ancestor_score>()) {
                 if (txn_to_send.size() >= (unsigned int)txn_tx_quota)
                     break;
-                if (txids_to_send.count(iter.GetTx().GetHash()) || sent_txn_bloom->contains(iter.GetTx().GetHash()))
+                if (txids_to_send.count(iter.GetTx().GetHash()) || sent_txn_bloom->contains(MakeUCharSpan(iter.GetTx().GetHash())))
                     continue;
 
                 std::vector<CTransactionRef> to_add{iter.GetSharedTx()};
@@ -1679,14 +1816,14 @@ static void MulticastTxnThread(const CService& mcastNode,
                     for (const CTxIn& txin : to_add.back()->vin) {
                         CTxMemPool::txiter init = mempool.mapTx.find(txin.prevout.hash);
                         if (init != mempool.mapTx.end() && !txids_to_send.count(txin.prevout.hash) &&
-                            !sent_txn_bloom->contains(txin.prevout.hash)) {
+                            !sent_txn_bloom->contains(MakeUCharSpan(txin.prevout.hash))) {
                             to_add.emplace_back(init->GetSharedTx());
                             has_dep = true;
                         }
                     }
                     if (!has_dep) {
                         if (txids_to_send.insert(to_add.back()->GetHash()).second) {
-                            sent_txn_bloom->insert(to_add.back()->GetHash());
+                            sent_txn_bloom->insert(MakeUCharSpan(to_add.back()->GetHash()));
                             txn_to_send.emplace_back(std::move(to_add.back()));
                         }
                         to_add.pop_back();
@@ -1694,8 +1831,8 @@ static void MulticastTxnThread(const CService& mcastNode,
                 }
             }
         }
-
-        for (const CTransactionRef& tx : txn_to_send) {
+        // TODO: Uncomment after adding udprealy.{cpp,h}
+        /* for (const CTransactionRef& tx : txn_to_send) {
             if (send_messages_break)
                 break;
 
@@ -1711,7 +1848,7 @@ static void MulticastTxnThread(const CService& mcastNode,
 
             std::unique_lock<std::mutex> lock(txn_window.m_mutex);
             txn_window.m_tx_count++;
-        }
+        } */
     }
 }
 
@@ -1725,7 +1862,7 @@ UniValue TxnTxInfoToJSON()
         UniValue info(UniValue::VOBJ);
         std::unique_lock<std::mutex> lock(w.second.m_mutex);
         info.pushKV("tx_count", w.second.m_tx_count);
-        ret.__pushKV(key, info);
+        ret.pushKV(key, info);
     }
     return ret;
 }
@@ -1744,8 +1881,8 @@ static void LaunchMulticastBackfillThreads()
                 mcast_tx_thread_names.emplace_back(ss.str());
                 mcast_tx_threads.emplace_back(&util::TraceThread,
                                               mcast_tx_thread_names.back().c_str(),
-                                              std::bind(MulticastBackfillThread,
-                                                        std::get<0>(node.first), &info));
+                                              std::bind(MulticastBackfillThread, std::get<0>(node.first), &info)
+                                            );
             }
         }
         // Thread for transmission of mempool txns
@@ -1755,8 +1892,8 @@ static void LaunchMulticastBackfillThreads()
             mcast_tx_thread_names.emplace_back(ss.str());
             mcast_tx_threads.emplace_back(&util::TraceThread,
                                           mcast_tx_thread_names.back().c_str(),
-                                          std::bind(MulticastTxnThread,
-                                                    std::get<0>(node.first), &info));
+                                          std::bind(MulticastTxnThread, std::get<0>(node.first), &info)
+                                        );
         }
     }
 }
@@ -1782,6 +1919,8 @@ static void LaunchMulticastBackfillThreads()
  */
 void MulticastTxBlock(const int height, codec_version_t codec_version)
 {
+    const node::BlockManager& blockman = g_node_context->chainman->ActiveChainstate().m_blockman;
+
     const CBlockIndex* pindex;
     {
         LOCK(cs_main);
@@ -1790,7 +1929,7 @@ void MulticastTxBlock(const int height, codec_version_t codec_version)
     }
 
     CBlock block;
-    assert(node::ReadBlockFromDisk(block, pindex, Params().GetConsensus()));
+    assert(blockman.ReadBlock(block, *pindex));
 
     for (const auto& node : multicast_nodes()) {
         // Send over the multicasttx instances enabled for block relaying
@@ -1802,8 +1941,8 @@ void MulticastTxBlock(const int height, codec_version_t codec_version)
 
         // Each node gets a different set of FEC chunks
         std::vector<UDPMessage> msgs;
-        UDPFillMessagesFromBlock(block, msgs, pindex->nHeight,
-                                 node.second.overhead_rep_blks, codec_version);
+        /* UDPFillMessagesFromBlock(block, msgs, pindex->nHeight,
+                                 node.second.overhead_rep_blks, codec_version); */
 
         for (const auto& msg : msgs) {
             SendMessage(
@@ -2162,13 +2301,13 @@ static void OpenUDPConnectionTo(const CService& addr, const UDPConnectionInfo& i
     if (info.connection_type != UDP_CONNECTION_TYPE_INBOUND_ONLY)
         maybe_have_write_nodes = true;
 
-    LogPrint(BCLog::UDPNET, "UDP: Initializing connection to %s...\n", addr.ToStringAddrPort());
+    LogDebug(BCLog::UDPNET, "UDP: Initializing connection to %s...\n", addr.ToStringAddrPort());
 
     UDPConnectionState& state = res.first->second;
     state.connection = info;
     state.state = (info.udp_mode == udp_mode_t::multicast) ? STATE_INIT_COMPLETE : STATE_INIT;
     state.lastSendTime = 0;
-    state.lastRecvTime = GetTimeMillis();
+    state.lastRecvTime = TicksSinceEpoch<std::chrono::milliseconds>(SystemClock::now());;
 
     if (info.udp_mode == udp_mode_t::multicast) {
         for (size_t i = 0; i < sizeof(state.last_pings) / sizeof(double); i++) {
