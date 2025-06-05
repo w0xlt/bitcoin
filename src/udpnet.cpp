@@ -3,14 +3,12 @@
 // Unlike the rest of Bitcoin Core, this file is
 // distributed under the Affero General Public License (AGPL v3)
 
-
-
 #include <ringbuffer.h>
 #include <throttle.h>
 #include <udpmulticasttx.h>
 #include <udpmulticasttxdb.h>
 #include <udpnet.h>
-// #include <udprelay.h>
+#include <udprelay.h>
 
 #include <bitcoin-build-config.h>
 #include <chainparams.h>
@@ -856,13 +854,12 @@ bool InitializeUDPConnections(node::NodeContext* const node_context)
     /* Multicast transmission threads */
     LaunchMulticastBackfillThreads();
 
-    // TODO: Uncomment after adding udprealy.{cpp,h}
-    /* BlockRecvInit(node_context->chainman.get());
+    BlockRecvInit(node_context->chainman.get());
 
     partial_block_load_thread.reset(new std::thread(&util::TraceThread,
                                                     "udploadpartialblks",
                                                     std::bind(LoadPartialBlocks, node_context->mempool.get())));
- */
+
     udp_read_thread.reset(new std::thread(&util::TraceThread, "udpread", &ThreadRunReadEventLoop));
 
     return true;
@@ -873,8 +870,7 @@ void StopUDPConnections()
     if (!udp_read_thread)
         return;
 
-    // TODO: Uncomment after adding udprealy.{cpp,h}
-    // StopLoadPartialBlocks();
+    StopLoadPartialBlocks();
     partial_block_load_thread->join();
     partial_block_load_thread.reset();
 
@@ -882,8 +878,7 @@ void StopUDPConnections()
     udp_read_thread->join();
     udp_read_thread.reset();
 
-    // TODO: Uncomment after adding udprealy.{cpp,h}
-    // BlockRecvShutdown();
+    BlockRecvShutdown();
 
     std::unique_lock<std::recursive_mutex> lock(cs_mapUDPNodes);
     UDPMessage msg;
@@ -1029,17 +1024,15 @@ static void read_socket_func(evutil_socket_t fd, short event, void* arg)
         }
         const UDPMulticastInfo& mcast_info = itm->second;
 
-        // TODO: Uncomment after adding udprealy.{cpp,h}
-        /* if (msg_type_masked == MSG_TYPE_BLOCK_HEADER_AND_TXIDS ||
+        if (msg_type_masked == MSG_TYPE_BLOCK_HEADER_AND_TXIDS ||
             msg_type_masked == MSG_TYPE_BLOCK_CONTENTS ||
             msg_type_masked == MSG_TYPE_TX_CONTENTS) {
             if (!HandleBlockTxMessage(msg, sizeof(UDPMessage) - 1, it->first, it->second, start, g_node_context))
                 send_and_disconnect(it);
             else
                 UpdateUdpMulticastRxBytes(mcast_info, res);
-        } else 
+        } else
             LogPrintf("UDP: Unexpected message from %s!\n", it->first.ToStringAddrPort());
-        } */
 
         return;
     }
@@ -1083,11 +1076,10 @@ static void read_socket_func(evutil_socket_t fd, short event, void* arg)
         return;
 
     if (msg_type_masked == MSG_TYPE_BLOCK_HEADER_AND_TXIDS || msg_type_masked == MSG_TYPE_BLOCK_CONTENTS) {
-        // TODO: Uncomment after adding udprealy.{cpp,h}
-        /* if (!HandleBlockTxMessage(msg, res, it->first, it->second, start, g_node_context)) {
+        if (!HandleBlockTxMessage(msg, res, it->first, it->second, start, g_node_context)) {
             send_and_disconnect(it);
             return;
-        } */
+        }
     } else if (msg_type_masked == MSG_TYPE_TX_CONTENTS) {
         LogPrintf("UDP: Got tx message over the wire from %s, this isn't supposed to happen!\n", it->first.ToStringAddrPort());
         /* NOTE Only the multicast service sends tx messages. */
@@ -1133,8 +1125,7 @@ static void read_socket_func(evutil_socket_t fd, short event, void* arg)
 static void OpenUDPConnectionTo(const CService& addr, const UDPConnectionInfo& info);
 static void timer_func(evutil_socket_t fd, short event, void* arg)
 {
-    // TODO: Uncomment after adding udprealy.{cpp,h}
-    // ProcessDownloadTimerEvents();
+    ProcessDownloadTimerEvents();
 
     UDPMessage msg;
     const int64_t now = TicksSinceEpoch<std::chrono::milliseconds>(SystemClock::now());;
@@ -1771,8 +1762,7 @@ static void MulticastTxnThread(const CService& mcastNode,
 
     auto it = mapTxQueues.find(info->group);
     assert(it != mapTxQueues.end());
-    // TODO: Uncomment after adding udprealy.{cpp,h}
-    // PerGroupMessageQueue& queue = it->second;
+    PerGroupMessageQueue& queue = it->second;
 
     /* Rate-limit the txn transmissions */
     Throttle throttle(info->txn_per_sec);
@@ -1831,8 +1821,7 @@ static void MulticastTxnThread(const CService& mcastNode,
                 }
             }
         }
-        // TODO: Uncomment after adding udprealy.{cpp,h}
-        /* for (const CTransactionRef& tx : txn_to_send) {
+        for (const CTransactionRef& tx : txn_to_send) {
             if (send_messages_break)
                 break;
 
@@ -1848,7 +1837,7 @@ static void MulticastTxnThread(const CService& mcastNode,
 
             std::unique_lock<std::mutex> lock(txn_window.m_mutex);
             txn_window.m_tx_count++;
-        } */
+        }
     }
 }
 

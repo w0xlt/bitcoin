@@ -3,7 +3,7 @@
 #include <node/blockstorage.h>
 #include <logging.h>
 #include <udpmulticasttx.h>
-// #include <udprelay.h>
+#include <udprelay.h>
 
 BackfillBlockWindow::BackfillBlockWindow(std::pair<uint16_t, uint16_t> tx_idx,
                                          bool save_progress) : m_tx_idx(tx_idx),
@@ -35,11 +35,10 @@ bool BackfillBlockWindow::Add(const node::BlockManager& blockman, const CBlockIn
 
     // Fill the FEC messages on the backfill block
     std::unique_lock block_lock(it->second.mutex);
-    // TODO: active after merging udp{net,relay,api}.{h,cpp}
-    /* UDPFillMessagesFromBlock(block,
+    UDPFillMessagesFromBlock(block,
                              it->second.msgs,
                              pindex->nHeight,
-                             overhead); */
+                             overhead);
     if (m_save_progress) {
         m_db.SetBlockProgress(pindex->nHeight, it->second.idx);
     }
