@@ -282,6 +282,7 @@ add_library(bitcoin_node STATIC EXCLUDE_FROM_ALL
   node/utxo_snapshot.cpp
   node/warnings.cpp
   noui.cpp
+  outoforder.cpp
   policy/ephemeral_policy.cpp
   policy/fees.cpp
   policy/fees_args.cpp
@@ -315,6 +316,7 @@ add_library(bitcoin_node STATIC EXCLUDE_FROM_ALL
   udpmulticasttx.cpp
   udpmulticasttxdb.cpp
   udpnet.cpp
+  # udprelay.cpp
   validation.cpp
   validationinterface.cpp
   versionbits.cpp
