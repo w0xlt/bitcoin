@@ -123,6 +123,10 @@ public:
 
     size_t BlockTxCount() const { return shorttxids.size() + prefilledtxn.size(); }
 
+    size_t BlockPrefilledTxCount() const { return prefilledtxn.size(); }
+    
+    size_t BlockShortTxCount() const { return shorttxids.size(); }
+
     SERIALIZE_METHODS(CBlockHeaderAndShortTxIDs, obj)
     {
         READWRITE(obj.header, obj.nonce, Using<VectorFormatter<CustomUintFormatter<SHORTTXIDS_LENGTH>>>(obj.shorttxids), obj.prefilledtxn);

@@ -316,7 +316,7 @@ add_library(bitcoin_node STATIC EXCLUDE_FROM_ALL
   udpmulticasttx.cpp
   udpmulticasttxdb.cpp
   udpnet.cpp
-  # udprelay.cpp
+  udprelay.cpp
   validation.cpp
   validationinterface.cpp
   versionbits.cpp

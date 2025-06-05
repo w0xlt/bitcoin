@@ -7,6 +7,7 @@
 
 #include <chainparams.h>
 #include <common/args.h>
+#include <common/system.h>
 #include <consensus/consensus.h>  // for MAX_BLOCK_SERIALIZED_SIZE
 #include <consensus/validation.h> // for BlockValidationState/TxValidationState
 #include <logging.h>
@@ -14,10 +15,9 @@
 #include <net_processing.h>
 #include <outoforder.h>
 #include <streams.h>
-#include <util/system.h>
 #include <util/thread.h>
 #include <validation.h>
-#include <version.h>
+#include <node/protocol_version.h>
 
 #include <algorithm>
 #include <condition_variable>
@@ -415,7 +415,7 @@ void UDPRelayBlock(const CBlock& block, int nHeight)
         headerAndIDs.setBlockHeight(nHeight);
         std::vector<unsigned char> header_data;
         header_data.reserve(2500 + 8 * block.vtx.size()); // Rather conservatively high estimate
-        VectorOutputStream stream(&header_data, SER_NETWORK, PROTOCOL_VERSION);
+        VectorOutputStream stream(&header_data);
         stream << headerAndIDs;
 
         std::chrono::steady_clock::time_point coded;
@@ -510,8 +510,10 @@ void UDPRelayBlock(const CBlock& block, int nHeight)
         if (fBench) {
             std::chrono::steady_clock::time_point all_sent(std::chrono::steady_clock::now());
             LogPrintf("UDP: Built all FEC chunks for block %s (%lu) in %lf %lf %lf %lf %lf %lf %lf ms with %lu header chunks\n", hashBlock.ToString(), hash_prefix, to_millis_double(initd - start), to_millis_double(coded - initd), to_millis_double(feced - coded), to_millis_double(header_sent - feced), to_millis_double(block_coded - header_sent), to_millis_double(block_fec_initd - block_coded), to_millis_double(all_sent - block_fec_initd), header_fecer.fec_chunks);
-            if (!inUDPProcess)
-                LogPrintf("UDP: Block %s had serialized size %lu\n", hashBlock.ToString(), GetSerializeSize(block, PROTOCOL_VERSION));
+            if (!inUDPProcess){
+                size_t block_size = ::GetSerializeSize(TX_WITH_WITNESS(block));
+                LogPrintf("UDP: Block %s had serialized size %lu\n", hashBlock.ToString(), block_size);
+            }
         } else
             LogPrintf("UDP: Built all FEC chunks for block %s\n", hashBlock.ToString());
 
@@ -542,7 +544,7 @@ void UDPFillMessagesFromTx(const CTransaction& tx, std::vector<std::pair<UDPMess
     const uint64_t hash_prefix = hash.GetUint64(0);
 
     std::vector<unsigned char> data;
-    VectorOutputStream stream(&data, SER_NETWORK, PROTOCOL_VERSION);
+    VectorOutputStream stream(&data);
 
     codec_version_t const codec_version = codec_version_t::default_version;
     stream << static_cast<std::uint8_t>(codec_version);
@@ -640,7 +642,7 @@ void UDPFillMessagesFromBlock(const CBlock& block, std::vector<UDPMessage>& msgs
 
     std::vector<unsigned char> header_data;
     header_data.reserve(2500 + 8 * block.vtx.size()); // Rather conservatively high estimate
-    VectorOutputStream stream(&header_data, SER_NETWORK, PROTOCOL_VERSION);
+    VectorOutputStream stream(&header_data);
     stream << headerAndIDs;
     const size_t n_header_chunks = DIV_CEIL(header_data.size(), FEC_CHUNK_SIZE);
     const size_t header_overhead = overhead.fixed + std::round(overhead.variable * n_header_chunks);
@@ -733,7 +735,7 @@ static void DoBackgroundBlockProcessing(const std::pair<std::pair<uint64_t, CSer
     std::unique_lock<std::mutex> lock(block_process_mutex);
     block_process_queue.emplace(block_data);
     if (block_process_queue.size() > queue_size_warn) {
-        LogPrint(BCLog::FEC, "Block process queue size: %ld\n",
+        LogDebug(BCLog::FEC, "Block process queue size: %ld\n",
                  block_process_queue.size());
     }
     lock.unlock();
@@ -799,7 +801,7 @@ void ProcessBlock(ChainstateManager* chainman, const std::pair<uint64_t, CServic
 
             CBlockHeaderAndLengthShortTxIDs header;
             try {
-                VectorInputStream stream(&header_data, SER_NETWORK, PROTOCOL_VERSION);
+                VectorInputStream stream(&header_data);
                 stream >> header;
             } catch (std::ios_base::failure& e) {
                 lock.unlock();
@@ -894,7 +896,7 @@ void ProcessBlock(ChainstateManager* chainman, const std::pair<uint64_t, CServic
                 size_t mempool_txns = block.block_data.GetMempoolCount();
                 size_t n_blk_txns = header.BlockShortTxCount();
                 block.txn_hit_ratio = (double)mempool_txns / n_blk_txns;
-                LogPrint(BCLog::FEC, "UDP: Block %s - Txns available: %ld/%ld  Txn hit ratio: %f\n",
+                LogDebug(BCLog::FEC, "UDP: Block %s - Txns available: %ld/%ld  Txn hit ratio: %f\n",
                          blockHash.ToString(), mempool_txns, n_blk_txns, block.txn_hit_ratio);
                 // When all txns are available in the mempool, the FEC-coded
                 // block is not even decoded. The block is decoded directly
@@ -1037,7 +1039,8 @@ void ProcessBlock(ChainstateManager* chainman, const std::pair<uint64_t, CServic
                 if (fBench) {
                     LogPrintf("UDP: Final block processing for %s took %lf %lf %lf %lf ms (new: %d)\n", decoded_block.GetHash().ToString(), to_millis_double(fec_reconstruct_finished - reconstruct_start), to_millis_double(block_finalized - fec_reconstruct_finished), to_millis_double(process_start - block_finalized), to_millis_double(std::chrono::steady_clock::now() - process_start), fNewBlock);
                     if (fNewBlock) {
-                        LogPrintf("UDP: Block %s had serialized size %lu\n", decoded_block.GetHash().ToString(), GetSerializeSize(decoded_block, PROTOCOL_VERSION));
+                        size_t block_size = ::GetSerializeSize(TX_WITH_WITNESS(decoded_block));
+                        LogPrintf("UDP: Block %s had serialized size %lu\n", decoded_block.GetHash().ToString(), block_size);
                     }
                 }
 
@@ -1118,7 +1121,7 @@ void ProcessBlock(ChainstateManager* chainman, const std::pair<uint64_t, CServic
             if (lock && !more_work)
                 lock.unlock();
             LogPrintf("UDP: Block %s - Initialized with %ld/%ld mempool-provided chunks (or more)\n", blockHash.ToString(), mempool_provided_chunks, total_chunk_count);
-            LogPrint(BCLog::FEC, "UDP: Block %s - Chunk hit ratio: %f\n",
+            LogDebug(BCLog::FEC, "UDP: Block %s - Chunk hit ratio: %f\n",
                      blockHash.ToString(), chunk_hit_ratio);
         }
     } while (more_work);
@@ -1272,7 +1275,7 @@ void StopLoadPartialBlocks()
 }
 
 // TODO: Use the one from net_processing (with appropriate lock-free-ness)
-static std::vector<std::pair<uint256, CTransactionRef>> udpnet_dummy_extra_txn;
+static std::vector<CTransactionRef> udpnet_dummy_extra_txn;
 ReadStatus PartialBlockData::ProvideHeaderData(const CBlockHeaderAndLengthShortTxIDs& header)
 {
     assert(in_header);
@@ -1481,7 +1484,7 @@ static bool HandleTx(UDPMessage& msg, const CService& node, UDPConnectionState& 
         std::vector<unsigned char> tx_data = state.tx_in_flight->GetDecodedData();
 
         try {
-            VectorInputStream stream(&tx_data, SER_NETWORK, PROTOCOL_VERSION);
+            VectorInputStream stream(&tx_data);
             codec_version_t codec_version;
             stream >> *reinterpret_cast<std::uint8_t*>(&codec_version);
             CTransactionRef tx;
@@ -1834,7 +1837,7 @@ void ProcessDownloadTimerEvents()
         // from a trusted peer, and we are not yet in sync with this peer, don't
         // time out the block at all.
         if (((it->second->peer != TRUSTED_PEER_DUMMY) || sync_with_trusted_peer) && (t_now - it->second->t_last_rx > std::chrono::hours(6))) {
-            LogPrint(BCLog::FEC, "Timing out partial block %lu\n", it->first.first);
+            LogDebug(BCLog::FEC, "Timing out partial block %lu\n", it->first.first);
             it = RemovePartialBlock(it);
         } else {
             it++;
@@ -1967,7 +1970,7 @@ UniValue AllBlkChunkStatsToJSON()
         std::string hex_hash_prefix(stream.str());
         const BlkChunkStats s = GetBlkChunkStats(*b.second);
         UniValue info = BlkChunkStatsToJSON(s);
-        o.__pushKV(hex_hash_prefix, info);
+        o.pushKV(hex_hash_prefix, info);
     }
     return o;
 }
@@ -1987,7 +1990,7 @@ UniValue FecHitRatioToJson()
             UniValue info(UniValue::VOBJ);
             info.pushKV("txn_ratio", it->second.last_txn_hit_ratio);
             info.pushKV("chunk_ratio", it->second.last_chunk_hit_ratio);
-            ret.__pushKV(it->first.ToStringAddrPort(), info);
+            ret.pushKV(it->first.ToStringAddrPort(), info);
         }
     }
     return ret;
