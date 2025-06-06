@@ -4,6 +4,7 @@
 
 #include <compressor.h>
 #include <script/script.h>
+#include <key_io.h>
 #include <test/util/random.h>
 #include <test/util/setup_common.h>
 
@@ -247,7 +248,7 @@ BOOST_AUTO_TEST_CASE(compress_transaction_with_scripts)
     const KeyData keys;
 
     CMutableTransaction outputm;
-    outputm.nVersion = 1;
+    outputm.version = 1;
     outputm.vin.resize(2);
     outputm.vin[0].prevout.SetNull();
     outputm.vin[0].scriptSig = CScript() << OP_0 << OP_0 << OP_0 << OP_NOP << OP_CHECKMULTISIG << OP_1;
@@ -410,7 +411,7 @@ void test_script_roundtrip(CScript const s)
 {
     auto const ret = encode_push_only(s);
     BOOST_CHECK(ret.first);
-    auto const script = decode_push_only(Span{ret.second});
+    auto const script = decode_push_only(std::span{ret.second});
     BOOST_CHECK(s == script);
 }
 
@@ -447,19 +448,22 @@ BOOST_AUTO_TEST_CASE(right_align_copy)
     BOOST_CHECK(dest == (r{0,0,0,0,0,0,0,0,0,0}));
 
     // dest is larger than src
-    right_align(Span{r{1, 2, 3, 4, 5}}, Span{dest});
+    auto data1 = r{1, 2, 3, 4, 5};
+    right_align(std::span{data1}, std::span{dest});
     BOOST_CHECK(dest == (r{0, 0, 0, 0, 0, 1, 2, 3, 4, 5}));
 
     dest = zero;
 
     // src is larger than dest
-    right_align(Span{r{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11}}, Span{dest});
+    auto data2 = r{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11};
+    right_align(std::span{data2}, std::span{dest});
     BOOST_CHECK(dest == (r{2, 3, 4, 5, 6, 7, 8, 9, 10, 11}));
 
     dest = zero;
 
     // src same size as dest
-    right_align(Span{r{1, 2, 3, 4, 5, 6, 7, 8, 9, 10}}, Span{dest});
+    auto data3 = r{1, 2, 3, 4, 5, 6, 7, 8, 9, 10};
+    right_align(std::span{data3}, std::span{dest});
     BOOST_CHECK(dest == (r{1, 2, 3, 4, 5, 6, 7, 8, 9, 10}));
 }
 
@@ -516,10 +520,15 @@ BOOST_AUTO_TEST_CASE(pad_sig)
     auto const padded3 = r{0x30, 11, 0x02, 3, 10, 11, 12, 0x02, 4, 13, 14, 15, 16, 3};
 
     // if sighashall is true, the flags *must* be 1
-    BOOST_CHECK(PadSig(Span{StripSig(padded0, false)}, false) == padded0);
-    BOOST_CHECK(PadSig(Span{StripSig(padded1, false)}, false) == padded1);
-    BOOST_CHECK(PadSig(Span{StripSig(padded3, false)}, false) == padded3);
-    BOOST_CHECK(PadSig(Span{StripSig(padded1, true)}, true) == padded1);
+    auto strip_sig0 = StripSig(padded0, false);
+    auto strip_sig1 = StripSig(padded1, false);
+    auto strip_sig2 = StripSig(padded3, false);
+    auto strip_sig3 = StripSig(padded1, true);
+
+    BOOST_CHECK(PadSig(std::span{strip_sig0}, false) == padded0);
+    BOOST_CHECK(PadSig(std::span{strip_sig1}, false) == padded1);
+    BOOST_CHECK(PadSig(std::span{strip_sig2}, false) == padded3);
+    BOOST_CHECK(PadSig(std::span{strip_sig3}, true)  == padded1);
 
     {
     auto const padded = r{0x30, 40
@@ -527,7 +536,8 @@ BOOST_AUTO_TEST_CASE(pad_sig)
         , 0x02, 33, 0 // S
         , 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff
         , 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0};
-    BOOST_CHECK(PadSig(Span{StripSig(padded, false)}, false) == padded);
+    auto strip_sig = StripSig(padded, false);
+    BOOST_CHECK(PadSig(std::span{strip_sig}, false) == padded);
     }
 
     {
@@ -537,7 +547,8 @@ BOOST_AUTO_TEST_CASE(pad_sig)
         , 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff
         , 0x02, 3, 10, 11, 12
         , 0};
-    BOOST_CHECK(PadSig(Span{StripSig(padded, false)}, false) == padded);
+    auto strip_sig = StripSig(padded, false);
+    BOOST_CHECK(PadSig(std::span{strip_sig}, false) == padded);
     }
 
     {
@@ -547,7 +558,8 @@ BOOST_AUTO_TEST_CASE(pad_sig)
         , 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff
         , 0x02, 3, 10, 11, 12
         , 1};
-    BOOST_CHECK(PadSig(Span{StripSig(padded, true)}, true) == padded);
+    auto strip_sig = StripSig(padded, true);
+    BOOST_CHECK(PadSig(std::span{strip_sig}, true) == padded);
     }
 }
 
@@ -653,7 +665,7 @@ BOOST_AUTO_TEST_CASE(strip_pubkey)
     // it here, and pass it in as a separate argument.
     uint8_t const template_type = stripped[0];
     stripped.erase(stripped.begin());
-    valtype const result = PadPubKey(Span{stripped}, template_type);
+    valtype const result = PadPubKey(std::span{stripped}, template_type);
     BOOST_CHECK(result == pubkey);
     }
 }
