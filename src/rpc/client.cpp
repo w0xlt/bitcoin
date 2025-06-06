@@ -310,6 +310,10 @@ static const CRPCConvertParam vRPCConvertParams[] =
     { "stop", 0, "wait" },
     { "addnode", 2, "v2transport" },
     { "addconnection", 2, "v2transport" },
+    { "getblocksize", 0, "height"},
+    { "getblockanalysis", 0, "height"},
+    { "testcompression", 0, "start_height"},
+    { "testcompression", 1, "end_height"},
 };
 // clang-format on
 
