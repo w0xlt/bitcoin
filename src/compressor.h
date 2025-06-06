@@ -225,80 +225,74 @@ void compressTransaction(Stream& s, CTransaction const& tx);
 
 enum codec_version_t : std::uint8_t { none, v1, default_version = v1 };
 
-// Simplified approach that completely avoids GetParams issues
 struct CTxCompressor
 {
-    std::variant<CMutableTransaction*, const CTransaction*, CTransactionRef*> tx;
-    codec_version_t codec_version = codec_version_t::v1;
-
     CTxCompressor(CTransactionRef& txin, codec_version_t v) : tx(&txin), codec_version(v) {}
-    CTxCompressor(const CTransaction& txin, codec_version_t v) : tx(&txin), codec_version(v) {}
-    CTxCompressor(CMutableTransaction& txin, codec_version_t v) : tx(&txin), codec_version(v) {}
+    CTxCompressor(CTransaction const& txin, codec_version_t v) : tx(&txin), codec_version(v) {}
+    CTxCompressor(CMutableTransaction &txin, codec_version_t v) : tx(&txin), codec_version(v) {}
 
     template<typename Stream>
     void Serialize(Stream& s) const {
         if (codec_version == codec_version_t::none) {
-            // For uncompressed serialization, manually call SerializeTransaction
-            // with explicit parameters to avoid GetParams issues
-            std::visit([&s](auto&& arg) {
-                using T = std::decay_t<decltype(arg)>;
-                if constexpr (std::is_same_v<T, CTransactionRef*>) {
-                    SerializeTransaction(**arg, s, TransactionSerParams{.allow_witness = true});
-                } else if constexpr (std::is_same_v<T, const CTransaction*>) {
-                    SerializeTransaction(*arg, s, TransactionSerParams{.allow_witness = true});
-                } else {
-                    throw std::runtime_error("cannot serialize CMutableTransaction");
-                }
-            }, tx);
-        } else if (codec_version == codec_version_t::v1) {
-            std::visit([&s](auto&& arg) {
-                using T = std::decay_t<decltype(arg)>;
-                if constexpr (std::is_same_v<T, CTransactionRef*>) {
-                    compressTransaction(s, **arg);
-                } else if constexpr (std::is_same_v<T, const CTransaction*>) {
-                    compressTransaction(s, *arg);
-                } else {
-                    throw std::runtime_error("cannot serialize CMutableTransaction");
-                }
-            }, tx);
-        } else {
-            throw std::invalid_argument("Unsupported codec version");
+            if (std::holds_alternative<CTransactionRef*>(tx)) {
+                s << TX_WITH_WITNESS(**std::get<CTransactionRef*>(tx));
+            }
+            else if (std::holds_alternative<CTransaction const*>(tx)) {
+                s << TX_WITH_WITNESS(*std::get<CTransaction const*>(tx));
+            }
+            else {
+                throw std::runtime_error("cannot serialize CMutableTransaction");
+            }
+        }
+        else if (codec_version == codec_version_t::v1) {
+            if (std::holds_alternative<CTransactionRef*>(tx)) {
+                compressTransaction(s, **std::get<CTransactionRef*>(tx));
+            }
+            else if (std::holds_alternative<CTransaction const*>(tx)) {
+                compressTransaction(s, *std::get<CTransaction const*>(tx));
+            }
+            else {
+                throw std::runtime_error("cannot serialize CMutableTransaction");
+            }
+        }
+        else {
+            throw std::invalid_argument("Unsupported codec version " + std::to_string(codec_version));
         }
     }
 
     template<typename Stream>
     void Unserialize(Stream& s) {
         if (codec_version == codec_version_t::none) {
-            // For uncompressed deserialization, manually call UnserializeTransaction
-            std::visit([&s](auto&& arg) {
-                using T = std::decay_t<decltype(arg)>;
-                if constexpr (std::is_same_v<T, CTransactionRef*>) {
-                    CMutableTransaction mtx;
-                    UnserializeTransaction(mtx, s, TransactionSerParams{.allow_witness = true});
-                    *arg = MakeTransactionRef(std::move(mtx));
-                } else if constexpr (std::is_same_v<T, CMutableTransaction*>) {
-                    UnserializeTransaction(*arg, s, TransactionSerParams{.allow_witness = true});
-                } else {
-                    throw std::runtime_error("cannot deserialize into const CTransaction");
-                }
-            }, tx);
-        } else if (codec_version == codec_version_t::v1) {
-            std::visit([&s](auto&& arg) {
-                using T = std::decay_t<decltype(arg)>;
-                if constexpr (std::is_same_v<T, CTransactionRef*>) {
-                    CMutableTransaction mtx;
-                    decompressTransaction(s, mtx);
-                    *arg = MakeTransactionRef(std::move(mtx));
-                } else if constexpr (std::is_same_v<T, CMutableTransaction*>) {
-                    decompressTransaction(s, *arg);
-                } else {
-                    throw std::runtime_error("cannot deserialize into const CTransaction");
-                }
-            }, tx);
-        } else {
-            throw std::invalid_argument("Unsupported codec version");
+            if (std::holds_alternative<CTransactionRef*>(tx)) {
+                s >> TX_WITH_WITNESS(*std::get<CTransactionRef*>(tx));    
+            }
+            else if (std::holds_alternative<CMutableTransaction*>(tx)) {
+              s >> TX_WITH_WITNESS(*std::get<CMutableTransaction*>(tx));
+            }
+            else {
+                throw std::runtime_error("cannot un-serialize into CTransaction");
+           }
+        }
+        else if (codec_version == codec_version_t::v1) {
+            if (std::holds_alternative<CTransactionRef*>(tx)) {
+                CMutableTransaction local_tx;
+                decompressTransaction(s, local_tx);
+                *std::get<CTransactionRef*>(tx) = MakeTransactionRef(std::move(local_tx));
+            }
+            else if (std::holds_alternative<CMutableTransaction*>(tx)) {
+                decompressTransaction(s, *std::get<CMutableTransaction*>(tx));
+            }
+            else {
+                throw std::runtime_error("cannot un-serialize into CTransaction");
+            }
+        }
+        else {
+            throw std::invalid_argument("Unsupported codec version " + std::to_string(codec_version));
         }
     }
+private:
+    std::variant<CMutableTransaction*, CTransaction const*, CTransactionRef*> tx;
+    codec_version_t codec_version = codec_version_t::v1;
 };
 
 #endif // BITCOIN_COMPRESSOR_H
