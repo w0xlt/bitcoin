@@ -1,5 +1,6 @@
 #include <boost/test/unit_test.hpp>
 #include <fec.h>
+#include <fec/wirehair.h>
 #include <memory>
 #include <sys/mman.h>
 #include <test/util/setup_common.h>

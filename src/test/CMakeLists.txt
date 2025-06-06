@@ -40,7 +40,7 @@ add_executable(test_bitcoin
   denialofservice_tests.cpp
   descriptor_tests.cpp
   disconnected_transactions.cpp
-  #fec_tests.cpp
+  fec_tests.cpp
   feefrac_tests.cpp
   flatfile_tests.cpp
   fs_tests.cpp
@@ -155,6 +155,7 @@ target_link_libraries(test_bitcoin
   secp256k1
   Boost::headers
   libevent::extra
+  bitcoin_fec
 )
 
 if(ENABLE_WALLET)
