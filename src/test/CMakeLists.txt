@@ -113,6 +113,7 @@ add_executable(test_bitcoin
   txrequest_tests.cpp
   txvalidation_tests.cpp
   txvalidationcache_tests.cpp
+  udprelay_tests.cpp
   uint256_tests.cpp
   util_string_tests.cpp
   util_tests.cpp
@@ -141,6 +142,7 @@ target_json_data_sources(test_bitcoin
 )
 target_raw_data_sources(test_bitcoin NAMESPACE test::data
   data/asmap.raw
+  data/block413567.raw
 )
 
 add_windows_application_manifest(test_bitcoin)
