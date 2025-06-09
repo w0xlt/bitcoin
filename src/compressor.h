@@ -183,7 +183,7 @@ bool IsFromScriptHashWitnessScriptHashMultisig(std::span<valtype const> stack, s
 bool IsFromScriptHashWitnessScriptHashPubKeyHash(std::span<valtype const> stack, std::span<valtype const> witnessstack, stattype statistic);
 bool IsFromNonWitnessOther(std::span<valtype const> stack, std::span<valtype const> witnessstack, stattype statistic);
 bool IsFromWitnessOther(std::span<valtype const> stack, std::span<valtype const> witnessstack, stattype statistic);
-bool IsValidSignatureEncoding(const std::vector<unsigned char> &sig);
+bool ValidSignatureEncoding(const std::vector<unsigned char> &sig);
 
 std::pair<bool, std::vector<valtype>> encode_push_only(const CScript &scriptSig);
 bool IsToPubKeyHash(CScript const& scriptPubKey, valtype& smallscript);
