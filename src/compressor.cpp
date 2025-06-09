@@ -656,7 +656,7 @@ bool IsFromMultisig(std::span<valtype const> stack, stattype statistic)
 bool IsFromEmbeddedMultisig(std::span<valtype const> stack, stattype statistic)
 {
     if (stack.size() < 3 || stack[0].size() != 0) return false;
-    valtype redeemscript = std::move(stack.back());
+    valtype redeemscript = stack.back();
     // pop the last element
     std::span<valtype const> solostack(stack.data(), stack.size() - 1);
     if (redeemscript.size() < 1 || redeemscript.back() != OP_CHECKMULTISIG) return false;
