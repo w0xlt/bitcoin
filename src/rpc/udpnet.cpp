@@ -20,7 +20,7 @@ RPCHelpMan getudppeerinfo()
 {
     return RPCHelpMan{
         "getudppeerinfo",
-        "\nReturns data about each connected UDP unicast peer as a json array of objects.\n",
+        "Returns data about each connected UDP unicast peer as a json array of objects.\n",
         {},
         RPCResult{
             RPCResult::Type::ARR,
@@ -78,7 +78,7 @@ RPCHelpMan addudpnode()
 {
     return RPCHelpMan{
         "addudpnode",
-        "\nAttempts add a node to the UDP addnode list.\n"
+        "Attempts add a node to the UDP addnode list.\n"
         "Or try a connection to a UDP node once.\n",
         {
             {"node", RPCArg::Type::STR, RPCArg::Optional::NO, "The node IP:port"},
@@ -144,7 +144,7 @@ RPCHelpMan disconnectudpnode()
 {
     return RPCHelpMan{
         "disconnectudpnode",
-        "\nDisconnects a connected UDP node.\n",
+        "Disconnects a connected UDP node.\n",
         {
             {"node", RPCArg::Type::STR, RPCArg::Optional::NO, "The node IP:port"},
         },
@@ -170,7 +170,7 @@ RPCHelpMan getudpmulticastinfo()
 {
     return RPCHelpMan{
         "getudpmulticastinfo",
-        "\nRetrieve information about the UDP multicast Rx instances.\n",
+        "Retrieve information about the UDP multicast Rx instances.\n",
         {},
         RPCResult{
             RPCResult::Type::OBJ_DYN,
@@ -212,7 +212,7 @@ RPCHelpMan getchunkstats()
 {
     return RPCHelpMan{
         "getchunkstats",
-        "\nReturns chunk statistics of current partial blocks.\n",
+        "Returns chunk statistics of current partial blocks.\n",
         {
             {"height", RPCArg::Type::NUM, RPCArg::Optional::OMITTED, "Height of the partial block of interest. If set to 0, shows all current partial blocks."},
         },
@@ -262,7 +262,7 @@ RPCHelpMan gettxwindowinfo()
 {
     return RPCHelpMan{
         "gettxwindowinfo",
-        "\nGet information from the multicast Tx block-interleave window.\n",
+        "Get information from the multicast Tx block-interleave window.\n",
         {
             {"physical_idx", RPCArg::Type::NUM, RPCArg::Optional::OMITTED, "Physical stream index"},
             {"logical_idx", RPCArg::Type::NUM, RPCArg::Optional::OMITTED, "Logical stream index"},
@@ -322,7 +322,7 @@ RPCHelpMan gettxntxinfo()
 {
     return RPCHelpMan{
         "gettxntxinfo",
-        "\nGet information regarding multicast transmissions of mempool txns.\n",
+        "Get information regarding multicast transmissions of mempool txns.\n",
         {},
         RPCResult{
             RPCResult::Type::OBJ_DYN,
@@ -351,7 +351,7 @@ RPCHelpMan gettxqueueinfo()
 {
     return RPCHelpMan{
         "gettxqueueinfo",
-        "\nGet information from the UDP Tx queues.\n",
+        "Get information from the UDP Tx queues.\n",
         {},
         RPCResult{
             RPCResult::Type::OBJ_DYN,
@@ -386,7 +386,7 @@ RPCHelpMan getfechitratio()
 {
     return RPCHelpMan{
         "getfechitratio",
-        "\nGet the last FEC hit ratios achieved on reception of blocks coming via UDP.\n"
+        "Get the last FEC hit ratios achieved on reception of blocks coming via UDP.\n"
         "\nNew blocks are relayed over UDP connections using compact block format. On\n"
         "reception of such a cmpctblock, the node tries to form the original block and\n"
         "tries to prefill the block's txns based on the mempool transactions that it\n"
