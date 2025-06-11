@@ -128,10 +128,6 @@ void RunTest(const TestVector& test)
     key.SetSeed(seed);
     pubkey = key.Neuter();
     for (const TestDerivation &derive : test.vDerive) {
-        unsigned char data[74];
-        key.Encode(data);
-        pubkey.Encode(data);
-
         // Test private key
         BOOST_CHECK(EncodeExtKey(key) == derive.prv);
         BOOST_CHECK(DecodeExtKey(derive.prv) == key); //ensure a base58 decoded key also matches
