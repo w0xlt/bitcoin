@@ -412,7 +412,7 @@ static struct in_addr GetIfIpAddr(const char* const ifname)
     return res_sin_addr;
 }
 
-static void ListNetworkInterfaces()
+__attribute__((unused)) static void ListNetworkInterfaces()
 {
 #ifdef _WIN32
     ULONG bufferSize = 15000;

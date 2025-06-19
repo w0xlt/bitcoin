@@ -723,7 +723,9 @@ static std::atomic_bool process_thread_shutdown(false);
 static std::queue<std::pair<std::pair<uint64_t, CService>, std::shared_ptr<PartialBlockData>>> block_process_queue;
 static size_t queue_size_warn = 10; // Print queue size when it exceeds this
 
-static void DoBackgroundBlockProcessing(const std::pair<std::pair<uint64_t, CService>, std::shared_ptr<PartialBlockData>>& block_data) EXCLUSIVE_LOCKS_REQUIRED(block_data.second->state_mutex)
+// TODO: For now, there is no good or simple solution to introduce the 
+// EXCLUSIVE_LOCKS_REQUIRED(block_data.second->state_mutex) annotation without Clang's thread safety analysis complaining
+static void DoBackgroundBlockProcessing(const std::pair<std::pair<uint64_t, CService>, std::shared_ptr<PartialBlockData>>& block_data) //EXCLUSIVE_LOCKS_REQUIRED(block_data.second->state_mutex)
 {
     if (block_data.second->awaiting_processing)
         return;
@@ -828,12 +830,14 @@ void ProcessBlock(ChainstateManager* chainman, const std::pair<uint64_t, CServic
             // Do we have the block already?
             if (!block.chain_lookup) {
                 const CBlockIndex* pblockindex;
+                bool is_block_data_availale = false;
                 {
                     LOCK(cs_main);
                     pblockindex = chainman->m_blockman.LookupBlockIndex(header.header.GetHash());
+                    is_block_data_availale = pblockindex->nStatus & BLOCK_HAVE_DATA;
                 }
                 block.chain_lookup = true;
-                if (pblockindex && (pblockindex->nStatus & BLOCK_HAVE_DATA)) {
+                if (pblockindex && is_block_data_availale) {
                     // We do have the full block already. Drop the partial block
                     // immediately and add it to setBlocksReceived, so that its
                     // subsequent chunks are ignored.

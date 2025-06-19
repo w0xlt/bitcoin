@@ -91,7 +91,8 @@ BackfillBlockWindowIt BackfillBlockWindow::Remove(BackfillBlockWindowConstIt it)
 
 void BackfillBlockWindow::Cleanup()
 {
-    std::lock_guard<std::mutex> window_lock(m_mutex);
+    AssertLockNotHeld(m_mutex);
+    LOCK(m_mutex);
     for (auto it = m_map.cbegin(); it != m_map.cend();) {
         std::lock_guard<std::mutex> block_lock(it->second.mutex);
         if (it->second.idx == it->second.msgs.size()) {
