@@ -230,6 +230,7 @@ add_library(bitcoin_node STATIC EXCLUDE_FROM_ALL
   consensus/tx_verify.cpp
   dbwrapper.cpp
   deploymentstatus.cpp
+  fec.cpp
   flatfile.cpp
   headerssync.cpp
   httprpc.cpp
@@ -280,6 +281,7 @@ add_library(bitcoin_node STATIC EXCLUDE_FROM_ALL
   node/txreconciliation.cpp
   node/utxo_snapshot.cpp
   node/warnings.cpp
+  open_hash_set.h
   noui.cpp
   policy/ephemeral_policy.cpp
   policy/fees.cpp
@@ -302,6 +304,7 @@ add_library(bitcoin_node STATIC EXCLUDE_FROM_ALL
   rpc/server_util.cpp
   rpc/signmessage.cpp
   rpc/txoutproof.cpp
+  rpc/udpnet.cpp
   script/sigcache.cpp
   signet.cpp
   torcontrol.cpp
@@ -310,6 +313,8 @@ add_library(bitcoin_node STATIC EXCLUDE_FROM_ALL
   txmempool.cpp
   txorphanage.cpp
   txrequest.cpp
+  udpnet.cpp
+  udprelay.cpp
   validation.cpp
   validationinterface.cpp
   versionbits.cpp
@@ -349,10 +354,12 @@ if(BUILD_DAEMON)
   )
   add_windows_resources(bitcoind bitcoind-res.rc)
   add_windows_application_manifest(bitcoind)
+  add_subdirectory(fec)
   target_link_libraries(bitcoind
     core_interface
     bitcoin_node
     $<TARGET_NAME_IF_EXISTS:bitcoin_wallet>
+    bitcoin_fec
   )
   install_binary_component(bitcoind HAS_MANPAGE)
 endif()
