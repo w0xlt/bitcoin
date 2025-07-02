@@ -12,10 +12,11 @@
 #include <stdint.h>
 #include <vector>
 
-#include <netaddress.h>
+#include <udpapi.h>
 
 #include <blockencodings.h>
 #include <fec.h>
+#include <netaddress.h>
 
 // This is largely the API between udpnet and udprelay, see udpapi for the
 // external-facing API

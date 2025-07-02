@@ -72,6 +72,7 @@
 #include <torcontrol.h>
 #include <txdb.h>
 #include <txmempool.h>
+#include <udpapi.h>
 #include <util/asmap.h>
 #include <util/batchpriority.h>
 #include <util/chaintype.h>
@@ -299,6 +300,7 @@ void Shutdown(NodeContext& node)
     StopRPC();
     StopHTTPServer();
     StopMapPort();
+    StopUDPConnections();
 
     // Because these depend on each-other, we make sure that neither can be
     // using the other before destroying them.
@@ -2083,6 +2085,13 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
 
     if (!node.connman->Start(scheduler, connOptions)) {
         return false;
+    }
+
+    // Start UDP at the very end since it has no concept of whether the res of the code is already up or not
+
+    if (GetUDPInboundPorts().size() || gArgs.GetArg("-fecwritedevice", "") != "" || gArgs.GetArg("-fecreaddevice", "") != "") {
+        if (!InitializeUDPConnections(&node))
+            return InitError(_("Failed to check the UDP listen port - is something else already bound to this port?"));
     }
 
     // ********************************************************* Step 13: finished

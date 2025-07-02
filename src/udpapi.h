@@ -8,11 +8,12 @@
 #define BITCOIN_UDPAPI_H
 
 #include <netaddress.h>
+#include <node/context.h>
 
 class CBlock;
 
 std::vector<std::pair<unsigned short, uint64_t> > GetUDPInboundPorts(); // port, outbound bandwidth for group
-bool InitializeUDPConnections();
+bool InitializeUDPConnections(node::NodeContext* const node_context);
 void StopUDPConnections();
 
 enum UDPConnectionType {
@@ -24,5 +25,18 @@ enum UDPConnectionType {
 // fUltimatelyTrusted means you trust them (ie whitelist) and ALL OF THEIR SUBSEQUENT WHITELISTED PEERS
 void OpenUDPConnectionTo(const CService& remote_addr, uint64_t local_magic, uint64_t remote_magic, bool fUltimatelyTrusted, UDPConnectionType connection_type = UDP_CONNECTION_TYPE_NORMAL, size_t group = 0);
 void OpenPersistentUDPConnectionTo(const CService& remote_addr, uint64_t local_magic, uint64_t remote_magic, bool fUltimatelyTrusted, UDPConnectionType connection_type = UDP_CONNECTION_TYPE_NORMAL, size_t group = 0);
+
+void CloseUDPConnectionTo(const CService& remote_addr);
+
+struct UDPConnectionStats {
+    CService remote_addr;
+    size_t group;
+    bool fUltimatelyTrusted;
+    int64_t lastRecvTime;
+    std::vector<double> last_pings;
+};
+void GetUDPConnectionList(std::vector<UDPConnectionStats>& connections_list);
+
+void UDPRelayBlock(const CBlock& block);
 
 #endif
