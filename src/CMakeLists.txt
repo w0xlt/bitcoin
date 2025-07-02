@@ -312,6 +312,7 @@ add_library(bitcoin_node STATIC EXCLUDE_FROM_ALL
   txmempool.cpp
   txorphanage.cpp
   txrequest.cpp
+  udpnet.cpp
   validation.cpp
   validationinterface.cpp
   versionbits.cpp
