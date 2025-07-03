@@ -5,9 +5,12 @@
 #ifndef BITCOIN_BLOCKENCODINGS_H
 #define BITCOIN_BLOCKENCODINGS_H
 
+#include <fec.h> // For consumers - defines FEC_CHUNK_SIZE
 #include <primitives/block.h>
 
 #include <functional>
+#include <compressor.h>
+#include <streams.h>
 
 class CTxMemPool;
 class BlockValidationState;
@@ -84,6 +87,7 @@ typedef enum ReadStatus_t
     READ_STATUS_OK,
     READ_STATUS_INVALID, // Invalid object, peer is sending bogus crap
     READ_STATUS_FAILED, // Failed to process object
+    READ_STATUS_UNSUPPORTED, // Used when the txn codec version is not supported
 } ReadStatus;
 
 class CBlockHeaderAndShortTxIDs {
@@ -155,22 +159,37 @@ public:
 
 class CBlockHeaderAndLengthShortTxIDs : public CBlockHeaderAndShortTxIDs {
 private:
-    std::vector<uint32_t> txlens; // size by TransactionCompressor
+    codec_version_t codec_version; // Compression/decompression scheme's version
+    std::vector<uint32_t> txlens; // compressed size by CTxCompressor
+    // NOTE: the prefilled transactions from the base class are not compressed
+    // since that would require an out-of-band channel to communicate
+    // compression version down to the base class. Note that
+    // CBlockHeadersAnsShortTxIDs is used in the normal bitcoin peer protocol as
+    // well, where transactions are not compressed.
     friend class PartiallyDownloadedChunkBlock;
+    int height = -1; // Block height - for OOOB storage of pre-BIP34 blocks
 public:
-    CBlockHeaderAndLengthShortTxIDs(const CBlock& block, bool fDeterministic = false);
+    codec_version_t codec_ver() const { return codec_version; }
+
+    CBlockHeaderAndLengthShortTxIDs(const CBlock& block, codec_version_t const cv, bool fDeterministic = false);
 
     // Dummy for deserialization
     CBlockHeaderAndLengthShortTxIDs() {}
 
+    int getBlockHeight() const { return height; };
+    void setBlockHeight(int h) { height = h; }
+    size_t ShortTxIdCount() const { return shorttxids.size(); }
+
     // Fills a map from offset within a FEC-coded block to the tx index in the block
     // Returns false if this object is invalid (txlens.size() != shortxids.size())
-    template<typename F>
+    template <typename F>
     ReadStatus FillIndexOffsetMap(F& callback) const;
 
     template <typename Stream>
     void Serialize(Stream& s) const
     {
+        s << Using<CustomUintFormatter<1>>(codec_version);
+        s << height;
         s << AsBase<CBlockHeaderAndShortTxIDs>(*this);
         // NOTE: the lengths within the txlens vector are serialized directly
         // instead of serializing the vector using the VectorFormatter wrapper.
@@ -183,6 +202,8 @@ public:
     template <typename Stream>
     void Unserialize(Stream& s)
     {
+        s >> Using<CustomUintFormatter<1>>(codec_version);
+        s >> height;
         s >> AsBase<CBlockHeaderAndShortTxIDs>(*this);
         txlens.clear();
         txlens.reserve(shorttxids.size());
@@ -217,6 +238,9 @@ private:
     bool block_finalized = false;
     std::shared_ptr<CBlock> decoded_block;
 
+    // this is initialized to what we read off the network in InitData()
+    codec_version_t codec_version = codec_version_t::default_version;
+
     // Things used in the iterative fill-from-mempool:
     std::map<size_t, size_t>::iterator fill_coding_index_offsets_it;
     std::map<uint16_t, uint16_t> txn_prefilled; // index -> number of prefilled txn at or below index
@@ -228,16 +252,20 @@ private:
 public:
     PartiallyDownloadedChunkBlock(CTxMemPool* poolIn) : PartiallyDownloadedBlock(poolIn), decoded_block(std::make_shared<CBlock>()) {}
 
-    // extra_txn is a list of extra transactions to look at, in <witness hash, reference> form
-    ReadStatus InitData(const CBlockHeaderAndLengthShortTxIDs& comprblock, const std::vector<std::pair<uint256, CTransactionRef>>& extra_txn);
+    // extra_txn is a list of extra transactions to look at, in <reference> form
+    ReadStatus InitData(const CBlockHeaderAndLengthShortTxIDs& comprblock, const std::vector<CTransactionRef>& extra_txn);
     ReadStatus DoIterativeFill(size_t& firstChunkProcessed);
     bool IsIterativeFillDone() const;
 
     bool IsBlockAvailable() const;
+    bool AreAllTxnsInMempool() const;
+    bool IsHeaderNull() const;
     ReadStatus FinalizeBlock();
     std::shared_ptr<const CBlock> GetBlock() const { assert(block_finalized); return decoded_block; }
     const std::vector<unsigned char>& GetCodedBlock() const { assert(AreChunksAvailable() && IsBlockAvailable()); return codedBlock; }
     uint256& GetBlockHash() const;
+
+    size_t GetMempoolCount() const { return mempool_count; }
 
     // Chunk-based methods are only callable if AreChunksAvailable()
     bool AreChunksAvailable() const;
