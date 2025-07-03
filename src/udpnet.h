@@ -115,7 +115,7 @@ struct PartialBlockData {
 
     bool Init(const UDPMessage& msg);
     ReadStatus ProvideHeaderData(const CBlockHeaderAndLengthShortTxIDs& header);
-    PartialBlockData(const CService& node, const UDPMessage& header_msg, const std::chrono::steady_clock::time_point& packet_recv); // Must be a MSG_TYPE_BLOCK_HEADER
+    PartialBlockData(const CService& node, CTxMemPool* mempool, const UDPMessage& header_msg, const std::chrono::steady_clock::time_point& packet_recv); // Must be a MSG_TYPE_BLOCK_HEADER
     void ReconstructBlockFromDecoder();
 };
 

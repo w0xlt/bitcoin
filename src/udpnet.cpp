@@ -75,6 +75,8 @@ bool maybe_have_write_nodes;
 static std::map<int64_t, std::tuple<CService, uint64_t, size_t> > nodesToRepeatDisconnect;
 static std::map<CService, UDPConnectionInfo> mapPersistentNodes;
 
+static node::NodeContext* g_node_context; // Initialized by InitializeUDPConnections
+
 static CService LOCAL_WRITE_DEVICE_SERVICE(CNetAddr(), 1);
 static CService LOCAL_READ_DEVICE_SERVICE(CNetAddr(), 2);
 
@@ -159,7 +161,7 @@ static std::unique_ptr<std::thread> udp_read_thread;
 static std::vector<std::thread> udp_write_threads;
 
 static void OpenLocalDeviceConnection(bool fWrite);
-static void StartLocalBackfillThread(node::NodeContext* const node_context);
+static void StartLocalBackfillThread();
 static std::tuple<int64_t, bool, std::string> get_local_device();
 
 static void AddConnectionFromString(const std::string& node, bool fTrust) {
@@ -222,6 +224,7 @@ static void CloseSocketsAndReadEvents() {
 
 bool InitializeUDPConnections(node::NodeContext* const node_context) {
     assert(udp_write_threads.empty() && !udp_read_thread);
+    g_node_context = node_context;
 
     const std::vector<std::pair<unsigned short, uint64_t> > group_list(GetUDPInboundPorts());
     for (std::pair<unsigned short, uint64_t> port : group_list) {
@@ -296,7 +299,7 @@ bool InitializeUDPConnections(node::NodeContext* const node_context) {
     if (std::get<0>(local_write_device)) {
         OpenLocalDeviceConnection(true);
         if (std::get<1>(local_write_device))
-            StartLocalBackfillThread(node_context);
+            StartLocalBackfillThread();
     }
 
     if (gArgs.IsArgSet("-fecreaddevice")) {
@@ -445,7 +448,7 @@ static void read_socket_func(evutil_socket_t fd, short event, void* arg) {
         return;
 
     if (msg_type_masked == MSG_TYPE_BLOCK_HEADER || msg_type_masked == MSG_TYPE_BLOCK_CONTENTS) {
-        if (!HandleBlockTxMessage(msg, res, it->first, it->second, start)) {
+        if (!HandleBlockTxMessage(msg, res, it->first, it->second, start, g_node_context)) {
             send_and_disconnect(it);
             return;
         }
@@ -574,7 +577,7 @@ static void do_read_local_messages() {
 
             const uint8_t msg_type_masked = (msg.header.msg_type & UDP_MSG_TYPE_TYPE_MASK);
             if (msg_type_masked == MSG_TYPE_BLOCK_HEADER || msg_type_masked == MSG_TYPE_BLOCK_CONTENTS || msg_type_masked == MSG_TYPE_TX_CONTENTS) {
-                if (!HandleBlockTxMessage(msg, sizeof(UDPMessage) - 1, it->first, it->second, start)) {
+                if (!HandleBlockTxMessage(msg, sizeof(UDPMessage) - 1, it->first, it->second, start, g_node_context)) {
                     send_and_disconnect(it);
                     continue;
                 }
@@ -884,18 +887,18 @@ static void do_send_messages() {
     }
 }
 
-static void StartLocalBackfillThread(node::NodeContext* const node_context) {
+static void StartLocalBackfillThread() {
     assert(LOCAL_SEND_GROUP < messageQueues.size());
     std::thread(&util::TraceThread,
-                "udpbackfill", [&node_context]() {
-        while (node_context->chainman->ActiveChainstate().m_chainman.IsInitialBlockDownload() && !send_messages_break)
+                "udpbackfill", []() {
+        while (g_node_context->chainman->ActiveChainstate().m_chainman.IsInitialBlockDownload() && !send_messages_break)
             std::this_thread::sleep_for(std::chrono::milliseconds(50));
 
         const CBlockIndex *lastBlock;
         CRollingBloomFilter sent_txn_bloom(500000, 0.001); // Hold 500k (~24*6 blocks of txn) txn
         {
             LOCK(cs_main);
-            lastBlock = node_context->chainman->ActiveTip()->pprev;
+            lastBlock = g_node_context->chainman->ActiveTip()->pprev;
             assert(lastBlock);
         }
 
@@ -908,7 +911,7 @@ static void StartLocalBackfillThread(node::NodeContext* const node_context) {
             {
                 LOCK(cs_main);
                 height = lastBlock->nHeight + 1;
-                const int chain_height = node_context->chainman->ActiveHeight();
+                const int chain_height = g_node_context->chainman->ActiveHeight();
                 if (height < chain_height - 24 * 6) {
                     height = chain_height - 24 * 6;
                 } else if (height > chain_height) {
@@ -916,7 +919,7 @@ static void StartLocalBackfillThread(node::NodeContext* const node_context) {
                     height = chain_height - 24 * 6;
                 } else if (height > chain_height - 12 * 6)
                     send_txn = 100;
-                lastBlock = node_context->chainman->ActiveChain()[height];
+                lastBlock = g_node_context->chainman->ActiveChain()[height];
             }
 
             if (send_txn) {
@@ -924,8 +927,8 @@ static void StartLocalBackfillThread(node::NodeContext* const node_context) {
                 txn_to_send.reserve(send_txn);
                 {
                     std::set<uint256> txids_to_send;
-                    LOCK(node_context->mempool->cs);
-                    for (const auto& iter : node_context->mempool->mapTx.get<ancestor_score>()) {
+                    LOCK(g_node_context->mempool->cs);
+                    for (const auto& iter : g_node_context->mempool->mapTx.get<ancestor_score>()) {
                         if (txn_to_send.size() >= send_txn)
                             break;
                         if (txids_to_send.count(iter.GetTx().GetHash()) || sent_txn_bloom.contains(MakeUCharSpan(iter.GetTx().GetHash())))
@@ -935,8 +938,8 @@ static void StartLocalBackfillThread(node::NodeContext* const node_context) {
                         while (!to_add.empty()) {
                             bool has_dep = false;
                             for (const CTxIn& txin : to_add.back()->vin) {
-                                CTxMemPool::txiter init = node_context->mempool->mapTx.find(txin.prevout.hash);
-                                if (init != node_context->mempool->mapTx.end() && !txids_to_send.count(txin.prevout.hash)) {
+                                CTxMemPool::txiter init = g_node_context->mempool->mapTx.find(txin.prevout.hash);
+                                if (init != g_node_context->mempool->mapTx.end() && !txids_to_send.count(txin.prevout.hash)) {
                                     to_add.emplace_back(init->GetSharedTx());
                                     has_dep = true;
                                 }
@@ -963,7 +966,7 @@ static void StartLocalBackfillThread(node::NodeContext* const node_context) {
             LogDebug(BCLog::UDPNET, "UDP: Building backfill block at height %d with hash %s\n", height, lastBlock->phashBlock->ToString());
 
             CBlock block;
-            assert(node_context->chainman->m_blockman.ReadBlock(block, *lastBlock));
+            assert(g_node_context->chainman->m_blockman.ReadBlock(block, *lastBlock));
             std::vector<UDPMessage> msgs;
             UDPFillMessagesFromBlock(block, msgs);
 
