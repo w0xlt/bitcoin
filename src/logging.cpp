@@ -200,8 +200,7 @@ static const std::map<std::string, BCLog::LogFlags, std::less<>> LOG_CATEGORIES_
     {"scan", BCLog::SCAN},
     {"txpackages", BCLog::TXPACKAGES},
     {"udpnet", BCLog::UDPNET},
-    {"fec", BCLog::FEC},
-    {"udpmcast", BCLog::UDPMCAST},
+    {"fec", BCLog::FEC}
 };
 
 static const std::unordered_map<BCLog::LogFlags, std::string> LOG_CATEGORIES_BY_FLAG{
