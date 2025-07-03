@@ -325,15 +325,10 @@ public:
     /** Convert a CMutableTransaction into a CTransaction. */
     explicit CTransaction(const CMutableTransaction& tx);
     explicit CTransaction(CMutableTransaction&& tx);
-    // explicit CTransaction(CMutableTransaction&& tx, bool cache);
 
     template <typename Stream>
     inline void Serialize(Stream& s) const {
         SerializeTransaction(*this, s, s.template GetParams<TransactionSerParams>());
-        /* if (encodedForm.size())
-            s.write(std::as_bytes(std::span{encodedForm}));
-        else
-            SerializeTransaction(*this, s, s.template GetParams<TransactionSerParams>()); */
     }
 
     /** This deserializing constructor is provided instead of an Unserialize method.
