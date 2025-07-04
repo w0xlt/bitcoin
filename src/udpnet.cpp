@@ -849,13 +849,25 @@ static void do_send_messages() {
                         //TODO: Handle?
                     }
                 } else {
-                    sockaddr_in6 remoteaddr;
-                    memset(&remoteaddr, 0, sizeof(remoteaddr));
-                    remoteaddr.sin6_family = AF_INET6;
-                    assert(std::get<0>(msg).GetIn6Addr(&remoteaddr.sin6_addr));
-                    remoteaddr.sin6_port = htons(std::get<0>(msg).GetPort());
 
-                    if (sendto(udp_socks[group], &std::get<1>(msg), std::get<2>(msg), 0, (sockaddr*)&remoteaddr, sizeof(remoteaddr)) != std::get<2>(msg)) {
+                    // Set destination address
+                    sockaddr_storage ss = {};
+                    socklen_t addrlen;
+                    if (std::get<0>(msg).IsIPv6()) {
+                        sockaddr_in6* remoteaddr = (sockaddr_in6*)&ss;
+                        remoteaddr->sin6_family = AF_INET6;
+                        assert(std::get<0>(msg).GetIn6Addr(&remoteaddr->sin6_addr));
+                        remoteaddr->sin6_port = htons(std::get<0>(msg).GetPort());
+                        addrlen = sizeof(sockaddr_in6);
+                    } else {
+                        sockaddr_in* remoteaddr = (sockaddr_in*)&ss;
+                        remoteaddr->sin_family = AF_INET;
+                        assert(std::get<0>(msg).GetInAddr(&remoteaddr->sin_addr));
+                        remoteaddr->sin_port = htons(std::get<0>(msg).GetPort());
+                        addrlen = sizeof(sockaddr_in);
+                    }
+
+                    if (sendto(udp_socks[group], &std::get<1>(msg), std::get<2>(msg), 0, (sockaddr*)&ss, addrlen) != std::get<2>(msg)) {
                         //TODO: Handle?
                     }
                 }
