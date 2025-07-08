@@ -88,7 +88,7 @@ RPCHelpMan addudpnode()
             {"group", RPCArg::Type::NUM, RPCArg::Default{0}, "'add' to add a persistent connection or 'onetry' to try a connection to the node once"},
             {"type", RPCArg::Type::STR, RPCArg::Optional::OMITTED, "May be one of 'bidirectional', 'inbound_only' or 'I_certify_remote_is_listening_and_not_a_DoS_target_outbound_only'."},
         },
-        RPCResults{},
+        RPCResult{RPCResult::Type::NONE, "", ""},
         RPCExamples{
             HelpExampleCli("addudpnode", "\"192.168.0.6:8333\" \"PA$$WORD\" \"THEIR_PA$$\" false \"onetry\"") +
             HelpExampleRpc("addudpnode", "\"192.168.0.6:8333\" \"PA$$WORD\" \"THEIR_PA$$\" false \"onetry\"")},
@@ -134,7 +134,7 @@ RPCHelpMan addudpnode()
             else if (strCommand == "add")
                 OpenPersistentUDPConnectionTo(addr.value(), local_magic, remote_magic, fTrust, connection_type, group);
 
-            return NullUniValue;
+            return UniValue::VNULL;
         },
     };
 }
