@@ -282,4 +282,6 @@ inline void LogPrintFormatInternal(std::string_view logging_function, std::strin
 #define LogDebug(category, ...) LogPrintLevel(category, BCLog::Level::Debug, __VA_ARGS__)
 #define LogTrace(category, ...) LogPrintLevel(category, BCLog::Level::Trace, __VA_ARGS__)
 
+void StopDebugLogFlushThread();
+
 #endif // BITCOIN_LOGGING_H
