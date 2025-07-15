@@ -33,6 +33,10 @@ enum WalletFeature
 bool IsFeatureSupported(int wallet_version, int feature_version);
 WalletFeature GetClosestWalletFeature(int version);
 
+//! Legacy wallets used versioning, unlike descriptor wallets.
+//! This field is retained for backward compatibility.
+static const int LATEST_LEGACY_WALLET_VERSION = 169900;
+
 enum WalletFlags : uint64_t {
     // wallet flags in the upper section (> 1 << 31) will lead to not opening the wallet if flag is unknown
     // unknown wallet flags in the lower section <= (1 << 31) will be tolerated
