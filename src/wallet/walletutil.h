@@ -30,8 +30,6 @@ enum WalletFeature
     FEATURE_LATEST = FEATURE_PRE_SPLIT_KEYPOOL
 };
 
-bool IsFeatureSupported(int wallet_version, int feature_version);
-
 //! Legacy wallets used versioning, unlike descriptor wallets.
 //! This field is retained for backward compatibility.
 static const int LATEST_LEGACY_WALLET_VERSION = 169900;
