@@ -32,7 +32,7 @@
 #include "gf256_ssse3.h"
 #include "gf256_neon.h"
 
-#ifdef LINUX_ARM
+#if defined(LINUX_ARM) && defined(__linux__)
 #include <unistd.h>
 #include <fcntl.h>
 #include <elf.h>
@@ -269,7 +269,7 @@ static void _cpuid(unsigned int cpu_info[4U], const unsigned int cpu_info_type)
 }
 
 #else
-#if defined(LINUX_ARM)
+#if defined(LINUX_ARM) && defined(__linux__)
 static void checkLinuxARMNeonCapabilities( bool& cpuHasNeon )
 {
     auto cpufile = open("/proc/self/auxv", O_RDONLY);
@@ -315,7 +315,7 @@ static void gf256_architecture_init()
     }
 #endif
 
-#if defined(LINUX_ARM)
+#if defined(LINUX_ARM) && defined(__linux__)
     // Check for NEON support on other ARM/Linux platforms
     checkLinuxARMNeonCapabilities(CpuHasNeon);
 #endif
