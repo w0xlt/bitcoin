@@ -31,7 +31,6 @@ enum WalletFeature
 };
 
 bool IsFeatureSupported(int wallet_version, int feature_version);
-WalletFeature GetClosestWalletFeature(int version);
 
 //! Legacy wallets used versioning, unlike descriptor wallets.
 //! This field is retained for backward compatibility.
