@@ -80,7 +80,7 @@ static node::NodeContext* g_node_context; // Initialized by InitializeUDPConnect
 static CService LOCAL_WRITE_DEVICE_SERVICE(CNetAddr(), 1);
 static CService LOCAL_READ_DEVICE_SERVICE(CNetAddr(), 2);
 
-#define LOCAL_DEVICE_CHECKSUM_MAGIC htole64(0xdeadbeef)
+#define LOCAL_DEVICE_CHECKSUM_MAGIC htole64_internal(0xdeadbeef)
 
 // TODO: The checksum stuff is not endian-safe (esp the poly impl):
 static void FillChecksum(uint64_t magic, UDPMessage& msg, const unsigned int length)
@@ -417,7 +417,7 @@ static void read_socket_func(evutil_socket_t fd, short event, void* arg) {
             return;
         }
 
-        state.protocolVersion = le64toh(msg.msg.longint);
+        state.protocolVersion = le64toh_internal(msg.msg.longint);
         if (PROTOCOL_VERSION_MIN(state.protocolVersion) > PROTOCOL_VERSION_CUR(UDP_PROTOCOL_VERSION)) {
             LogPrintf("UDP: Got min protocol version we didnt understand (%u:%u) from %s\n", PROTOCOL_VERSION_MIN(state.protocolVersion), PROTOCOL_VERSION_CUR(state.protocolVersion), it->first.ToStringAddrPort());
             send_and_disconnect(it);
@@ -472,7 +472,7 @@ static void read_socket_func(evutil_socket_t fd, short event, void* arg) {
             return;
         }
 
-        uint64_t nonce = le64toh(msg.msg.longint);
+        uint64_t nonce = le64toh_internal(msg.msg.longint);
         std::map<uint64_t, int64_t>::iterator nonceit = state.ping_times.find(nonce);
         if (nonceit == state.ping_times.end()) // Possibly duplicated packet
             LogPrintf("UDP: Got PONG message without PING from %s\n", it->first.ToStringAddrPort());
@@ -635,7 +635,7 @@ static void timer_func(evutil_socket_t fd, short event, void* arg) {
 
         if (!(state.state & STATE_GOT_SYN_ACK) && origLastSendTime < now - 1000) {
             msg.header.msg_type = MSG_TYPE_SYN;
-            msg.msg.longint = htole64(UDP_PROTOCOL_VERSION);
+            msg.msg.longint = htole64_internal(UDP_PROTOCOL_VERSION);
             SendMessage(msg, sizeof(UDPMessageHeader) + 8, false, it);
             state.lastSendTime = now;
         }
@@ -649,7 +649,7 @@ static void timer_func(evutil_socket_t fd, short event, void* arg) {
         if ((state.state & STATE_INIT_COMPLETE) == STATE_INIT_COMPLETE && state.lastPingTime < now - 1000 * 60 * 15) {
             uint64_t pingnonce = FastRandomContext().rand64();
             msg.header.msg_type = MSG_TYPE_PING;
-            msg.msg.longint = htole64(pingnonce);
+            msg.msg.longint = htole64_internal(pingnonce);
             SendMessage(msg, sizeof(UDPMessageHeader) + 8, false, it);
             state.ping_times[pingnonce] = TicksSinceEpoch<std::chrono::microseconds>(SystemClock::now());
             state.lastPingTime = now;
@@ -776,7 +776,8 @@ static inline bool fill_cache(PerQueueSendState* states, std::chrono::steady_clo
 static void do_send_messages() {
 #ifndef WIN32
     {
-        struct sched_param sched{sched_get_priority_max(SCHED_RR)};
+        struct sched_param sched = {};
+        sched.sched_priority = sched_get_priority_max(SCHED_RR);
         int res = pthread_setschedparam(pthread_self(), SCHED_RR, &sched);
         LogPrintf("UDP: %s write thread priority to SCHED_RR%s\n", !res ? "Set" : "Was unable to set", !res ? "" : (res == EPERM ? " (permission denied)" : " (other error)"));
         if (res) {
@@ -1143,7 +1144,7 @@ void OpenUDPConnectionTo(const CService& addr, uint64_t local_magic, uint64_t re
     if (connection_type == UDP_CONNECTION_TYPE_INBOUND_ONLY)
         group = LOCAL_RECEIVE_GROUP;
 
-    OpenUDPConnectionTo(addr, {htole64(local_magic), htole64(remote_magic), group, fUltimatelyTrusted, connection_type});
+    OpenUDPConnectionTo(addr, {htole64_internal(local_magic), htole64_internal(remote_magic), group, fUltimatelyTrusted, connection_type});
 }
 
 void OpenPersistentUDPConnectionTo(const CService& addr, uint64_t local_magic, uint64_t remote_magic, bool fUltimatelyTrusted, UDPConnectionType connection_type, size_t group) {
@@ -1155,7 +1156,7 @@ void OpenPersistentUDPConnectionTo(const CService& addr, uint64_t local_magic, u
     if (mapPersistentNodes.count(addr))
         return;
 
-    UDPConnectionInfo info = {htole64(local_magic), htole64(remote_magic), group, fUltimatelyTrusted, connection_type};
+    UDPConnectionInfo info = {htole64_internal(local_magic), htole64_internal(remote_magic), group, fUltimatelyTrusted, connection_type};
     OpenUDPConnectionTo(addr, info);
     mapPersistentNodes[addr] = info;
 }
