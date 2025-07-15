@@ -639,18 +639,13 @@ void CWallet::SetLastBlockProcessed(int block_height, uint256 block_hash)
     WriteBestBlock();
 }
 
-void CWallet::SetMinVersion(enum WalletFeature nVersion, WalletBatch* batch_in)
+void CWallet::SetLatestLegacyWalletVersion(WalletBatch* batch_in)
 {
     LOCK(cs_wallet);
-    if (nWalletVersion >= nVersion)
-        return;
-    WalletLogPrintf("Setting minversion to %d\n", nVersion);
-    nWalletVersion = nVersion;
-
+    WalletLogPrintf("Setting minversion to %d\n", LATEST_LEGACY_WALLET_VERSION);
     {
         WalletBatch* batch = batch_in ? batch_in : new WalletBatch(GetDatabase());
-        if (nWalletVersion > 40000)
-            batch->WriteMinVersion(nWalletVersion);
+        batch->WriteLatestLegacyWalletVersion();
         if (!batch_in)
             delete batch;
     }
@@ -825,9 +820,6 @@ bool CWallet::EncryptWallet(const SecureString& strWalletPassphrase)
                 assert(false);
             }
         }
-
-        // Encryption was introduced in version 0.4.0
-        SetMinVersion(FEATURE_WALLETCRYPT, encrypted_batch);
 
         if (!encrypted_batch->TxnCommit()) {
             delete encrypted_batch;
@@ -2866,8 +2858,7 @@ std::shared_ptr<CWallet> CWallet::Create(WalletContext& context, const std::stri
     {
         LOCK(walletInstance->cs_wallet);
 
-        // ensure this wallet.dat can only be opened by clients supporting HD with chain split and expects no default key
-        walletInstance->SetMinVersion(FEATURE_LATEST);
+        walletInstance->SetLatestLegacyWalletVersion();
 
         // Init with passed flags.
         // Always set the cache upgrade flag as this feature is supported from the beginning.

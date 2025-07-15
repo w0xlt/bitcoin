@@ -47,7 +47,10 @@ public:
     virtual WalletDatabase& GetDatabase() const = 0;
     virtual bool IsWalletFlagSet(uint64_t) const = 0;
     virtual void UnsetBlankWalletFlag(WalletBatch&) = 0;
-    virtual void SetMinVersion(enum WalletFeature, WalletBatch* = nullptr) = 0;
+    //! Sets the wallet version field, which was used only by legacy wallets.
+    //! This field is retained for backward compatibility so that
+    //! newly created wallets can be opened by older software versions.
+    virtual void SetLatestLegacyWalletVersion(WalletBatch* = nullptr) = 0;
     //! Pass the encryption key to cb().
     virtual bool WithEncryptionKey(std::function<bool (const CKeyingMaterial&)> cb) const = 0;
     virtual bool HasEncryptionKeys() const = 0;
