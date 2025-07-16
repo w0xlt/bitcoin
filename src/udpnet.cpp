@@ -228,27 +228,49 @@ bool InitializeUDPConnections(node::NodeContext* const node_context) {
 
     const std::vector<std::pair<unsigned short, uint64_t> > group_list(GetUDPInboundPorts());
     for (std::pair<unsigned short, uint64_t> port : group_list) {
-        udp_socks.push_back(socket(AF_INET6, SOCK_DGRAM, 0));
-        assert(udp_socks.back());
-
-        int opt = 1;
-        assert(setsockopt(udp_socks.back(), SOL_SOCKET, SO_REUSEADDR, &opt,  sizeof(opt)) == 0);
-        opt = 0;
-        assert(setsockopt(udp_socks.back(), IPPROTO_IPV6, IPV6_V6ONLY, &opt,  sizeof(opt)) == 0);
-        fcntl(udp_socks.back(), F_SETFL, fcntl(udp_socks.back(), F_GETFL) | O_NONBLOCK);
-
-        struct sockaddr_in6 wildcard;
-        memset(&wildcard, 0, sizeof(wildcard));
-        wildcard.sin6_family = AF_INET6;
-        memcpy(&wildcard.sin6_addr, &in6addr_any, sizeof(in6addr_any));
-        wildcard.sin6_port = htons(port.first);
-
-        if (bind(udp_socks.back(), (sockaddr*) &wildcard, sizeof(wildcard))) {
+        // Create separate IPv6 and IPv4 sockets for this UDP port
+        int sock6 = socket(AF_INET6, SOCK_DGRAM, 0);
+        if (sock6 < 0) {
             CloseSocketsAndReadEvents();
             return false;
         }
-
-        LogPrintf("UDP: Bound to port %hd for group %lu with %lu Mbps\n", port.first, udp_socks.size() - 1, port.second);
+        int opt = 1;
+        assert(setsockopt(sock6, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) == 0);
+        assert(setsockopt(sock6, IPPROTO_IPV6, IPV6_V6ONLY, &opt, sizeof(opt)) == 0);
+        fcntl(sock6, F_SETFL, fcntl(sock6, F_GETFL) | O_NONBLOCK);
+        struct sockaddr_in6 addr6;
+        memset(&addr6, 0, sizeof(addr6));
+        addr6.sin6_family = AF_INET6;
+        addr6.sin6_addr = in6addr_any;
+        addr6.sin6_port = htons(port.first);
+        if (bind(sock6, (sockaddr*)&addr6, sizeof(addr6)) != 0) {
+            CloseSocketsAndReadEvents();
+            close(sock6);
+            return false;
+        }
+        int sock4 = socket(AF_INET, SOCK_DGRAM, 0);
+        if (sock4 < 0) {
+            CloseSocketsAndReadEvents();
+            close(sock6);
+            return false;
+        }
+        assert(setsockopt(sock4, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) == 0);
+        fcntl(sock4, F_SETFL, fcntl(sock4, F_GETFL) | O_NONBLOCK);
+        struct sockaddr_in addr4;
+        memset(&addr4, 0, sizeof(addr4));
+        addr4.sin_family = AF_INET;
+        addr4.sin_addr.s_addr = INADDR_ANY;
+        addr4.sin_port = htons(port.first);
+        if (bind(sock4, (sockaddr*)&addr4, sizeof(addr4)) != 0) {
+            CloseSocketsAndReadEvents();
+            close(sock6);
+            close(sock4);
+            return false;
+        }
+        // Register both sockets and log the binding
+        udp_socks.push_back(sock6);
+        udp_socks.push_back(sock4);\
+        LogPrintf("UDP: Bound to port %hu for group %lu with %lu Mbps\n", port.first, (unsigned long)(udp_socks.size()/2 - 1), port.second);
     }
 
     event_base_read = event_base_new();
@@ -381,25 +403,29 @@ static void read_socket_func(evutil_socket_t fd, short event, void* arg) {
     std::chrono::steady_clock::time_point start(std::chrono::steady_clock::now());
 
     UDPMessage msg;
-    /* We will place the incoming UDP message payload into `msg`. However, not
-     * necessarily the incoming payload will fill the entire `UDPMessage`
-     * structure. Hence, zero-initialize `msg` here. */
-    struct sockaddr_in6 remoteaddr;
-    socklen_t remoteaddrlen = sizeof(remoteaddr);
-
-    ssize_t res = recvfrom(fd, &msg, sizeof(msg), MSG_DONTWAIT, (sockaddr*)&remoteaddr, &remoteaddrlen);
+    sockaddr_storage remote_addr;
+    socklen_t remote_addr_len = sizeof(remote_addr);
+    ssize_t res = recvfrom(fd, &msg, sizeof(msg), MSG_DONTWAIT, (sockaddr*)&remote_addr, &remote_addr_len);
+     
     if (res < 0) {
         int err = errno;
         LogPrintf("UDP: Error reading from socket: %d (%s)!\n", err, NetworkErrorString(err));
         return;
     }
-    assert(remoteaddrlen == sizeof(remoteaddr));
 
     if (size_t(res) < sizeof(UDPMessageHeader) || size_t(res) >= sizeof(UDPMessage))
         return;
 
+    CService remote_service;
+    if (((sockaddr*)&remote_addr)->sa_family == AF_INET6) {
+        remote_service = CService(*(sockaddr_in6*)&remote_addr);
+    } else if (((sockaddr*)&remote_addr)->sa_family == AF_INET) {
+        remote_service = CService(*(sockaddr_in*)&remote_addr);
+    } else {
+        return;
+    }
     std::unique_lock<std::recursive_mutex> lock(cs_mapUDPNodes);
-    std::map<CService, UDPConnectionState>::iterator it = mapUDPNodes.find(CService(remoteaddr));
+    auto it = mapUDPNodes.find(remote_service);
     if (it == mapUDPNodes.end())
         return;
     if (!CheckChecksum(it->second.connection.local_magic, msg, res))
@@ -843,11 +869,11 @@ static void do_send_messages() {
                 FillChecksum(std::get<3>(msg), std::get<1>(msg), std::get<2>(msg));
 
                 if (send_state.local) {
-                    assert(std::get<2>(msg) == sizeof(UDPMessage) - 1); // UDPMessage is 1 byte larger than block messages
-
-                    if (write(udp_socks[group], &LOCAL_MAGIC_BYTES, sizeof(LOCAL_MAGIC_BYTES)) != sizeof(LOCAL_MAGIC_BYTES) ||
-                            write(udp_socks[group], &std::get<1>(msg), std::get<2>(msg)) != std::get<2>(msg)) {
-                        //TODO: Handle?
+                    assert(std::get<2>(msg) == sizeof(UDPMessage) - 1);
+                    int localSock = udp_socks.back();
+                    if (write(localSock, &LOCAL_MAGIC_BYTES, sizeof(LOCAL_MAGIC_BYTES)) != sizeof(LOCAL_MAGIC_BYTES) ||
+                        write(localSock, &std::get<1>(msg), std::get<2>(msg)) != std::get<2>(msg)) {
+                            // TODO: Handle write error (if needed)
                     }
                 } else {
 
@@ -868,8 +894,9 @@ static void do_send_messages() {
                         addrlen = sizeof(sockaddr_in);
                     }
 
-                    if (sendto(udp_socks[group], &std::get<1>(msg), std::get<2>(msg), 0, (sockaddr*)&ss, addrlen) != std::get<2>(msg)) {
-                        //TODO: Handle?
+                    int sendSock = std::get<0>(msg).IsIPv6() ? udp_socks[group * 2] : udp_socks[group * 2 + 1];
+                    if (sendto(sendSock, &std::get<1>(msg), std::get<2>(msg), 0, (sockaddr*)&ss, addrlen) != std::get<2>(msg)) {
+                        // TODO: Handle send error (e.g. log it)
                     }
                 }
 
