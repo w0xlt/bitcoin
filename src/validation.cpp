@@ -4500,9 +4500,9 @@ bool ChainstateManager::AcceptBlock(const std::shared_ptr<const CBlock>& pblock,
 
     // Header is valid/has work, merkle tree and segwit merkle tree are good...RELAY NOW
     // (but if it does not build on our best tip, let the SendMessages loop relay it)
-    // if (!IsInitialBlockDownload() && fHasMoreOrSameWork) {
+    if (!IsInitialBlockDownload() && fHasMoreOrSameWork) {
         UDPRelayBlock(block); // TODO: Do this via NewPoWValidBlock!
-    // }
+    }
 
     // Header is valid/has work, merkle tree and segwit merkle tree are good...RELAY NOW
     // (but if it does not build on our best tip, let the SendMessages loop relay it)
