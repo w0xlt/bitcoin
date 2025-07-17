@@ -961,14 +961,6 @@ private:
     void ProcessCompactBlockTxns(CNode& pfrom, Peer& peer, const BlockTransactions& block_transactions)
         EXCLUSIVE_LOCKS_REQUIRED(g_msgproc_mutex, !m_most_recent_block_mutex);
 
-    /**
-     * When a peer sends us a valid block, instruct it to announce blocks to us
-     * using CMPCTBLOCK if possible by adding its nodeid to the end of
-     * lNodesAnnouncingHeaderAndIDs, and keeping that list under a certain size by
-     * removing the first element if necessary.
-     */
-    void MaybeSetPeerAsAnnouncingHeaderAndIDs(NodeId nodeid) EXCLUSIVE_LOCKS_REQUIRED(cs_main, !m_peer_mutex);
-
     /** Stack of nodes which we have set to announce using compact blocks */
     std::list<NodeId> lNodesAnnouncingHeaderAndIDs GUARDED_BY(cs_main);
 
@@ -1247,65 +1239,6 @@ bool PeerManagerImpl::BlockRequested(NodeId nodeid, const CBlockIndex& block, st
         *pit = &itInFlight->second.second;
     }
     return true;
-}
-
-void PeerManagerImpl::MaybeSetPeerAsAnnouncingHeaderAndIDs(NodeId nodeid)
-{
-    AssertLockHeld(cs_main);
-
-    // When in -blocksonly mode, never request high-bandwidth mode from peers. Our
-    // mempool will not contain the transactions necessary to reconstruct the
-    // compact block.
-    if (m_opts.ignore_incoming_txs) return;
-
-    CNodeState* nodestate = State(nodeid);
-    PeerRef peer{GetPeerRef(nodeid)};
-    if (!nodestate || !nodestate->m_provides_cmpctblocks) {
-        // Don't request compact blocks if the peer has not signalled support
-        return;
-    }
-
-    int num_outbound_hb_peers = 0;
-    for (std::list<NodeId>::iterator it = lNodesAnnouncingHeaderAndIDs.begin(); it != lNodesAnnouncingHeaderAndIDs.end(); it++) {
-        if (*it == nodeid) {
-            lNodesAnnouncingHeaderAndIDs.erase(it);
-            lNodesAnnouncingHeaderAndIDs.push_back(nodeid);
-            return;
-        }
-        PeerRef peer_ref{GetPeerRef(*it)};
-        if (peer_ref && !peer_ref->m_is_inbound) ++num_outbound_hb_peers;
-    }
-    if (peer && peer->m_is_inbound) {
-        // If we're adding an inbound HB peer, make sure we're not removing
-        // our last outbound HB peer in the process.
-        if (lNodesAnnouncingHeaderAndIDs.size() >= 3 && num_outbound_hb_peers == 1) {
-            PeerRef remove_peer{GetPeerRef(lNodesAnnouncingHeaderAndIDs.front())};
-            if (remove_peer && !remove_peer->m_is_inbound) {
-                // Put the HB outbound peer in the second slot, so that it
-                // doesn't get removed.
-                std::swap(lNodesAnnouncingHeaderAndIDs.front(), *std::next(lNodesAnnouncingHeaderAndIDs.begin()));
-            }
-        }
-    }
-    m_connman.ForNode(nodeid, [this](CNode* pfrom) EXCLUSIVE_LOCKS_REQUIRED(::cs_main) {
-        AssertLockHeld(::cs_main);
-        if (lNodesAnnouncingHeaderAndIDs.size() >= 3) {
-            // As per BIP152, we only get 3 of our peers to announce
-            // blocks using compact encodings.
-            m_connman.ForNode(lNodesAnnouncingHeaderAndIDs.front(), [this](CNode* pnodeStop){
-                MakeAndPushMessage(*pnodeStop, NetMsgType::SENDCMPCT, /*high_bandwidth=*/false, /*version=*/CMPCTBLOCKS_VERSION);
-                // save BIP152 bandwidth state: we select peer to be low-bandwidth
-                pnodeStop->m_bip152_highbandwidth_to = false;
-                return true;
-            });
-            lNodesAnnouncingHeaderAndIDs.pop_front();
-        }
-        MakeAndPushMessage(*pfrom, NetMsgType::SENDCMPCT, /*high_bandwidth=*/true, /*version=*/CMPCTBLOCKS_VERSION);
-        // save BIP152 bandwidth state: we select peer to be high-bandwidth
-        pfrom->m_bip152_highbandwidth_to = true;
-        lNodesAnnouncingHeaderAndIDs.push_back(pfrom->GetId());
-        return true;
-    });
 }
 
 bool PeerManagerImpl::TipMayBeStale()
@@ -2116,19 +2049,6 @@ void PeerManagerImpl::BlockChecked(const CBlock& block, const BlockValidationSta
         it != mapBlockSource.end() &&
         State(it->second.first)) {
             MaybePunishNodeForBlock(/*nodeid=*/ it->second.first, state, /*via_compact_block=*/ !it->second.second);
-    }
-    // Check that:
-    // 1. The block is valid
-    // 2. We're not in initial block download
-    // 3. This is currently the best block we're aware of. We haven't updated
-    //    the tip yet so we have no way to check this directly here. Instead we
-    //    just check that there are currently no other blocks in flight.
-    else if (state.IsValid() &&
-             !m_chainman.IsInitialBlockDownload() &&
-             mapBlocksInFlight.count(hash) == mapBlocksInFlight.size()) {
-        if (it != mapBlockSource.end()) {
-            MaybeSetPeerAsAnnouncingHeaderAndIDs(it->second.first);
-        }
     }
     if (it != mapBlockSource.end())
         mapBlockSource.erase(it);
@@ -3692,6 +3612,17 @@ void PeerManagerImpl::ProcessMessage(CNode& pfrom, const std::string& msg_type, 
             // We send this to non-NODE NETWORK peers as well, because
             // they may wish to request compact blocks from us
             MakeAndPushMessage(pfrom, NetMsgType::SENDCMPCT, /*high_bandwidth=*/false, /*version=*/CMPCTBLOCKS_VERSION);
+
+            // Set the BIP152 high-bandwidth flag
+            pfrom.m_bip152_highbandwidth_to = true;
+
+            // Add to high-bandwidth list (no limit for FIBRE)
+            LOCK(cs_main);
+            CNodeState* nodestate = State(pfrom.GetId());
+            if (nodestate) {
+                nodestate->m_provides_cmpctblocks = true;
+                lNodesAnnouncingHeaderAndIDs.push_back(pfrom.GetId());
+            }
         }
 
         if (m_txreconciliation) {
@@ -3733,6 +3664,29 @@ void PeerManagerImpl::ProcessMessage(CNode& pfrom, const std::string& msg_type, 
 
     if (msg_type == NetMsgType::SENDHEADERS) {
         peer->m_prefers_headers = true;
+
+        // The peer announced support for compact blocks.
+        // We already sent SENDCMPCT(0) in GetAddr, but we can resend it here if the logic changes.
+        // This message is also sent to non-NODE_NETWORK peers, as they may want to request compact blocks from nodes.
+
+        // For FIBER, we treat all peers as high-bandwidth peers to minimize latency.
+        // We instruct the peer to send us blocks using high-bandwidth advertisements (cmpctblock).
+        MakeAndPushMessage(pfrom, NetMsgType::SENDCMPCT, /*high_bandwidth=*/true, /*version=*/CMPCTBLOCKS_VERSION);
+
+        // Set the BIP152 high bandwidth flag
+        pfrom.m_bip152_highbandwidth_to = true;
+
+        // Added to high bandwidth list (no limit for FIBER)
+        LOCK(cs_main);
+        CNodeState* nodestate = State(pfrom.GetId());
+        if (nodestate) {
+            nodestate->m_provides_cmpctblocks = true;
+            // Avoid adding duplicates if the logic is triggered multiple times
+            if (std::find(lNodesAnnouncingHeaderAndIDs.begin(), lNodesAnnouncingHeaderAndIDs.end(), pfrom.GetId()) == lNodesAnnouncingHeaderAndIDs.end()) {
+                lNodesAnnouncingHeaderAndIDs.push_back(pfrom.GetId());
+            }
+        }
+
         return;
     }
 
@@ -3751,6 +3705,12 @@ void PeerManagerImpl::ProcessMessage(CNode& pfrom, const std::string& msg_type, 
         // save whether peer selects us as BIP152 high-bandwidth peer
         // (receiving sendcmpct(1) signals high-bandwidth, sendcmpct(0) low-bandwidth)
         pfrom.m_bip152_highbandwidth_from = sendcmpct_hb;
+
+        // FIBRE: Also ensure we set them as HB from our side if not already done
+        if (std::find(lNodesAnnouncingHeaderAndIDs.begin(), lNodesAnnouncingHeaderAndIDs.end(), pfrom.GetId()) == lNodesAnnouncingHeaderAndIDs.end()) {
+            lNodesAnnouncingHeaderAndIDs.push_back(pfrom.GetId());
+        }
+
         return;
     }
 
