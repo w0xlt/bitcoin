@@ -316,5 +316,16 @@ BOOST_AUTO_TEST_CASE(codex32_mixed_case)
     }
 }
 
+BOOST_AUTO_TEST_CASE(codex32_encode_test_specific_seed)
+{
+    // Test vector for codex32_secret_encode
+    std::vector<uint8_t> seed = ParseHex("659dec01c6c731124084add1fabc04833d3aa6718f7696ba1faebb4fe1a7a8b6");
+
+    std::string error;
+    std::string encoded = codex32_secret_encode("cl", "werd", 0, seed, error);
+    BOOST_CHECK(error.empty());
+    BOOST_CHECK_EQUAL(encoded, "cl10werdsvkw7cqwxcuc3ysyy4hgl40qysv7n4fn33amfdwsl46a5lcd84zmqr8mmr3gq62atn");
+}
+
 BOOST_AUTO_TEST_SUITE_END()
 } // namespace wallet
