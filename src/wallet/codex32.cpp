@@ -204,7 +204,7 @@ std::vector<uint8_t> DecodePayload(const std::string& payload)
             uint8_t overshoot = rem - 3;
             assert(overshoot > 0);
             ret.push_back(next_byte | (fe >> overshoot));
-            next_byte = fe << (8 - overshoot);
+            next_byte = (fe << (8 - overshoot)) & 0xFF;
         }
 
         rem = (rem + 5) % 8;
@@ -409,7 +409,7 @@ std::string codex32_secret_encode(const std::string& hrp,
 
     for (size_t i = 0; i < seed.size(); i++) {
         // Each byte provides at least one u5. Push that.
-        uint8_t u5 = (next_u5 << (5 - rem)) | seed[i] >> (3 + rem);
+        uint8_t u5 = ((next_u5 << (5 - rem)) | (seed[i] >> (3 + rem))) & 0x1F;
 
         bip93 += BECH32_CHARSET[u5];
         next_u5 = seed[i] & ((1 << (3 + rem)) - 1);
@@ -423,7 +423,7 @@ std::string codex32_secret_encode(const std::string& hrp,
         rem = (rem + 8) % 5;
     }
     if (rem > 0) {
-        bip93 += BECH32_CHARSET[next_u5 << (5 - rem)];
+        bip93 += BECH32_CHARSET[(next_u5 << (5 - rem)) & 0x1F];
     }
 
     const ChecksumEngine& csum_engine = INITIAL_ENGINE_CSUM[seed.size() >= 51 ? 1 : 0];
