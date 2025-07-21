@@ -3595,6 +3595,8 @@ void CWallet::SetupOwnDescriptorScriptPubKeyMans(WalletBatch& batch)
         m_seed_keys[seed.GetID()] = seed_key;
     }
 
+    SetWalletFlagWithDB(batch, WALLET_FLAG_SEEDS_STORED);
+
     SetupDescriptorScriptPubKeyMans(batch, master_key);
 }
 
