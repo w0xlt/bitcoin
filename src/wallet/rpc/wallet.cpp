@@ -946,6 +946,7 @@ RPCHelpMan importdescriptors();
 RPCHelpMan listdescriptors();
 RPCHelpMan backupwallet();
 RPCHelpMan restorewallet();
+RPCHelpMan getseedbackup();
 
 // coins
 RPCHelpMan getreceivedbyaddress();
@@ -1011,6 +1012,7 @@ std::span<const CRPCCommand> GetWalletRPCCommands()
         {"wallet", &getreceivedbylabel},
         {"wallet", &gettransaction},
         {"wallet", &getbalances},
+        {"wallet", &getseedbackup},
         {"wallet", &getwalletinfo},
         {"wallet", &importdescriptors},
         {"wallet", &importprunedfunds},

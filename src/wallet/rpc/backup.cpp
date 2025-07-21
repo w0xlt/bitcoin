@@ -654,4 +654,73 @@ RPCHelpMan restorewallet()
 },
     };
 }
+
+RPCHelpMan getseedbackup()
+{
+    return RPCHelpMan{
+        "getseedbackup",
+        "Return the BIP32 wallet seed in raw hexadecimal form for descriptor wallets.\n"
+        "Wallet must be an unlocked descriptor wallet. For encrypted wallets, the wallet must be unlocked.\n",
+        {},
+        RPCResult{
+            RPCResult::Type::ARR, "seeds", "Array of wallet seeds in hex format.",
+            {
+                {RPCResult::Type::STR, "hex", "(string) The raw seed in hex (128 or 256 bits in hex string form). If the wallet has multiple seeds, an array of hex strings is returned."}
+            }
+        },
+        RPCExamples{
+            HelpExampleCli("getseedbackup", "")
+        },
+        [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
+{
+    std::shared_ptr<CWallet> const pwallet = GetWalletForJSONRPCRequest(request);
+    if (!pwallet) {
+        throw JSONRPCError(RPC_WALLET_ERROR, "Wallet not found");
+    }
+    CWallet* wallet = pwallet.get();
+    LOCK(wallet->cs_wallet);
+
+    if (!wallet->IsWalletFlagSet(WALLET_FLAG_DESCRIPTORS)) {
+        throw JSONRPCError(RPC_WALLET_ERROR, "getseedbackup is only available for descriptor wallets");
+    }
+    if (wallet->IsCrypted() && wallet->IsLocked()) {
+        throw JSONRPCError(RPC_WALLET_UNLOCK_NEEDED, "Error: Wallet is encrypted and locked. Unlock the wallet to retrieve the seed.");
+    }
+
+    // Gather seeds
+    UniValue result(UniValue::VARR);
+    if (wallet->IsCrypted()) {
+        // Use the in-memory encrypted seeds and decrypt them
+        bool ok = wallet->WithEncryptionKey([&](const CKeyingMaterial& enc_key) {
+            for (const auto& entry : wallet->m_crypted_seed_keys) {
+                const CPubKey& pubkey = entry.second.first;
+                const std::vector<unsigned char>& crypted_secret = entry.second.second;
+                CKey seed_key;
+                if (!DecryptKey(enc_key, crypted_secret, pubkey, seed_key)) {
+                    throw JSONRPCError(RPC_WALLET_ERROR, "Failed to decrypt wallet seed");
+                }
+                result.push_back(HexStr(seed_key));
+            }
+            return true;
+        });
+        (void)ok; // The lambda either returns true or throws on failure
+    } else {
+        for (const auto& entry : wallet->m_seed_keys) {
+            const CKey& seed_key = entry.second;
+            result.push_back(HexStr(seed_key));
+        }
+    }
+
+    if (result.empty()) {
+        throw JSONRPCError(RPC_WALLET_ERROR, "No seed available in this wallet");
+    }
+    // If only one seed, return as a single string (not an array) for convenience
+    /* if (result.size() == 1) {
+        return result[0];
+    } */
+
+    return result;
+},
+    };
+}
 } // namespace wallet

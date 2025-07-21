@@ -1069,6 +1069,16 @@ public:
     //! Find the private key for the given key id from the wallet's descriptors, if available
     //! Returns nullopt when no descriptor has the key or if the wallet is locked.
     std::optional<CKey> GetKey(const CKeyID& keyid) const;
+
+    void AddWalletSeed(const CKey& seed_key);
+
+    void AddCryptedWalletSeed(const CPubKey& pubkey, const std::vector<unsigned char>& crypted_secret);
+
+    //!< Stored descriptor wallet seeds (unencrypted)
+    std::map<CKeyID, CKey> m_seed_keys;
+    //!< Encrypted wallet seeds (pubkey and encrypted secret)
+    std::map<CKeyID, std::pair<CPubKey, std::vector<unsigned char>>> m_crypted_seed_keys;
+
 };
 
 /**
