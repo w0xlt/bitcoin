@@ -21,6 +21,7 @@
 #include <util/time.h>
 #include <util/translation.h>
 #include <wallet/codex32.h>
+#include <wallet/context.h>
 #include <wallet/rpc/util.h>
 #include <wallet/wallet.h>
 
@@ -867,9 +868,23 @@ RPCHelpMan recoverwalletfromseed()
         throw JSONRPCError(RPC_INVALID_PARAMETER, "codex32_secret is invalid or produces an out-of-range seed");
     }
 
+    DatabaseOptions options;
+    DatabaseStatus status;
+    ReadDatabaseArgs(*context.args, options);
+    options.require_create = true;
+    options.create_flags =  0 | WALLET_FLAG_DESCRIPTORS;
+    options.create_passphrase = passphrase;
+    bilingual_str error;
+    const std::shared_ptr<CWallet> wallet = CreateWallet(context, wallet_name, load_on_start, options, status, key, error, warnings);
+    if (!wallet) {
+        RPCErrorCode code = status == DatabaseStatus::FAILED_ENCRYPT ? RPC_WALLET_ENCRYPTION_FAILED : RPC_WALLET_ERROR;
+        throw JSONRPCError(code, error.original);
+    }
+
     UniValue obj(UniValue::VOBJ);
-    obj.pushKV("name", "test");
+    obj.pushKV("name", wallet->GetName());
     PushWarnings(warnings, obj);
+
     return obj;
 },
     };
