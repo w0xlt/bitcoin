@@ -949,6 +949,7 @@ RPCHelpMan listdescriptors();
 RPCHelpMan backupwallet();
 RPCHelpMan restorewallet();
 RPCHelpMan exposesecret();
+RPCHelpMan recoverwalletfromseed();
 
 // coins
 RPCHelpMan getreceivedbyaddress();
@@ -1003,6 +1004,7 @@ std::span<const CRPCCommand> GetWalletRPCCommands()
         {"wallet", &createwallet},
         {"wallet", &createwalletdescriptor},
         {"wallet", &restorewallet},
+        {"wallet", &recoverwalletfromseed},
         {"wallet", &exposesecret},
         {"wallet", &encryptwallet},
         {"wallet", &getaddressesbylabel},

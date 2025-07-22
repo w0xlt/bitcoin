@@ -35,21 +35,6 @@
 
 namespace {
 
-// Bech32 character set
-const char* BECH32_CHARSET = "qpzry9x8gf2tvdw0s3jn54khce6mua7l";
-
-// Reverse mapping for bech32 charset
-const int8_t BECH32_CHARSET_REV[128] = {
-    -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
-    -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
-    -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
-    15, -1, 10, 17, 21, 20, 26, 30,  7,  5, -1, -1, -1, -1, -1, -1,
-    -1, 29, -1, 24, 13, 25,  9,  8, 23, -1, 18, 22, 31, 27, 19, -1,
-     1,  0,  3, 16, 11, 28, 12, 14,  6,  4,  2, -1, -1, -1, -1, -1,
-    -1, 29, -1, 24, 13, 25,  9,  8, 23, -1, 18, 22, 31, 27, 19, -1,
-     1,  0,  3, 16, 11, 28, 12, 14,  6,  4,  2, -1, -1, -1, -1, -1
-};
-
 struct ChecksumEngine {
     std::array<uint8_t, 15> generator;
     std::array<uint8_t, 15> residue;
@@ -140,7 +125,7 @@ void InputHRP(const std::array<uint8_t, 15>& generator, std::array<uint8_t, 15>&
 void InputDataStr(const std::array<uint8_t, 15>& generator, std::array<uint8_t, 15>& residue, const std::string& datastr, size_t len)
 {
     for (size_t i = 0; i < datastr.length(); i++) {
-        InputFE(generator, residue, BECH32_CHARSET_REV[(int)datastr[i]], len);
+        InputFE(generator, residue, bech32::CHARSET_REV[(int)datastr[i]], len);
     }
 }
 
@@ -172,7 +157,7 @@ void CalculateChecksum(const std::string& hrp, std::string& csum, const std::str
 
     csum.clear();
     for (size_t i = 0; i < engine.len; i++) {
-        csum += BECH32_CHARSET[engine.residue[i]];
+        csum += bech32::CHARSET[engine.residue[i]];
     }
 }
 
@@ -188,7 +173,7 @@ std::vector<uint8_t> DecodePayload(const std::string& payload)
     /* We have already checked this is a valid bech32 string! */
     for (size_t i = 0; i < payload.length(); i++) {
         int ch = payload[i];
-        uint8_t fe = BECH32_CHARSET_REV[ch];
+        uint8_t fe = bech32::CHARSET_REV[ch];
 
         if (rem < 3) {
             // If we are within 3 bits of the start we can fit the whole next char in
@@ -261,7 +246,7 @@ std::optional<std::pair<std::string, size_t>> Bech32CaseFixup(const std::string&
             }
         }
 
-        if (BECH32_CHARSET_REV[c] == -1) {
+        if (bech32::CHARSET_REV[c] == -1) {
             return std::nullopt;
         }
     }
@@ -390,12 +375,12 @@ std::string codex32_secret_encode(const std::string& hrp,
             return "";
         }
 
-        int8_t rev = BECH32_CHARSET_REV[(int)id[i]];
+        int8_t rev = bech32::CHARSET_REV[(int)id[i]];
         if (rev == -1) {
             error_str = "Invalid id: must be valid bech32 string";
             return "";
         }
-        if (BECH32_CHARSET[rev] != id[i]) {
+        if (bech32::CHARSET[rev] != id[i]) {
             error_str = "Invalid id: must be lower-case";
             return "";
         }
@@ -411,19 +396,19 @@ std::string codex32_secret_encode(const std::string& hrp,
         // Each byte provides at least one u5. Push that.
         uint8_t u5 = ((next_u5 << (5 - rem)) | (seed[i] >> (3 + rem))) & 0x1F;
 
-        bip93 += BECH32_CHARSET[u5];
+        bip93 += bech32::CHARSET[u5];
         next_u5 = seed[i] & ((1 << (3 + rem)) - 1);
 
         // If there were 2 or more bits from the last iteration, then
         // this iteration will push *two* u5s.
         if (rem >= 2) {
-            bip93 += BECH32_CHARSET[next_u5 >> (rem - 2)];
+            bip93 += bech32::CHARSET[next_u5 >> (rem - 2)];
             next_u5 &= (1 << (rem - 2)) - 1;
         }
         rem = (rem + 8) % 5;
     }
     if (rem > 0) {
-        bip93 += BECH32_CHARSET[(next_u5 << (5 - rem)) & 0x1F];
+        bip93 += bech32::CHARSET[(next_u5 << (5 - rem)) & 0x1F];
     }
 
     const ChecksumEngine& csum_engine = INITIAL_ENGINE_CSUM[seed.size() >= 51 ? 1 : 0];

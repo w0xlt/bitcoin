@@ -316,16 +316,51 @@ BOOST_AUTO_TEST_CASE(codex32_mixed_case)
     }
 }
 
-BOOST_AUTO_TEST_CASE(codex32_encode_test_specific_seed)
+BOOST_AUTO_TEST_CASE(codex32_encode_test_specific_seed_1)
 {
     // Test vector for codex32_secret_encode
     std::vector<uint8_t> seed = ParseHex("659dec01c6c731124084add1fabc04833d3aa6718f7696ba1faebb4fe1a7a8b6");
 
     std::string error;
-    std::string encoded = codex32_secret_encode("cl", "werd", 0, seed, error);
+    std::string hrp = "cl";
+    std::string encoded = codex32_secret_encode(hrp, "werd", 0, seed, error);
     BOOST_CHECK(error.empty());
     BOOST_CHECK_EQUAL(encoded, "cl10werdsvkw7cqwxcuc3ysyy4hgl40qysv7n4fn33amfdwsl46a5lcd84zmqr8mmr3gq62atn");
+
+    std::optional<Codex32> parts = codex32_decode(hrp, encoded, error);
+    BOOST_CHECK(error.empty());
+    BOOST_CHECK(parts.has_value());
+    BOOST_CHECK_EQUAL(parts->hrp, hrp);
+    BOOST_CHECK_EQUAL(parts->threshold, 0);
+    BOOST_CHECK_EQUAL(std::string(parts->id.data()), "werd");
+    BOOST_CHECK_EQUAL(parts->share_idx, 's');
+    BOOST_CHECK_EQUAL(HexStr(parts->payload), "659dec01c6c731124084add1fabc04833d3aa6718f7696ba1faebb4fe1a7a8b6");
 }
+
+BOOST_AUTO_TEST_CASE(codex32_encode_test_specific_seed_2)
+{
+    std::string seed_hex = "e208d110a84650d6ae8b27776eb82ccd7963318d9af777306a496198c13a1d2b";
+    std::string hrp = "wr";
+    std::string id =  "f2tv";
+
+    // Test vector for codex32_secret_encode
+    std::vector<uint8_t> seed = ParseHex(seed_hex);
+
+    std::string error;
+    
+    std::string encoded = codex32_secret_encode(hrp, id, 0, seed, error);
+    BOOST_CHECK(error.empty());
+    BOOST_CHECK_EQUAL(encoded, "wr10f2tvsugydzy9ggegddt5tyamkawpve4ukxvvdntmhwvr2f9se3sf6r54slxj9n4fxe7vmp");
+
+    std::optional<Codex32> parts = codex32_decode(hrp, encoded, error);
+    BOOST_CHECK(error.empty());
+    BOOST_CHECK(parts.has_value());
+    BOOST_CHECK_EQUAL(parts->hrp, hrp);
+    BOOST_CHECK_EQUAL(parts->threshold, 0);
+    BOOST_CHECK_EQUAL(std::string(parts->id.data()), id);
+    BOOST_CHECK_EQUAL(parts->share_idx, 's');
+    BOOST_CHECK_EQUAL(HexStr(parts->payload), seed_hex);
+} 
 
 BOOST_AUTO_TEST_SUITE_END()
 } // namespace wallet
