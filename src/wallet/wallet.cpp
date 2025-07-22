@@ -2875,6 +2875,11 @@ std::shared_ptr<CWallet> CWallet::Create(WalletContext& context, const std::stri
         }
     }
 
+    // if there is any seed, set the expected flag
+    if (!walletInstance->m_seed_keys.empty() || !walletInstance->m_crypted_seed_keys.empty()) {
+        walletInstance->SetWalletFlag(WALLET_FLAG_SEEDS_STORED);
+    }
+
     // This wallet is in its first run if there are no ScriptPubKeyMans and it isn't blank or no privkeys
     const bool fFirstRun = walletInstance->m_spk_managers.empty() &&
                      !walletInstance->IsWalletFlagSet(WALLET_FLAG_DISABLE_PRIVATE_KEYS) &&

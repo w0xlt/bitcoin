@@ -683,6 +683,9 @@ RPCHelpMan getseedbackup()
     if (!wallet->IsWalletFlagSet(WALLET_FLAG_DESCRIPTORS)) {
         throw JSONRPCError(RPC_WALLET_ERROR, "getseedbackup is only available for descriptor wallets");
     }
+    if (!wallet->IsWalletFlagSet(WALLET_FLAG_SEEDS_STORED)) {
+        throw JSONRPCError(RPC_WALLET_ERROR, "This wallet does not have seeds stored.");
+    }
     if (wallet->IsCrypted() && wallet->IsLocked()) {
         throw JSONRPCError(RPC_WALLET_UNLOCK_NEEDED, "Error: Wallet is encrypted and locked. Unlock the wallet to retrieve the seed.");
     }

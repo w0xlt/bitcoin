@@ -47,6 +47,9 @@ enum WalletFlags : uint64_t {
     // Indicates that the descriptor cache has been upgraded to cache last hardened xpubs
     WALLET_FLAG_LAST_HARDENED_XPUB_CACHED = (1ULL << 2),
 
+    //! Indicates that the wallet seeds in stored in database and can be retrieved
+    WALLET_FLAG_SEEDS_STORED = (1ULL << 3),
+
     // will enforce the rule that the wallet can't contain any private keys (only watch-only/pubkeys)
     WALLET_FLAG_DISABLE_PRIVATE_KEYS = (1ULL << 32),
 
@@ -75,9 +78,6 @@ enum WalletFlags : uint64_t {
 
     //! Indicates that the wallet needs an external signer
     WALLET_FLAG_EXTERNAL_SIGNER = (1ULL << 35),
-
-    //! Indicates that the wallet seeds in stored in database and can be retrieved
-    WALLET_FLAG_SEEDS_STORED = (1ULL << 36),
 };
 
 //! Get the path of the wallet directory.
