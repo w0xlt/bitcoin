@@ -805,6 +805,8 @@ RPCHelpMan recoverwalletfromseed()
             {"codex32_seed", RPCArg::Type::STR, RPCArg::Optional::NO, "The codex32 seed that will be used to recover the wallet."},
             {"passphrase", RPCArg::Type::STR, RPCArg::Optional::OMITTED, "Encrypt the wallet with this passphrase."},
             {"load_on_startup", RPCArg::Type::BOOL, RPCArg::Optional::OMITTED, "Save wallet name to persistent settings and load on startup. True to add wallet to startup list, false to remove, null to leave unchanged."},
+            {"rescan", RPCArg::Type::BOOL, RPCArg::Default{true}, "Whether to rescan the blockchain for wallet transactions."},
+            {"start_height", RPCArg::Type::NUM, RPCArg::Default{0}, "Block height to start rescan from. If omitted, starts from genesis block."},
         },
         RPCResult{
             RPCResult::Type::OBJ, "", "",
@@ -833,15 +835,17 @@ RPCHelpMan recoverwalletfromseed()
 
     SecureString passphrase;
     passphrase.reserve(100);
-    if (!request.params[3].isNull()) {
-        passphrase = std::string_view{request.params[3].get_str()};
+    if (!request.params[2].isNull()) {
+        passphrase = std::string_view{request.params[2].get_str()};
         if (passphrase.empty()) {
             // Empty string means unencrypted
             warnings.emplace_back(Untranslated("Empty string given as passphrase, wallet will not be encrypted."));
         }
     }
 
-    std::optional<bool> load_on_start = request.params[4].isNull() ? std::nullopt : std::optional<bool>(request.params[4].get_bool());
+    std::optional<bool> load_on_start = request.params[3].isNull() ? std::nullopt : std::optional<bool>(request.params[3].get_bool());
+    bool rescan = request.params[4].isNull() ? true : request.params[4].get_bool();
+    int start_height = request.params[5].isNull() ? 0 : request.params[5].getInt<int>();
 
     // Decode the codex32 secret
     std::string error_msg;
@@ -879,6 +883,30 @@ RPCHelpMan recoverwalletfromseed()
     if (!wallet) {
         RPCErrorCode code = status == DatabaseStatus::FAILED_ENCRYPT ? RPC_WALLET_ENCRYPTION_FAILED : RPC_WALLET_ERROR;
         throw JSONRPCError(code, error.original);
+    }
+
+    // Rescan the blockchain if requested
+    if (rescan) {
+
+        // Make sure the results are valid at least up to the most recent block
+        // the user could have gotten from another RPC command prior to now
+        wallet->BlockUntilSyncedToCurrentChain();
+
+        WalletRescanReserver reserver(*wallet);
+        if (!reserver.reserve(/*with_passphrase=*/true)) {
+            throw JSONRPCError(RPC_WALLET_ERROR, "Wallet is currently rescanning. Abort existing rescan or wait.");
+        }
+
+        // Ensure that the wallet is not locked for the remainder of this RPC, as
+        // the passphrase is used to top up the keypool.
+        LOCK(wallet->m_relock_mutex);
+
+        wallet->RescanFromTime(start_height, reserver, /*update=*/true);
+        wallet->ResubmitWalletTransactions(/*relay=*/false, /*force=*/true);
+
+        if (wallet->IsAbortingRescan()) {
+            throw JSONRPCError(RPC_MISC_ERROR, "Rescan aborted by user.");
+        }
     }
 
     UniValue obj(UniValue::VOBJ);

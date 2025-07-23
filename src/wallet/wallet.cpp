@@ -438,7 +438,7 @@ std::shared_ptr<CWallet> CreateWallet(WalletContext& context, const std::string&
             // Set a seed for the wallet
             {
                 LOCK(wallet->cs_wallet);
-                wallet->SetupDescriptorScriptPubKeyMans(/* seed_key_opt=*/ std::nullopt);
+                wallet->SetupDescriptorScriptPubKeyMans(seed_key_opt);
             }
 
             // Relock the wallet

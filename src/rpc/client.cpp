@@ -302,6 +302,8 @@ static const CRPCConvertParam vRPCConvertParams[] =
     { "createwallet", 7, "external_signer"},
     { "restorewallet", 2, "load_on_startup"},
     { "recoverwalletfromseed", 3, "load_on_startup"},
+    { "recoverwalletfromseed", 4, "rescan"},
+    { "recoverwalletfromseed", 5, "start_height"},
     { "loadwallet", 1, "load_on_startup"},
     { "unloadwallet", 1, "load_on_startup"},
     { "getnodeaddresses", 0, "count"},
