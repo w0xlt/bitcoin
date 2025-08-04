@@ -464,7 +464,8 @@ RPCHelpMan listtransactions()
                 },
         [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
 {
-    const std::shared_ptr<const CWallet> pwallet = GetWalletForJSONRPCRequest(request);
+    // std::shared_ptr<const CWallet> pwallet = GetWalletForJSONRPCRequest(request);
+    std::shared_ptr<CWallet> const pwallet = GetWalletForJSONRPCRequest(request);
     if (!pwallet) return UniValue::VNULL;
 
     // Make sure the results are valid at least up to the most recent block
@@ -504,6 +505,10 @@ RPCHelpMan listtransactions()
             ListTransactions(*pwallet, *pwtx, 0, true, ret, filter, filter_label);
             if ((int)ret.size() >= (nCount+nFrom)) break;
         }
+    }
+
+    {
+        pwallet->ListEncryptedTransactions();
     }
 
     // ret is newest to oldest

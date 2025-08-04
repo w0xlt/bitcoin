@@ -1011,6 +1011,29 @@ static DBErrors LoadAddressBookRecords(CWallet* pwallet, DatabaseBatch& batch) E
     return result;
 }
 
+DBErrors WalletBatch::LoadEncryptedTxRecords(CWallet* pwallet, bool& any_unordered)
+{
+    LOCK(pwallet->cs_wallet);
+
+    // Load descriptor record
+    DBErrors result = DBErrors::LOAD_OK;
+
+    DatabaseBatch& batch = *m_batch;
+
+   // Load tx record
+    any_unordered = false;
+    LoadResult tx_res = LoadRecords(pwallet, batch, DBKeys::ENC_TX,
+        [&any_unordered] (CWallet* pwallet, DataStream& key, DataStream& value, std::string& err) EXCLUSIVE_LOCKS_REQUIRED(pwallet->cs_wallet) {
+        DBErrors result = DBErrors::LOAD_OK;
+
+        std::cout << "Loading encrypted tx record" << std::endl;
+
+        return result;
+    });
+
+    return tx_res.m_result;
+}
+
 static DBErrors LoadTxRecords(CWallet* pwallet, DatabaseBatch& batch, bool& any_unordered) EXCLUSIVE_LOCKS_REQUIRED(pwallet->cs_wallet)
 {
     AssertLockHeld(pwallet->cs_wallet);

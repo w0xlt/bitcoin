@@ -934,6 +934,8 @@ public:
     //! Retrieve all of the wallet's flags
     uint64_t GetWalletFlags() const;
 
+    void ListEncryptedTransactions();
+
     /** Returns a bracketed wallet name for displaying in logs, will return [default wallet] if the wallet has no name */
     std::string GetDisplayName() const override
     {

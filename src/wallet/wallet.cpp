@@ -1762,6 +1762,13 @@ uint64_t CWallet::GetWalletFlags() const
     return m_wallet_flags;
 }
 
+void CWallet::ListEncryptedTransactions()
+{
+    WalletBatch batch(GetDatabase());
+    auto any_unordered = false;
+    batch.LoadEncryptedTxRecords(this, any_unordered);
+}
+
 void CWallet::MaybeUpdateBirthTime(int64_t time)
 {
     int64_t birthtime = m_birth_time.load();
