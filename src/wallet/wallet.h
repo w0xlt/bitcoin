@@ -314,6 +314,7 @@ class CWallet final : public WalletStorage, public interfaces::Chain::Notificati
 {
 private:
     CKeyingMaterial vMasterKey GUARDED_BY(cs_wallet);
+    CKeyingMaterial vMetadataKey GUARDED_BY(cs_wallet);
 
     bool Unlock(const CKeyingMaterial& vMasterKeyIn);
 

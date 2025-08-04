@@ -387,6 +387,7 @@ std::shared_ptr<CWallet> CreateWallet(WalletContext& context, const std::string&
     // Born encrypted wallets need to be created blank first.
     if (!passphrase.empty()) {
         wallet_creation_flags |= WALLET_FLAG_BLANK_WALLET;
+        wallet_creation_flags |= WALLET_FLAG_METADATA_ENCRYPTED;
     }
 
     // Private keys must be disabled for an external signer wallet
@@ -582,6 +583,13 @@ bool CWallet::Unlock(const SecureString& strWalletPassphrase)
                 continue; // try another master key
             }
             if (Unlock(plain_master_key)) {
+                // Derive one-time metadata encryption key from passphrase
+                uint8_t keybuf[32];
+                CSHA256().Write((const unsigned char*)strWalletPassphrase.data(),
+                    strWalletPassphrase.size()).Finalize(keybuf);
+                vMetadataKey.assign(keybuf, keybuf + 32);
+                memory_cleanse(keybuf, sizeof(keybuf));
+
                 // Now that we've unlocked, upgrade the descriptor cache
                 UpgradeDescriptorCache();
                 return true;
