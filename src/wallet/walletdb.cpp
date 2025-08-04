@@ -1011,24 +1011,72 @@ static DBErrors LoadAddressBookRecords(CWallet* pwallet, DatabaseBatch& batch) E
     return result;
 }
 
-DBErrors WalletBatch::LoadEncryptedTxRecords(CWallet* pwallet, bool& any_unordered)
+DBErrors WalletBatch::LoadEncryptedTxRecords(CWallet* pwallet, bool& any_unordered, CKeyingMaterial& metadata_key)
 {
     LOCK(pwallet->cs_wallet);
 
     // Load descriptor record
-    DBErrors result = DBErrors::LOAD_OK;
+    // DBErrors result = DBErrors::LOAD_OK;
 
     DatabaseBatch& batch = *m_batch;
 
    // Load tx record
     any_unordered = false;
     LoadResult tx_res = LoadRecords(pwallet, batch, DBKeys::ENC_TX,
-        [&any_unordered] (CWallet* pwallet, DataStream& key, DataStream& value, std::string& err) EXCLUSIVE_LOCKS_REQUIRED(pwallet->cs_wallet) {
-        DBErrors result = DBErrors::LOAD_OK;
-
+        [&any_unordered, metadata_key] (CWallet* pwallet, DataStream& key, DataStream& value, std::string& err) EXCLUSIVE_LOCKS_REQUIRED(pwallet->cs_wallet) {
         std::cout << "Loading encrypted tx record" << std::endl;
 
-        return result;
+        Txid xor_txid;
+        key >> xor_txid;
+
+        std::cout << "xor_txid: " << xor_txid.ToString() << std::endl;
+
+        Txid txid = XorObfuscateTxid(xor_txid, metadata_key);
+
+        std::cout << "Txid: " << txid.ToString() << std::endl;
+
+        std::vector<unsigned char> enc_wtx;
+        value >> enc_wtx;
+
+        uint256 iv = xor_txid.ToUint256();
+
+        CKeyingMaterial plaintext;
+        if (!DecryptSecret(metadata_key, enc_wtx, iv, plaintext)) {
+            err = "Error reading wallet database: Encrypted transaction record decryption failed";
+            return DBErrors::CORRUPT;
+        }
+
+        DataStream ssTx{plaintext};
+
+        CWalletTx wtx(nullptr, TxStateInactive{});
+        ssTx >> wtx;
+
+
+        std::cout << "Deserialized Txid: " << wtx.GetHash().ToString() << std::endl;
+
+        if (wtx.GetHash() != txid) {
+            err = "Error reading wallet database: Encrypted transaction record hash mismatch";
+            return DBErrors::CORRUPT;
+        }
+
+        /* auto fill_wtx = [&](CWalletTx& wtx, bool new_tx) {
+            if(!new_tx) {
+                // There's some corruption here since the tx we just tried to load was already in the wallet.
+                err = "Error: Corrupt transaction found. This can be fixed by removing transactions from wallet and rescanning.";
+                result = DBErrors::CORRUPT;
+                return false;
+            }
+            ssTx >> wtx;
+            if (wtx.GetHash() != txid)
+                return false;
+
+            if (wtx.nOrderPos == -1)
+                any_unordered = true;
+
+            return true;
+        }; */
+
+        return DBErrors::LOAD_OK;
     });
 
     return tx_res.m_result;

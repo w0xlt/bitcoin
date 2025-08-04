@@ -264,7 +264,7 @@ public:
     bool EraseActiveScriptPubKeyMan(uint8_t type, bool internal);
 
     DBErrors LoadWallet(CWallet* pwallet);
-    DBErrors LoadEncryptedTxRecords(CWallet* pwallet, bool& any_unordered);
+    DBErrors LoadEncryptedTxRecords(CWallet* pwallet, bool& any_unordered, CKeyingMaterial& metadata_key);
 
     //! Delete records of the given types
     bool EraseRecords(const std::unordered_set<std::string>& types);

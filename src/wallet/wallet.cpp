@@ -1026,6 +1026,9 @@ bool CWallet::WriteTransation(WalletBatch& batch, const CWalletTx& wtx) {
         Txid xor_txid = XorObfuscateTxid(wtx.GetHash(), vMetadataKey);
         uint256 iv = xor_txid.ToUint256();
 
+        std::cout << "xor_txid: " << xor_txid.ToString() << std::endl;
+        std::cout << "Txid: " << wtx.GetHash().ToString() << std::endl;
+
         // Encrypt the serialized transaction data
         CKeyingMaterial plaintext(enc_tx.begin(), enc_tx.end());
         std::vector<unsigned char> ciphertext;
@@ -1766,7 +1769,7 @@ void CWallet::ListEncryptedTransactions()
 {
     WalletBatch batch(GetDatabase());
     auto any_unordered = false;
-    batch.LoadEncryptedTxRecords(this, any_unordered);
+    batch.LoadEncryptedTxRecords(this, any_unordered, vMetadataKey);
 }
 
 void CWallet::MaybeUpdateBirthTime(int64_t time)
