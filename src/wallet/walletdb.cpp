@@ -52,6 +52,7 @@ const std::string POOL{"pool"};
 const std::string PURPOSE{"purpose"};
 const std::string SETTINGS{"settings"};
 const std::string TX{"tx"};
+const std::string ENC_TX{"enc_tx"};
 const std::string VERSION{"version"};
 const std::string WALLETDESCRIPTOR{"walletdescriptor"};
 const std::string WALLETDESCRIPTORCACHE{"walletdescriptorcache"};
@@ -92,6 +93,11 @@ bool WalletBatch::ErasePurpose(const std::string& strAddress)
 bool WalletBatch::WriteTx(const CWalletTx& wtx)
 {
     return WriteIC(std::make_pair(DBKeys::TX, wtx.GetHash()), wtx);
+}
+
+bool WalletBatch::WriteEncryptedTx(const Txid& hash, const std::vector<unsigned char>& ciphertext)
+{
+    return WriteIC(std::make_pair(DBKeys::ENC_TX, hash), ciphertext);
 }
 
 bool WalletBatch::EraseTx(Txid hash)

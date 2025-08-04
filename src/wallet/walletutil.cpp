@@ -8,6 +8,7 @@
 #include <common/args.h>
 #include <key_io.h>
 #include <logging.h>
+#include <wallet/crypter.h>
 
 namespace wallet {
 fs::path GetWalletDir()
@@ -97,6 +98,26 @@ WalletDescriptor GenerateWalletDescriptor(const CExtPubKey& master_key, const Ou
     std::vector<std::unique_ptr<Descriptor>> desc = Parse(desc_str, keys, error, false);
     WalletDescriptor w_desc(std::move(desc.at(0)), creation_time, 0, 0, 0);
     return w_desc;
+}
+
+Txid XorObfuscateTxid(const Txid& originalTxid, const CKeyingMaterial& vMetadataKey) {
+    // Derive a 32-byte mask from the key
+    uint256 mask;
+    CSHA256 hasher;
+    hasher.Write(vMetadataKey.data(), vMetadataKey.size());
+    hasher.Finalize(reinterpret_cast<unsigned char*>(mask.data()));
+
+    // XOR the txid with the mask
+    uint256 obfuscated;
+    const unsigned char* original_data = reinterpret_cast<const unsigned char*>(originalTxid.data());
+    const unsigned char* mask_data = reinterpret_cast<const unsigned char*>(mask.data());
+    unsigned char* obfuscated_data = reinterpret_cast<unsigned char*>(obfuscated.data());
+
+    for (int i = 0; i < 32; ++i) {
+        obfuscated_data[i] = original_data[i] ^ mask_data[i];
+    }
+
+    return Txid::FromUint256(obfuscated);
 }
 
 } // namespace wallet

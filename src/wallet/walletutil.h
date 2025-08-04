@@ -7,6 +7,7 @@
 
 #include <script/descriptor.h>
 #include <util/fs.h>
+#include <wallet/crypter.h>
 
 #include <vector>
 
@@ -123,6 +124,8 @@ public:
 };
 
 WalletDescriptor GenerateWalletDescriptor(const CExtPubKey& master_key, const OutputType& output_type, bool internal);
+
+Txid XorObfuscateTxid(const Txid& originalTxid, const CKeyingMaterial& vMetadataKey);
 } // namespace wallet
 
 #endif // BITCOIN_WALLET_WALLETUTIL_H

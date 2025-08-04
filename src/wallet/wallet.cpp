@@ -1009,7 +1009,42 @@ bool CWallet::IsSpentKey(const CScript& scriptPubKey) const
 }
 
 bool CWallet::WriteTransation(WalletBatch& batch, const CWalletTx& wtx) {
+
+    if (IsWalletFlagSet(WALLET_FLAG_METADATA_ENCRYPTED)) {
+        assert(!vMetadataKey.empty());
+
+        // Encrypt and write transaction
+        DataStream ssTx{};
+        ssTx << TX_WITH_WITNESS(wtx);
+
+        // Convert std::byte to unsigned char
+        std::vector<unsigned char> enc_tx;
+        enc_tx.reserve(ssTx.size());
+        std::transform(ssTx.begin(), ssTx.end(), std::back_inserter(enc_tx),
+                    [](std::byte b) { return static_cast<unsigned char>(b); });
+
+        Txid xor_txid = XorObfuscateTxid(wtx.GetHash(), vMetadataKey);
+        uint256 iv = xor_txid.ToUint256();
+
+        // Encrypt the serialized transaction data
+        CKeyingMaterial plaintext(enc_tx.begin(), enc_tx.end());
+        std::vector<unsigned char> ciphertext;
+
+        if (!EncryptSecret(vMetadataKey, plaintext, iv, ciphertext) || !batch.WriteEncryptedTx(xor_txid, ciphertext)) {
+            WalletLogPrintf("%s: Error: failed to write encrypted tx %s\n", __func__, wtx.GetHash().ToString());
+            return false;
+        } /* else {
+            WalletLogPrintf("%s: Transaction encrypted and stored: %s \n", __func__, wtx.GetHash().ToString());
+
+        } */
+
+        // std::vector<unsigned char> enc_tx(ssTx.begin(), ssTx.end());
+    }
+    // } else {
+        // If the wallet is not encrypted, we can write the transaction without encryption
+        // WalletLogPrintf("Plain Transaction store %s\n", wtx.GetHash().ToString());
     return batch.WriteTx(wtx);
+    // }
 }
 
 CWalletTx* CWallet::AddToWallet(CTransactionRef tx, const TxState& state, const UpdateWalletTxFn& update_wtx, bool rescanning_old_block)

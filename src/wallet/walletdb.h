@@ -222,6 +222,7 @@ public:
     bool ErasePurpose(const std::string& strAddress);
 
     bool WriteTx(const CWalletTx& wtx);
+    bool WriteEncryptedTx(const Txid& hash, const std::vector<unsigned char>& ciphertext);
     bool EraseTx(Txid hash);
 
     bool WriteKeyMetadata(const CKeyMetadata& meta, const CPubKey& pubkey, const bool overwrite);
