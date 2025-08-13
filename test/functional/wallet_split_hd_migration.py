@@ -3,10 +3,7 @@
 Test wallet migration from ancient versions to current version.
 Tests two wallet types that are actually testable:
 1. Non-HD wallet from v0.14.3
-2. HD wallet from v0.14.3 (VERSION_HD_CHAIN_SPLIT)
-
-Note: VERSION_HD_BASE wallets from v0.13.x cannot be tested due to 
-JSON-RPC 1.0 incompatibility with the modern test framework.
+2. HD wallet from v0.14.3 (VERSION_HD_BASE)
 """
 import os
 import shutil
@@ -86,6 +83,7 @@ class WalletMigrationTest(BitcoinTestFramework):
         old_wallet_info = self.nodes[0].getwalletinfo()
         hdmasterkeyid = old_wallet_info.get('hdmasterkeyid', 'Not HD')
         self.log.info(f"Old wallet info: HD master key = {hdmasterkeyid}")
+        assert('keypoolsize_hd_internal' not in old_wallet_info) # Ensure we are testing non-HD or single-chain (VERSION_HD_BASE) wallets
         
         # Verify wallet type
         if "non-HD" in wallet_type:
@@ -288,6 +286,8 @@ class WalletMigrationTest(BitcoinTestFramework):
         
         # Test 2: HD wallet from v0.14.3 (VERSION_HD_CHAIN_SPLIT)
         self.test_hd_chain_split_migration()
+
+        # assert(False)
 
 if __name__ == '__main__':
     WalletMigrationTest(__file__).main()
