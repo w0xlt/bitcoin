@@ -9,7 +9,6 @@
 #include <primitives/block.h>
 
 #include <functional>
-#include <compressor.h>
 #include <streams.h>
 
 class CTxMemPool;
@@ -159,7 +158,6 @@ public:
 
 class CBlockHeaderAndLengthShortTxIDs : public CBlockHeaderAndShortTxIDs {
 private:
-    codec_version_t codec_version; // Compression/decompression scheme's version
     std::vector<uint32_t> txlens; // compressed size by CTxCompressor
     // NOTE: the prefilled transactions from the base class are not compressed
     // since that would require an out-of-band channel to communicate
@@ -169,9 +167,7 @@ private:
     friend class PartiallyDownloadedChunkBlock;
     int height = -1; // Block height - for OOOB storage of pre-BIP34 blocks
 public:
-    codec_version_t codec_ver() const { return codec_version; }
-
-    CBlockHeaderAndLengthShortTxIDs(const CBlock& block, codec_version_t const cv, bool fDeterministic = false);
+    CBlockHeaderAndLengthShortTxIDs(const CBlock& block, bool fDeterministic = false);
 
     // Dummy for deserialization
     CBlockHeaderAndLengthShortTxIDs() {}
@@ -188,7 +184,6 @@ public:
     template <typename Stream>
     void Serialize(Stream& s) const
     {
-        s << Using<CustomUintFormatter<1>>(codec_version);
         s << height;
         s << AsBase<CBlockHeaderAndShortTxIDs>(*this);
         // NOTE: the lengths within the txlens vector are serialized directly
@@ -202,7 +197,6 @@ public:
     template <typename Stream>
     void Unserialize(Stream& s)
     {
-        s >> Using<CustomUintFormatter<1>>(codec_version);
         s >> height;
         s >> AsBase<CBlockHeaderAndShortTxIDs>(*this);
         txlens.clear();
@@ -237,9 +231,6 @@ private:
     bool allTxnFromMempool;
     bool block_finalized = false;
     std::shared_ptr<CBlock> decoded_block;
-
-    // this is initialized to what we read off the network in InitData()
-    codec_version_t codec_version = codec_version_t::default_version;
 
     // Things used in the iterative fill-from-mempool:
     std::map<size_t, size_t>::iterator fill_coding_index_offsets_it;

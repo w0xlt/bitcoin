@@ -287,7 +287,7 @@ void UDPRelayBlock(const CBlock& block) {
             initd = std::chrono::steady_clock::now();
 
         ChunkCodedBlock *codedBlock = (ChunkCodedBlock*) alloca(sizeof(ChunkCodedBlock));
-        CBlockHeaderAndLengthShortTxIDs headerAndIDs(block, codec_version_t::default_version, true);
+        CBlockHeaderAndLengthShortTxIDs headerAndIDs(block, true);
         std::vector<unsigned char> data;
         data.reserve(2500 + 8 * block.vtx.size()); // Rather conservatively high estimate
         VectorOutputStream stream(&data);
@@ -431,7 +431,7 @@ void UDPFillMessagesFromBlock(const CBlock& block, std::vector<UDPMessage>& msgs
     const uint256 hashBlock(block.GetHash());
     const uint64_t hash_prefix = hashBlock.GetUint64(0);
 
-    CBlockHeaderAndLengthShortTxIDs headerAndIDs(block, codec_version_t::default_version, true);
+    CBlockHeaderAndLengthShortTxIDs headerAndIDs(block, true);
 
     std::vector<unsigned char> data;
     data.reserve(2500 + 8 * block.vtx.size()); // Rather conservatively high estimate
@@ -855,10 +855,8 @@ static bool HandleTx(UDPMessage& msg, size_t length, const CService& node, UDPCo
 
         try {
             VectorInputStream stream(&tx_data);
-            codec_version_t codec_version;
-            stream >> *reinterpret_cast<std::uint8_t*>(&codec_version);
             CTransactionRef tx;
-            stream >> CTxCompressor(tx, codec_version);
+            stream >>  TX_WITH_WITNESS(tx);
             LOCK(cs_main);
             TxValidationState state;
             const MempoolAcceptResult result = AcceptToMemoryPool(node_context->chainman->ActiveChainstate(), tx, GetTime(), /*bypass_limits=*/false, /*test_accept=*/false);
