@@ -397,6 +397,31 @@ ReadStatus PartiallyDownloadedChunkBlock::InitData(const CBlockHeaderAndLengthSh
     if (status != READ_STATUS_OK)
         return status;
 
+    // Add this debugging
+    LogPrintf("--> DEBUG: index_offsets.size()=%zu\n", index_offsets.size());
+    if (!index_offsets.empty()) {
+        LogPrintf("--> DEBUG: First offset=%zu, Last offset=%zu\n", 
+                index_offsets.begin()->first, index_offsets.rbegin()->first);
+        
+        // Check for suspiciously large offsets
+        for (const auto& entry : index_offsets) {
+            if (entry.first > MAX_BLOCK_SERIALIZED_SIZE) {
+                LogPrintf("--> ERROR: Invalid offset %zu for tx index %zu\n", 
+                        entry.first, entry.second);
+                break;  // Don't spam the log
+            }
+        }
+    }
+
+    // Also log txlens
+    LogPrintf("--> DEBUG: txlens.size()=%zu\n", comprblock.txlens.size());
+    size_t total_txlens = 0;
+    for (size_t i = 0; i < std::min(size_t(10), comprblock.txlens.size()); i++) {
+        LogPrintf("--> DEBUG: txlens[%zu]=%u\n", i, comprblock.txlens[i]);
+        total_txlens += comprblock.txlens[i];
+    }
+    LogPrintf("--> DEBUG: Sum of first 10 txlens=%zu\n", total_txlens);
+
     std::chrono::steady_clock::time_point index_offset_mapped;
     if (fBench)
         index_offset_mapped = std::chrono::steady_clock::now();
@@ -409,10 +434,23 @@ ReadStatus PartiallyDownloadedChunkBlock::InitData(const CBlockHeaderAndLengthSh
     }
 
     if (index_offsets.size()) {
-        size_t codedBlockSize = DIV_CEIL(
-                                index_offsets.rbegin()->first +
-                                comprblock.txlens[get_txlens_index(txn_prefilled, index_offsets.rbegin()->second)] + 80,
-                            FEC_CHUNK_SIZE) * FEC_CHUNK_SIZE;
+        size_t max_offset = index_offsets.rbegin()->first;
+        size_t last_tx_index = index_offsets.rbegin()->second;
+        size_t last_tx_len = comprblock.txlens[get_txlens_index(txn_prefilled, last_tx_index)];
+        
+        size_t calculated_size = max_offset + last_tx_len + 80;
+        
+        // For valid Bitcoin blocks, calculated_size should never exceed MAX_BLOCK_SERIALIZED_SIZE
+        // If it does, something is wrong with the calculation or data
+        if (calculated_size > MAX_BLOCK_SERIALIZED_SIZE) {
+            LogPrintf("WARNING: Calculated size %zu exceeds MAX_BLOCK_SERIALIZED_SIZE %u\n",
+                      calculated_size, MAX_BLOCK_SERIALIZED_SIZE);
+            // This indicates a protocol error or corruption
+            return READ_STATUS_INVALID;
+        }
+        
+        size_t codedBlockSize = DIV_CEIL(calculated_size, FEC_CHUNK_SIZE) * FEC_CHUNK_SIZE;
+        
         chunksAvailable.resize(codedBlockSize / FEC_CHUNK_SIZE);
         remainingChunks = codedBlockSize / FEC_CHUNK_SIZE;
         codedBlock.resize(codedBlockSize);
@@ -450,13 +488,19 @@ bool PartiallyDownloadedChunkBlock::SerializeTransaction(VectorOutputStream& str
 }
 
 ReadStatus PartiallyDownloadedChunkBlock::DoIterativeFill(size_t& firstChunkProcessed) {
+    // Check if we're already done
+    if (fill_coding_index_offsets_it == index_offsets.end()) {
+        firstChunkProcessed = 0;
+        return READ_STATUS_OK;
+    }
+    
     std::map<size_t, size_t>::iterator current_it = fill_coding_index_offsets_it;
     size_t current_index = current_it->first;
 
     VectorOutputStream stream(&codedBlock, current_index);
-
     firstChunkProcessed = current_index / FEC_CHUNK_SIZE;
 
+    // Check which transactions are available in the current chunk
     for (; fill_coding_index_offsets_it != index_offsets.end(); fill_coding_index_offsets_it++) {
         if (fill_coding_index_offsets_it->first / FEC_CHUNK_SIZE == current_index / FEC_CHUNK_SIZE)
             haveChunk &= IsTxAvailable(fill_coding_index_offsets_it->second);
@@ -464,13 +508,55 @@ ReadStatus PartiallyDownloadedChunkBlock::DoIterativeFill(size_t& firstChunkProc
             break;
     }
 
-    // First process the chunk we were most recently in
+    // CRITICAL FIX: Check if iterator reached end() after the loop
+    if (fill_coding_index_offsets_it == index_offsets.end()) {
+        // We've reached the end of index_offsets
+        if (haveChunk) {
+            // Process all remaining transactions in the current chunk
+            for (; current_it != index_offsets.end(); current_it++) {
+                if (!SerializeTransaction(stream, current_it))
+                    return READ_STATUS_FAILED;
+            }
+            
+            // Mark the final chunk(s) as available
+            size_t start_chunk = current_index / FEC_CHUNK_SIZE;
+            size_t end_chunk = chunksAvailable.size() - 1; // Process up to the last chunk
+            
+            for (size_t i = start_chunk; i <= end_chunk && i < chunksAvailable.size(); i++) {
+                if (i == chunksAvailable.size() - 1) {
+                    // Write the header to the last 80 bytes of the last chunk
+                    size_t header_pos = chunksAvailable.size() * FEC_CHUNK_SIZE - 80;
+                    if (stream.pos() < header_pos)
+                        stream.skip_bytes(header_pos - stream.pos());
+                    assert(stream.pos() == header_pos);
+                    stream << header;
+                }
+                if (!chunksAvailable[i])
+                    remainingChunks--;
+                chunksAvailable[i] = true;
+            }
+        }
+        return READ_STATUS_OK;
+    }
+
+    // If we get here, fill_coding_index_offsets_it is NOT at end(), so it's safe to access
+    size_t end_chunk = fill_coding_index_offsets_it->first / FEC_CHUNK_SIZE;
+    
+    // Sanity check - this should never happen now that we fixed the iterator bug
+    if (end_chunk >= chunksAvailable.size()) {
+        LogPrintf("ERROR: DoIterativeFill invalid end_chunk=%zu >= chunksAvailable.size()=%zu\n", 
+                  end_chunk, chunksAvailable.size());
+        return READ_STATUS_FAILED;
+    }
+
+    // Process the chunk we were most recently in
     if (haveChunk) {
         for (; current_it != fill_coding_index_offsets_it; current_it++) {
             if (!SerializeTransaction(stream, current_it))
-                return READ_STATUS_FAILED; // Could be a shorttxid collision
+                return READ_STATUS_FAILED;
         }
-        for (size_t i = current_index / FEC_CHUNK_SIZE; i < fill_coding_index_offsets_it->first / FEC_CHUNK_SIZE; i++) {
+        
+        for (size_t i = current_index / FEC_CHUNK_SIZE; i < end_chunk && i < chunksAvailable.size(); i++) {
             if (i == chunksAvailable.size() - 1) {
                 // Write the header to the last 80 bytes of the last chunk
                 size_t header_pos = chunksAvailable.size() * FEC_CHUNK_SIZE - 80;
@@ -483,24 +569,27 @@ ReadStatus PartiallyDownloadedChunkBlock::DoIterativeFill(size_t& firstChunkProc
                 remainingChunks--;
             chunksAvailable[i] = true;
         }
-    }//TODO else if (haveMostRecentlyCheckedTx && mostRecentlyCheckedTxFillsChunk(s)OnItsOwn
-        //TODO: Handle chunk that spanned a border and filled up at least one chunk on its own
-        // Note that the current FillIndexOffsetMap implementation will never use this
+    }
+    //TODO else if (haveMostRecentlyCheckedTx && mostRecentlyCheckedTxFillsChunk(s)OnItsOwn
+    //TODO: Handle chunk that spanned a border and filled up at least one chunk on its own
+    // Note that the current FillIndexOffsetMap implementation will never use this
 
     haveChunk = true; // Next chunk gets a fresh start
 
     // If we're gonna try to process this chunk later...
-    if (fill_coding_index_offsets_it != index_offsets.end() && IsTxAvailable(fill_coding_index_offsets_it->second)) {
+    // (we already know fill_coding_index_offsets_it != end() here)
+    if (IsTxAvailable(fill_coding_index_offsets_it->second)) {
         current_index = fill_coding_index_offsets_it->first;
         if (current_index % FEC_CHUNK_SIZE != 0) {
-            // If we don't start on a chunk boundry, we assume the previous transaction
+            // If we don't start on a chunk boundary, we assume the previous transaction
             // came into our chunk, as otherwise our packing algorithm is braindead
             assert(fill_coding_index_offsets_it != index_offsets.begin());
-            std::map<size_t, size_t>::iterator previt = fill_coding_index_offsets_it; previt--;
+            std::map<size_t, size_t>::iterator previt = fill_coding_index_offsets_it; 
+            previt--;
             if (IsTxAvailable(previt->second)) {
                 if (stream.pos() <= previt->first) { // If previt was not already encoded...
                     if (!SerializeTransaction(stream, previt))
-                        return READ_STATUS_FAILED; // Could be a shorttxid collision
+                        return READ_STATUS_FAILED;
                 }
             } else
                 haveChunk = false; // I'm sorry, but its just not gonna work out - its not you, its me

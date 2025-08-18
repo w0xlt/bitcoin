@@ -796,20 +796,30 @@ PartialBlockData::PartialBlockData(const CService& node, CTxMemPool* mempool, co
         currentlyProcessing(false), block_data(mempool)
     { assert(Init(msg)); }
 
-void PartialBlockData::ReconstructBlockFromDecoder() {
-    assert(decoder.DecodeReady());
-
-    for (uint32_t i = 0; i < DIV_CEIL(obj_length, sizeof(UDPBlockMessage::data)); i++) {
-        if (!block_data.IsChunkAvailable(i)) {
-            const void* data_ptr = decoder.GetDataPtr(i);
-            assert(data_ptr);
-            memcpy(block_data.GetChunk(i), data_ptr, sizeof(UDPBlockMessage::data));
-            block_data.MarkChunkAvailable(i);
+    void PartialBlockData::ReconstructBlockFromDecoder() {
+        assert(decoder.DecodeReady());
+    
+        // Use the actual chunk count from block_data, not obj_length
+        uint32_t chunk_count = block_data.GetChunkCount();
+        
+        for (uint32_t i = 0; i < chunk_count; i++) {
+            if (!block_data.IsChunkAvailable(i)) {
+                // Only copy if the decoder has this chunk
+                if (i < DIV_CEIL(obj_length, sizeof(UDPBlockMessage::data))) {
+                    const void* data_ptr = decoder.GetDataPtr(i);
+                    assert(data_ptr);
+                    memcpy(block_data.GetChunk(i), data_ptr, sizeof(UDPBlockMessage::data));
+                } else {
+                    // For chunks beyond what the decoder has, zero them out
+                    // This handles the padding at the end of the block
+                    memset(block_data.GetChunk(i), 0, FEC_CHUNK_SIZE);
+                }
+                block_data.MarkChunkAvailable(i);
+            }
         }
+    
+        assert(block_data.IsBlockAvailable());
     }
-
-    assert(block_data.IsBlockAvailable());
-};
 
 static void BlockMsgHToLE(UDPMessage& msg) {
     msg.msg.block.hash_prefix = htole64_internal(msg.msg.block.hash_prefix);
