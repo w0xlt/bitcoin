@@ -63,7 +63,16 @@
     #define GF256_TARGET_MOBILE
 #endif // ANDROID
 
+#if defined(__AVX2__) && (!defined (_MSC_VER) || _MSC_VER >= 1900)
+    #define GF256_TRY_AVX2 /* 256-bit */
+    #include <immintrin.h>
+    #define GF256_ALIGN_BYTES 32
+#else // __AVX2__
+    #define GF256_ALIGN_BYTES 16
+#endif // __AVX2__
+
 #if !defined(GF256_TARGET_MOBILE)
+    #include <tmmintrin.h> // SSSE3: _mm_shuffle_epi8
     #include <emmintrin.h> // SSE2
 #endif // GF256_TARGET_MOBILE
 
@@ -83,6 +92,11 @@
     #define GF256_M128 __m128i
 #endif // GF256_TARGET_MOBILE
 
+// Compiler-specific 256-bit SIMD register keyword
+#ifdef GF256_TRY_AVX2
+    #define GF256_M256 __m256i
+#endif
+
 // Compiler-specific C++11 restrict keyword
 #define GF256_RESTRICT __restrict
 
@@ -95,7 +109,6 @@
 
 // Compiler-specific alignment keyword
 // Note: Alignment only matters for ARM NEON where it should be 16
-#define GF256_ALIGN_BYTES 16
 #ifdef _MSC_VER
     #define GF256_ALIGNED __declspec(align(GF256_ALIGN_BYTES))
 #else // _MSC_VER
@@ -125,6 +138,21 @@ extern void gf256_memswap(void * GF256_RESTRICT vx, void * GF256_RESTRICT vy, in
 /// The context object stores tables required to perform library calculations
 struct gf256_ctx
 {
+    /// We require memory to be aligned since the SIMD instructions benefit from
+    /// or require aligned accesses to the table data.
+    struct
+    {
+        GF256_ALIGNED GF256_M128 TABLE_LO_Y[256];
+        GF256_ALIGNED GF256_M128 TABLE_HI_Y[256];
+    } MM128;
+#ifdef GF256_TRY_AVX2
+    struct
+    {
+        GF256_ALIGNED GF256_M256 TABLE_LO_Y[256];
+        GF256_ALIGNED GF256_M256 TABLE_HI_Y[256];
+    } MM256;
+#endif // GF256_TRY_AVX2
+
     /// Mul/Div/Inv/Sqr tables
     uint8_t GF256_MUL_TABLE[256 * 256];
     uint8_t GF256_DIV_TABLE[256 * 256];

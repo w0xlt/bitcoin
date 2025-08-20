@@ -15,7 +15,7 @@
 #define CM256_MAX_CHUNKS 27
 
 #include <fec/cm256.h>
-#include <fec/wirehair.h>
+#include <fec/wirehair/wirehair.h>
 #include <open_hash_set.h>
 #include <random.h>
 
