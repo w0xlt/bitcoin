@@ -1233,6 +1233,94 @@ bool CheckHostPortOptions(const ArgsManager& args) {
     return true;
 }
 
+/**
+ * @brief Deduplicates binding vectors internally and checks for cross-vector conflicts.
+ *
+ * For vWhiteBinds: Removes duplicates with identical service AND permissions, but reports
+ * conflicts when same service has different permissions.
+ * For other vectors: Simply removes duplicates.
+ * Cross-vector duplicates are always reported as conflicts.
+ *
+ * @param vWhiteBinds Vector of whitelisted bind permissions (will be deduplicated)
+ * @param vBinds Vector of regular bind services (will be deduplicated)
+ * @param onion_binds Vector of onion-specific bind services (will be deduplicated)
+ * @return std::optional<CService> containing the first conflict found, or std::nullopt if no conflicts
+ */
+std::optional<CService> DeduplicateAndCheckBindingConflicts(
+    std::vector<NetWhitebindPermissions>& vWhiteBinds,
+    std::vector<CService>& vBinds,
+    std::vector<CService>& onion_binds)
+{
+    // Step 1: Handle vWhiteBinds deduplication with special logic for permissions
+    {
+        std::map<CService, NetPermissionFlags> seen_whitebinds;
+        std::vector<NetWhitebindPermissions> deduplicated;
+
+        for (const auto& wb : vWhiteBinds) {
+            auto it = seen_whitebinds.find(wb.m_service);
+            if (it == seen_whitebinds.end()) {
+                // First occurrence of this service
+                seen_whitebinds[wb.m_service] = wb.m_flags;
+                deduplicated.push_back(wb);
+            } else if (it->second == wb.m_flags) {
+                // Same service, same permissions - harmless duplicate, skip it
+                continue;
+            } else {
+                // Same service, different permissions - conflict!
+                return wb.m_service;
+            }
+        }
+        vWhiteBinds = std::move(deduplicated);
+    }
+
+    // Step 2: Simple deduplication for vBinds
+    {
+        std::set<CService> seen;
+        auto it = std::remove_if(vBinds.begin(), vBinds.end(),
+            [&seen](const CService& service) {
+                return !seen.insert(service).second;  // Remove if already seen
+            });
+        vBinds.erase(it, vBinds.end());
+    }
+
+    // Step 3: Simple deduplication for onion_binds
+    {
+        std::set<CService> seen;
+        auto it = std::remove_if(onion_binds.begin(), onion_binds.end(),
+            [&seen](const CService& service) {
+                return !seen.insert(service).second;  // Remove if already seen
+            });
+        onion_binds.erase(it, onion_binds.end());
+    }
+
+    // Step 4: Check for cross-vector conflicts
+    // Build sets for efficient lookup
+    std::set<CService> whitebind_services;
+    for (const auto& wb : vWhiteBinds) {
+        whitebind_services.insert(wb.m_service);
+    }
+
+    // Check if any service from vBinds exists in vWhiteBinds
+    for (const auto& bind : vBinds) {
+        if (whitebind_services.count(bind)) {
+            return bind;  // Conflict between vBinds and vWhiteBinds
+        }
+    }
+
+    // Check if any service from onion_binds exists in vWhiteBinds or vBinds
+    std::set<CService> bind_services(vBinds.begin(), vBinds.end());
+    for (const auto& onion_bind : onion_binds) {
+        if (whitebind_services.count(onion_bind)) {
+            return onion_bind;  // Conflict between onion_binds and vWhiteBinds
+        }
+        if (bind_services.count(onion_bind)) {
+            return onion_bind;  // Conflict between onion_binds and vBinds
+        }
+    }
+
+    return std::nullopt;  // No conflicts found
+}
+
 // A GUI user may opt to retry once with do_reindex set if there is a failure during chainstate initialization.
 // The function therefore has to support re-entry.
 static ChainstateLoadResult InitAndLoadChainstate(
@@ -2141,6 +2229,11 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
     }
 
     connOptions.m_i2p_accept_incoming = args.GetBoolArg("-i2pacceptincoming", DEFAULT_I2P_ACCEPT_INCOMING);
+
+    if (auto conflict = DeduplicateAndCheckBindingConflicts(connOptions.vWhiteBinds, connOptions.vBinds, connOptions.onion_binds)) {
+        return InitError(Untranslated(strprintf("Different binding configurations assigned to the address %s",
+                                            conflict->ToStringAddrPort())));
+    }
 
     if (!node.connman->Start(scheduler, connOptions)) {
         return false;

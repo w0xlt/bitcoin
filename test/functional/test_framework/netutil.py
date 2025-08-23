@@ -63,6 +63,25 @@ def _convert_ip_port(array):
 
     return host_out,int(port,16)
 
+def debug_netstat(pid):
+    '''Debug version to see what's being matched'''
+    inodes = get_socket_inodes(pid)
+    print(f"Process {pid} socket inodes: {inodes}")
+
+    with open('/proc/net/tcp', 'r') as f:
+        lines = f.readlines()
+        header = lines[0]
+        print(f"Header: {header}")
+
+        for line in lines[1:]:
+            parts = line.split()
+            if len(parts) >= 10:
+                state = parts[3]
+                inode = int(parts[9])
+                if state == '0A' and inode in inodes:  # 0A is LISTEN state
+                    print(f"Matched line: {line}")
+                    print(f"Parts: {parts}")
+
 def netstat(typ='tcp'):
     '''
     Function to return a list with status of tcp connections at linux systems
@@ -89,6 +108,7 @@ def get_bind_addrs(pid):
     Get bind addresses as (host,port) tuples for process pid.
     '''
     inodes = get_socket_inodes(pid)
+    debug_netstat(pid)
     bind_addrs = []
     for conn in netstat('tcp') + netstat('tcp6'):
         if conn[3] == STATE_LISTEN and conn[4] in inodes:

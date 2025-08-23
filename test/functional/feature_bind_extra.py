@@ -11,6 +11,7 @@ from test_framework.netutil import (
     addr_to_hex,
     get_bind_addrs,
 )
+from test_framework.test_node import ErrorMatch
 from test_framework.test_framework import (
     BitcoinTestFramework,
 )
@@ -27,7 +28,7 @@ class BindExtraTest(BitcoinTestFramework):
         # Avoid any -bind= on the command line. Force the framework to avoid
         # adding -bind=127.0.0.1.
         self.bind_to_localhost_only = False
-        self.num_nodes = 3
+        self.num_nodes = 5
 
     def skip_test_if_missing_module(self):
         # Due to OS-specific network stats queries, we only run on Linux.
@@ -69,7 +70,29 @@ class BindExtraTest(BitcoinTestFramework):
         )
         port += 1
 
+
+        # Node3, duplicated -bind=... and -bind=...
+        self.expected.append(
+            [
+                [f"-bind=127.0.0.1:{port}", f"-bind=127.0.0.1:{port}", f"-bind=127.0.0.1:{port + 1}"],
+                [(loopback_ipv4, port), (loopback_ipv4, port), (loopback_ipv4, port + 1)]
+            ],
+        )
+        port += 2
+
+        # Node4, duplicated -bind=...=onion and -bind=...=onion
+        self.expected.append(
+            [
+                [f"-bind=127.0.0.1:{port}=onion", f"-bind=127.0.0.1:{port}=onion", f"-bind=127.0.0.1:{port + 1}=onion"],
+                [(loopback_ipv4, port), (loopback_ipv4, port), (loopback_ipv4, port + 1)]
+            ],
+        )
+        port += 2
+
         self.extra_args = list(map(lambda e: e[0], self.expected))
+
+        # self.log.info("extra_args:", self.extra_args)
+
         self.setup_nodes()
 
     def run_test(self):
@@ -85,7 +108,20 @@ class BindExtraTest(BitcoinTestFramework):
             binds = set(filter(lambda e: len(e[0]) != ipv6_addr_len_bytes, binds))
             # Remove RPC ports. They are not relevant for this test.
             binds = set(filter(lambda e: e[1] != rpc_port(i), binds))
+
+
+            self.log.info("HERE:")
+            self.log.info(binds)
+            self.log.info(set(expected_services))
+
             assert_equal(binds, set(expected_services))
+
+            self.stop_node(i)
+
+
+        self.nodes[4].assert_start_raises_init_error(["-bind=127.0.0.1:11012", "-bind=127.0.0.1:11012=onion"], "Different binding configurations assigned to the address 127.0.0.1:11012", match=ErrorMatch.PARTIAL_REGEX)
+        self.nodes[4].assert_start_raises_init_error(["-whitebind=noban@127.0.0.1:11012", "-whitebind=relay@127.0.0.1:11012"], "Different binding configurations assigned to the address 127.0.0.1:11012", match=ErrorMatch.PARTIAL_REGEX)
+
 
 if __name__ == '__main__':
     BindExtraTest(__file__).main()
