@@ -11,6 +11,7 @@ from test_framework.netutil import (
     addr_to_hex,
     get_bind_addrs,
 )
+from test_framework.test_node import ErrorMatch
 from test_framework.test_framework import (
     BitcoinTestFramework,
 )
@@ -77,6 +78,26 @@ class BindExtraTest(BitcoinTestFramework):
         )
         port += 1 # Increment port to avoid conflicts
 
+        # Test case 4: duplicated -bind=... and -bind=...
+        test_cases.append(
+            [
+                [f"-bind=127.0.0.1:{port}", f"-bind=127.0.0.1:{port}", f"-bind=127.0.0.1:{port + 1}"],
+                [(loopback_ipv4, port), (loopback_ipv4, port), (loopback_ipv4, port + 1)],
+                "duplicated -bind=... and -bind=..."
+            ],
+        )
+        port += 2
+
+        # Test case 5: duplicated -bind=...=onion and -bind=...=onion
+        test_cases.append(
+            [
+                [f"-bind=127.0.0.1:{port}=onion", f"-bind=127.0.0.1:{port}=onion", f"-bind=127.0.0.1:{port + 1}=onion"],
+                [(loopback_ipv4, port), (loopback_ipv4, port), (loopback_ipv4, port + 1)],
+                "duplicated -bind=...=onion and -bind=...=onion"
+            ],
+        )
+        port += 2
+
         # Run each test case by restarting the node with different configurations
         for i, (args, expected_services, description) in enumerate(test_cases):
             self.log.info(f"Test case {i + 1}: {description}")
@@ -104,6 +125,18 @@ class BindExtraTest(BitcoinTestFramework):
 
             assert_equal(binds, set(expected_services))
             self.log.info(f"Test case {i + 1} passed!\n")
+
+        self.stop_node(0)
+
+        self.nodes[0].assert_start_raises_init_error(
+            ["-bind=127.0.0.1:11012", "-bind=127.0.0.1:11012=onion"],
+            "Different binding configurations assigned to the address 127.0.0.1:11012",
+            match=ErrorMatch.PARTIAL_REGEX)
+
+        self.nodes[0].assert_start_raises_init_error(
+            ["-whitebind=noban@127.0.0.1:11012", "-whitebind=relay@127.0.0.1:11012"],
+            "Different binding configurations assigned to the address 127.0.0.1:11012",
+            match=ErrorMatch.PARTIAL_REGEX)
 
 
 if __name__ == '__main__':
