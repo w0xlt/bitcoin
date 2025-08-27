@@ -114,6 +114,9 @@ public:
     /** Get peer manager info. */
     virtual PeerManagerInfo GetInfo() const = 0;
 
+    /** Get reference to extra transactions for compact block reconstruction. */
+    virtual std::vector<std::pair<Wtxid, CTransactionRef>>& GetExtraTxnForCompact() = 0;
+
     /** Relay transaction to all peers. */
     virtual void RelayTransaction(const Txid& txid, const Wtxid& wtxid) = 0;
 
