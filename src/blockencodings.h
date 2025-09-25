@@ -244,7 +244,7 @@ public:
     PartiallyDownloadedChunkBlock(CTxMemPool* poolIn) : PartiallyDownloadedBlock(poolIn), decoded_block(std::make_shared<CBlock>()) {}
 
     // extra_txn is a list of extra transactions to look at, in <reference> form
-    ReadStatus InitData(const CBlockHeaderAndLengthShortTxIDs& comprblock, const std::vector<CTransactionRef>& extra_txn);
+    ReadStatus InitData(const CBlockHeaderAndLengthShortTxIDs& comprblock, const std::vector<std::pair<Wtxid, CTransactionRef>>& extra_txn);
     ReadStatus DoIterativeFill(size_t& firstChunkProcessed);
     bool IsIterativeFillDone() const;
 

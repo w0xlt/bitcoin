@@ -769,7 +769,7 @@ void BlockRecvShutdown() {
 }
 
 // TODO: Use the one from net_processing (with appropriate lock-free-ness)
-static std::vector<CTransactionRef> udpnet_dummy_extra_txn;
+static std::vector<std::pair<Wtxid, CTransactionRef>> udpnet_dummy_extra_txn;
 ReadStatus PartialBlockData::ProvideHeaderData(const CBlockHeaderAndLengthShortTxIDs& header) {
     assert(in_header);
     in_header = false;

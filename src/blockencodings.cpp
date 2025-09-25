@@ -370,7 +370,8 @@ struct FillIndexOffsetMapCallback {
         index_offsets[offset] = index;
     }
 };
-ReadStatus PartiallyDownloadedChunkBlock::InitData(const CBlockHeaderAndLengthShortTxIDs& comprblock, const std::vector<CTransactionRef>& extra_txn) {
+
+ReadStatus PartiallyDownloadedChunkBlock::InitData(const CBlockHeaderAndLengthShortTxIDs& comprblock, const std::vector<std::pair<Wtxid, CTransactionRef>>& extra_txn) {
     const bool fBench = LogAcceptCategory(BCLog::BENCH, BCLog::Level::Debug);
     std::chrono::steady_clock::time_point start;
     if (fBench)
