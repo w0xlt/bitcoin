@@ -464,7 +464,7 @@ private:
         const std::string& section,
         const std::map<std::string, std::vector<common::SettingsValue>>& args) const EXCLUSIVE_LOCKS_REQUIRED(cs_args);
 
-    bool ProcessOptionKey(std::string& key, std::optional<std::string>& val, std::string& error) EXCLUSIVE_LOCKS_REQUIRED(cs_args);
+    bool ProcessOptionKey(std::string& key, std::optional<std::string>& val, std::string& error, const bool found_after_non_option = false) EXCLUSIVE_LOCKS_REQUIRED(cs_args);
 };
 
 extern ArgsManager gArgs;

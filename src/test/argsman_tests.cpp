@@ -214,14 +214,14 @@ BOOST_AUTO_TEST_CASE(util_ParseParameters)
 
     BOOST_CHECK(testArgs.ParseParameters(7, argv_test, error));
     // expectation: -ignored is ignored (program name argument),
-    // -a, -b and -ccc end up in map, -d ignored because it is after
-    // a non-option argument (non-GNU option parsing)
+    // -a, -b and -ccc end up in map, also -d since the parser detects
+    // [options] after a non-option argument (GNU-style option parsing)
     BOOST_CHECK(testArgs.IsArgSet("-a") && testArgs.IsArgSet("-b") && testArgs.IsArgSet("-ccc")
-                && !testArgs.IsArgSet("f") && !testArgs.IsArgSet("-d"));
+                && !testArgs.IsArgSet("f") && testArgs.IsArgSet("-d"));
     testArgs.LockSettings([&](const common::Settings& s) {
-        BOOST_CHECK(s.command_line_options.size() == 3 && s.ro_config.empty());
+        BOOST_CHECK(s.command_line_options.size() == 4 && s.ro_config.empty());
         BOOST_CHECK(s.command_line_options.contains("a") && s.command_line_options.contains("b") && s.command_line_options.contains("ccc")
-                    && !s.command_line_options.contains("f") && !s.command_line_options.contains("d"));
+                    && !s.command_line_options.contains("f") && s.command_line_options.contains("d"));
 
         BOOST_CHECK(s.command_line_options.at("a").size() == 1);
         BOOST_CHECK(s.command_line_options.at("a").front().get_str() == "");
