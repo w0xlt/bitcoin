@@ -1173,7 +1173,7 @@ static RPCHelpMan gettxout()
             RPCResult{"Array of results, aligned with input (null when not found).",
                 RPCResult::Type::ARR, "", "",
                 {
-                    RPCResult{"If the UTXO was not found", RPCResult::Type::NONE, "", ""},
+                    RPCResult{"If the UTXO was not found", RPCResult::Type::ELISION, "", ""},
                     RPCResult{"Otherwise", RPCResult::Type::OBJ, "", "", {
                         {RPCResult::Type::STR_HEX, "bestblock", "The hash of the block at the tip of the chain"},
                         {RPCResult::Type::NUM, "confirmations", "The number of confirmations"},
@@ -1207,14 +1207,22 @@ static RPCHelpMan gettxout()
     CCoinsViewCache* coins_view = &active_chainstate.CoinsTip();
 
     bool fMempool = true;
-    if (!request.params[2].isNull())
-        fMempool = request.params[2].get_bool();
+    if (!request.params[1].isNull())
+        fMempool = request.params[1].get_bool();
 
     UniValue ret(UniValue::VARR);
 
     for (const UniValue& outpoint : request.params[0].get_array().getValues()) {
-        auto hash{Txid::FromUint256(ParseHashV(outpoint, "txid"))};
-        uint32_t index = outpoint.find_value("vout").getInt<uint32_t>();
+        // pull the fields out of the object
+        const UniValue& txidv = outpoint.find_value("txid");
+        const UniValue& voutv = outpoint.find_value("vout");
+        if (txidv.isNull() || voutv.isNull()) {
+            throw JSONRPCError(RPC_INVALID_PARAMETER, "Each element must have txid (string) and vout (number)");
+        }
+
+        auto hash  = Txid::FromUint256(ParseHashV(txidv, "txid"));  // <-- parse the string field
+        uint32_t index = (uint32_t)voutv.getInt<int64_t>();         // or voutv.get_int(), cast as needed
+
         COutPoint out{hash, index};
 
         UniValue item(UniValue::VOBJ);
