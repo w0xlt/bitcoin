@@ -174,14 +174,17 @@ void ArgsManager::SelectConfigNetwork(const std::string& network)
     m_network = network;
 }
 
-bool ArgsManager::ProcessOptionKey(std::string& key, std::optional<std::string>& val, std::string& error, const bool found_after_non_option) {
-
-    std::string original_input = key; // Capture the original key
-    if (val) original_input += "=" + *val; // Append =value if it exists
+bool ArgsManager::ProcessOptionKey(std::string& key, std::optional<std::string>& val, std::string& error, const bool found_after_non_option)
+{
+    bool double_dash{false};
+    std::string original_input{key};
+    if (val) original_input += "=" + *val;
 
     // Transform --foo to -foo
-    if (key.length() > 1 && key[1] == '-')
+    if (key.length() > 1 && key[1] == '-') {
         key.erase(0, 1);
+        double_dash = true;
+    }
 
     // Transform -foo to foo
     key.erase(0, 1);
@@ -191,15 +194,24 @@ bool ArgsManager::ProcessOptionKey(std::string& key, std::optional<std::string>&
     // Unknown command line options and command line options with dot characters
     // (which are returned from InterpretKey with nonempty section strings)are not valid.
     if (!flags || !keyinfo.section.empty()) {
-        if (!found_after_non_option) {
-            error = strprintf("Invalid parameter %s", original_input);
-        } else {
-            // if the option is invalid but comes after a non-option (found_after_non_option)
-            // leave it up to the command if it accepts args that begin with "-"
+        if (double_dash && found_after_non_option) {
+            KeyInfo named_keyinfo = InterpretKey("named");
+            if (auto named_flags = GetArgFlags_('-' + named_keyinfo.name); named_flags && named_keyinfo.section.empty()) {
+                auto named_value = InterpretValue(named_keyinfo, nullptr, *named_flags, error);
+                if (!named_value) return false;
+
+                m_settings.command_line_options[named_keyinfo.name].push_back(*named_value);
+                m_command.emplace_back(original_input.substr(2));
+                return true;
+            }
+        }
+
+        if (found_after_non_option) {
             m_command.emplace_back(original_input);
-            // returns true to continue processing the args of the command
             return true;
         }
+
+        error = strprintf("Invalid parameter %s", original_input);
         return false;
     }
 
