@@ -5,6 +5,7 @@
 #include <boost/test/unit_test.hpp>
 
 #include <ohttp/ohttp.h>
+#include <ohttp/bhttp.h>
 #include <dhkem_secp256k1.h>   // ensure HPKE context init & helpers are present :contentReference[oaicite:28]{index=28}
 #include <key.h>
 #include <util/strencodings.h>
@@ -68,6 +69,74 @@ BOOST_AUTO_TEST_CASE(ohttp_roundtrip_client_gateway)
     auto got_res = client.OpenResponse(enc_res);
     BOOST_REQUIRE(got_res.has_value());
     BOOST_CHECK_EQUAL(HexStr(*got_res), HexStr(bhttp_res));
+}
+
+BOOST_AUTO_TEST_CASE(ohttp_roundtrip_client_gateway_with_bhttp)
+{
+    // Receiver (Gateway) HPKE keypair
+    CKey skR; skR.MakeNewKey(/*uncompressed*/false);
+    CPubKey pkR = skR.GetPubKey();
+    BOOST_CHECK(pkR.size() == dhkem_secp256k1::NPK);
+
+    // KeyConfig (application-provided)
+    KeyConfig cfg = MakeKeyConfig(/*key_id=*/1, pkR);
+    BOOST_CHECK(cfg.IsSupported());
+
+    // Serialize+parse the key list container (sanity)
+    std::vector<KeyConfig> list{cfg};
+    auto blob = SerializeKeyConfigList(list);
+    auto parsed = ParseKeyConfigList(blob);
+    BOOST_CHECK_EQUAL(parsed.size(), 1U);
+    BOOST_CHECK(parsed[0].IsSupported());
+    BOOST_CHECK_EQUAL(parsed[0].key_id, cfg.key_id);
+
+    // Build a real bHTTP known-length request (RFC 9292) to send via OHTTP.
+    bhttp::Request inner_req;
+    inner_req.method    = "POST";
+    inner_req.scheme    = "https";
+    inner_req.authority = "relay.example";     // any host
+    inner_req.path      = "/payjoin/v2/mailbox";
+    inner_req.headers   = {
+        {"content-type", "application/payjoin"},
+        {"accept",       "application/octet-stream"},
+    };
+    inner_req.body      = std::vector<uint8_t>{'P','J','-','R','E','Q'}; // example payload
+    auto enc_req_body = bhttp::EncodeKnownLengthRequest(inner_req);
+    BOOST_REQUIRE(enc_req_body.has_value());
+
+    ClientContext client;
+    auto enc_req = client.EncapsulateRequest(cfg, *enc_req_body);
+    BOOST_REQUIRE(enc_req.has_value());
+
+    // Gateway decapsulates the request
+    GatewayRequestContext gwctx;
+    auto got_req = Gateway::DecapsulateRequest(
+        *enc_req,
+        /*expected_key_id=*/1,
+        std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(skR.data()), skR.size()),
+        gwctx);
+    BOOST_REQUIRE(got_req.has_value());
+    // Request bytes should match exactly what the client encoded.
+    BOOST_CHECK_EQUAL_COLLECTIONS(got_req->begin(), got_req->end(), enc_req_body->begin(), enc_req_body->end());
+
+    // Produce a real bHTTP known-length response and encapsulate it.
+    bhttp::Response inner_res;
+    inner_res.status  = 200;
+    inner_res.headers = { {"content-type","application/octet-stream"} };
+    inner_res.body    = std::vector<uint8_t>{'P','J','-','R','E','S'};
+    auto enc_res_body = bhttp::EncodeKnownLengthResponse(inner_res);
+    BOOST_REQUIRE(enc_res_body.has_value());
+    auto enc_res = Gateway::EncapsulateResponse(gwctx, *enc_res_body);
+
+    // Client opens the Encapsulated Response
+    auto got_res = client.OpenResponse(enc_res);
+    BOOST_REQUIRE(got_res.has_value());
+    // And decodes the bHTTP response
+    auto decoded = bhttp::DecodeKnownLengthResponse(*got_res);
+    BOOST_REQUIRE(decoded.has_value());
+    BOOST_CHECK_EQUAL(decoded->status, inner_res.status);
+    BOOST_CHECK_EQUAL_COLLECTIONS(decoded->body.begin(), decoded->body.end(),
+        inner_res.body.begin(), inner_res.body.end());
 }
 
 BOOST_AUTO_TEST_SUITE_END()

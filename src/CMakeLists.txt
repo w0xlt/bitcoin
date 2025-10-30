@@ -121,6 +121,7 @@ add_library(bitcoin_common STATIC EXCLUDE_FROM_ALL
   net_types.cpp
   netaddress.cpp
   netbase.cpp
+  ohttp/bhttp.cpp
   ohttp/ohttp.cpp
   outputtype.cpp
   policy/feerate.cpp
