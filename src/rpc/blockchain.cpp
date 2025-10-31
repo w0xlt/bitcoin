@@ -53,6 +53,9 @@
 #include <validationinterface.h>
 #include <versionbits.h>
 
+#include <ohttp/ohttp.h>
+#include <ohttp/bhttp.h>
+
 #include <cstdint>
 
 #include <condition_variable>
@@ -3469,6 +3472,330 @@ return RPCHelpMan{
     };
 }
 
+// Store client contexts between start/finish calls. TEST ONLY.
+static std::mutex g_ohttp_mu;
+static std::unordered_map<std::string, ohttp::ClientContext> g_ohttp_sessions;
+
+static std::string NewSessionId()
+{
+    unsigned char buf[16];
+    GetRandBytes(buf); // Core RNG
+    return HexStr(buf);
+}
+
+static bool ParseHeadersObject(const UniValue& obj,
+    std::vector<std::pair<std::string, std::string>>& out)
+{
+    if (!obj.isObject()) return false;
+
+    const auto& uobj = obj.get_obj();
+    const auto& keys = obj.getKeys();
+    out.reserve(uobj.size());
+
+    for (size_t i = 0; i < uobj.size(); ++i) {
+    const std::string& k = keys[i];
+    const UniValue&    v = uobj[i];
+    if (!v.isStr()) return false;
+        out.emplace_back(k, v.get_str());
+    }
+    return true;
+}
+
+// ohttpencap_start(keys_hex, inner, key_id)
+//  - keys_hex: hex of application/ohttp-keys blob
+//  - inner: {method, scheme, authority, path, headers:{...}, body_hex?}
+//  - key_id (optional): select specific key_id from the list
+static RPCHelpMan ohttpencap_start()
+{
+    return RPCHelpMan{
+        "ohttpencap_start",
+        "Build a bHTTP request, encapsulate with OHTTP, and return a session_id\n"
+        "plus the message/ohttp-req bytes (hex). Use ohttpopen_finish to decrypt the reply.\n"
+        "TEST-ONLY; calls network only when you POST the returned bytes with curl.\n",
+        {
+            {"keys_hex", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "Hex string of application/ohttp-keys (KeyConfig list)."},
+            {"inner",    RPCArg::Type::OBJ, RPCArg::Optional::NO, "bHTTP inner request",
+                {
+                    {"method",    RPCArg::Type::STR, RPCArg::Optional::OMITTED, "HTTP method (default \"GET\")."},
+                    {"scheme",    RPCArg::Type::STR, RPCArg::Optional::OMITTED, "Scheme (default \"https\")."},
+                    {"authority", RPCArg::Type::STR, RPCArg::Optional::OMITTED, "Host[:port] (default \"payjo.in\")."},
+                    {"path",      RPCArg::Type::STR, RPCArg::Optional::OMITTED, "Absolute path (default \"/\")."},
+                    {"headers",   RPCArg::Type::OBJ, RPCArg::Optional::OMITTED,
+                        "Header map of strings -> strings.",
+                        {
+                            {"header_name", RPCArg::Type::STR, RPCArg::Optional::NO, "Header value"}
+                        }
+                    },
+                    {"body_hex",  RPCArg::Type::STR_HEX, RPCArg::Optional::OMITTED, "Optional body bytes (hex)."},
+                }
+            },
+            {"key_id",   RPCArg::Type::NUM, RPCArg::Optional::OMITTED, "Optional: select a specific KeyConfig.key_id."},
+        },
+        RPCResult{
+            RPCResult::Type::OBJ, "", "",
+            {
+                {RPCResult::Type::STR_HEX, "enc_req_hex", "Encapsulated request (message/ohttp-req) as hex."},
+                {RPCResult::Type::STR,     "session_id",  "Opaque session id to pass to ohttpopen_finish."},
+                {RPCResult::Type::STR_HEX, "bhttp_req_hex", "The exact bHTTP (known-length) request bytes we encapsulated."},
+                {RPCResult::Type::NUM,     "bhttp_req_len", "Length of the bHTTP request."},
+                {RPCResult::Type::OBJ,     "chosen_key",   "",
+                    {
+                        {RPCResult::Type::NUM, "key_id", "Key identifier used."},
+                        {RPCResult::Type::NUM, "kem_id", "KEM id."},
+                    }
+                },
+                {RPCResult::Type::STR,     "curl_hint", "One-liner to POST enc_req_hex to an OHTTP relay."},
+            }
+        },
+        RPCExamples{
+            HelpExampleCli("ohttpencap_start", R"("$(xxd -p -c 0 ohttp-keys.bin)")  +
+            HelpExampleCli("ohttpencap_start", R"({ "method":"GET","scheme":"https","authority":"payjo.in","path":"/","headers":{"accept":"*/*"}})" )
+        },
+        [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue 
+        
+        {
+            const std::string keys_hex = self.Arg<std::string>("keys_hex");
+            const UniValue& inner      = self.Arg<UniValue>("inner");
+            // const std::optional<int64_t> key_id_req = self.MaybeArg<int64_t>("key_id");
+            const std::optional<int64_t> key_id_req{request.params[2].isNull() ? std::nullopt : std::optional<int64_t>{request.params[2].getInt<int>()}};
+ 
+            // Parse KeyConfig list
+            const auto keys_bytes = ParseHex(keys_hex);
+            auto key_list = ohttp::ParseKeyConfigList(std::span<const uint8_t>(keys_bytes.data(), keys_bytes.size()));
+            if (key_list.empty()) throw JSONRPCError(RPC_MISC_ERROR, "No supported KeyConfig in keys_hex");
+
+            // Pick first supported or the requested key_id
+            ohttp::KeyConfig cfg{};
+            bool found = false;
+            if (key_id_req.has_value()) {
+                for (const auto& k : key_list) { if (k.key_id == key_id_req.value()) { cfg = k; found = true; break; } }
+                if (!found) throw JSONRPCError(RPC_INVALID_PARAMETER, "key_id not found in keys_hex");
+            } else {
+                cfg = key_list.front();
+            }
+
+            // Build bHTTP known-length inner request
+            bhttp::Request r;
+            const UniValue* headers_u = inner.exists("headers") ? &inner["headers"] : nullptr;
+            r.method    = inner.exists("method")    ? inner["method"].get_str()    : "GET";
+            r.scheme    = inner.exists("scheme")    ? inner["scheme"].get_str()    : "https";
+            r.authority = inner.exists("authority") ? inner["authority"].get_str() : "payjo.in";
+            r.path      = inner.exists("path")      ? inner["path"].get_str()      : "/";
+            if (headers_u) {
+                if (!ParseHeadersObject(*headers_u, r.headers)) {
+                    throw JSONRPCError(RPC_INVALID_PARAMETER, "headers must be an object of string->string");
+                }
+            }
+            if (inner.exists("body_hex")) {
+                auto body = ParseHex(inner["body_hex"].get_str());
+                r.body.assign(body.begin(), body.end());
+            }
+            auto bhttp_req = bhttp::EncodeKnownLengthRequest(r);
+            if (!bhttp_req.has_value()) throw JSONRPCError(RPC_MISC_ERROR, "bHTTP encode failed");
+
+            // OHTTP client encapsulation
+            ohttp::ClientContext client;
+            auto enc_req = client.EncapsulateRequest(cfg, *bhttp_req);
+            if (!enc_req.has_value()) throw JSONRPCError(RPC_MISC_ERROR, "OHTTP encapsulation failed");
+
+            // Store session
+            std::string sid = NewSessionId();
+            {
+                std::lock_guard<std::mutex> l(g_ohttp_mu);
+                g_ohttp_sessions.emplace(sid, std::move(client));
+            }
+
+            // Result
+            UniValue out(UniValue::VOBJ);
+            out.pushKV("enc_req_hex",   HexStr(*enc_req));
+            out.pushKV("session_id",    sid);
+            out.pushKV("bhttp_req_hex", HexStr(*bhttp_req));
+            out.pushKV("bhttp_req_len", (int)bhttp_req->size());
+            UniValue chosen(UniValue::VOBJ);
+            chosen.pushKV("key_id", cfg.key_id);
+            chosen.pushKV("kem_id", cfg.kem_id);
+            out.pushKV("chosen_key", chosen);
+
+            // Simple curl one-liner (post to an OHTTP relay)
+            out.pushKV("curl_hint",
+                "echo " + HexStr(*enc_req) +
+                " | xxd -r -p | curl -fsS https://pj.bobspacebkk.com "
+                "-H 'Content-Type: message/ohttp-req' --data-binary @- | xxd -p -c 0");
+  
+            return out;
+        }
+    };
+}
+
+// ohttpencap_start(keys_hex, key_id)
+//  - keys_hex: hex of application/ohttp-keys blob
+//  - key_id (optional): select specific key_id from the list
+static RPCHelpMan ohttpencap_start2()
+{
+    return RPCHelpMan{
+        "ohttpencap_start2",
+        "Build a default bHTTP request (GET https://payjo.in/), encapsulate with OHTTP, and return a session_id\n"
+        "plus the message/ohttp-req bytes (hex). Use ohttpopen_finish to decrypt the reply.\n"
+        "TEST-ONLY; calls network only when you POST the returned bytes with curl.\n",
+        {
+            {"keys_hex", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "Hex string of application/ohttp-keys (KeyConfig list)."},
+            {"key_id",   RPCArg::Type::NUM,     RPCArg::Optional::OMITTED, "Optional: select a specific KeyConfig.key_id."},
+        },
+        RPCResult{
+            RPCResult::Type::OBJ, "", "",
+            {
+                {RPCResult::Type::STR_HEX, "enc_req_hex", "Encapsulated request (message/ohttp-req) as hex."},
+                {RPCResult::Type::STR,     "session_id",  "Opaque session id to pass to ohttpopen_finish."},
+                {RPCResult::Type::STR_HEX, "bhttp_req_hex", "The exact bHTTP (known-length) request bytes we encapsulated."},
+                {RPCResult::Type::NUM,     "bhttp_req_len", "Length of the bHTTP request."},
+                {RPCResult::Type::OBJ,     "chosen_key",   "",
+                    {
+                        {RPCResult::Type::NUM, "key_id", "Key identifier used."},
+                        {RPCResult::Type::NUM, "kem_id", "KEM id."},
+                    }
+                },
+                {RPCResult::Type::STR,     "curl_hint", "One-liner to POST enc_req_hex to an OHTTP relay."},
+            }
+        },
+        RPCExamples{
+            HelpExampleCli("ohttpencap_start", R"("$(xxd -p -c 0 ohttp-keys.bin)") +
+            HelpExampleCli("ohttpencap_start", R"("$(xxd -p -c 0 ohttp-keys.bin)" ) // 42
+        },
+        [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
+        {
+            // Params: keys_hex (required), key_id (optional)
+            const std::string keys_hex = self.Arg<std::string>("keys_hex");
+            const std::optional<int64_t> key_id_req{
+                request.params[1].isNull() ? std::nullopt
+                                            : std::optional<int64_t>{request.params[1].getInt<int>()}
+            };
+
+            // Parse KeyConfig list
+            const auto keys_bytes = ParseHex(keys_hex);
+            auto key_list = ohttp::ParseKeyConfigList(
+                std::span<const uint8_t>(keys_bytes.data(), keys_bytes.size()));
+            if (key_list.empty()) throw JSONRPCError(RPC_MISC_ERROR, "No supported KeyConfig in keys_hex");
+
+            // Pick first supported or the requested key_id
+            ohttp::KeyConfig cfg{};
+            bool found = false;
+            if (key_id_req.has_value()) {
+                for (const auto& k : key_list) {
+                    if (k.key_id == key_id_req.value()) { cfg = k; found = true; break; }
+                }
+                if (!found) throw JSONRPCError(RPC_INVALID_PARAMETER, "key_id not found in keys_hex");
+            } else {
+                cfg = key_list.front();
+            }
+
+            // Build bHTTP known-length inner request with default values:
+            //   GET https://payjo.in/   (no headers, empty body)
+            bhttp::Request r;
+            r.method    = "GET";
+            r.scheme    = "https";
+            r.authority = "payjo.in";
+            r.path      = "/";
+            // r.headers stays empty; r.body stays empty.
+            auto bhttp_req = bhttp::EncodeKnownLengthRequest(r);
+            if (!bhttp_req.has_value()) throw JSONRPCError(RPC_MISC_ERROR, "bHTTP encode failed");
+
+            // OHTTP client encapsulation
+            ohttp::ClientContext client;
+            auto enc_req = client.EncapsulateRequest(cfg, *bhttp_req);
+            if (!enc_req.has_value()) throw JSONRPCError(RPC_MISC_ERROR, "OHTTP encapsulation failed");
+
+            // Store session
+            std::string sid = NewSessionId();
+            {
+                std::lock_guard<std::mutex> l(g_ohttp_mu);
+                g_ohttp_sessions.emplace(sid, std::move(client));
+            }
+
+            // Result
+            UniValue out(UniValue::VOBJ);
+            out.pushKV("enc_req_hex",   HexStr(*enc_req));
+            out.pushKV("session_id",    sid);
+            out.pushKV("bhttp_req_hex", HexStr(*bhttp_req));
+            out.pushKV("bhttp_req_len", (int)bhttp_req->size());
+            UniValue chosen(UniValue::VOBJ);
+            chosen.pushKV("key_id", cfg.key_id);
+            chosen.pushKV("kem_id", cfg.kem_id);
+            out.pushKV("chosen_key", chosen);
+
+            // Simple curl one-liner (post to an OHTTP relay)
+            out.pushKV("curl_hint",
+                "echo " + HexStr(*enc_req) +
+                " | xxd -r -p | curl -fsS https://pj.bobspacebkk.com "
+                "-H 'Content-Type: message/ohttp-req' --data-binary @- | xxd -p -c 0");
+
+            return out;
+        }
+    };
+}
+
+// ohttpopen_finish(session_id, enc_res_hex)
+//  - session_id: from ohttpencap_start
+//  - enc_res_hex: hex of message/ohttp-res from relay response
+static RPCHelpMan ohttpopen_finish()
+{
+    return RPCHelpMan{
+        "ohttpopen_finish",
+        "Open a message/ohttp-res using the stored HPKE state, decode bHTTP response,\n"
+        "and return status/headers/body. TEST-ONLY.\n",
+        {
+            {"session_id",  RPCArg::Type::STR, RPCArg::Optional::NO, "Token returned by ohttpencap_start."},
+            {"enc_res_hex", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "Encapsulated response (message/ohttp-res) as hex."},
+        },
+        RPCResult{
+            RPCResult::Type::OBJ, "", "",
+            {
+                {RPCResult::Type::NUM, "status", "HTTP status code from inner bHTTP response (if decodable)."},
+                {RPCResult::Type::OBJ, "headers", ""},
+                {RPCResult::Type::STR_HEX, "body_hex", "Body as hex (exact bytes)."},
+                {RPCResult::Type::STR, "note", "If bHTTP decode fails, raw plaintext is returned in body_hex."}
+            }
+        },
+        RPCExamples{
+            HelpExampleCli("ohttpopen_finish", R"("0123abcd..." "$(cat enc-res.hex)")
+        },
+        [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue {
+            const std::string sid   = self.Arg<std::string>("session_id");
+            const std::string reshx = self.Arg<std::string>("enc_res_hex");
+
+            // Lookup session
+            ohttp:: ClientContext client;
+            {
+                std::lock_guard<std::mutex> l(g_ohttp_mu);
+                auto it = g_ohttp_sessions.find(sid);
+                if (it == g_ohttp_sessions.end()) throw JSONRPCError(RPC_INVALID_PARAMETER, "unknown session_id");
+                client = std::move(it->second);
+                g_ohttp_sessions.erase(it);
+            }
+
+            // Open response
+            const auto enc_res = ParseHex(reshx);
+            auto pt = client.OpenResponse(std::span<const uint8_t>(enc_res.data(), enc_res.size()));
+            if (!pt.has_value()) throw JSONRPCError(RPC_MISC_ERROR, "OHTTP response decryption failed");
+
+            // Try bHTTP decode
+            UniValue out(UniValue::VOBJ);
+            auto maybe = bhttp::DecodeKnownLengthResponse(*pt);
+            if (maybe.has_value()) {
+                out.pushKV("status", (int)maybe->status);
+                UniValue hdrs(UniValue::VOBJ);
+                for (const auto& kv : maybe->headers) hdrs.pushKV(kv.first, kv.second);
+                out.pushKV("headers", hdrs);
+                out.pushKV("body_hex", HexStr(maybe->body));
+            } else {
+                out.pushKV("status", 0);
+                out.pushKV("headers", UniValue(UniValue::VOBJ));
+                out.pushKV("body_hex", HexStr(*pt));
+                out.pushKV("note", "bHTTP decode failed; returned raw plaintext bytes");
+            }
+            return out;
+        }
+    };
+}
 
 void RegisterBlockchainRPCCommands(CRPCTable& t)
 {
@@ -3502,6 +3829,9 @@ void RegisterBlockchainRPCCommands(CRPCTable& t)
         {"blockchain", &waitfornewblock},
         {"blockchain", &waitforblock},
         {"blockchain", &waitforblockheight},
+        {"blockchain", &ohttpencap_start},
+        {"blockchain", &ohttpencap_start2},
+        {"blockchain", &ohttpopen_finish},
         {"hidden", &syncwithvalidationinterfacequeue},
     };
     for (const auto& c : commands) {

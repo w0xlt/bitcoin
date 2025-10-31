@@ -141,12 +141,13 @@ add_library(bitcoin_common STATIC EXCLUDE_FROM_ALL
   script/solver.cpp
 )
 target_link_libraries(bitcoin_common
+  PUBLIC
+    secp256k1
   PRIVATE
     core_interface
     bitcoin_consensus
     bitcoin_util
     univalue
-    secp256k1
     Boost::headers
     $<TARGET_NAME_IF_EXISTS:USDT::headers>
     $<$<PLATFORM_ID:Windows>:ws2_32>
