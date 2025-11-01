@@ -122,6 +122,8 @@ add_library(bitcoin_common STATIC EXCLUDE_FROM_ALL
   netaddress.cpp
   netbase.cpp
   outputtype.cpp
+  payjoin/bhttp.cpp
+  payjoin/ohttp.cpp
   policy/feerate.cpp
   policy/policy.cpp
   pow.cpp
@@ -272,6 +274,10 @@ add_library(bitcoin_node STATIC EXCLUDE_FROM_ALL
   $<$<TARGET_EXISTS:bitcoin_wallet>:wallet/init.cpp>
   $<$<NOT:$<TARGET_EXISTS:bitcoin_wallet>>:dummywallet.cpp>
 )
+
+# Find libcurl (portable): provides imported target CURL::libcurl
+find_package(CURL QUIET)
+
 target_link_libraries(bitcoin_node
   PRIVATE
     core_interface
@@ -287,6 +293,14 @@ target_link_libraries(bitcoin_node
     $<TARGET_NAME_IF_EXISTS:libevent::pthreads>
     $<TARGET_NAME_IF_EXISTS:USDT::headers>
 )
+
+# Link cURL to the library that owns rpc/blockchain.cpp (PUBLIC so it propagates to bitcoind/bitcoin-node/tests)
+if (CURL_FOUND)
+  target_link_libraries(bitcoin_node PUBLIC CURL::libcurl)
+  target_compile_definitions(bitcoin_node PRIVATE USE_LIBCURL=1)
+else()
+  message(FATAL_ERROR "fetchohttpkeys() in rpc/blockchain.cpp uses libcurl, but cURL was not found. Install libcurl dev or set CMAKE_PREFIX_PATH.")
+endif()
 
 # Bitcoin wrapper executable that can call other executables.
 if(BUILD_BITCOIN_BIN)
