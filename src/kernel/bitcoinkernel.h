@@ -488,7 +488,7 @@ typedef uint8_t btck_ChainType;
  */
 BITCOINKERNEL_API btck_ValidationMode btck_tx_validation_state_get_validation_mode(
         const btck_TxValidationState* state) BITCOINKERNEL_ARG_NONNULL(1);
-    
+
 BITCOINKERNEL_API btck_TxValidationResult btck_tx_validation_state_get_tx_validation_result(
     const btck_TxValidationState* state) BITCOINKERNEL_ARG_NONNULL(1);
 
