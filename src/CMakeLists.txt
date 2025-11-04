@@ -254,6 +254,7 @@ add_library(bitcoin_node STATIC EXCLUDE_FROM_ALL
   rpc/mempool.cpp
   rpc/mining.cpp
   rpc/net.cpp
+  rpc/payjoin.cpp
   rpc/node.cpp
   rpc/output_script.cpp
   rpc/rawtransaction.cpp
