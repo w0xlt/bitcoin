@@ -77,12 +77,15 @@ static UniValue KeyConfigToJSON(const ohttp::KeyConfig& cfg) {
 
 static RPCHelpMan fetchohttpkeys()
 {
+    static const char* DEFAULT_RELAY = "https://pj.bobspacebkk.com";
+    static const char* DEFAULT_DIR   = "https://payjo.in";
+
     return RPCHelpMan{
         "fetchohttpkeys",
         "Fetch OHTTP KeyConfig from the Payjoin Directory through an OHTTP Relay (HTTP CONNECT bootstrap).\n",
         {
-            {"ohttp_relay", RPCArg::Type::STR, RPCArg::Default{"https://pj.bobspacebkk.com"}, "OHTTP Relay URL"},
-            {"payjoin_directory", RPCArg::Type::STR, RPCArg::Default{"https://payjo.in"}, "Payjoin Directory origin"},
+            {"ohttp_relay", RPCArg::Type::STR, RPCArg::Default{DEFAULT_RELAY}, "OHTTP Relay URL"},
+            {"payjoin_directory", RPCArg::Type::STR, RPCArg::Default{DEFAULT_DIR}, "Payjoin Directory origin"},
         },
         RPCResult{
             RPCResult::Type::OBJ, "", "",
@@ -97,8 +100,18 @@ static RPCHelpMan fetchohttpkeys()
             HelpExampleRpc("fetchohttpkeys", "")
         },
         [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue {
-            std::string proxy = request.params[0].get_str();
-            std::string directory = request.params[1].get_str();
+
+            const auto& params = request.params;
+
+            std::string proxy = DEFAULT_RELAY;
+            if (params.size() > 0 && !params[0].isNull()) {
+                proxy = params[0].get_str();
+            }
+
+            std::string directory = DEFAULT_DIR;
+            if (params.size() > 1 && !params[1].isNull()) {
+                directory = params[1].get_str();
+            }
 
             std::string url = directory;
             if (!url.empty() && url.back() == '/') url.pop_back();
