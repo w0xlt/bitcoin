@@ -109,7 +109,6 @@ add_library(bitcoin_common STATIC EXCLUDE_FROM_ALL
   core_read.cpp
   core_write.cpp
   deploymentinfo.cpp
-  dhkem_secp256k1.cpp
   external_signer.cpp
   init/common.cpp
   kernel/chainparams.cpp
@@ -123,6 +122,7 @@ add_library(bitcoin_common STATIC EXCLUDE_FROM_ALL
   netbase.cpp
   outputtype.cpp
   payjoin/bhttp.cpp
+  payjoin/dhkem_secp256k1.cpp
   payjoin/ohttp.cpp
   policy/feerate.cpp
   policy/policy.cpp

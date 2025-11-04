@@ -6,10 +6,10 @@
 #include <cstring>
 #include <vector>
 
-#include <dhkem_secp256k1.h>
 #include <crypto/hmac_sha256.h>
 #include <random.h>                               // GetRandBytes
 #include <secp256k1.h>                            // parse/serialize pubkeys for 33→65 conversion
+#include <payjoin/dhkem_secp256k1.h>
 
 namespace ohttp {
 

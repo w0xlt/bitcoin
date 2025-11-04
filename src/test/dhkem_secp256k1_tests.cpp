@@ -3,7 +3,7 @@
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
 #include <boost/test/unit_test.hpp>
-#include <dhkem_secp256k1.h>
+
 #include <key.h>  // for ECC context management
 #include <test/util/json.h>
 #include <test/data/dhkem_secp256k1_test_vectors.json.h>
@@ -11,6 +11,7 @@
 #include <univalue.h>
 #include <util/strencodings.h>
 #include <vector>
+#include <payjoin/dhkem_secp256k1.h>
 
 using namespace dhkem_secp256k1;
 
