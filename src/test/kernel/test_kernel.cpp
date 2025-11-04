@@ -17,9 +17,18 @@
 #include <format>
 #include <iostream>
 #include <memory>
+#include <algorithm>
+#include <cstring>
+
+// Build txs with Core types, then serialize once.
+#include <primitives/transaction.h>
+#include <script/script.h>
+#include <streams.h>
+#include <uint256.h>
 #include <optional>
 #include <random>
 #include <ranges>
+#include <array>
 #include <span>
 #include <string>
 #include <string_view>
@@ -74,6 +83,84 @@ std::string byte_span_to_hex_string_reversed(std::span<const std::byte> bytes)
 
     return oss.str();
 }
+
+// -----------------------------------------------------------------------------
+// Helpers to build raw legacy (non-witness) transactions for CheckTransaction tests
+// -----------------------------------------------------------------------------
+namespace {
+    
+    struct InputSpec {
+        std::array<std::byte, 32> prev_hash; // little-endian txid bytes
+        uint32_t index;                      // vout
+        std::vector<std::byte> script;       // scriptSig
+        uint32_t sequence;                   // usually 0xffffffff
+    };
+
+    struct OutputSpec {
+        int64_t amount;                      // satoshis (can be negative to test rejection)
+        std::vector<std::byte> script;       // scriptPubKey
+    };
+
+    inline std::array<std::byte, 32> fill32(uint8_t b)
+    {
+        std::array<std::byte, 32> a{};
+        a.fill(static_cast<std::byte>(b));
+        return a;
+    }
+
+    inline bool is_zero32(const std::array<std::byte,32>& a)
+    {
+        return std::all_of(a.begin(), a.end(), [](std::byte b){ return b == std::byte{0}; });
+    }
+
+    inline uint256 U256FromLE(const std::array<std::byte,32>& le)
+    {
+        uint256 x;
+        std::memcpy(x.begin(), le.data(), 32); // base_blob storage is little-endian
+        return x;
+    }
+
+    inline CScript ToScript(std::span<const std::byte> s)
+    {
+        const unsigned char* p = reinterpret_cast<const unsigned char*>(s.data());
+        return CScript(p, p + s.size());
+    }
+
+    std::vector<std::byte> make_legacy_tx(
+        const std::vector<InputSpec>& vin,
+        const std::vector<OutputSpec>& vout,
+        uint32_t version = 2,
+        uint32_t locktime = 0)
+    {
+        CMutableTransaction mtx;
+        mtx.version = static_cast<int32_t>(version);
+        mtx.nLockTime = locktime;
+        mtx.vin.reserve(vin.size());
+        for (const auto& in : vin) {
+            CTxIn txin;
+            if (is_zero32(in.prev_hash) && in.index == std::numeric_limits<uint32_t>::max()) {
+                txin.prevout.SetNull();                   // coinbase marker
+            } else {
+                auto txid = ::Txid::FromUint256(U256FromLE(in.prev_hash));
+                txin.prevout = COutPoint(txid, in.index);
+            }
+            txin.scriptSig = ToScript(in.script);
+            txin.nSequence = in.sequence;
+            mtx.vin.push_back(std::move(txin));
+        }
+        mtx.vout.reserve(vout.size());
+        for (const auto& out : vout) {
+            mtx.vout.emplace_back(out.amount, ToScript(out.script));
+        }
+        const CTransaction ctx{mtx};
+        std::vector<unsigned char> raw;
+        VectorWriter ss{raw, 0};
+        ss << TX_WITH_WITNESS(ctx);
+        std::vector<std::byte> bytes(raw.size());
+        std::memcpy(bytes.data(), raw.data(), raw.size());
+        return bytes;
+    }
+} // namespace
 
 constexpr auto VERIFY_ALL_PRE_SEGWIT{ScriptVerificationFlags::P2SH | ScriptVerificationFlags::DERSIG |
                                      ScriptVerificationFlags::NULLDUMMY | ScriptVerificationFlags::CHECKLOCKTIMEVERIFY |
@@ -535,15 +622,15 @@ BOOST_AUTO_TEST_CASE(logging_tests)
     };
 
     logging_set_options(logging_options);
-    logging_set_level_category(LogCategory::BENCH, LogLevel::TRACE_LEVEL);
-    logging_disable_category(LogCategory::BENCH);
-    logging_enable_category(LogCategory::VALIDATION);
-    logging_disable_category(LogCategory::VALIDATION);
+    logging_set_level_category(btck::LogCategory::BENCH, LogLevel::TRACE_LEVEL);
+    logging_disable_category(btck::LogCategory::BENCH);
+    logging_enable_category(btck::LogCategory::VALIDATION);
+    logging_disable_category(btck::LogCategory::VALIDATION);
 
     // Check that connecting, connecting another, and then disconnecting and connecting a logger again works.
     {
-        logging_set_level_category(LogCategory::KERNEL, LogLevel::TRACE_LEVEL);
-        logging_enable_category(LogCategory::KERNEL);
+        logging_set_level_category(btck::LogCategory::KERNEL, LogLevel::TRACE_LEVEL);
+        logging_enable_category(btck::LogCategory::KERNEL);
         Logger logger{std::make_unique<TestLog>()};
         Logger logger_2{std::make_unique<TestLog>()};
     }
@@ -859,8 +946,8 @@ BOOST_AUTO_TEST_CASE(btck_chainman_regtest_tests)
     auto read_block_2 = chainman->ReadBlock(tip_2).value();
     check_equal(read_block_2.ToBytes(), hex_string_to_byte_vec(REGTEST_BLOCK_DATA[REGTEST_BLOCK_DATA.size() - 2]));
 
-    Txid txid = read_block.Transactions()[0].Txid();
-    Txid txid_2 = read_block_2.Transactions()[0].Txid();
+    btck::Txid txid = read_block.Transactions()[0].Txid();
+    btck::Txid txid_2 = read_block_2.Transactions()[0].Txid();
     BOOST_CHECK(txid != txid_2);
     BOOST_CHECK(txid == txid);
     CheckHandle(txid, txid_2);
@@ -972,4 +1059,161 @@ BOOST_AUTO_TEST_CASE(btck_chainman_regtest_tests)
     BOOST_CHECK(!chainman->ReadBlock(tip_2).has_value());
     std::filesystem::remove_all(test_directory.m_directory / "blocks" / "rev00000.dat");
     BOOST_CHECK_THROW(chainman->ReadBlockSpentOutputs(tip), std::runtime_error);
+}
+
+// -----------------------------------------------------------------------------
+// CheckTransaction tests
+// -----------------------------------------------------------------------------
+BOOST_AUTO_TEST_CASE(btck_check_transaction_tests)
+{
+    using namespace btck;
+    constexpr uint32_t SEQ_FINAL = 0xFFFFFFFFu;
+
+    // Common building blocks
+    const auto noncb_prev = fill32(0x11);        // non-null outpoint hash
+    const auto null_hash  = fill32(0x00);        // coinbase outpoint hash
+    const OutputSpec out_zero{0, {}};            // zero-sat empty script output
+    // Consensus MAX_MONEY in satoshis (21,000,000 * 100,000,000).
+    constexpr int64_t MAX_MONEY_SATS = 21'000'000LL * 100'000'000LL;
+
+    // 1) Minimal valid non-coinbase (vin:1 non-null prevout, vout:1, amounts in range)
+    {
+        InputSpec in{noncb_prev, 0, /*scriptSig=*/{}, SEQ_FINAL};
+        Transaction tx{make_legacy_tx({in}, {out_zero})};
+        auto [ok, st] = CheckTransaction(tx);
+        BOOST_CHECK(ok);
+        BOOST_CHECK(st.GetValidationMode() == ValidationMode::VALID);
+        // (CheckTransaction sets result only on invalid path.)
+        BOOST_CHECK(st.GetTxValidationResult() == TxValidationResult::UNSET);
+    }
+
+    // 2) Duplicate inputs -> invalid
+    {
+        InputSpec in{noncb_prev, 0, {}, SEQ_FINAL};
+        // two identical inputs (same prevout)
+        Transaction tx{make_legacy_tx(/*vin=*/{in, in}, /*vout=*/{out_zero})};
+        auto [ok, st] = CheckTransaction(tx);
+        BOOST_CHECK(!ok);
+        BOOST_CHECK(st.GetValidationMode() == ValidationMode::INVALID);
+        BOOST_CHECK(st.GetTxValidationResult() == TxValidationResult::CONSENSUS);
+    }
+
+    // 3) Output with negative value -> invalid
+    {
+        InputSpec in{noncb_prev, 0, {}, SEQ_FINAL};
+        const OutputSpec out_neg{-1, {}}; // serialize as int64_t(-1)
+        Transaction tx{make_legacy_tx(/*vin=*/{in}, /*vout=*/{out_neg})};
+        auto [ok, st] = CheckTransaction(tx);
+        BOOST_CHECK(!ok);
+        BOOST_CHECK(st.GetValidationMode() == ValidationMode::INVALID);
+        BOOST_CHECK(st.GetTxValidationResult() == TxValidationResult::CONSENSUS);
+    }
+
+    // 5) Output with value > MAX_MONEY -> invalid
+    // Use a safely too-large *positive* amount (2^55) which is < 2^63 to avoid sign issues,
+    // but > 21e14 (MAX_MONEY). Amount bytes (LE): 00 00 00 00 00 00 80 00.
+    {
+        InputSpec in{noncb_prev, 0, {}, SEQ_FINAL};
+        const int64_t kTooLarge = static_cast<int64_t>(0x0080000000000000ULL);
+        const OutputSpec out_large{kTooLarge, {}};
+        Transaction tx{make_legacy_tx(/*vin=*/{in}, /*vout=*/{out_large})};
+        auto [ok, st] = CheckTransaction(tx);
+        BOOST_CHECK(!ok);
+        BOOST_CHECK(st.GetValidationMode() == ValidationMode::INVALID);
+        BOOST_CHECK(st.GetTxValidationResult() == TxValidationResult::CONSENSUS);
+    }
+
+    // 5) Coinbase with scriptSig length < 2 -> invalid
+    {
+        // Coinbase input: prevout hash = 0x00..00, index = 0xFFFFFFFF
+        InputSpec cb_in_too_short{null_hash, 0xFFFFFFFFu, std::vector<std::byte>(1, std::byte{0x00}), SEQ_FINAL};
+        Transaction tx{make_legacy_tx(/*vin=*/{cb_in_too_short}, /*vout=*/{out_zero})};
+        auto [ok, st] = CheckTransaction(tx);
+        BOOST_CHECK(!ok);
+        BOOST_CHECK(st.GetValidationMode() == ValidationMode::INVALID);
+        BOOST_CHECK(st.GetTxValidationResult() == TxValidationResult::CONSENSUS);
+    }
+
+    // 6) Coinbase with scriptSig length 2..100 -> valid (use exactly 2)
+    {
+        InputSpec cb_in_ok{null_hash, 0xFFFFFFFFu, std::vector<std::byte>(2, std::byte{0x00}), SEQ_FINAL};
+        Transaction tx{make_legacy_tx(/*vin=*/{cb_in_ok}, /*vout=*/{out_zero})};
+        auto [ok, st] = CheckTransaction(tx);
+        BOOST_CHECK(ok);
+        BOOST_CHECK(st.GetValidationMode() == ValidationMode::VALID);
+        // (CheckTransaction sets result only on invalid path.)
+        BOOST_CHECK(st.GetTxValidationResult() == TxValidationResult::UNSET);
+    }
+
+    // 7) Coinbase with scriptSig length > 100 -> invalid (use 101 bytes)
+    {
+        InputSpec cb_in_too_long{null_hash, 0xFFFFFFFFu, std::vector<std::byte>(101, std::byte{0x00}), SEQ_FINAL};
+        Transaction tx{make_legacy_tx(/*vin=*/{cb_in_too_long}, /*vout=*/{out_zero})};
+        auto [ok, st] = CheckTransaction(tx);
+        BOOST_CHECK(!ok);
+        BOOST_CHECK(st.GetValidationMode() == ValidationMode::INVALID);
+        BOOST_CHECK(st.GetTxValidationResult() == TxValidationResult::CONSENSUS);
+    }
+
+    // 8) vin empty -> invalid
+    {
+        std::vector<std::byte> tx_data = make_legacy_tx(/*vin=*/{}, /*vout=*/{out_zero});
+        auto broken_tx_data{std::span<std::byte>{tx_data.begin(), tx_data.begin()}};
+        BOOST_CHECK_THROW(Transaction{broken_tx_data}, std::runtime_error);
+    }
+    
+    // 9) vout empty -> invalid
+    {
+        InputSpec in{noncb_prev, 0, {}, SEQ_FINAL};
+        std::vector<std::byte> tx_data = make_legacy_tx(/*vin=*/{in}, /*vout=*/{});
+        auto broken_tx_data{std::span<std::byte>{tx_data.begin(), tx_data.begin()}};
+        BOOST_CHECK_THROW(Transaction{broken_tx_data}, std::runtime_error);
+    }
+
+    // 10) Sum of outputs > MAX_MONEY -> invalid (each output individually valid)
+    {
+        InputSpec in{noncb_prev, 0, {}, SEQ_FINAL};
+        // (MAX_MONEY - 1) + 2 = MAX_MONEY + 1
+        const OutputSpec out1{MAX_MONEY_SATS - 1, {}};
+        const OutputSpec out2{2, {}};
+        Transaction tx{make_legacy_tx(/*vin=*/{in}, /*vout=*/{out1, out2})};
+        auto [ok, st] = CheckTransaction(tx);
+        BOOST_CHECK(!ok);
+        BOOST_CHECK(st.GetValidationMode() == ValidationMode::INVALID);
+        BOOST_CHECK(st.GetTxValidationResult() == TxValidationResult::CONSENSUS);
+    }
+
+    // 10) Sum of outputs == MAX_MONEY -> valid (sanity)
+    {
+        InputSpec in{noncb_prev, 0, {}, SEQ_FINAL};
+        const OutputSpec out1{MAX_MONEY_SATS / 2, {}};
+        const OutputSpec out2{MAX_MONEY_SATS - (MAX_MONEY_SATS / 2), {}};
+        Transaction tx{make_legacy_tx(/*vin=*/{in}, /*vout=*/{out1, out2})};
+        auto [ok, st] = CheckTransaction(tx);
+        BOOST_CHECK(ok);
+        BOOST_CHECK(st.GetValidationMode() == ValidationMode::VALID);
+        BOOST_CHECK(st.GetTxValidationResult() == TxValidationResult::UNSET);
+    }
+
+    // 12) Non-coinbase with a null prevout anywhere -> invalid
+    // (Two inputs -> tx is NOT coinbase; the null prevout is forbidden.)
+    {
+        InputSpec nullprev_in{null_hash, 0xFFFFFFFFu, {}, SEQ_FINAL};
+        InputSpec good_in{noncb_prev, 0, {}, SEQ_FINAL};
+        Transaction tx{make_legacy_tx(/*vin=*/{nullprev_in, good_in}, /*vout=*/{out_zero})};
+        auto [ok, st] = CheckTransaction(tx);
+        BOOST_CHECK(!ok);
+        BOOST_CHECK(st.GetValidationMode() == ValidationMode::INVALID);
+        BOOST_CHECK(st.GetTxValidationResult() == TxValidationResult::CONSENSUS);
+    }
+
+    // 13) Non-coinbase with tiny scriptSig -> still valid (scriptSig size is not constrained here)
+    {
+        InputSpec in{noncb_prev, 0, /*scriptSig=*/{std::byte{0x00}}, SEQ_FINAL};
+        Transaction tx{make_legacy_tx(/*vin=*/{in}, /*vout=*/{out_zero})};
+        auto [ok, st] = CheckTransaction(tx);
+        BOOST_CHECK(ok);
+        BOOST_CHECK(st.GetValidationMode() == ValidationMode::VALID);
+        BOOST_CHECK(st.GetTxValidationResult() == TxValidationResult::UNSET);
+    }
 }
