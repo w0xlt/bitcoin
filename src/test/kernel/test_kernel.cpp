@@ -1076,15 +1076,25 @@ BOOST_AUTO_TEST_CASE(btck_check_transaction_tests)
     // Consensus MAX_MONEY in satoshis (21,000,000 * 100,000,000).
     constexpr int64_t MAX_MONEY_SATS = 21'000'000LL * 100'000'000LL;
 
+    auto expect_invalid_consensus = [](const Transaction& tx) {
+        auto [ok, st] = CheckTransaction(tx);
+        BOOST_CHECK(!ok);
+        BOOST_CHECK(st.GetValidationMode() == ValidationMode::INVALID);
+        BOOST_CHECK(st.GetTxValidationResult() == TxValidationResult::CONSENSUS);
+    };
+    
+    auto expect_valid = [](const Transaction& tx) {
+        auto [ok, st] = CheckTransaction(tx);
+        BOOST_CHECK(ok);
+        BOOST_CHECK(st.GetValidationMode() == ValidationMode::VALID);
+        BOOST_CHECK(st.GetTxValidationResult() == TxValidationResult::UNSET);
+    };
+
     // 1) Minimal valid non-coinbase (vin:1 non-null prevout, vout:1, amounts in range)
     {
         InputSpec in{noncb_prev, 0, /*scriptSig=*/{}, SEQ_FINAL};
         Transaction tx{make_legacy_tx({in}, {out_zero})};
-        auto [ok, st] = CheckTransaction(tx);
-        BOOST_CHECK(ok);
-        BOOST_CHECK(st.GetValidationMode() == ValidationMode::VALID);
-        // (CheckTransaction sets result only on invalid path.)
-        BOOST_CHECK(st.GetTxValidationResult() == TxValidationResult::UNSET);
+        expect_valid(tx);
     }
 
     // 2) Duplicate inputs -> invalid
@@ -1092,10 +1102,7 @@ BOOST_AUTO_TEST_CASE(btck_check_transaction_tests)
         InputSpec in{noncb_prev, 0, {}, SEQ_FINAL};
         // two identical inputs (same prevout)
         Transaction tx{make_legacy_tx(/*vin=*/{in, in}, /*vout=*/{out_zero})};
-        auto [ok, st] = CheckTransaction(tx);
-        BOOST_CHECK(!ok);
-        BOOST_CHECK(st.GetValidationMode() == ValidationMode::INVALID);
-        BOOST_CHECK(st.GetTxValidationResult() == TxValidationResult::CONSENSUS);
+        expect_invalid_consensus(tx);
     }
 
     // 3) Output with negative value -> invalid
@@ -1103,56 +1110,36 @@ BOOST_AUTO_TEST_CASE(btck_check_transaction_tests)
         InputSpec in{noncb_prev, 0, {}, SEQ_FINAL};
         const OutputSpec out_neg{-1, {}}; // serialize as int64_t(-1)
         Transaction tx{make_legacy_tx(/*vin=*/{in}, /*vout=*/{out_neg})};
-        auto [ok, st] = CheckTransaction(tx);
-        BOOST_CHECK(!ok);
-        BOOST_CHECK(st.GetValidationMode() == ValidationMode::INVALID);
-        BOOST_CHECK(st.GetTxValidationResult() == TxValidationResult::CONSENSUS);
+        expect_invalid_consensus(tx);
     }
 
-    // 5) Output with value > MAX_MONEY -> invalid
-    // Use a safely too-large *positive* amount (2^55) which is < 2^63 to avoid sign issues,
-    // but > 21e14 (MAX_MONEY). Amount bytes (LE): 00 00 00 00 00 00 80 00.
-    {
-        InputSpec in{noncb_prev, 0, {}, SEQ_FINAL};
-        const int64_t kTooLarge = static_cast<int64_t>(0x0080000000000000ULL);
-        const OutputSpec out_large{kTooLarge, {}};
-        Transaction tx{make_legacy_tx(/*vin=*/{in}, /*vout=*/{out_large})};
-        auto [ok, st] = CheckTransaction(tx);
-        BOOST_CHECK(!ok);
-        BOOST_CHECK(st.GetValidationMode() == ValidationMode::INVALID);
-        BOOST_CHECK(st.GetTxValidationResult() == TxValidationResult::CONSENSUS);
-    }
-
-    // 5) Coinbase with scriptSig length < 2 -> invalid
+    // 4) Coinbase with scriptSig length < 2 -> invalid
     {
         // Coinbase input: prevout hash = 0x00..00, index = 0xFFFFFFFF
         InputSpec cb_in_too_short{null_hash, 0xFFFFFFFFu, std::vector<std::byte>(1, std::byte{0x00}), SEQ_FINAL};
         Transaction tx{make_legacy_tx(/*vin=*/{cb_in_too_short}, /*vout=*/{out_zero})};
-        auto [ok, st] = CheckTransaction(tx);
-        BOOST_CHECK(!ok);
-        BOOST_CHECK(st.GetValidationMode() == ValidationMode::INVALID);
-        BOOST_CHECK(st.GetTxValidationResult() == TxValidationResult::CONSENSUS);
+        expect_invalid_consensus(tx);
     }
 
-    // 6) Coinbase with scriptSig length 2..100 -> valid (use exactly 2)
+    // 5) Coinbase with scriptSig length 2..100 -> valid (use exactly 2)
     {
         InputSpec cb_in_ok{null_hash, 0xFFFFFFFFu, std::vector<std::byte>(2, std::byte{0x00}), SEQ_FINAL};
         Transaction tx{make_legacy_tx(/*vin=*/{cb_in_ok}, /*vout=*/{out_zero})};
-        auto [ok, st] = CheckTransaction(tx);
-        BOOST_CHECK(ok);
-        BOOST_CHECK(st.GetValidationMode() == ValidationMode::VALID);
-        // (CheckTransaction sets result only on invalid path.)
-        BOOST_CHECK(st.GetTxValidationResult() == TxValidationResult::UNSET);
+        expect_valid(tx);
+    }
+
+    // 6) Coinbase with scriptSig length == 100 -> valid
+    {
+        InputSpec cb_in_100{null_hash, 0xFFFFFFFFu, std::vector<std::byte>(100, std::byte{0x00}), SEQ_FINAL};
+        Transaction tx{make_legacy_tx({cb_in_100}, {out_zero})};
+        expect_valid(tx);
     }
 
     // 7) Coinbase with scriptSig length > 100 -> invalid (use 101 bytes)
     {
         InputSpec cb_in_too_long{null_hash, 0xFFFFFFFFu, std::vector<std::byte>(101, std::byte{0x00}), SEQ_FINAL};
         Transaction tx{make_legacy_tx(/*vin=*/{cb_in_too_long}, /*vout=*/{out_zero})};
-        auto [ok, st] = CheckTransaction(tx);
-        BOOST_CHECK(!ok);
-        BOOST_CHECK(st.GetValidationMode() == ValidationMode::INVALID);
-        BOOST_CHECK(st.GetTxValidationResult() == TxValidationResult::CONSENSUS);
+        expect_invalid_consensus(tx);
     }
 
     // 8) vin empty -> invalid
@@ -1170,50 +1157,39 @@ BOOST_AUTO_TEST_CASE(btck_check_transaction_tests)
         BOOST_CHECK_THROW(Transaction{broken_tx_data}, std::runtime_error);
     }
 
-    // 10) Sum of outputs > MAX_MONEY -> invalid (each output individually valid)
+    // 10) Output with value > MAX_MONEY -> invalid
+    {
+        InputSpec in{noncb_prev, 0, {}, SEQ_FINAL};
+        const OutputSpec out_large{MAX_MONEY_SATS + 1, {}};
+        Transaction tx{make_legacy_tx(/*vin=*/{in}, /*vout=*/{out_large})};
+        expect_invalid_consensus(tx);
+    }
+
+    // 11) Sum of outputs > MAX_MONEY -> invalid (each output individually valid)
     {
         InputSpec in{noncb_prev, 0, {}, SEQ_FINAL};
         // (MAX_MONEY - 1) + 2 = MAX_MONEY + 1
         const OutputSpec out1{MAX_MONEY_SATS - 1, {}};
         const OutputSpec out2{2, {}};
         Transaction tx{make_legacy_tx(/*vin=*/{in}, /*vout=*/{out1, out2})};
-        auto [ok, st] = CheckTransaction(tx);
-        BOOST_CHECK(!ok);
-        BOOST_CHECK(st.GetValidationMode() == ValidationMode::INVALID);
-        BOOST_CHECK(st.GetTxValidationResult() == TxValidationResult::CONSENSUS);
+        expect_invalid_consensus(tx);
     }
 
-    // 10) Sum of outputs == MAX_MONEY -> valid (sanity)
+    // 12) Sum of outputs == MAX_MONEY -> valid (sanity)
     {
         InputSpec in{noncb_prev, 0, {}, SEQ_FINAL};
         const OutputSpec out1{MAX_MONEY_SATS / 2, {}};
         const OutputSpec out2{MAX_MONEY_SATS - (MAX_MONEY_SATS / 2), {}};
         Transaction tx{make_legacy_tx(/*vin=*/{in}, /*vout=*/{out1, out2})};
-        auto [ok, st] = CheckTransaction(tx);
-        BOOST_CHECK(ok);
-        BOOST_CHECK(st.GetValidationMode() == ValidationMode::VALID);
-        BOOST_CHECK(st.GetTxValidationResult() == TxValidationResult::UNSET);
+        expect_valid(tx);
     }
 
-    // 12) Non-coinbase with a null prevout anywhere -> invalid
+    // 13) Non-coinbase with a null prevout anywhere -> invalid
     // (Two inputs -> tx is NOT coinbase; the null prevout is forbidden.)
     {
         InputSpec nullprev_in{null_hash, 0xFFFFFFFFu, {}, SEQ_FINAL};
         InputSpec good_in{noncb_prev, 0, {}, SEQ_FINAL};
         Transaction tx{make_legacy_tx(/*vin=*/{nullprev_in, good_in}, /*vout=*/{out_zero})};
-        auto [ok, st] = CheckTransaction(tx);
-        BOOST_CHECK(!ok);
-        BOOST_CHECK(st.GetValidationMode() == ValidationMode::INVALID);
-        BOOST_CHECK(st.GetTxValidationResult() == TxValidationResult::CONSENSUS);
-    }
-
-    // 13) Non-coinbase with tiny scriptSig -> still valid (scriptSig size is not constrained here)
-    {
-        InputSpec in{noncb_prev, 0, /*scriptSig=*/{std::byte{0x00}}, SEQ_FINAL};
-        Transaction tx{make_legacy_tx(/*vin=*/{in}, /*vout=*/{out_zero})};
-        auto [ok, st] = CheckTransaction(tx);
-        BOOST_CHECK(ok);
-        BOOST_CHECK(st.GetValidationMode() == ValidationMode::VALID);
-        BOOST_CHECK(st.GetTxValidationResult() == TxValidationResult::UNSET);
+        expect_invalid_consensus(tx);
     }
 }
