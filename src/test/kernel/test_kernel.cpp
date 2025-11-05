@@ -17,14 +17,6 @@
 #include <format>
 #include <iostream>
 #include <memory>
-#include <algorithm>
-#include <cstring>
-
-// Build txs with Core types, then serialize once.
-#include <primitives/transaction.h>
-#include <script/script.h>
-#include <streams.h>
-#include <uint256.h>
 #include <optional>
 #include <random>
 #include <ranges>
@@ -88,7 +80,49 @@ std::string byte_span_to_hex_string_reversed(std::span<const std::byte> bytes)
 // Helpers to build raw legacy (non-witness) transactions for CheckTransaction tests
 // -----------------------------------------------------------------------------
 namespace {
-    
+    inline void append_u16(std::vector<std::byte>& out, uint16_t v)
+    {
+        out.push_back(static_cast<std::byte>(v & 0xFF));
+        out.push_back(static_cast<std::byte>((v >> 8) & 0xFF));
+    }
+    inline void append_u32(std::vector<std::byte>& out, uint32_t v)
+    {
+        for (int i = 0; i < 4; ++i) {
+            out.push_back(static_cast<std::byte>(v & 0xFF));
+            v >>= 8;
+        }
+    }
+    inline void append_u64(std::vector<std::byte>& out, uint64_t v)
+    {
+        for (int i = 0; i < 8; ++i) {
+            out.push_back(static_cast<std::byte>(v & 0xFF));
+            v >>= 8;
+        }
+    }
+    inline void append_i64(std::vector<std::byte>& out, int64_t v)
+    {
+        // Serialize signed 64-bit little-endian (as Bitcoin tx amounts are CAmount/int64)
+        for (int i = 0; i < 8; ++i) {
+            out.push_back(static_cast<std::byte>(static_cast<uint8_t>(v & 0xFF)));
+            v >>= 8;
+        }
+    }
+    inline void append_varint(std::vector<std::byte>& out, uint64_t n)
+    {
+        if (n < 0xFD) {
+            out.push_back(static_cast<std::byte>(n));
+        } else if (n <= 0xFFFF) {
+            out.push_back(std::byte{0xFD});
+            append_u16(out, static_cast<uint16_t>(n));
+        } else if (n <= 0xFFFFFFFFULL) {
+            out.push_back(std::byte{0xFE});
+            append_u32(out, static_cast<uint32_t>(n));
+        } else {
+            out.push_back(std::byte{0xFF});
+            append_u64(out, n);
+        }
+    }
+
     struct InputSpec {
         std::array<std::byte, 32> prev_hash; // little-endian txid bytes
         uint32_t index;                      // vout
@@ -108,57 +142,32 @@ namespace {
         return a;
     }
 
-    inline bool is_zero32(const std::array<std::byte,32>& a)
-    {
-        return std::all_of(a.begin(), a.end(), [](std::byte b){ return b == std::byte{0}; });
-    }
-
-    inline uint256 U256FromLE(const std::array<std::byte,32>& le)
-    {
-        uint256 x;
-        std::memcpy(x.begin(), le.data(), 32); // base_blob storage is little-endian
-        return x;
-    }
-
-    inline CScript ToScript(std::span<const std::byte> s)
-    {
-        const unsigned char* p = reinterpret_cast<const unsigned char*>(s.data());
-        return CScript(p, p + s.size());
-    }
-
     std::vector<std::byte> make_legacy_tx(
         const std::vector<InputSpec>& vin,
         const std::vector<OutputSpec>& vout,
         uint32_t version = 2,
         uint32_t locktime = 0)
     {
-        CMutableTransaction mtx;
-        mtx.version = static_cast<int32_t>(version);
-        mtx.nLockTime = locktime;
-        mtx.vin.reserve(vin.size());
+        std::vector<std::byte> tx;
+        tx.reserve(10 + vin.size() * 48 + vout.size() * 34); // rough reservation
+
+        append_u32(tx, version);
+        append_varint(tx, vin.size());
         for (const auto& in : vin) {
-            CTxIn txin;
-            if (is_zero32(in.prev_hash) && in.index == std::numeric_limits<uint32_t>::max()) {
-                txin.prevout.SetNull();                   // coinbase marker
-            } else {
-                auto txid = ::Txid::FromUint256(U256FromLE(in.prev_hash));
-                txin.prevout = COutPoint(txid, in.index);
-            }
-            txin.scriptSig = ToScript(in.script);
-            txin.nSequence = in.sequence;
-            mtx.vin.push_back(std::move(txin));
+            tx.insert(tx.end(), in.prev_hash.begin(), in.prev_hash.end());
+            append_u32(tx, in.index);
+            append_varint(tx, in.script.size());
+            tx.insert(tx.end(), in.script.begin(), in.script.end());
+            append_u32(tx, in.sequence);
         }
-        mtx.vout.reserve(vout.size());
+        append_varint(tx, vout.size());
         for (const auto& out : vout) {
-            mtx.vout.emplace_back(out.amount, ToScript(out.script));
+            append_i64(tx, out.amount);
+            append_varint(tx, out.script.size());
+            tx.insert(tx.end(), out.script.begin(), out.script.end());
         }
-        const CTransaction ctx{mtx};
-        std::vector<unsigned char> raw;
-        VectorWriter ss{raw, 0};
-        ss << TX_WITH_WITNESS(ctx);
-        std::vector<std::byte> bytes(raw.size());
-        std::memcpy(bytes.data(), raw.data(), raw.size());
-        return bytes;
+        append_u32(tx, locktime);
+        return tx;
     }
 } // namespace
 
