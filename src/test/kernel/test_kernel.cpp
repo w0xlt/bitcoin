@@ -1073,8 +1073,6 @@ BOOST_AUTO_TEST_CASE(btck_check_transaction_tests)
     const auto noncb_prev = fill32(0x11);        // non-null outpoint hash
     const auto null_hash  = fill32(0x00);        // coinbase outpoint hash
     const OutputSpec out_zero{0, {}};            // zero-sat empty script output
-    // Consensus MAX_MONEY in satoshis (21,000,000 * 100,000,000).
-    constexpr int64_t MAX_MONEY_SATS = 21'000'000LL * 100'000'000LL;
 
     auto expect_invalid_consensus = [](const Transaction& tx) {
         auto [ok, st] = CheckTransaction(tx);
@@ -1097,99 +1095,98 @@ BOOST_AUTO_TEST_CASE(btck_check_transaction_tests)
         expect_valid(tx);
     }
 
-    // 2) Duplicate inputs -> invalid
-    {
-        InputSpec in{noncb_prev, 0, {}, SEQ_FINAL};
-        // two identical inputs (same prevout)
-        Transaction tx{make_legacy_tx(/*vin=*/{in, in}, /*vout=*/{out_zero})};
-        expect_invalid_consensus(tx);
+    {    
+        struct Case { size_t len; bool expect_ok; };
+        for (const Case c : std::initializer_list<Case>{
+            {1,false}, // 2) Coinbase with scriptSig length < 2 -> invalid
+            {2,true},  // 3) Coinbase with scriptSig length 2..100 -> valid (use exactly 2)
+            {100,true}, // 4) Coinbase with scriptSig length == 100 -> valid
+            {101,false}} // 5) Coinbase with scriptSig length > 100 -> invalid (use 101 bytes)
+        ) {
+            InputSpec cb_in{null_hash, 0xFFFFFFFFu, std::vector<std::byte>(c.len, std::byte{0x00}), SEQ_FINAL};
+            Transaction tx{make_legacy_tx(/*vin=*/{cb_in}, /*vout=*/{out_zero})};
+    
+            BOOST_TEST_CONTEXT("coinbase_scriptSig_len=" << c.len) {
+                if (c.expect_ok) {
+                    expect_valid(tx);
+                } else {
+                    expect_invalid_consensus(tx);
+                }
+            }
+        }
     }
 
-    // 3) Output with negative value -> invalid
+    // 6) vin empty -> invalid
     {
-        InputSpec in{noncb_prev, 0, {}, SEQ_FINAL};
-        const OutputSpec out_neg{-1, {}}; // serialize as int64_t(-1)
-        Transaction tx{make_legacy_tx(/*vin=*/{in}, /*vout=*/{out_neg})};
-        expect_invalid_consensus(tx);
-    }
-
-    // 4) Coinbase with scriptSig length < 2 -> invalid
-    {
-        // Coinbase input: prevout hash = 0x00..00, index = 0xFFFFFFFF
-        InputSpec cb_in_too_short{null_hash, 0xFFFFFFFFu, std::vector<std::byte>(1, std::byte{0x00}), SEQ_FINAL};
-        Transaction tx{make_legacy_tx(/*vin=*/{cb_in_too_short}, /*vout=*/{out_zero})};
-        expect_invalid_consensus(tx);
-    }
-
-    // 5) Coinbase with scriptSig length 2..100 -> valid (use exactly 2)
-    {
-        InputSpec cb_in_ok{null_hash, 0xFFFFFFFFu, std::vector<std::byte>(2, std::byte{0x00}), SEQ_FINAL};
-        Transaction tx{make_legacy_tx(/*vin=*/{cb_in_ok}, /*vout=*/{out_zero})};
-        expect_valid(tx);
-    }
-
-    // 6) Coinbase with scriptSig length == 100 -> valid
-    {
-        InputSpec cb_in_100{null_hash, 0xFFFFFFFFu, std::vector<std::byte>(100, std::byte{0x00}), SEQ_FINAL};
-        Transaction tx{make_legacy_tx({cb_in_100}, {out_zero})};
-        expect_valid(tx);
-    }
-
-    // 7) Coinbase with scriptSig length > 100 -> invalid (use 101 bytes)
-    {
-        InputSpec cb_in_too_long{null_hash, 0xFFFFFFFFu, std::vector<std::byte>(101, std::byte{0x00}), SEQ_FINAL};
-        Transaction tx{make_legacy_tx(/*vin=*/{cb_in_too_long}, /*vout=*/{out_zero})};
-        expect_invalid_consensus(tx);
-    }
-
-    // 8) vin empty -> invalid
-    {
-        std::vector<std::byte> tx_data = make_legacy_tx(/*vin=*/{}, /*vout=*/{out_zero});
-        auto broken_tx_data{std::span<std::byte>{tx_data.begin(), tx_data.begin()}};
+        std::vector<std::byte> broken_tx_data = make_legacy_tx(/*vin=*/{}, /*vout=*/{out_zero});
         BOOST_CHECK_THROW(Transaction{broken_tx_data}, std::runtime_error);
     }
     
-    // 9) vout empty -> invalid
+    // 7) vout empty -> invalid
     {
         InputSpec in{noncb_prev, 0, {}, SEQ_FINAL};
-        std::vector<std::byte> tx_data = make_legacy_tx(/*vin=*/{in}, /*vout=*/{});
-        auto broken_tx_data{std::span<std::byte>{tx_data.begin(), tx_data.begin()}};
-        BOOST_CHECK_THROW(Transaction{broken_tx_data}, std::runtime_error);
-    }
-
-    // 10) Output with value > MAX_MONEY -> invalid
-    {
-        InputSpec in{noncb_prev, 0, {}, SEQ_FINAL};
-        const OutputSpec out_large{MAX_MONEY_SATS + 1, {}};
-        Transaction tx{make_legacy_tx(/*vin=*/{in}, /*vout=*/{out_large})};
+        std::vector<std::byte> broken_tx_data = make_legacy_tx(/*vin=*/{in}, /*vout=*/{});
+        Transaction tx{broken_tx_data};
         expect_invalid_consensus(tx);
     }
 
-    // 11) Sum of outputs > MAX_MONEY -> invalid (each output individually valid)
+    // Money range tests
     {
-        InputSpec in{noncb_prev, 0, {}, SEQ_FINAL};
-        // (MAX_MONEY - 1) + 2 = MAX_MONEY + 1
-        const OutputSpec out1{MAX_MONEY_SATS - 1, {}};
-        const OutputSpec out2{2, {}};
-        Transaction tx{make_legacy_tx(/*vin=*/{in}, /*vout=*/{out1, out2})};
-        expect_invalid_consensus(tx);
+        // Consensus MAX_MONEY in satoshis (21,000,000 * 100,000,000).
+        constexpr int64_t MAX_MONEY_SATS = 21'000'000LL * 100'000'000LL;
+    
+        struct MoneyCase {
+            std::vector<OutputSpec> vout;
+            bool expect_ok;
+            const char* label;
+        };
+    
+        const std::vector<MoneyCase> cases = {
+            // 8) negative output value -> invalid
+            { { OutputSpec{-1, {}} }, false, "negative_output_value" },
+    
+            // 9) one output over MAX_MONEY -> invalid
+            { { OutputSpec{MAX_MONEY_SATS + 1, {}} }, false, "one_output_over_max" },
+    
+            // 10) sum of outputs over MAX_MONEY -> invalid
+            { { OutputSpec{MAX_MONEY_SATS - 1, {}}, OutputSpec{2, {}} }, false, "sum_over_max" },
+    
+            // 11) sum of outputs equals MAX_MONEY -> valid
+            { { OutputSpec{MAX_MONEY_SATS / 2, {}},
+                OutputSpec{MAX_MONEY_SATS - (MAX_MONEY_SATS / 2), {}} }, true, "sum_equal_max" },
+        };
+    
+        for (const auto& c : cases) {
+            InputSpec in{noncb_prev, 0, /*scriptSig=*/{}, SEQ_FINAL};
+            Transaction tx{make_legacy_tx(/*vin=*/{in}, /*vout=*/c.vout)};
+    
+            BOOST_TEST_CONTEXT("money_case=" << c.label) {
+                if (c.expect_ok) {
+                    expect_valid(tx);
+                } else {
+                    expect_invalid_consensus(tx);
+                }
+            }
+        }
     }
 
-    // 12) Sum of outputs == MAX_MONEY -> valid (sanity)
+    // Additional invalid cases
     {
         InputSpec in{noncb_prev, 0, {}, SEQ_FINAL};
-        const OutputSpec out1{MAX_MONEY_SATS / 2, {}};
-        const OutputSpec out2{MAX_MONEY_SATS - (MAX_MONEY_SATS / 2), {}};
-        Transaction tx{make_legacy_tx(/*vin=*/{in}, /*vout=*/{out1, out2})};
-        expect_valid(tx);
-    }
-
-    // 13) Non-coinbase with a null prevout anywhere -> invalid
-    // (Two inputs -> tx is NOT coinbase; the null prevout is forbidden.)
-    {
         InputSpec nullprev_in{null_hash, 0xFFFFFFFFu, {}, SEQ_FINAL};
-        InputSpec good_in{noncb_prev, 0, {}, SEQ_FINAL};
-        Transaction tx{make_legacy_tx(/*vin=*/{nullprev_in, good_in}, /*vout=*/{out_zero})};
-        expect_invalid_consensus(tx);
+
+        std::vector<std::pair<std::vector<InputSpec>, const char*>> cases = {
+            // 12) Duplicate inputs -> invalid
+            { {in, in},              "duplicate_input" },  
+            // 13) Non-coinbase with a null prevout anywhere -> invalid
+            // (Two inputs -> tx is NOT coinbase; the null prevout is forbidden.)
+            { {nullprev_in, in},     "null_prevout_in_non_coinbase" },
+        };
+
+        for (auto& [vin, label] : cases) {
+            Transaction tx{make_legacy_tx(vin, {out_zero})};
+            BOOST_TEST_CONTEXT(label) { expect_invalid_consensus(tx); }
+        }
     }
+    
 }
