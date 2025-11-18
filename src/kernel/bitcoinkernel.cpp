@@ -1256,3 +1256,64 @@ int btck_chain_contains(const btck_Chain* chain, const btck_BlockTreeEntry* entr
     LOCK(::cs_main);
     return btck_Chain::get(chain).Contains(&btck_BlockTreeEntry::get(entry)) ? 1 : 0;
 }
+
+namespace {
+    static inline uint8_t ToBtckMode(const BlockValidationState& st)
+    {
+        if (st.IsValid())   return btck_ValidationMode_VALID;
+        if (st.IsInvalid()) return btck_ValidationMode_INVALID;
+        return btck_ValidationMode_INTERNAL_ERROR;
+    }
+
+    static inline uint32_t ToBtckReason(const BlockValidationState& st)
+    {
+        using R = BlockValidationResult;
+        switch (st.GetResult()) {
+            case R::BLOCK_RESULT_UNSET:      return btck_BlockValidationResult_UNSET;
+            case R::BLOCK_CONSENSUS:         return btck_BlockValidationResult_CONSENSUS;
+            case R::BLOCK_CACHED_INVALID:    return btck_BlockValidationResult_CACHED_INVALID;
+            case R::BLOCK_INVALID_HEADER:    return btck_BlockValidationResult_INVALID_HEADER;
+            case R::BLOCK_MUTATED:           return btck_BlockValidationResult_MUTATED;
+            case R::BLOCK_MISSING_PREV:      return btck_BlockValidationResult_MISSING_PREV;
+            case R::BLOCK_INVALID_PREV:      return btck_BlockValidationResult_INVALID_PREV;
+            case R::BLOCK_TIME_FUTURE:       return btck_BlockValidationResult_TIME_FUTURE;
+            case R::BLOCK_HEADER_LOW_WORK:   return btck_BlockValidationResult_HEADER_LOW_WORK;
+        }
+        return btck_BlockValidationResult_UNSET;
+    }
+}
+
+int btck_check_block_context_free(
+    const btck_Context* ctx,
+    const btck_Block* block,
+    unsigned flags,
+    uint8_t* out_mode,
+    uint32_t* out_reason)
+{
+    if (out_mode)   *out_mode   = btck_ValidationMode_INTERNAL_ERROR;
+    if (out_reason) *out_reason = btck_BlockValidationResult_UNSET;
+    if (!ctx || !block) return -1;
+
+    try {
+        auto cblock = btck_Block::get(block);
+        const Consensus::Params& consensus = btck_Context::get(ctx)->m_chainparams->GetConsensus();
+
+        BlockValidationState st;
+
+        // Block body structural checks (can toggle merkle recheck)
+        const bool check_pow_again      = (flags & BTCK_SANITY_CHECK_POW) != 0;
+        const bool check_merkle         = (flags & BTCK_SANITY_CHECK_MERKLE) != 0;
+        if (!CheckBlock(*cblock.get(), st, consensus, /*fCheckPOW=*/check_pow_again, /*fCheckMerkleRoot=*/check_merkle)) {
+            if (out_mode)   *out_mode   = ToBtckMode(st);
+            if (out_reason) *out_reason = ToBtckReason(st);
+            return 0;
+        }
+
+        if (out_mode)   *out_mode   = btck_ValidationMode_VALID;
+        if (out_reason) *out_reason = btck_BlockValidationResult_UNSET;
+        return 0;
+    } catch (...) {
+        return -1; // internal error
+    }
+}
+

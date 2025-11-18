@@ -1547,6 +1547,37 @@ BITCOINKERNEL_API void btck_block_hash_to_bytes(
  */
 BITCOINKERNEL_API void btck_block_hash_destroy(btck_BlockHash* block_hash);
 
+/** Bitflags to control context-free checks (optional). */
+#define BTCK_SANITY_CHECK_POW     0x01  /* run CheckProofOfWork via CheckBlockHeader */
+#define BTCK_SANITY_CHECK_MERKLE  0x02  /* verify merkle root (and mutation detection) */
+#define BTCK_SANITY_CHECK_ALL     (BTCK_SANITY_CHECK_POW | BTCK_SANITY_CHECK_MERKLE)
+
+/**
+ * Context-free validation for a full block.
+ *
+ * Performs Bitcoin Core's context-free checks:
+ *   - CheckBlock(...): size/weight, coinbase-only rules, per-tx context-free checks,
+ *                      merkle root & mutation detection (if flags include MERKLE)
+ *
+ * This function does NOT:
+ *   - access the UTXO set or mempool;
+ *   - touch the block index, store anything on disk, or update chainstate;
+ *   - perform height/time dependent checks (no ContextualCheck*).
+ *
+ * @param ctx        A btck_Context created with chain parameters set (used to fetch consensus params).
+ * @param block      Parsed block object created with btck_block_create(...).
+ * @param flags      BTCK_SANITY_CHECK_* bitmask; use BTCK_SANITY_CHECK_ALL for full context-free checks.
+ * @param out_mode   (optional) btck_ValidationMode_* result (VALID/INVALID/INTERNAL_ERROR).
+ * @param out_reason (optional) btck_BlockValidationResult_* reason (UNSET/CONSENSUS/INVALID_HEADER/MUTATED/...).
+ * @return 0 if the function executed (regardless of validity); -1 on internal error (bad args, exceptions).
+ */
+int btck_check_block_context_free(
+    const btck_Context* ctx,
+    const btck_Block* block,
+    unsigned flags,
+    uint8_t* out_mode,
+    uint32_t* out_reason);
+
 ///@}
 
 #ifdef __cplusplus
