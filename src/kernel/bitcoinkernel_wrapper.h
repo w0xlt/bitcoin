@@ -773,8 +773,7 @@ public:
         BlockCheckFlags flags,
         BlockValidationState& state) const
     {
-        auto raw_state = reinterpret_cast<btck_BlockValidationState*>(const_cast<BlockValidationState*>(&state));
-        return btck_block_check(get(), consensus_params.get(), static_cast<btck_BlockCheckFlags>(flags), raw_state) == 1;
+        return btck_block_check(get(), consensus_params.get(), static_cast<btck_BlockCheckFlags>(flags), state.get()) == 1;
     }
 
     MAKE_RANGE_METHOD(Transactions, Block, &Block::CountTransactions, &Block::GetTransaction, *this)
