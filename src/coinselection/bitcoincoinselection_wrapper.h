@@ -5,544 +5,416 @@
 #ifndef BITCOIN_COINSELECTION_BITCOINCOINSELECTION_WRAPPER_H
 #define BITCOIN_COINSELECTION_BITCOINCOINSELECTION_WRAPPER_H
 
-#include <coinselection/bitcoincoinselection.h>
+/**
+ * @file bitcoincoinselection_wrapper.h
+ * @brief C++ API for Bitcoin Core coin selection algorithms
+ *
+ * This header provides a clean C++ interface that directly uses Bitcoin Core
+ * types (wallet::OutputGroup, wallet::SelectionResult) with RAII wrappers
+ * for convenient resource management.
+ *
+ * For C bindings or FFI, use bitcoincoinselection.h instead.
+ */
+
+#include <consensus/amount.h>
+#include <policy/feerate.h>
+#include <policy/policy.h>
+#include <primitives/transaction.h>
+#include <random.h>
+#include <uint256.h>
+#include <util/result.h>
+#include <wallet/coinselection.h>
 
 #include <array>
-#include <cstdint>
 #include <memory>
 #include <optional>
-#include <span>
 #include <stdexcept>
 #include <string>
 #include <vector>
 
 namespace btccs {
 
-// Type alias for amounts (satoshis)
-using Amount = btccs_Amount;
+// ==========================================================================
+// Type Aliases - Use Bitcoin Core types directly
+// ==========================================================================
 
-// Enums wrapping C enum types
-enum class SelectionStatus : btccs_SelectionStatus {
-    SUCCESS = btccs_SelectionStatus_SUCCESS,
-    INSUFFICIENT_FUNDS = btccs_SelectionStatus_INSUFFICIENT_FUNDS,
-    MAX_WEIGHT_EXCEEDED = btccs_SelectionStatus_MAX_WEIGHT_EXCEEDED,
-    NO_SOLUTION_FOUND = btccs_SelectionStatus_NO_SOLUTION_FOUND,
-    INVALID_PARAMETER = btccs_SelectionStatus_INVALID_PARAMETER,
-    INTERNAL_ERROR = btccs_SelectionStatus_INTERNAL_ERROR
+using Amount = CAmount;
+using FeeRate = CFeeRate;
+
+// Re-export Bitcoin Core wallet types for convenience
+using COutput = wallet::COutput;
+using OutputGroup = wallet::OutputGroup;
+using SelectionResult = wallet::SelectionResult;
+
+// ==========================================================================
+// Enums
+// ==========================================================================
+
+enum class SelectionStatus : uint8_t {
+    SUCCESS = 0,
+    INSUFFICIENT_FUNDS = 1,
+    MAX_WEIGHT_EXCEEDED = 2,
+    NO_SOLUTION_FOUND = 3,
+    INVALID_PARAMETER = 4,
+    INTERNAL_ERROR = 5
 };
 
-enum class SelectionAlgorithm : btccs_SelectionAlgorithm {
-    BNB = btccs_SelectionAlgorithm_BNB,
-    SRD = btccs_SelectionAlgorithm_SRD,
-    COINGRINDER = btccs_SelectionAlgorithm_COINGRINDER,
-    KNAPSACK = btccs_SelectionAlgorithm_KNAPSACK,
-    MANUAL = btccs_SelectionAlgorithm_MANUAL
+enum class SelectionAlgorithm : uint8_t {
+    BNB = 0,
+    SRD = 1,
+    COINGRINDER = 2,
+    KNAPSACK = 3,
+    MANUAL = 4
 };
 
-// Forward declarations
-class OutPoint;
-class TxOut;
-class CoinOutput;
-class OutputGroup;
-class SelectionResult;
-class CoinSelectionParams;
-class RandomContext;
+// ==========================================================================
+// Exception
+// ==========================================================================
 
-// Exception thrown on errors
 class CoinSelectionError : public std::runtime_error {
 public:
-    explicit CoinSelectionError(const std::string& msg, SelectionStatus status = SelectionStatus::INTERNAL_ERROR)
-        : std::runtime_error(msg), m_status{status} {}
+    explicit CoinSelectionError(const std::string& msg,
+                                SelectionStatus status = SelectionStatus::INTERNAL_ERROR)
+        : std::runtime_error(msg), m_status(status) {}
+
     SelectionStatus status() const { return m_status; }
+
 private:
     SelectionStatus m_status;
 };
 
-// Helper to check pointers
-template <typename T>
-T* check(T* ptr, const char* msg = "Failed to create object") {
-    if (ptr == nullptr) {
-        throw CoinSelectionError(msg);
-    }
-    return ptr;
-}
-
 // ==========================================================================
-// OutPoint - Transaction outpoint (txid + vout)
+// UtxoPool - Builder for creating a pool of UTXOs
 // ==========================================================================
 
-class OutPoint {
+/**
+ * @brief A builder class for creating UTXO pools for coin selection.
+ *
+ * Example usage:
+ * @code
+ *   UtxoPool pool;
+ *   pool.Add(txid1, 0, 100000, 68, 6, fee1, ltfee1);
+ *   pool.Add(txid2, 1, 250000, 68, 3, fee2, ltfee2);
+ *
+ *   auto result = pool.SelectBnB(target, costOfChange);
+ * @endcode
+ */
+class UtxoPool {
 public:
-    OutPoint(const unsigned char txid[32], uint32_t vout)
-        : m_ptr{check(btccs_outpoint_create(txid, vout), "Failed to create outpoint")} {}
+    UtxoPool() = default;
 
-    OutPoint(const std::array<unsigned char, 32>& txid, uint32_t vout)
-        : OutPoint(txid.data(), vout) {}
+    /**
+     * @brief Add a UTXO to the pool.
+     *
+     * @param txid          Transaction ID (32 bytes).
+     * @param vout          Output index.
+     * @param value         Output value in satoshis.
+     * @param input_bytes   Estimated input size when spent (68 for P2WPKH).
+     * @param depth         Confirmation depth (0 = unconfirmed).
+     * @param fee           Fee at current feerate.
+     * @param long_term_fee Fee at long-term feerate.
+     * @return Reference to this pool for chaining.
+     */
+    UtxoPool& Add(const std::array<unsigned char, 32>& txid,
+                  uint32_t vout,
+                  Amount value,
+                  int input_bytes,
+                  int depth,
+                  Amount fee,
+                  Amount long_term_fee)
+    {
+        uint256 hash;
+        std::memcpy(hash.begin(), txid.data(), 32);
+        COutPoint outpoint(Txid::FromUint256(hash), vout);
 
-    OutPoint(const OutPoint& other)
-        : m_ptr{check(btccs_outpoint_copy(other.m_ptr.get()), "Failed to copy outpoint")} {}
+        CTxOut txout(value, CScript());
+        auto coin = std::make_shared<COutput>(
+            outpoint, txout, depth, input_bytes,
+            /*solvable=*/true, /*safe=*/true, /*time=*/0, /*from_me=*/false, fee);
+        coin->long_term_fee = long_term_fee;
 
-    OutPoint(OutPoint&&) = default;
-    OutPoint& operator=(OutPoint&&) = default;
+        OutputGroup group;
+        group.Insert(coin, 0, 0);
+        m_groups.push_back(std::move(group));
 
-    OutPoint& operator=(const OutPoint& other) {
-        if (this != &other) {
-            m_ptr.reset(check(btccs_outpoint_copy(other.m_ptr.get()), "Failed to copy outpoint"));
-        }
         return *this;
     }
 
-    std::array<unsigned char, 32> GetTxid() const {
-        std::array<unsigned char, 32> txid;
-        btccs_outpoint_get_txid(m_ptr.get(), txid.data());
-        return txid;
+    /**
+     * @brief Add a UTXO using simplified parameters with feerate calculation.
+     *
+     * @param txid         Transaction ID.
+     * @param vout         Output index.
+     * @param value        Output value in satoshis.
+     * @param input_bytes  Estimated input size (68 for P2WPKH).
+     * @param depth        Confirmation depth.
+     * @param feerate      Current feerate.
+     * @param lt_feerate   Long-term feerate (optional, defaults to feerate/3).
+     * @return Reference to this pool for chaining.
+     */
+    UtxoPool& Add(const std::array<unsigned char, 32>& txid,
+                  uint32_t vout,
+                  Amount value,
+                  int input_bytes,
+                  int depth,
+                  const FeeRate& feerate,
+                  std::optional<FeeRate> lt_feerate = std::nullopt)
+    {
+        Amount fee = feerate.GetFee(input_bytes);
+        Amount lt_fee = lt_feerate ? lt_feerate->GetFee(input_bytes)
+                                   : FeeRate(feerate.GetFeePerK() / 3).GetFee(input_bytes);
+        return Add(txid, vout, value, input_bytes, depth, fee, lt_fee);
     }
 
-    uint32_t GetVout() const {
-        return btccs_outpoint_get_vout(m_ptr.get());
-    }
-
-    bool operator==(const OutPoint& other) const {
-        return btccs_outpoint_equals(m_ptr.get(), other.m_ptr.get()) != 0;
-    }
-
-    btccs_OutPoint* get() const { return m_ptr.get(); }
-
-private:
-    struct Deleter { void operator()(btccs_OutPoint* p) { btccs_outpoint_destroy(p); } };
-    std::unique_ptr<btccs_OutPoint, Deleter> m_ptr;
-};
-
-// ==========================================================================
-// TxOut - Transaction output
-// ==========================================================================
-
-class TxOut {
-public:
-    TxOut(Amount value, const std::vector<unsigned char>& script_pubkey)
-        : m_ptr{check(btccs_txout_create(value, script_pubkey.data(), script_pubkey.size()),
-                      "Failed to create txout")} {}
-
-    TxOut(Amount value, std::span<const unsigned char> script_pubkey)
-        : m_ptr{check(btccs_txout_create(value, script_pubkey.data(), script_pubkey.size()),
-                      "Failed to create txout")} {}
-
-    TxOut(const TxOut& other)
-        : m_ptr{check(btccs_txout_copy(other.m_ptr.get()), "Failed to copy txout")} {}
-
-    TxOut(TxOut&&) = default;
-    TxOut& operator=(TxOut&&) = default;
-
-    TxOut& operator=(const TxOut& other) {
-        if (this != &other) {
-            m_ptr.reset(check(btccs_txout_copy(other.m_ptr.get()), "Failed to copy txout"));
-        }
+    /**
+     * @brief Add an existing OutputGroup to the pool.
+     */
+    UtxoPool& AddGroup(OutputGroup group)
+    {
+        m_groups.push_back(std::move(group));
         return *this;
     }
 
-    Amount GetValue() const {
-        return btccs_txout_get_value(m_ptr.get());
+    /** Get the number of groups in the pool. */
+    size_t Size() const { return m_groups.size(); }
+
+    /** Check if pool is empty. */
+    bool Empty() const { return m_groups.empty(); }
+
+    /** Clear all UTXOs from the pool. */
+    void Clear() { m_groups.clear(); }
+
+    /** Get direct access to the groups (for advanced use). */
+    std::vector<OutputGroup>& Groups() { return m_groups; }
+    const std::vector<OutputGroup>& Groups() const { return m_groups; }
+
+    // ======================================================================
+    // Coin Selection Methods
+    // ======================================================================
+
+    /**
+     * @brief Select coins using Branch and Bound (changeless solutions).
+     *
+     * @param target          Target effective value.
+     * @param cost_of_change  Cost of creating and spending change.
+     * @param max_weight      Maximum selection weight (default: MAX_STANDARD_TX_WEIGHT).
+     * @return Selection result, or nullopt if no solution found.
+     */
+    std::optional<SelectionResult> SelectBnB(
+        Amount target,
+        Amount cost_of_change,
+        int max_weight = MAX_STANDARD_TX_WEIGHT) const
+    {
+        auto groups = m_groups; // Copy since BnB may sort
+        auto result = wallet::SelectCoinsBnB(groups, target, cost_of_change, max_weight);
+        if (!result) return std::nullopt;
+        return std::move(*result);
     }
 
-    std::vector<unsigned char> GetScriptPubKey() const {
-        size_t len = 0;
-        btccs_txout_get_script_pubkey(m_ptr.get(), nullptr, &len);
-        std::vector<unsigned char> script(len);
-        btccs_txout_get_script_pubkey(m_ptr.get(), script.data(), &len);
-        return script;
+    /**
+     * @brief Select coins using Single Random Draw.
+     *
+     * @param target      Target value.
+     * @param change_fee  Fee for change output.
+     * @param rng         Random context.
+     * @param max_weight  Maximum selection weight.
+     * @return Selection result, or nullopt if no solution found.
+     */
+    std::optional<SelectionResult> SelectSRD(
+        Amount target,
+        Amount change_fee,
+        FastRandomContext& rng,
+        int max_weight = MAX_STANDARD_TX_WEIGHT) const
+    {
+        auto groups = m_groups;
+        auto result = wallet::SelectCoinsSRD(groups, target, change_fee, rng, max_weight);
+        if (!result) return std::nullopt;
+        return std::move(*result);
     }
 
-    btccs_TxOut* get() const { return m_ptr.get(); }
+    /**
+     * @brief Select coins using CoinGrinder (minimizes weight).
+     *
+     * @param target         Target value.
+     * @param change_target  Minimum change amount.
+     * @param max_weight     Maximum selection weight.
+     * @return Selection result, or nullopt if no solution found.
+     */
+    std::optional<SelectionResult> SelectCoinGrinder(
+        Amount target,
+        Amount change_target,
+        int max_weight = MAX_STANDARD_TX_WEIGHT) const
+    {
+        auto groups = m_groups;
+        auto result = wallet::CoinGrinder(groups, target, change_target, max_weight);
+        if (!result) return std::nullopt;
+        return std::move(*result);
+    }
+
+    /**
+     * @brief Select coins using Knapsack solver.
+     *
+     * @param target         Target value.
+     * @param change_target  Minimum change amount.
+     * @param rng            Random context.
+     * @param max_weight     Maximum selection weight.
+     * @return Selection result, or nullopt if no solution found.
+     */
+    std::optional<SelectionResult> SelectKnapsack(
+        Amount target,
+        Amount change_target,
+        FastRandomContext& rng,
+        int max_weight = MAX_STANDARD_TX_WEIGHT) const
+    {
+        auto groups = m_groups;
+        auto result = wallet::KnapsackSolver(groups, target, change_target, rng, max_weight);
+        if (!result) return std::nullopt;
+        return std::move(*result);
+    }
 
 private:
-    struct Deleter { void operator()(btccs_TxOut* p) { btccs_txout_destroy(p); } };
-    std::unique_ptr<btccs_TxOut, Deleter> m_ptr;
+    std::vector<OutputGroup> m_groups;
 };
 
 // ==========================================================================
-// CoinOutput - UTXO with metadata
+// CoinSelectionParams - Fee calculation helper
 // ==========================================================================
 
-class CoinOutput {
-public:
-    // Full constructor with all parameters
-    CoinOutput(const OutPoint& outpoint, const TxOut& txout, int depth, int input_bytes,
-               bool spendable, bool solvable, bool safe, int64_t time, bool from_me,
-               Amount fee, Amount long_term_fee)
-        : m_ptr{check(btccs_coin_output_create(
-              outpoint.get(), txout.get(), depth, input_bytes,
-              spendable ? 1 : 0, solvable ? 1 : 0, safe ? 1 : 0,
-              time, from_me ? 1 : 0, fee, long_term_fee),
-              "Failed to create coin output")} {}
-
-    // Simple constructor
-    CoinOutput(const OutPoint& outpoint, const TxOut& txout, int depth, int input_bytes)
-        : m_ptr{check(btccs_coin_output_create_simple(outpoint.get(), txout.get(), depth, input_bytes),
-                      "Failed to create coin output")} {}
-
-    CoinOutput(const CoinOutput& other)
-        : m_ptr{check(btccs_coin_output_copy(other.m_ptr.get()), "Failed to copy coin output")} {}
-
-    CoinOutput(CoinOutput&&) = default;
-    CoinOutput& operator=(CoinOutput&&) = default;
-
-    CoinOutput& operator=(const CoinOutput& other) {
-        if (this != &other) {
-            m_ptr.reset(check(btccs_coin_output_copy(other.m_ptr.get()), "Failed to copy coin output"));
-        }
-        return *this;
-    }
-
-    Amount GetValue() const { return btccs_coin_output_get_value(m_ptr.get()); }
-    Amount GetEffectiveValue() const { return btccs_coin_output_get_effective_value(m_ptr.get()); }
-    int GetDepth() const { return btccs_coin_output_get_depth(m_ptr.get()); }
-    int GetInputBytes() const { return btccs_coin_output_get_input_bytes(m_ptr.get()); }
-    Amount GetFee() const { return btccs_coin_output_get_fee(m_ptr.get()); }
-    Amount GetLongTermFee() const { return btccs_coin_output_get_long_term_fee(m_ptr.get()); }
-    bool IsSpendable() const { return btccs_coin_output_is_spendable(m_ptr.get()) != 0; }
-    bool IsSafe() const { return btccs_coin_output_is_safe(m_ptr.get()) != 0; }
-
-    void SetFees(Amount fee, Amount long_term_fee) {
-        btccs_coin_output_set_fees(m_ptr.get(), fee, long_term_fee);
-    }
-
-    btccs_CoinOutput* get() const { return m_ptr.get(); }
-
-private:
-    // Constructor from raw pointer (for views)
-    explicit CoinOutput(btccs_CoinOutput* ptr) : m_ptr{ptr} {}
-    friend class OutputGroup;
-    friend class SelectionResult;
-
-    struct Deleter { void operator()(btccs_CoinOutput* p) { btccs_coin_output_destroy(p); } };
-    std::unique_ptr<btccs_CoinOutput, Deleter> m_ptr;
-};
-
-// ==========================================================================
-// OutputGroup - Group of outputs (typically from same address)
-// ==========================================================================
-
-class OutputGroup {
-public:
-    OutputGroup()
-        : m_ptr{check(btccs_output_group_create(), "Failed to create output group")} {}
-
-    OutputGroup(const OutputGroup& other)
-        : m_ptr{check(btccs_output_group_copy(other.m_ptr.get()), "Failed to copy output group")} {}
-
-    OutputGroup(OutputGroup&&) = default;
-    OutputGroup& operator=(OutputGroup&&) = default;
-
-    OutputGroup& operator=(const OutputGroup& other) {
-        if (this != &other) {
-            m_ptr.reset(check(btccs_output_group_copy(other.m_ptr.get()), "Failed to copy output group"));
-        }
-        return *this;
-    }
-
-    void Insert(const CoinOutput& coin, size_t ancestors = 0, size_t descendants = 0) {
-        btccs_output_group_insert(m_ptr.get(), coin.get(), ancestors, descendants);
-    }
-
-    size_t Size() const { return btccs_output_group_size(m_ptr.get()); }
-    Amount GetValue() const { return btccs_output_group_get_value(m_ptr.get()); }
-    Amount GetSelectionAmount() const { return btccs_output_group_get_selection_amount(m_ptr.get()); }
-    Amount GetFee() const { return btccs_output_group_get_fee(m_ptr.get()); }
-    Amount GetLongTermFee() const { return btccs_output_group_get_long_term_fee(m_ptr.get()); }
-    int GetWeight() const { return btccs_output_group_get_weight(m_ptr.get()); }
-
-    bool IsEligible(int required_confirms, size_t max_ancestors, size_t max_descendants) const {
-        return btccs_output_group_is_eligible(m_ptr.get(), required_confirms, max_ancestors, max_descendants) != 0;
-    }
-
-    btccs_OutputGroup* get() const { return m_ptr.get(); }
-
-private:
-    struct Deleter { void operator()(btccs_OutputGroup* p) { btccs_output_group_destroy(p); } };
-    std::unique_ptr<btccs_OutputGroup, Deleter> m_ptr;
-};
-
-// ==========================================================================
-// CoinSelectionParams - Parameters for coin selection
-// ==========================================================================
-
+/**
+ * @brief Helper class for calculating coin selection parameters.
+ *
+ * This provides convenient calculation of change costs and fees
+ * based on feerates and output sizes.
+ */
 class CoinSelectionParams {
 public:
-    // Full constructor
-    CoinSelectionParams(int64_t effective_feerate_sat_per_kvb,
-                        int64_t long_term_feerate_sat_per_kvb,
-                        int64_t discard_feerate_sat_per_kvb,
-                        size_t change_output_size,
-                        size_t change_spend_size,
-                        Amount min_viable_change,
-                        size_t tx_noinputs_size,
-                        bool avoid_partial_spends)
-        : m_ptr{check(btccs_coin_selection_params_create(
-              effective_feerate_sat_per_kvb, long_term_feerate_sat_per_kvb,
-              discard_feerate_sat_per_kvb, change_output_size, change_spend_size,
-              min_viable_change, tx_noinputs_size, avoid_partial_spends ? 1 : 0),
-              "Failed to create coin selection params")} {}
+    /**
+     * @brief Create parameters with explicit sizes.
+     *
+     * @param effective_feerate  Current transaction feerate.
+     * @param long_term_feerate  Long-term expected feerate.
+     * @param discard_feerate    Minimum feerate for dust threshold.
+     * @param change_output_size Size of change output (31 for P2WPKH).
+     * @param change_spend_size  Size of spending change (68 for P2WPKH).
+     */
+    CoinSelectionParams(FeeRate effective_feerate,
+                        FeeRate long_term_feerate,
+                        FeeRate discard_feerate,
+                        size_t change_output_size = 31,
+                        size_t change_spend_size = 68)
+        : m_effective_feerate(effective_feerate)
+        , m_long_term_feerate(long_term_feerate)
+        , m_discard_feerate(discard_feerate)
+        , m_change_output_size(change_output_size)
+        , m_change_spend_size(change_spend_size)
+    {}
 
-    // Simple constructor with defaults
+    /**
+     * @brief Create parameters with just the effective feerate.
+     *
+     * Uses sensible defaults:
+     * - Long-term feerate = effective / 3
+     * - Discard feerate = 3 sat/vB
+     * - P2WPKH sizes (31 bytes output, 68 bytes spend)
+     */
+    explicit CoinSelectionParams(FeeRate effective_feerate)
+        : m_effective_feerate(effective_feerate)
+        , m_long_term_feerate(effective_feerate.GetFeePerK() / 3)
+        , m_discard_feerate(3000)
+        , m_change_output_size(31)
+        , m_change_spend_size(68)
+    {}
+
+    /**
+     * @brief Create parameters from sat/kvB value.
+     */
     explicit CoinSelectionParams(int64_t effective_feerate_sat_per_kvb)
-        : m_ptr{check(btccs_coin_selection_params_create_default(effective_feerate_sat_per_kvb),
-                      "Failed to create coin selection params")} {}
+        : CoinSelectionParams(FeeRate(effective_feerate_sat_per_kvb))
+    {}
 
-    CoinSelectionParams(const CoinSelectionParams& other)
-        : m_ptr{check(btccs_coin_selection_params_copy(other.m_ptr.get()),
-                      "Failed to copy coin selection params")} {}
-
-    CoinSelectionParams(CoinSelectionParams&&) = default;
-    CoinSelectionParams& operator=(CoinSelectionParams&&) = default;
-
-    CoinSelectionParams& operator=(const CoinSelectionParams& other) {
-        if (this != &other) {
-            m_ptr.reset(check(btccs_coin_selection_params_copy(other.m_ptr.get()),
-                              "Failed to copy coin selection params"));
-        }
-        return *this;
+    /** Cost of creating a change output. */
+    Amount GetChangeFee() const
+    {
+        return m_effective_feerate.GetFee(m_change_output_size);
     }
 
-    Amount GetCostOfChange() const { return btccs_coin_selection_params_get_cost_of_change(m_ptr.get()); }
-    Amount GetChangeFee() const { return btccs_coin_selection_params_get_change_fee(m_ptr.get()); }
-
-    void SetSubtractFeeOutputs(bool subtract) {
-        btccs_coin_selection_params_set_subtract_fee_outputs(m_ptr.get(), subtract ? 1 : 0);
+    /** Total cost of change (creation + future spend). */
+    Amount GetCostOfChange() const
+    {
+        return GetChangeFee() + m_discard_feerate.GetFee(m_change_spend_size);
     }
 
-    btccs_CoinSelectionParams* get() const { return m_ptr.get(); }
+    /** Calculate fee for an input of given size. */
+    Amount GetInputFee(int input_bytes) const
+    {
+        return m_effective_feerate.GetFee(input_bytes);
+    }
+
+    /** Calculate long-term fee for an input. */
+    Amount GetInputLongTermFee(int input_bytes) const
+    {
+        return m_long_term_feerate.GetFee(input_bytes);
+    }
+
+    // Accessors
+    const FeeRate& EffectiveFeeRate() const { return m_effective_feerate; }
+    const FeeRate& LongTermFeeRate() const { return m_long_term_feerate; }
+    const FeeRate& DiscardFeeRate() const { return m_discard_feerate; }
 
 private:
-    struct Deleter { void operator()(btccs_CoinSelectionParams* p) { btccs_coin_selection_params_destroy(p); } };
-    std::unique_ptr<btccs_CoinSelectionParams, Deleter> m_ptr;
+    FeeRate m_effective_feerate;
+    FeeRate m_long_term_feerate;
+    FeeRate m_discard_feerate;
+    size_t m_change_output_size;
+    size_t m_change_spend_size;
 };
 
 // ==========================================================================
-// RandomContext - Random number generator context
-// ==========================================================================
-
-class RandomContext {
-public:
-    RandomContext()
-        : m_ptr{check(btccs_random_context_create(), "Failed to create random context")} {}
-
-    explicit RandomContext(const std::array<unsigned char, 32>& seed)
-        : m_ptr{check(btccs_random_context_create_seeded(seed.data()), "Failed to create seeded random context")} {}
-
-    RandomContext(RandomContext&&) = default;
-    RandomContext& operator=(RandomContext&&) = default;
-
-    // Non-copyable (RNG state shouldn't be duplicated)
-    RandomContext(const RandomContext&) = delete;
-    RandomContext& operator=(const RandomContext&) = delete;
-
-    btccs_RandomContext* get() const { return m_ptr.get(); }
-
-private:
-    struct Deleter { void operator()(btccs_RandomContext* p) { btccs_random_context_destroy(p); } };
-    std::unique_ptr<btccs_RandomContext, Deleter> m_ptr;
-};
-
-// ==========================================================================
-// SelectionResult - Result of coin selection
-// ==========================================================================
-
-class SelectionResult {
-public:
-    SelectionResult(Amount target, SelectionAlgorithm algorithm)
-        : m_ptr{check(btccs_selection_result_create(target, static_cast<btccs_SelectionAlgorithm>(algorithm)),
-                      "Failed to create selection result")} {}
-
-    SelectionResult(const SelectionResult& other)
-        : m_ptr{check(btccs_selection_result_copy(other.m_ptr.get()), "Failed to copy selection result")} {}
-
-    SelectionResult(SelectionResult&&) = default;
-    SelectionResult& operator=(SelectionResult&&) = default;
-
-    SelectionResult& operator=(const SelectionResult& other) {
-        if (this != &other) {
-            m_ptr.reset(check(btccs_selection_result_copy(other.m_ptr.get()), "Failed to copy selection result"));
-        }
-        return *this;
-    }
-
-    void AddInput(const OutputGroup& group) {
-        btccs_selection_result_add_input(m_ptr.get(), group.get());
-    }
-
-    size_t GetInputCount() const { return btccs_selection_result_get_input_count(m_ptr.get()); }
-    Amount GetSelectedValue() const { return btccs_selection_result_get_selected_value(m_ptr.get()); }
-    Amount GetSelectedEffectiveValue() const { return btccs_selection_result_get_selected_effective_value(m_ptr.get()); }
-    Amount GetTarget() const { return btccs_selection_result_get_target(m_ptr.get()); }
-    Amount GetWaste() const { return btccs_selection_result_get_waste(m_ptr.get()); }
-    int GetWeight() const { return btccs_selection_result_get_weight(m_ptr.get()); }
-
-    SelectionAlgorithm GetAlgorithm() const {
-        return static_cast<SelectionAlgorithm>(btccs_selection_result_get_algorithm(m_ptr.get()));
-    }
-
-    Amount GetChange(Amount cost_of_change, Amount change_fee) const {
-        return btccs_selection_result_get_change(m_ptr.get(), cost_of_change, change_fee);
-    }
-
-    void RecalculateWaste(Amount min_viable_change, Amount change_cost, Amount change_fee) {
-        btccs_selection_result_recalculate_waste(m_ptr.get(), min_viable_change, change_cost, change_fee);
-    }
-
-    btccs_SelectionResult* get() const { return m_ptr.get(); }
-
-private:
-    // Constructor from raw pointer (for algorithm results)
-    explicit SelectionResult(btccs_SelectionResult* ptr) : m_ptr{ptr} {}
-    friend std::optional<SelectionResult> SelectCoinsBnB(std::vector<OutputGroup>&, Amount, Amount, int, SelectionStatus*);
-    friend std::optional<SelectionResult> SelectCoinsSRD(const std::vector<OutputGroup>&, Amount, Amount, RandomContext&, int, SelectionStatus*);
-    friend std::optional<SelectionResult> CoinGrinder(std::vector<OutputGroup>&, Amount, Amount, int, SelectionStatus*);
-    friend std::optional<SelectionResult> KnapsackSolver(std::vector<OutputGroup>&, Amount, Amount, RandomContext&, int, SelectionStatus*);
-
-    struct Deleter { void operator()(btccs_SelectionResult* p) { btccs_selection_result_destroy(p); } };
-    std::unique_ptr<btccs_SelectionResult, Deleter> m_ptr;
-};
-
-// ==========================================================================
-// Algorithm wrapper functions
+// Utility Functions
 // ==========================================================================
 
 /**
- * Branch and Bound coin selection - finds changeless solutions.
+ * @brief Generate a randomized change target for privacy.
  */
-inline std::optional<SelectionResult> SelectCoinsBnB(
-    std::vector<OutputGroup>& utxo_pool,
-    Amount selection_target,
-    Amount cost_of_change,
-    int max_selection_weight = btccs_get_max_standard_tx_weight(),
-    SelectionStatus* status_out = nullptr)
+inline Amount GenerateChangeTarget(Amount payment_value, Amount change_fee, FastRandomContext& rng)
 {
-    std::vector<btccs_OutputGroup*> pool_ptrs;
-    pool_ptrs.reserve(utxo_pool.size());
-    for (auto& group : utxo_pool) {
-        pool_ptrs.push_back(group.get());
-    }
-
-    btccs_SelectionStatus status;
-    btccs_SelectionResult* result = btccs_select_coins_bnb(
-        pool_ptrs.data(), pool_ptrs.size(),
-        selection_target, cost_of_change, max_selection_weight, &status);
-
-    if (status_out) *status_out = static_cast<SelectionStatus>(status);
-
-    if (result == nullptr) {
-        return std::nullopt;
-    }
-    return SelectionResult{result};
+    return wallet::GenerateChangeTarget(payment_value, change_fee, rng);
 }
 
 /**
- * Single Random Draw coin selection.
+ * @brief Get maximum standard transaction weight.
  */
-inline std::optional<SelectionResult> SelectCoinsSRD(
-    const std::vector<OutputGroup>& utxo_pool,
-    Amount target_value,
-    Amount change_fee,
-    RandomContext& rng,
-    int max_selection_weight = btccs_get_max_standard_tx_weight(),
-    SelectionStatus* status_out = nullptr)
+inline int GetMaxStandardTxWeight()
 {
-    std::vector<const btccs_OutputGroup*> pool_ptrs;
-    pool_ptrs.reserve(utxo_pool.size());
-    for (const auto& group : utxo_pool) {
-        pool_ptrs.push_back(group.get());
-    }
-
-    btccs_SelectionStatus status;
-    btccs_SelectionResult* result = btccs_select_coins_srd(
-        pool_ptrs.data(), pool_ptrs.size(),
-        target_value, change_fee, rng.get(), max_selection_weight, &status);
-
-    if (status_out) *status_out = static_cast<SelectionStatus>(status);
-
-    if (result == nullptr) {
-        return std::nullopt;
-    }
-    return SelectionResult{result};
+    return MAX_STANDARD_TX_WEIGHT;
 }
 
 /**
- * CoinGrinder - minimizes input set weight.
+ * @brief Convert input bytes to weight units.
  */
-inline std::optional<SelectionResult> CoinGrinder(
-    std::vector<OutputGroup>& utxo_pool,
-    Amount selection_target,
-    Amount change_target,
-    int max_selection_weight = btccs_get_max_standard_tx_weight(),
-    SelectionStatus* status_out = nullptr)
+inline int GetInputWeight(int input_bytes)
 {
-    std::vector<btccs_OutputGroup*> pool_ptrs;
-    pool_ptrs.reserve(utxo_pool.size());
-    for (auto& group : utxo_pool) {
-        pool_ptrs.push_back(group.get());
-    }
-
-    btccs_SelectionStatus status;
-    btccs_SelectionResult* result = btccs_select_coins_coingrinder(
-        pool_ptrs.data(), pool_ptrs.size(),
-        selection_target, change_target, max_selection_weight, &status);
-
-    if (status_out) *status_out = static_cast<SelectionStatus>(status);
-
-    if (result == nullptr) {
-        return std::nullopt;
-    }
-    return SelectionResult{result};
+    return input_bytes * WITNESS_SCALE_FACTOR;
 }
 
 /**
- * Knapsack solver - legacy randomized subset sum.
+ * @brief Get library version string.
  */
-inline std::optional<SelectionResult> KnapsackSolver(
-    std::vector<OutputGroup>& groups,
-    Amount target_value,
-    Amount change_target,
-    RandomContext& rng,
-    int max_selection_weight = btccs_get_max_standard_tx_weight(),
-    SelectionStatus* status_out = nullptr)
+inline std::string Version()
 {
-    std::vector<btccs_OutputGroup*> pool_ptrs;
-    pool_ptrs.reserve(groups.size());
-    for (auto& group : groups) {
-        pool_ptrs.push_back(group.get());
+    return "0.2.0";
+}
+
+/**
+ * @brief Helper to create a txid from a seed value (for testing).
+ */
+inline std::array<unsigned char, 32> MakeTxid(uint32_t seed)
+{
+    std::array<unsigned char, 32> txid{};
+    for (size_t i = 0; i < 4; ++i) {
+        txid[i] = (seed >> (i * 8)) & 0xFF;
     }
-
-    btccs_SelectionStatus status;
-    btccs_SelectionResult* result = btccs_select_coins_knapsack(
-        pool_ptrs.data(), pool_ptrs.size(),
-        target_value, change_target, rng.get(), max_selection_weight, &status);
-
-    if (status_out) *status_out = static_cast<SelectionStatus>(status);
-
-    if (result == nullptr) {
-        return std::nullopt;
-    }
-    return SelectionResult{result};
-}
-
-// ==========================================================================
-// Utility functions
-// ==========================================================================
-
-inline Amount GenerateChangeTarget(Amount payment_value, Amount change_fee, RandomContext& rng) {
-    return btccs_generate_change_target(payment_value, change_fee, rng.get());
-}
-
-inline int GetMaxStandardTxWeight() {
-    return btccs_get_max_standard_tx_weight();
-}
-
-inline int GetInputWeight(int input_bytes) {
-    return btccs_get_input_weight(input_bytes);
-}
-
-inline std::string Version() {
-    return btccs_version();
+    return txid;
 }
 
 } // namespace btccs

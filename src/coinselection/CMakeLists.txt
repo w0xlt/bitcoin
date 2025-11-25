@@ -5,11 +5,16 @@
 include(GNUInstallDirs)
 
 # libbitcoincoinselection - A library for Bitcoin coin selection algorithms
-# This library exposes Bitcoin Core's coin selection algorithms (BnB, SRD,
-# CoinGrinder, Knapsack) through a stable C API.
 #
-# Similar to libbitcoinkernel, this library includes all necessary source
-# files directly to be self-contained.
+# This library exposes Bitcoin Core's coin selection algorithms (BnB, SRD,
+# CoinGrinder, Knapsack) through both C and C++ APIs.
+#
+# The C++ API (bitcoincoinselection_wrapper.h) directly uses Bitcoin Core
+# types (wallet::OutputGroup, wallet::SelectionResult) for zero-overhead
+# integration with C++ projects.
+#
+# The C API (bitcoincoinselection.h) provides language-agnostic bindings
+# for FFI integration with other languages.
 
 add_library(bitcoincoinselection
   bitcoincoinselection.cpp
@@ -60,23 +65,23 @@ target_include_directories(bitcoincoinselection
     $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
 )
 
-# Add a convenience libbitcoincoinselection target as a synonym
+# Convenience target
 add_custom_target(libbitcoincoinselection)
 add_dependencies(libbitcoincoinselection bitcoincoinselection)
 
-# Set library version
+# Library version
 set_target_properties(bitcoincoinselection PROPERTIES
-  VERSION 0.1.0
+  VERSION 0.2.0
   SOVERSION 0
 )
 
-# Handle static library case
+# Static library definition
 get_target_property(bitcoincoinselection_type bitcoincoinselection TYPE)
 if(bitcoincoinselection_type STREQUAL "STATIC_LIBRARY")
   target_compile_definitions(bitcoincoinselection PUBLIC BITCOINCOINSELECTION_STATIC)
 endif()
 
-# Generate pkg-config file
+# pkg-config
 configure_file(
   ${PROJECT_SOURCE_DIR}/libbitcoincoinselection.pc.in
   ${PROJECT_BINARY_DIR}/libbitcoincoinselection.pc
@@ -88,17 +93,11 @@ install(FILES ${PROJECT_BINARY_DIR}/libbitcoincoinselection.pc
   COMPONENT libbitcoincoinselection
 )
 
-# Install targets (same pattern as libbitcoinkernel)
+# Install library
 install(TARGETS bitcoincoinselection
-  RUNTIME
-    DESTINATION ${CMAKE_INSTALL_BINDIR}
-    COMPONENT libbitcoincoinselection
-  LIBRARY
-    DESTINATION ${CMAKE_INSTALL_LIBDIR}
-    COMPONENT libbitcoincoinselection
-  ARCHIVE
-    DESTINATION ${CMAKE_INSTALL_LIBDIR}
-    COMPONENT libbitcoincoinselection
+  RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR} COMPONENT libbitcoincoinselection
+  LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR} COMPONENT libbitcoincoinselection
+  ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR} COMPONENT libbitcoincoinselection
 )
 
 # Install headers
