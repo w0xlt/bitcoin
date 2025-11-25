@@ -7,10 +7,11 @@
 #include <coinselection/bitcoincoinselection.h>
 
 #include <consensus/amount.h>
-#include <consensus/consensus.h>
 #include <policy/feerate.h>
+#include <policy/policy.h>
 #include <primitives/transaction.h>
 #include <random.h>
+#include <script/script.h>
 #include <uint256.h>
 #include <util/check.h>
 #include <wallet/coinselection.h>
@@ -86,7 +87,6 @@ struct CoinOutputInternal {
     CTxOut txout;
     int depth{0};
     int input_bytes{-1};
-    bool spendable{true};
     bool solvable{true};
     bool safe{true};
     int64_t time{0};
@@ -97,18 +97,19 @@ struct CoinOutputInternal {
     CoinOutputInternal() = default;
 
     CoinOutputInternal(const COutPoint& op, const CTxOut& to, int d, int ib,
-                       bool sp, bool so, bool sa, int64_t t, bool fm, CAmount f, CAmount ltf)
+                       bool so, bool sa, int64_t t, bool fm, CAmount f, CAmount ltf)
         : outpoint(op), txout(to), depth(d), input_bytes(ib),
-          spendable(sp), solvable(so), safe(sa), time(t), from_me(fm),
+          solvable(so), safe(sa), time(t), from_me(fm),
           fee(f), long_term_fee(ltf) {}
 
     CAmount GetValue() const { return txout.nValue; }
     CAmount GetEffectiveValue() const { return txout.nValue - fee; }
 
     // Convert to wallet::COutput for use with internal algorithms
+    // COutput constructor: (outpoint, txout, depth, input_bytes, solvable, safe, time, from_me, fees)
     std::shared_ptr<wallet::COutput> ToCOutput() const {
         auto output = std::make_shared<wallet::COutput>(
-            outpoint, txout, depth, input_bytes, spendable, solvable, safe, time, from_me, fee);
+            outpoint, txout, depth, input_bytes, solvable, safe, time, from_me, fee);
         output->long_term_fee = long_term_fee;
         return output;
     }
@@ -284,12 +285,12 @@ struct SelectionResultInternal {
             internal->txout = coin->txout;
             internal->depth = coin->depth;
             internal->input_bytes = coin->input_bytes;
-            internal->spendable = coin->spendable;
             internal->solvable = coin->solvable;
             internal->safe = coin->safe;
             internal->time = coin->time;
             internal->from_me = coin->from_me;
-            internal->fee = coin->fee;
+            // Use GetFee() method since fee is private
+            internal->fee = coin->GetFee();
             internal->long_term_fee = coin->long_term_fee;
             m_selected_inputs.push_back(internal);
         }
@@ -342,7 +343,10 @@ btccs_OutPoint* btccs_outpoint_create(const unsigned char txid[32], uint32_t vou
     if (txid == nullptr) return nullptr;
     uint256 hash;
     std::memcpy(hash.begin(), txid, 32);
-    return btccs_OutPoint::create(hash, vout);
+    // Use Txid::FromUint256 since the direct constructor is private
+    Txid tx_id = Txid::FromUint256(hash);
+    auto outpoint = std::make_unique<COutPoint>(tx_id, vout);
+    return reinterpret_cast<btccs_OutPoint*>(outpoint.release());
 }
 
 btccs_OutPoint* btccs_outpoint_copy(const btccs_OutPoint* outpoint)
@@ -352,7 +356,8 @@ btccs_OutPoint* btccs_outpoint_copy(const btccs_OutPoint* outpoint)
 
 void btccs_outpoint_get_txid(const btccs_OutPoint* outpoint, unsigned char txid_out[32])
 {
-    std::memcpy(txid_out, btccs_OutPoint::get(outpoint).hash.begin(), 32);
+    const auto& op = btccs_OutPoint::get(outpoint);
+    std::memcpy(txid_out, op.hash.begin(), 32);
 }
 
 uint32_t btccs_outpoint_get_vout(const btccs_OutPoint* outpoint)
@@ -423,7 +428,7 @@ btccs_CoinOutput* btccs_coin_output_create(
     const btccs_TxOut* txout,
     int depth,
     int input_bytes,
-    int spendable,
+    int spendable,  // Note: maps to solvable in new API
     int solvable,
     int safe,
     int64_t time,
@@ -431,11 +436,14 @@ btccs_CoinOutput* btccs_coin_output_create(
     btccs_Amount fee,
     btccs_Amount long_term_fee)
 {
+    // In the new API, "spendable" concept is split into solvable+safe
+    // We use solvable parameter directly, and spendable is ignored for backwards compat
+    (void)spendable; // unused
     return btccs_CoinOutput::create(
         btccs_OutPoint::get(outpoint),
         btccs_TxOut::get(txout),
         depth, input_bytes,
-        spendable != 0, solvable != 0, safe != 0,
+        solvable != 0, safe != 0,
         time, from_me != 0, fee, long_term_fee);
 }
 
@@ -449,7 +457,7 @@ btccs_CoinOutput* btccs_coin_output_create_simple(
         btccs_OutPoint::get(outpoint),
         btccs_TxOut::get(txout),
         depth, input_bytes,
-        true, true, true, 0, false, 0, 0);
+        true, true, 0, false, 0, 0);
 }
 
 btccs_CoinOutput* btccs_coin_output_copy(const btccs_CoinOutput* coin)
@@ -499,7 +507,9 @@ btccs_Amount btccs_coin_output_get_long_term_fee(const btccs_CoinOutput* coin)
 
 int btccs_coin_output_is_spendable(const btccs_CoinOutput* coin)
 {
-    return btccs_CoinOutput::get(coin).spendable ? 1 : 0;
+    // Spendable = solvable && safe
+    const auto& c = btccs_CoinOutput::get(coin);
+    return (c.solvable && c.safe) ? 1 : 0;
 }
 
 int btccs_coin_output_is_safe(const btccs_CoinOutput* coin)
