@@ -24,6 +24,10 @@
 #include <optional>
 #include <vector>
 
+// Define G_TRANSLATION_FUN symbol in libbitcoincoinselection library so users
+// of the library aren't required to export this symbol
+extern const std::function<std::string(const char*)> G_TRANSLATION_FUN{nullptr};
+
 // Library version
 static const char* BTCCS_VERSION = "0.1.0";
 
@@ -294,7 +298,12 @@ struct SelectionResultInternal {
             internal->long_term_fee = coin->long_term_fee;
             m_selected_inputs.push_back(internal);
         }
-        m_waste = result.GetWaste();
+        // Don't call result.GetWaste() as it may assert if waste hasn't been computed.
+        // Calculate waste ourselves based on the inputs.
+        m_waste = 0;
+        for (const auto& coin : m_selected_inputs) {
+            m_waste += coin->fee - coin->long_term_fee;
+        }
     }
 };
 
