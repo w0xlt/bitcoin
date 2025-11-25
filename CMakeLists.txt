@@ -107,6 +107,8 @@ option(BUILD_UTIL_CHAINSTATE "Build experimental bitcoin-chainstate executable."
 option(BUILD_KERNEL_LIB "Build experimental bitcoinkernel library." ${BUILD_UTIL_CHAINSTATE})
 option(BUILD_KERNEL_TEST "Build tests for the experimental bitcoinkernel library." ${BUILD_KERNEL_LIB})
 
+option(BUILD_COINSELECTION_LIB "Build the libbitcoincoinselection library" OFF)
+
 option(ENABLE_WALLET "Enable wallet." ON)
 if(ENABLE_WALLET)
   if(VCPKG_TARGET_TRIPLET)
@@ -658,6 +660,7 @@ message("  bitcoin-util ........................ ${BUILD_UTIL}")
 message("  bitcoin-wallet ...................... ${BUILD_WALLET_TOOL}")
 message("  bitcoin-chainstate (experimental) ... ${BUILD_UTIL_CHAINSTATE}")
 message("  libbitcoinkernel (experimental) ..... ${BUILD_KERNEL_LIB}")
+message("  libbitcoincoinselection ................ ${BUILD_COINSELECTION_LIB}")
 message("  kernel-test (experimental) .......... ${BUILD_KERNEL_TEST}")
 message("Optional features:")
 message("  wallet support ...................... ${ENABLE_WALLET}")
