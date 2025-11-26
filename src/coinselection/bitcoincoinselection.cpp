@@ -172,3 +172,118 @@ void btccs_random_context_destroy(btccs_RandomContext* rng)
 {
     delete rng;
 }
+
+// ==========================================================================
+// Coin Selection Algorithms
+// ==========================================================================
+
+btccs_SelectionResult* btccs_select_coins_bnb(
+    btccs_UtxoPool* pool,
+    btccs_Amount selection_target,
+    btccs_Amount cost_of_change,
+    int max_weight,
+    btccs_SelectionStatus* status)
+{
+    // pool is marked nonnull
+    try {
+        // Make a copy since BnB may modify the groups
+        std::vector<wallet::OutputGroup> groups = pool->groups;
+
+        auto result = wallet::SelectCoinsBnB(groups, selection_target, cost_of_change, max_weight);
+        if (!result) {
+            if (status) *status = btccs_SelectionStatus_NO_SOLUTION_FOUND;
+            return nullptr;
+        }
+
+        const CAmount waste = ComputeWasteFromPool(*result, pool);
+
+        if (status) *status = btccs_SelectionStatus_SUCCESS;
+        return new btccs_SelectionResult(std::move(*result), btccs_SelectionAlgorithm_BNB, waste);
+    } catch (...) {
+        if (status) *status = btccs_SelectionStatus_INTERNAL_ERROR;
+        return nullptr;
+    }
+}
+
+btccs_SelectionResult* btccs_select_coins_srd(
+    btccs_UtxoPool* pool,
+    btccs_Amount target_value,
+    btccs_Amount change_fee,
+    btccs_RandomContext* rng,
+    int max_weight,
+    btccs_SelectionStatus* status)
+{
+    // pool and rng are marked nonnull
+    try {
+        std::vector<wallet::OutputGroup> groups = pool->groups;
+
+        auto result = wallet::SelectCoinsSRD(groups, target_value, change_fee, rng->rng, max_weight);
+        if (!result) {
+            if (status) *status = btccs_SelectionStatus_NO_SOLUTION_FOUND;
+            return nullptr;
+        }
+
+        const CAmount waste = ComputeWasteFromPool(*result, pool);
+
+        if (status) *status = btccs_SelectionStatus_SUCCESS;
+        return new btccs_SelectionResult(std::move(*result), btccs_SelectionAlgorithm_SRD, waste);
+    } catch (...) {
+        if (status) *status = btccs_SelectionStatus_INTERNAL_ERROR;
+        return nullptr;
+    }
+}
+
+btccs_SelectionResult* btccs_select_coins_coingrinder(
+    btccs_UtxoPool* pool,
+    btccs_Amount selection_target,
+    btccs_Amount change_target,
+    int max_weight,
+    btccs_SelectionStatus* status)
+{
+    // pool is marked nonnull
+    try {
+        std::vector<wallet::OutputGroup> groups = pool->groups;
+
+        auto result = wallet::CoinGrinder(groups, selection_target, change_target, max_weight);
+        if (!result) {
+            if (status) *status = btccs_SelectionStatus_NO_SOLUTION_FOUND;
+            return nullptr;
+        }
+
+        const CAmount waste = ComputeWasteFromPool(*result, pool);
+
+        if (status) *status = btccs_SelectionStatus_SUCCESS;
+        return new btccs_SelectionResult(std::move(*result), btccs_SelectionAlgorithm_COINGRINDER, waste);
+    } catch (...) {
+        if (status) *status = btccs_SelectionStatus_INTERNAL_ERROR;
+        return nullptr;
+    }
+}
+
+btccs_SelectionResult* btccs_select_coins_knapsack(
+    btccs_UtxoPool* pool,
+    btccs_Amount target_value,
+    btccs_Amount change_target,
+    btccs_RandomContext* rng,
+    int max_weight,
+    btccs_SelectionStatus* status)
+{
+    // pool and rng are marked nonnull
+    try {
+        std::vector<wallet::OutputGroup> groups = pool->groups;
+
+        auto result = wallet::KnapsackSolver(groups, target_value, change_target, rng->rng, max_weight);
+        if (!result) {
+            if (status) *status = btccs_SelectionStatus_NO_SOLUTION_FOUND;
+            return nullptr;
+        }
+
+        const CAmount waste = ComputeWasteFromPool(*result, pool);
+
+        if (status) *status = btccs_SelectionStatus_SUCCESS;
+        return new btccs_SelectionResult(std::move(*result), btccs_SelectionAlgorithm_KNAPSACK, waste);
+    } catch (...) {
+        if (status) *status = btccs_SelectionStatus_INTERNAL_ERROR;
+        return nullptr;
+    }
+}
