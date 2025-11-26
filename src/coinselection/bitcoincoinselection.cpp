@@ -16,6 +16,7 @@
 #include <wallet/coinselection.h>
 
 #include <cstring>
+#include <map>
 #include <memory>
 #include <vector>
 
@@ -29,7 +30,13 @@ static const char* BTCCS_VERSION = "0.2.0";
 // ==========================================================================
 
 struct btccs_UtxoPool {
+    struct CoinFeeData {
+        CAmount fee;
+        CAmount long_term_fee;
+    };
+
     std::vector<wallet::OutputGroup> groups;
+    std::map<COutPoint, CoinFeeData> fee_map;
 
     void AddUtxo(const COutPoint& outpoint, CAmount value, int input_bytes,
                  int depth, CAmount fee, CAmount long_term_fee)
@@ -45,6 +52,9 @@ struct btccs_UtxoPool {
         wallet::OutputGroup group;
         group.Insert(coin, /*ancestors=*/0, /*descendants=*/0);
         groups.push_back(std::move(group));
+
+        // Record the fee information so we can later compute a C-API specific waste metric.
+        fee_map.emplace(outpoint, CoinFeeData{fee, long_term_fee});
     }
 };
 
@@ -55,9 +65,12 @@ struct btccs_UtxoPool {
 struct btccs_SelectionResult {
     wallet::SelectionResult result;
     btccs_SelectionAlgorithm algorithm;
+    CAmount waste; //!< C-API specific waste metric, in satoshis
 
-    btccs_SelectionResult(wallet::SelectionResult&& r, btccs_SelectionAlgorithm algo)
-        : result(std::move(r)), algorithm(algo) {}
+    btccs_SelectionResult(wallet::SelectionResult&& r,
+                          btccs_SelectionAlgorithm algo,
+                          CAmount waste_in)
+        : result(std::move(r)), algorithm(algo), waste(waste_in) {}
 };
 
 // ==========================================================================
@@ -70,6 +83,35 @@ struct btccs_RandomContext {
     btccs_RandomContext() : rng() {}
     explicit btccs_RandomContext(const uint256& seed) : rng(seed) {}
 };
+
+/**
+ * Compute the C-API waste metric for a given SelectionResult using
+ * the per-input fee information stored in the originating UTXO pool.
+ *
+ * The C-API defines waste as the sum over all selected inputs of
+ * (fee_at_current_feerate - fee_at_long_term_feerate).
+ *
+ * This is intentionally a lightweight metric that does not try to
+ * re-implement Bitcoin Core's internal SelectionResult::GetWaste()
+ * logic (which may also account for change and other factors).
+ */
+static CAmount ComputeWasteFromPool(const wallet::SelectionResult& result,
+                                    const btccs_UtxoPool* pool)
+{
+    CAmount waste = 0;
+    if (pool == nullptr) return waste;
+
+    for (const auto& coin : result.GetInputSet()) {
+        auto it = pool->fee_map.find(coin->outpoint);
+        if (it == pool->fee_map.end()) {
+            continue;
+        }
+        const CAmount fee = it->second.fee;
+        const CAmount lt_fee = it->second.long_term_fee;
+        waste += fee - lt_fee;
+    }
+    return waste;
+}
 
 // ==========================================================================
 // UTXO Pool Implementation
@@ -153,8 +195,10 @@ btccs_SelectionResult* btccs_select_coins_bnb(
             return nullptr;
         }
 
+        const CAmount waste = ComputeWasteFromPool(*result, pool);
+
         if (status) *status = btccs_SelectionStatus_SUCCESS;
-        return new btccs_SelectionResult(std::move(*result), btccs_SelectionAlgorithm_BNB);
+        return new btccs_SelectionResult(std::move(*result), btccs_SelectionAlgorithm_BNB, waste);
     } catch (...) {
         if (status) *status = btccs_SelectionStatus_INTERNAL_ERROR;
         return nullptr;
@@ -179,8 +223,10 @@ btccs_SelectionResult* btccs_select_coins_srd(
             return nullptr;
         }
 
+        const CAmount waste = ComputeWasteFromPool(*result, pool);
+
         if (status) *status = btccs_SelectionStatus_SUCCESS;
-        return new btccs_SelectionResult(std::move(*result), btccs_SelectionAlgorithm_SRD);
+        return new btccs_SelectionResult(std::move(*result), btccs_SelectionAlgorithm_SRD, waste);
     } catch (...) {
         if (status) *status = btccs_SelectionStatus_INTERNAL_ERROR;
         return nullptr;
@@ -204,8 +250,10 @@ btccs_SelectionResult* btccs_select_coins_coingrinder(
             return nullptr;
         }
 
+        const CAmount waste = ComputeWasteFromPool(*result, pool);
+
         if (status) *status = btccs_SelectionStatus_SUCCESS;
-        return new btccs_SelectionResult(std::move(*result), btccs_SelectionAlgorithm_COINGRINDER);
+        return new btccs_SelectionResult(std::move(*result), btccs_SelectionAlgorithm_COINGRINDER, waste);
     } catch (...) {
         if (status) *status = btccs_SelectionStatus_INTERNAL_ERROR;
         return nullptr;
@@ -230,8 +278,10 @@ btccs_SelectionResult* btccs_select_coins_knapsack(
             return nullptr;
         }
 
+        const CAmount waste = ComputeWasteFromPool(*result, pool);
+
         if (status) *status = btccs_SelectionStatus_SUCCESS;
-        return new btccs_SelectionResult(std::move(*result), btccs_SelectionAlgorithm_KNAPSACK);
+        return new btccs_SelectionResult(std::move(*result), btccs_SelectionAlgorithm_KNAPSACK, waste);
     } catch (...) {
         if (status) *status = btccs_SelectionStatus_INTERNAL_ERROR;
         return nullptr;
@@ -271,12 +321,7 @@ btccs_Amount btccs_selection_result_get_selected_effective_value(const btccs_Sel
 btccs_Amount btccs_selection_result_get_waste(const btccs_SelectionResult* result)
 {
     // result is marked nonnull
-    // Calculate basic waste: fee difference from long-term
-    CAmount waste = 0;
-    for (const auto& coin : result->result.GetInputSet()) {
-        waste += coin->GetFee() - coin->long_term_fee;
-    }
-    return waste;
+    return result->waste;
 }
 
 int btccs_selection_result_get_weight(const btccs_SelectionResult* result)
