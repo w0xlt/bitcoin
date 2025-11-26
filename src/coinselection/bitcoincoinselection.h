@@ -85,6 +85,233 @@ typedef uint8_t btccs_SelectionAlgorithm;
 #define btccs_SelectionAlgorithm_KNAPSACK    ((btccs_SelectionAlgorithm)3)
 #define btccs_SelectionAlgorithm_MANUAL      ((btccs_SelectionAlgorithm)4)
 
+/* ========================================================================== */
+/*                           UTXO Pool Functions                               */
+/* ========================================================================== */
+
+/**
+ * @brief Create an empty UTXO pool.
+ * @return New UTXO pool handle, or NULL on error.
+ */
+BITCOINCOINSELECTION_API btccs_UtxoPool* BITCOINCOINSELECTION_WARN_UNUSED_RESULT
+btccs_utxo_pool_create(void);
+
+/**
+ * @brief Add a UTXO to the pool.
+ *
+ * @param pool         Pool handle. Non-null.
+ * @param txid         Transaction ID (32 bytes, little-endian). Non-null.
+ * @param vout         Output index.
+ * @param value        Output value in satoshis.
+ * @param input_bytes  Estimated input size when spent (e.g., 68 for P2WPKH).
+ * @param depth        Confirmation depth (0 for unconfirmed).
+ * @param fee          Fee to spend at current feerate.
+ * @param long_term_fee Fee to spend at long-term feerate.
+ */
+BITCOINCOINSELECTION_API void btccs_utxo_pool_add(
+    btccs_UtxoPool* pool,
+    const unsigned char txid[32],
+    uint32_t vout,
+    btccs_Amount value,
+    int input_bytes,
+    int depth,
+    btccs_Amount fee,
+    btccs_Amount long_term_fee) BITCOINCOINSELECTION_ARG_NONNULL(1, 2);
+
+/**
+ * @brief Get the number of UTXOs in the pool.
+ */
+BITCOINCOINSELECTION_API size_t BITCOINCOINSELECTION_WARN_UNUSED_RESULT
+btccs_utxo_pool_size(const btccs_UtxoPool* pool) BITCOINCOINSELECTION_ARG_NONNULL(1);
+
+/**
+ * @brief Destroy a UTXO pool.
+ */
+BITCOINCOINSELECTION_API void btccs_utxo_pool_destroy(btccs_UtxoPool* pool);
+
+/* ========================================================================== */
+/*                        Random Context Functions                             */
+/* ========================================================================== */
+
+/**
+ * @brief Create a cryptographically secure random context.
+ */
+BITCOINCOINSELECTION_API btccs_RandomContext* BITCOINCOINSELECTION_WARN_UNUSED_RESULT
+btccs_random_context_create(void);
+
+/**
+ * @brief Create a seeded random context (for deterministic testing).
+ * @param seed 32-byte seed.
+ */
+BITCOINCOINSELECTION_API btccs_RandomContext* BITCOINCOINSELECTION_WARN_UNUSED_RESULT
+btccs_random_context_create_seeded(const unsigned char seed[32]) BITCOINCOINSELECTION_ARG_NONNULL(1);
+
+/**
+ * @brief Destroy a random context.
+ */
+BITCOINCOINSELECTION_API void btccs_random_context_destroy(btccs_RandomContext* rng);
+
+/* ========================================================================== */
+/*                     Coin Selection Algorithms                               */
+/* ========================================================================== */
+
+/**
+ * @brief Select coins using Branch and Bound (finds changeless solutions).
+ *
+ * @param pool                 UTXO pool. Non-null.
+ * @param selection_target     Target effective value in satoshis.
+ * @param cost_of_change       Cost of creating and spending change.
+ * @param max_weight           Maximum selection weight (use btccs_get_max_standard_tx_weight()).
+ * @param status               Output status code. May be NULL.
+ * @return Selection result, or NULL on failure.
+ */
+BITCOINCOINSELECTION_API btccs_SelectionResult* BITCOINCOINSELECTION_WARN_UNUSED_RESULT
+btccs_select_coins_bnb(
+    btccs_UtxoPool* pool,
+    btccs_Amount selection_target,
+    btccs_Amount cost_of_change,
+    int max_weight,
+    btccs_SelectionStatus* status) BITCOINCOINSELECTION_ARG_NONNULL(1);
+
+/**
+ * @brief Select coins using Single Random Draw.
+ *
+ * @param pool             UTXO pool. Non-null.
+ * @param target_value     Target value in satoshis.
+ * @param change_fee       Fee for change output.
+ * @param rng              Random context. Non-null.
+ * @param max_weight       Maximum selection weight.
+ * @param status           Output status code. May be NULL.
+ * @return Selection result, or NULL on failure.
+ */
+BITCOINCOINSELECTION_API btccs_SelectionResult* BITCOINCOINSELECTION_WARN_UNUSED_RESULT
+btccs_select_coins_srd(
+    btccs_UtxoPool* pool,
+    btccs_Amount target_value,
+    btccs_Amount change_fee,
+    btccs_RandomContext* rng,
+    int max_weight,
+    btccs_SelectionStatus* status) BITCOINCOINSELECTION_ARG_NONNULL(1, 4);
+
+/**
+ * @brief Select coins using CoinGrinder (minimizes input weight).
+ *
+ * @param pool              UTXO pool. Non-null.
+ * @param selection_target  Target value in satoshis.
+ * @param change_target     Minimum change amount.
+ * @param max_weight        Maximum selection weight.
+ * @param status            Output status code. May be NULL.
+ * @return Selection result, or NULL on failure.
+ */
+BITCOINCOINSELECTION_API btccs_SelectionResult* BITCOINCOINSELECTION_WARN_UNUSED_RESULT
+btccs_select_coins_coingrinder(
+    btccs_UtxoPool* pool,
+    btccs_Amount selection_target,
+    btccs_Amount change_target,
+    int max_weight,
+    btccs_SelectionStatus* status) BITCOINCOINSELECTION_ARG_NONNULL(1);
+
+/**
+ * @brief Select coins using Knapsack (legacy randomized solver).
+ *
+ * @param pool           UTXO pool. Non-null.
+ * @param target_value   Target value in satoshis.
+ * @param change_target  Minimum change amount.
+ * @param rng            Random context. Non-null.
+ * @param max_weight     Maximum selection weight.
+ * @param status         Output status code. May be NULL.
+ * @return Selection result, or NULL on failure.
+ */
+BITCOINCOINSELECTION_API btccs_SelectionResult* BITCOINCOINSELECTION_WARN_UNUSED_RESULT
+btccs_select_coins_knapsack(
+    btccs_UtxoPool* pool,
+    btccs_Amount target_value,
+    btccs_Amount change_target,
+    btccs_RandomContext* rng,
+    int max_weight,
+    btccs_SelectionStatus* status) BITCOINCOINSELECTION_ARG_NONNULL(1, 4);
+
+/* ========================================================================== */
+/*                       Selection Result Functions                            */
+/* ========================================================================== */
+
+/** Get number of selected inputs. */
+BITCOINCOINSELECTION_API size_t BITCOINCOINSELECTION_WARN_UNUSED_RESULT
+btccs_selection_result_get_input_count(const btccs_SelectionResult* result) BITCOINCOINSELECTION_ARG_NONNULL(1);
+
+/** Get total selected value (before fees). */
+BITCOINCOINSELECTION_API btccs_Amount BITCOINCOINSELECTION_WARN_UNUSED_RESULT
+btccs_selection_result_get_selected_value(const btccs_SelectionResult* result) BITCOINCOINSELECTION_ARG_NONNULL(1);
+
+/** Get total selected effective value (after fees). */
+BITCOINCOINSELECTION_API btccs_Amount BITCOINCOINSELECTION_WARN_UNUSED_RESULT
+btccs_selection_result_get_selected_effective_value(const btccs_SelectionResult* result) BITCOINCOINSELECTION_ARG_NONNULL(1);
+
+/** Get the waste metric. */
+BITCOINCOINSELECTION_API btccs_Amount BITCOINCOINSELECTION_WARN_UNUSED_RESULT
+btccs_selection_result_get_waste(const btccs_SelectionResult* result) BITCOINCOINSELECTION_ARG_NONNULL(1);
+
+/** Get total weight of selected inputs. */
+BITCOINCOINSELECTION_API int BITCOINCOINSELECTION_WARN_UNUSED_RESULT
+btccs_selection_result_get_weight(const btccs_SelectionResult* result) BITCOINCOINSELECTION_ARG_NONNULL(1);
+
+/** Get algorithm used for selection. */
+BITCOINCOINSELECTION_API btccs_SelectionAlgorithm BITCOINCOINSELECTION_WARN_UNUSED_RESULT
+btccs_selection_result_get_algorithm(const btccs_SelectionResult* result) BITCOINCOINSELECTION_ARG_NONNULL(1);
+
+/**
+ * @brief Get outpoint of a selected input.
+ * @param result   Selection result. Non-null.
+ * @param index    Input index.
+ * @param txid_out Buffer for txid (32 bytes). Non-null.
+ * @param vout_out Output for vout index. Non-null.
+ * @return 0 on success, -1 if index out of bounds.
+ */
+BITCOINCOINSELECTION_API int btccs_selection_result_get_input_outpoint(
+    const btccs_SelectionResult* result,
+    size_t index,
+    unsigned char txid_out[32],
+    uint32_t* vout_out) BITCOINCOINSELECTION_ARG_NONNULL(1, 3, 4);
+
+/** Destroy a selection result. */
+BITCOINCOINSELECTION_API void btccs_selection_result_destroy(btccs_SelectionResult* result);
+
+/* ========================================================================== */
+/*                         Utility Functions                                   */
+/* ========================================================================== */
+
+/** Get the maximum standard transaction weight (400,000 WU). */
+BITCOINCOINSELECTION_API int BITCOINCOINSELECTION_WARN_UNUSED_RESULT
+btccs_get_max_standard_tx_weight(void);
+
+/** Convert input bytes to weight units. */
+BITCOINCOINSELECTION_API int BITCOINCOINSELECTION_WARN_UNUSED_RESULT
+btccs_get_input_weight(int input_bytes);
+
+/**
+ * @brief Calculate cost of change output.
+ * @param feerate_sat_per_kvb Feerate in sat/kvB.
+ * @param change_output_size  Change output size (31 for P2WPKH).
+ * @param change_spend_size   Change spend size (68 for P2WPKH).
+ */
+BITCOINCOINSELECTION_API btccs_Amount BITCOINCOINSELECTION_WARN_UNUSED_RESULT
+btccs_calculate_cost_of_change(
+    int64_t feerate_sat_per_kvb,
+    size_t change_output_size,
+    size_t change_spend_size);
+
+/**
+ * @brief Generate randomized change target for privacy.
+ */
+BITCOINCOINSELECTION_API btccs_Amount BITCOINCOINSELECTION_WARN_UNUSED_RESULT
+btccs_generate_change_target(
+    btccs_Amount payment_value,
+    btccs_Amount change_fee,
+    btccs_RandomContext* rng) BITCOINCOINSELECTION_ARG_NONNULL(3);
+
+/** Get library version string. */
+BITCOINCOINSELECTION_API const char* btccs_version(void);
+
 #ifdef __cplusplus
 } // extern "C"
 #endif
