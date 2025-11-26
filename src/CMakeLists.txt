@@ -427,6 +427,9 @@ if(BUILD_UTIL_CHAINSTATE)
   install_binary_component(bitcoin-chainstate INTERNAL)
 endif()
 
+if(BUILD_COINSELECTION_LIB)
+  add_subdirectory(coinselection)
+endif()
 
 add_subdirectory(test/util)
 if(BUILD_BENCH)
