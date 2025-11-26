@@ -287,3 +287,113 @@ btccs_SelectionResult* btccs_select_coins_knapsack(
         return nullptr;
     }
 }
+
+// ==========================================================================
+// Selection Result Implementation
+// ==========================================================================
+
+size_t btccs_selection_result_get_input_count(const btccs_SelectionResult* result)
+{
+    // result is marked nonnull
+    return result->result.GetInputSet().size();
+}
+
+btccs_Amount btccs_selection_result_get_selected_value(const btccs_SelectionResult* result)
+{
+    // result is marked nonnull
+    CAmount total = 0;
+    for (const auto& coin : result->result.GetInputSet()) {
+        total += coin->txout.nValue;
+    }
+    return total;
+}
+
+btccs_Amount btccs_selection_result_get_selected_effective_value(const btccs_SelectionResult* result)
+{
+    // result is marked nonnull
+    CAmount total = 0;
+    for (const auto& coin : result->result.GetInputSet()) {
+        total += coin->GetEffectiveValue();
+    }
+    return total;
+}
+
+btccs_Amount btccs_selection_result_get_waste(const btccs_SelectionResult* result)
+{
+    // result is marked nonnull
+    return result->waste;
+}
+
+int btccs_selection_result_get_weight(const btccs_SelectionResult* result)
+{
+    // result is marked nonnull
+    return result->result.GetWeight();
+}
+
+btccs_SelectionAlgorithm btccs_selection_result_get_algorithm(const btccs_SelectionResult* result)
+{
+    // result is marked nonnull
+    return result->algorithm;
+}
+
+int btccs_selection_result_get_input_outpoint(
+    const btccs_SelectionResult* result,
+    size_t index,
+    unsigned char txid_out[32],
+    uint32_t* vout_out)
+{
+    // result, txid_out, vout_out are marked nonnull
+    const auto& inputs = result->result.GetInputSet();
+    if (index >= inputs.size()) return -1;
+
+    // GetInputSet returns a set, need to iterate
+    auto it = inputs.begin();
+    std::advance(it, index);
+
+    std::memcpy(txid_out, (*it)->outpoint.hash.begin(), 32);
+    *vout_out = (*it)->outpoint.n;
+    return 0;
+}
+
+void btccs_selection_result_destroy(btccs_SelectionResult* result)
+{
+    delete result;
+}
+
+// ==========================================================================
+// Utility Functions
+// ==========================================================================
+
+int btccs_get_max_standard_tx_weight(void)
+{
+    return MAX_STANDARD_TX_WEIGHT;
+}
+
+int btccs_get_input_weight(int input_bytes)
+{
+    return input_bytes * WITNESS_SCALE_FACTOR;
+}
+
+btccs_Amount btccs_calculate_cost_of_change(
+    int64_t feerate_sat_per_kvb,
+    size_t change_output_size,
+    size_t change_spend_size)
+{
+    CFeeRate feerate(feerate_sat_per_kvb);
+    CFeeRate discard_rate(3000); // Default 3 sat/vB discard rate
+    return feerate.GetFee(change_output_size) + discard_rate.GetFee(change_spend_size);
+}
+
+btccs_Amount btccs_generate_change_target(
+    btccs_Amount payment_value,
+    btccs_Amount change_fee,
+    btccs_RandomContext* rng)
+{
+    // rng is marked nonnull
+    return wallet::GenerateChangeTarget(payment_value, change_fee, rng->rng);
+}
+
+const char* btccs_version(void)
+{
+    return BTCCS_VERSION;
+}
