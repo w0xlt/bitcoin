@@ -108,6 +108,7 @@ option(BUILD_KERNEL_LIB "Build experimental bitcoinkernel library." ${BUILD_UTIL
 option(BUILD_KERNEL_TEST "Build tests for the experimental bitcoinkernel library." ${BUILD_KERNEL_LIB})
 
 option(BUILD_COINSELECTION_LIB "Build the libbitcoincoinselection library" OFF)
+option(BUILD_COINSELECTION_TEST "Build tests for libbitcoincoinselection library." ${BUILD_COINSELECTION_LIB})
 
 option(ENABLE_WALLET "Enable wallet." ON)
 if(ENABLE_WALLET)
