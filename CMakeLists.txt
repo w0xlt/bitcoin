@@ -104,6 +104,7 @@ option(BUILD_TX "Build bitcoin-tx executable." ${BUILD_TESTS})
 option(BUILD_UTIL "Build bitcoin-util executable." ${BUILD_TESTS})
 
 option(BUILD_COINSELECTION_LIB "Build the libbitcoincoinselection library" OFF)
+option(BUILD_COINSELECTION_TEST "Build tests for libbitcoincoinselection library." ${BUILD_COINSELECTION_LIB})
 
 option(BUILD_UTIL_CHAINSTATE "Build experimental bitcoin-chainstate executable." OFF)
 option(BUILD_KERNEL_LIB "Build experimental bitcoinkernel library." ${BUILD_UTIL_CHAINSTATE})

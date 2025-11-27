@@ -429,6 +429,9 @@ endif()
 
 if(BUILD_COINSELECTION_LIB)
   add_subdirectory(coinselection)
+  if(BUILD_COINSELECTION_TEST)
+    add_subdirectory(test/coinselection)
+  endif()
 endif()
 
 add_subdirectory(test/util)
