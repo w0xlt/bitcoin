@@ -14,6 +14,12 @@
  * for convenient resource management.
  *
  * For C bindings or FFI, use bitcoincoinselection.h instead.
+ *
+ * Version 0.3.0 Changes:
+ * - Selection methods now use Bitcoin Core's RecalculateWaste() for accurate
+ *   waste metrics instead of a simplified calculation.
+ * - Added CoinSelectionParams helper class for managing fee-related parameters.
+ * - Selection methods now require CoinSelectionParams for proper waste calculation.
  */
 
 #include <consensus/amount.h>
@@ -84,6 +90,131 @@ private:
 };
 
 // ==========================================================================
+// CoinSelectionParams - Fee calculation helper
+// ==========================================================================
+
+/**
+ * @brief Helper class for calculating coin selection parameters.
+ *
+ * This provides convenient calculation of change costs and fees
+ * based on feerates and output sizes. Required for accurate waste
+ * calculation using Bitcoin Core's RecalculateWaste().
+ *
+ * Example usage:
+ * @code
+ *   // Simple construction with just effective feerate
+ *   CoinSelectionParams params(10000); // 10 sat/vB
+ *
+ *   // Or with explicit control
+ *   CoinSelectionParams params(
+ *       CFeeRate(10000),  // effective feerate
+ *       CFeeRate(3000),   // long-term feerate
+ *       CFeeRate(3000),   // discard feerate
+ *       31,               // change output size (P2WPKH)
+ *       68                // change spend size (P2WPKH)
+ *   );
+ *
+ *   // Use with selection
+ *   auto result = pool.SelectBnB(target, params);
+ * @endcode
+ */
+class CoinSelectionParams {
+public:
+    /**
+     * @brief Create parameters with explicit sizes and feerates.
+     *
+     * @param effective_feerate  Current transaction feerate.
+     * @param long_term_feerate  Long-term expected feerate for consolidation.
+     * @param discard_feerate    Minimum feerate for dust threshold.
+     * @param change_output_size Size of change output (31 for P2WPKH).
+     * @param change_spend_size  Size of spending change (68 for P2WPKH).
+     */
+    CoinSelectionParams(FeeRate effective_feerate,
+                        FeeRate long_term_feerate,
+                        FeeRate discard_feerate,
+                        size_t change_output_size = 31,
+                        size_t change_spend_size = 68)
+        : m_effective_feerate(effective_feerate)
+        , m_long_term_feerate(long_term_feerate)
+        , m_discard_feerate(discard_feerate)
+        , m_change_output_size(change_output_size)
+        , m_change_spend_size(change_spend_size)
+    {}
+
+    /**
+     * @brief Create parameters with just the effective feerate.
+     *
+     * Uses sensible defaults:
+     * - Long-term feerate = effective / 3
+     * - Discard feerate = 3 sat/vB
+     * - P2WPKH sizes (31 bytes output, 68 bytes spend)
+     */
+    explicit CoinSelectionParams(FeeRate effective_feerate)
+        : m_effective_feerate(effective_feerate)
+        , m_long_term_feerate(effective_feerate.GetFeePerK() / 3)
+        , m_discard_feerate(3000)
+        , m_change_output_size(31)
+        , m_change_spend_size(68)
+    {}
+
+    /**
+     * @brief Create parameters from sat/kvB value.
+     */
+    explicit CoinSelectionParams(int64_t effective_feerate_sat_per_kvb)
+        : CoinSelectionParams(FeeRate(effective_feerate_sat_per_kvb))
+    {}
+
+    /** Fee for creating the change output at current feerate. */
+    Amount GetChangeFee() const
+    {
+        return m_effective_feerate.GetFee(m_change_output_size);
+    }
+
+    /** Total cost of change (creation + future spend at discard rate). */
+    Amount GetCostOfChange() const
+    {
+        return GetChangeFee() + m_discard_feerate.GetFee(m_change_spend_size);
+    }
+
+    /**
+     * @brief Get minimum viable change amount.
+     *
+     * Returns a value that ensures change is worth creating.
+     * Typically the cost of spending the change output.
+     */
+    Amount GetMinViableChange() const
+    {
+        return m_discard_feerate.GetFee(m_change_spend_size);
+    }
+
+    /** Calculate fee for an input of given size. */
+    Amount GetInputFee(int input_bytes) const
+    {
+        return m_effective_feerate.GetFee(input_bytes);
+    }
+
+    /** Calculate long-term fee for an input. */
+    Amount GetInputLongTermFee(int input_bytes) const
+    {
+        return m_long_term_feerate.GetFee(input_bytes);
+    }
+
+    // Accessors
+    const FeeRate& EffectiveFeeRate() const { return m_effective_feerate; }
+    const FeeRate& LongTermFeeRate() const { return m_long_term_feerate; }
+    const FeeRate& DiscardFeeRate() const { return m_discard_feerate; }
+    size_t ChangeOutputSize() const { return m_change_output_size; }
+    size_t ChangeSpendSize() const { return m_change_spend_size; }
+
+private:
+    FeeRate m_effective_feerate;
+    FeeRate m_long_term_feerate;
+    FeeRate m_discard_feerate;
+    size_t m_change_output_size;
+    size_t m_change_spend_size;
+};
+
+// ==========================================================================
 // UtxoPool - Builder for creating a pool of UTXOs
 // ==========================================================================
 
@@ -92,11 +223,16 @@ private:
  *
  * Example usage:
  * @code
- *   UtxoPool pool;
- *   pool.Add(txid1, 0, 100000, 68, 6, fee1, ltfee1);
- *   pool.Add(txid2, 1, 250000, 68, 3, fee2, ltfee2);
+ *   CoinSelectionParams params(10000); // 10 sat/vB
  *
- *   auto result = pool.SelectBnB(target, costOfChange);
+ *   UtxoPool pool;
+ *   pool.Add(txid1, 0, 100000, 68, 6, params);
+ *   pool.Add(txid2, 1, 250000, 68, 3, params);
+ *
+ *   auto result = pool.SelectBnB(target, params);
+ *   if (result) {
+ *       // Use result->GetWaste() for the full waste metric
+ *   }
  * @endcode
  */
 class UtxoPool {
@@ -104,7 +240,7 @@ public:
     UtxoPool() = default;
 
     /**
-     * @brief Add a UTXO to the pool.
+     * @brief Add a UTXO to the pool with explicit fee values.
      *
      * @param txid          Transaction ID (32 bytes).
      * @param vout          Output index.
@@ -141,7 +277,30 @@ public:
     }
 
     /**
-     * @brief Add a UTXO using simplified parameters with feerate calculation.
+     * @brief Add a UTXO using CoinSelectionParams for fee calculation.
+     *
+     * @param txid         Transaction ID.
+     * @param vout         Output index.
+     * @param value        Output value in satoshis.
+     * @param input_bytes  Estimated input size (68 for P2WPKH).
+     * @param depth        Confirmation depth.
+     * @param params       Coin selection parameters for fee calculation.
+     * @return Reference to this pool for chaining.
+     */
+    UtxoPool& Add(const std::array<unsigned char, 32>& txid,
+                  uint32_t vout,
+                  Amount value,
+                  int input_bytes,
+                  int depth,
+                  const CoinSelectionParams& params)
+    {
+        return Add(txid, vout, value, input_bytes, depth,
+                   params.GetInputFee(input_bytes),
+                   params.GetInputLongTermFee(input_bytes));
+    }
+
+    /**
+     * @brief Add a UTXO using explicit feerates.
      *
      * @param txid         Transaction ID.
      * @param vout         Output index.
@@ -195,19 +354,25 @@ public:
     /**
      * @brief Select coins using Branch and Bound (changeless solutions).
      *
-     * @param target          Target effective value.
-     * @param cost_of_change  Cost of creating and spending change.
-     * @param max_weight      Maximum selection weight (default: MAX_STANDARD_TX_WEIGHT).
-     * @return Selection result, or nullopt if no solution found.
+     * BnB attempts to find an exact match for the target, avoiding
+     * change creation entirely.
+     *
+     * @param target  Target effective value.
+     * @param params  Coin selection parameters (for cost_of_change).
+     * @param max_weight  Maximum selection weight (default: MAX_STANDARD_TX_WEIGHT).
+     * @return Selection result with waste calculated, or nullopt if no solution.
      */
     std::optional<SelectionResult> SelectBnB(
         Amount target,
-        Amount cost_of_change,
+        const CoinSelectionParams& params,
         int max_weight = MAX_STANDARD_TX_WEIGHT) const
     {
-        auto groups = m_groups; // Copy since BnB may sort
-        auto result = wallet::SelectCoinsBnB(groups, target, cost_of_change, max_weight);
+        auto groups = m_groups;
+        auto result = wallet::SelectCoinsBnB(groups, target, params.GetCostOfChange(), max_weight);
         if (!result) return std::nullopt;
+
+        // BnB targets exact matches, so min_viable_change = 0
+        result->RecalculateWaste(0, params.GetCostOfChange(), 0);
         return std::move(*result);
     }
 
@@ -215,158 +380,108 @@ public:
      * @brief Select coins using Single Random Draw.
      *
      * @param target      Target value.
-     * @param change_fee  Fee for change output.
+     * @param params      Coin selection parameters.
      * @param rng         Random context.
      * @param max_weight  Maximum selection weight.
-     * @return Selection result, or nullopt if no solution found.
+     * @return Selection result with waste calculated, or nullopt if no solution.
      */
     std::optional<SelectionResult> SelectSRD(
         Amount target,
-        Amount change_fee,
+        const CoinSelectionParams& params,
         FastRandomContext& rng,
         int max_weight = MAX_STANDARD_TX_WEIGHT) const
     {
         auto groups = m_groups;
-        auto result = wallet::SelectCoinsSRD(groups, target, change_fee, rng, max_weight);
+        auto result = wallet::SelectCoinsSRD(groups, target, params.GetChangeFee(), rng, max_weight);
         if (!result) return std::nullopt;
+
+        result->RecalculateWaste(
+            params.GetMinViableChange(),
+            params.GetCostOfChange(),
+            params.GetChangeFee()
+        );
         return std::move(*result);
     }
 
     /**
      * @brief Select coins using CoinGrinder (minimizes weight).
      *
-     * @param target         Target value.
-     * @param change_target  Minimum change amount.
-     * @param max_weight     Maximum selection weight.
-     * @return Selection result, or nullopt if no solution found.
+     * Best used when feerates are high and minimizing input count matters.
+     *
+     * @param target      Target value.
+     * @param params      Coin selection parameters.
+     * @param max_weight  Maximum selection weight.
+     * @return Selection result with waste calculated, or nullopt if no solution.
      */
     std::optional<SelectionResult> SelectCoinGrinder(
         Amount target,
-        Amount change_target,
+        const CoinSelectionParams& params,
         int max_weight = MAX_STANDARD_TX_WEIGHT) const
     {
         auto groups = m_groups;
-        auto result = wallet::CoinGrinder(groups, target, change_target, max_weight);
+        auto result = wallet::CoinGrinder(groups, target, params.GetMinViableChange(), max_weight);
         if (!result) return std::nullopt;
+
+        result->RecalculateWaste(
+            params.GetMinViableChange(),
+            params.GetCostOfChange(),
+            params.GetChangeFee()
+        );
         return std::move(*result);
     }
 
     /**
      * @brief Select coins using Knapsack solver.
      *
-     * @param target         Target value.
-     * @param change_target  Minimum change amount.
-     * @param rng            Random context.
-     * @param max_weight     Maximum selection weight.
-     * @return Selection result, or nullopt if no solution found.
+     * The legacy randomized solver, used as a fallback.
+     *
+     * @param target      Target value.
+     * @param params      Coin selection parameters.
+     * @param rng         Random context.
+     * @param max_weight  Maximum selection weight.
+     * @return Selection result with waste calculated, or nullopt if no solution.
      */
     std::optional<SelectionResult> SelectKnapsack(
         Amount target,
-        Amount change_target,
+        const CoinSelectionParams& params,
         FastRandomContext& rng,
         int max_weight = MAX_STANDARD_TX_WEIGHT) const
     {
         auto groups = m_groups;
-        auto result = wallet::KnapsackSolver(groups, target, change_target, rng, max_weight);
+        auto result = wallet::KnapsackSolver(groups, target, params.GetMinViableChange(), rng, max_weight);
         if (!result) return std::nullopt;
+
+        result->RecalculateWaste(
+            params.GetMinViableChange(),
+            params.GetCostOfChange(),
+            params.GetChangeFee()
+        );
+        return std::move(*result);
+    }
+
+    // ======================================================================
+    // Legacy Selection Methods (for backward compatibility)
+    // ======================================================================
+
+    /**
+     * @brief Select coins using BnB with explicit cost_of_change.
+     * @deprecated Use SelectBnB(target, params) instead.
+     */
+    [[deprecated("Use SelectBnB(target, params) for accurate waste calculation")]]
+    std::optional<SelectionResult> SelectBnB(
+        Amount target,
+        Amount cost_of_change,
+        int max_weight = MAX_STANDARD_TX_WEIGHT) const
+    {
+        auto groups = m_groups;
+        auto result = wallet::SelectCoinsBnB(groups, target, cost_of_change, max_weight);
+        if (!result) return std::nullopt;
+        result->RecalculateWaste(0, cost_of_change, 0);
         return std::move(*result);
     }
 
 private:
     std::vector<OutputGroup> m_groups;
-};
-
-// ==========================================================================
-// CoinSelectionParams - Fee calculation helper
-// ==========================================================================
-
-/**
- * @brief Helper class for calculating coin selection parameters.
- *
- * This provides convenient calculation of change costs and fees
- * based on feerates and output sizes.
- */
-class CoinSelectionParams {
-public:
-    /**
-     * @brief Create parameters with explicit sizes.
-     *
-     * @param effective_feerate  Current transaction feerate.
-     * @param long_term_feerate  Long-term expected feerate.
-     * @param discard_feerate    Minimum feerate for dust threshold.
-     * @param change_output_size Size of change output (31 for P2WPKH).
-     * @param change_spend_size  Size of spending change (68 for P2WPKH).
-     */
-    CoinSelectionParams(FeeRate effective_feerate,
-                        FeeRate long_term_feerate,
-                        FeeRate discard_feerate,
-                        size_t change_output_size = 31,
-                        size_t change_spend_size = 68)
-        : m_effective_feerate(effective_feerate)
-        , m_long_term_feerate(long_term_feerate)
-        , m_discard_feerate(discard_feerate)
-        , m_change_output_size(change_output_size)
-        , m_change_spend_size(change_spend_size)
-    {}
-
-    /**
-     * @brief Create parameters with just the effective feerate.
-     *
-     * Uses sensible defaults:
-     * - Long-term feerate = effective / 3
-     * - Discard feerate = 3 sat/vB
-     * - P2WPKH sizes (31 bytes output, 68 bytes spend)
-     */
-    explicit CoinSelectionParams(FeeRate effective_feerate)
-        : m_effective_feerate(effective_feerate)
-        , m_long_term_feerate(effective_feerate.GetFeePerK() / 3)
-        , m_discard_feerate(3000)
-        , m_change_output_size(31)
-        , m_change_spend_size(68)
-    {}
-
-    /**
-     * @brief Create parameters from sat/kvB value.
-     */
-    explicit CoinSelectionParams(int64_t effective_feerate_sat_per_kvb)
-        : CoinSelectionParams(FeeRate(effective_feerate_sat_per_kvb))
-    {}
-
-    /** Cost of creating a change output. */
-    Amount GetChangeFee() const
-    {
-        return m_effective_feerate.GetFee(m_change_output_size);
-    }
-
-    /** Total cost of change (creation + future spend). */
-    Amount GetCostOfChange() const
-    {
-        return GetChangeFee() + m_discard_feerate.GetFee(m_change_spend_size);
-    }
-
-    /** Calculate fee for an input of given size. */
-    Amount GetInputFee(int input_bytes) const
-    {
-        return m_effective_feerate.GetFee(input_bytes);
-    }
-
-    /** Calculate long-term fee for an input. */
-    Amount GetInputLongTermFee(int input_bytes) const
-    {
-        return m_long_term_feerate.GetFee(input_bytes);
-    }
-
-    // Accessors
-    const FeeRate& EffectiveFeeRate() const { return m_effective_feerate; }
-    const FeeRate& LongTermFeeRate() const { return m_long_term_feerate; }
-    const FeeRate& DiscardFeeRate() const { return m_discard_feerate; }
-
-private:
-    FeeRate m_effective_feerate;
-    FeeRate m_long_term_feerate;
-    FeeRate m_discard_feerate;
-    size_t m_change_output_size;
-    size_t m_change_spend_size;
 };
 
 // ==========================================================================
@@ -402,7 +517,7 @@ inline int GetInputWeight(int input_bytes)
  */
 inline std::string Version()
 {
-    return "0.2.0";
+    return "0.3.0";
 }
 
 /**
