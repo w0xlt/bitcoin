@@ -92,7 +92,7 @@ public:
     COutput(const COutPoint& outpoint, const CTxOut& txout, int depth, int input_bytes, bool solvable, bool safe, int64_t time, bool from_me, const CAmount fees)
         : COutput(outpoint, txout, depth, input_bytes, solvable, safe, time, from_me)
     {
-        // if input_bytes is unknown, then fees should be 0, if input_bytes is known, then the fees should be a positive integer or 0 (input_bytes known and fees = 0 only happens in the tests)
+        // if input_bytes is unknown, then fees should be 0, if input_bytes is known, then the fees should be a positive integer or 0
         assert((input_bytes < 0 && fees == 0) || (input_bytes > 0 && fees >= 0));
         fee = fees;
         effective_value = txout.nValue - fee.value();
@@ -191,8 +191,69 @@ struct CoinSelectionParams {
           m_max_tx_weight(max_tx_weight)
     {
     }
+
     CoinSelectionParams(FastRandomContext& rng_fast)
         : rng_fast{rng_fast} {}
+};
+
+/**
+ * Interface providing the chain information needed for coin selection.
+ * This abstraction allows coin selection to be used without a wallet dependency.
+ *
+ * The wallet implementation (CWalletCoinSelectionSource) wraps CWallet and
+ * interfaces::Chain to provide this interface. External users can implement
+ * their own version.
+ */
+struct CoinSelectionSource {
+    virtual ~CoinSelectionSource() = default;
+
+    /**
+     * Get the ancestor and descendant count for a transaction.
+     * Used for grouping outputs and checking mempool chain limits.
+     *
+     * @param[in]  txid         The transaction id to query
+     * @param[out] ancestors    The number of in-mempool ancestors
+     * @param[out] descendants  The number of in-mempool descendants
+     */
+    virtual void GetTransactionAncestry(const Txid& txid, size_t& ancestors, size_t& descendants) const = 0;
+
+    /**
+     * Calculate the combined bump fee for a set of unconfirmed UTXOs.
+     * This accounts for shared ancestry when multiple UTXOs are selected.
+     *
+     * @param[in] outpoints    The set of outpoints to calculate bump fee for
+     * @param[in] feerate      The target feerate
+     * @return The combined bump fee, or std::nullopt on failure (e.g., cluster too large)
+     */
+    virtual std::optional<CAmount> CalculateCombinedBumpFee(
+        const std::vector<COutPoint>& outpoints,
+        const CFeeRate& feerate) const = 0;
+
+    /**
+     * Get the mempool package limits (max ancestors and max descendants).
+     *
+     * @param[out] limit_ancestor_count   Maximum number of ancestors
+     * @param[out] limit_descendant_count Maximum number of descendants
+     */
+    virtual void GetPackageLimits(unsigned int& limit_ancestor_count,
+                                  unsigned int& limit_descendant_count) const = 0;
+};
+
+/**
+ * Options/settings for coin selection that are typically sourced from wallet configuration.
+ * These are separated from CoinSelectionParams to allow library users to configure
+ * coin selection behavior without a wallet.
+ */
+struct CoinSelectionOptions {
+    /** Whether to allow spending zero-confirmation change outputs. */
+    bool spend_zero_conf_change{true};
+
+    /** Whether to reject transactions with long mempool chains. */
+    bool reject_long_chains{false};
+
+    CoinSelectionOptions() = default;
+    CoinSelectionOptions(bool spend_zero_conf, bool reject_long)
+        : spend_zero_conf_change(spend_zero_conf), reject_long_chains(reject_long) {}
 };
 
 /** Parameters for filtering which OutputGroups we may use in coin selection.
@@ -213,9 +274,16 @@ struct CoinEligibilityFilter
     const bool m_include_partial_groups{false};
 
     CoinEligibilityFilter() = delete;
-    CoinEligibilityFilter(int conf_mine, int conf_theirs, uint64_t max_ancestors) : conf_mine(conf_mine), conf_theirs(conf_theirs), max_ancestors(max_ancestors), max_descendants(max_ancestors) {}
-    CoinEligibilityFilter(int conf_mine, int conf_theirs, uint64_t max_ancestors, uint64_t max_descendants) : conf_mine(conf_mine), conf_theirs(conf_theirs), max_ancestors(max_ancestors), max_descendants(max_descendants) {}
-    CoinEligibilityFilter(int conf_mine, int conf_theirs, uint64_t max_ancestors, uint64_t max_descendants, bool include_partial) : conf_mine(conf_mine), conf_theirs(conf_theirs), max_ancestors(max_ancestors), max_descendants(max_descendants), m_include_partial_groups(include_partial) {}
+    CoinEligibilityFilter(int conf_mine, int conf_theirs, uint64_t max_ancestors)
+        : conf_mine(conf_mine), conf_theirs(conf_theirs),
+          max_ancestors(max_ancestors), max_descendants(max_ancestors) {}
+    CoinEligibilityFilter(int conf_mine, int conf_theirs, uint64_t max_ancestors, uint64_t max_descendants)
+        : conf_mine(conf_mine), conf_theirs(conf_theirs),
+          max_ancestors(max_ancestors), max_descendants(max_descendants) {}
+    CoinEligibilityFilter(int conf_mine, int conf_theirs, uint64_t max_ancestors, uint64_t max_descendants, bool include_partial)
+        : conf_mine(conf_mine), conf_theirs(conf_theirs),
+          max_ancestors(max_ancestors), max_descendants(max_descendants),
+          m_include_partial_groups(include_partial) {}
 
     bool operator<(const CoinEligibilityFilter& other) const {
         return std::tie(conf_mine, conf_theirs, max_ancestors, max_descendants, m_include_partial_groups)
@@ -258,9 +326,9 @@ struct OutputGroup
     int m_weight{0};
 
     OutputGroup() = default;
-    OutputGroup(const CoinSelectionParams& params) :
-        m_long_term_feerate(params.m_long_term_feerate),
-        m_subtract_fee_outputs(params.m_subtract_fee_outputs)
+    explicit OutputGroup(const CoinSelectionParams& params)
+        : m_long_term_feerate(params.m_long_term_feerate),
+          m_subtract_fee_outputs(params.m_subtract_fee_outputs)
     {}
 
     void Insert(const std::shared_ptr<COutput>& output, size_t ancestors, size_t descendants);
@@ -290,7 +358,7 @@ struct OutputGroupTypeMap
     size_t TypesCount() { return groups_by_type.size(); }
 };
 
-typedef std::map<CoinEligibilityFilter, OutputGroupTypeMap> FilteredOutputGroups;
+using FilteredOutputGroups = std::map<CoinEligibilityFilter, OutputGroupTypeMap>;
 
 /** Choose a random change target for each transaction to make it harder to fingerprint the Core
  * wallet based on the change output values of transactions it creates.
@@ -335,7 +403,7 @@ private:
     /** False if algorithm was cut short by hitting limit of attempts and solution is non-optimal */
     bool m_algo_completed{true};
     /** The count of selections that were evaluated by this coin selection attempt */
-    size_t m_selections_evaluated;
+    size_t m_selections_evaluated{0};
     /** Total weight of the selected inputs */
     int m_weight{0};
     /** How much individual inputs overestimated the bump fees for the shared ancestry */
@@ -398,7 +466,7 @@ public:
     void SetSelectionsEvaluated(size_t attempts);
 
     /** Get selections_evaluated */
-    size_t GetSelectionsEvaluated() const ;
+    size_t GetSelectionsEvaluated() const;
 
     /**
      * Combines the @param[in] other selection result into 'this' selection result.
@@ -441,26 +509,39 @@ public:
     int GetWeight() const { return m_weight; }
 };
 
-util::Result<SelectionResult> SelectCoinsBnB(std::vector<OutputGroup>& utxo_pool, const CAmount& selection_target, const CAmount& cost_of_change,
+util::Result<SelectionResult> SelectCoinsBnB(std::vector<OutputGroup>& utxo_pool,
+                                             const CAmount& selection_target,
+                                             const CAmount& cost_of_change,
                                              int max_selection_weight);
 
-util::Result<SelectionResult> CoinGrinder(std::vector<OutputGroup>& utxo_pool, const CAmount& selection_target, CAmount change_target, int max_selection_weight);
+util::Result<SelectionResult> CoinGrinder(std::vector<OutputGroup>& utxo_pool,
+                                          const CAmount& selection_target,
+                                          CAmount change_target,
+                                          int max_selection_weight);
 
 /** Select coins by Single Random Draw. OutputGroups are selected randomly from the eligible
  * outputs until the target is satisfied
  *
  * @param[in]  utxo_pool    The positive effective value OutputGroups eligible for selection
  * @param[in]  target_value The target value to select for
- * @param[in]  rng The randomness source to shuffle coins
+ * @param[in]  change_fee   Fee for including change output
+ * @param[in]  rng          The randomness source to shuffle coins
  * @param[in]  max_selection_weight The maximum allowed weight for a selection result to be valid
  * @returns If successful, a valid SelectionResult, otherwise, util::Error
  */
-util::Result<SelectionResult> SelectCoinsSRD(const std::vector<OutputGroup>& utxo_pool, CAmount target_value, CAmount change_fee, FastRandomContext& rng,
+util::Result<SelectionResult> SelectCoinsSRD(const std::vector<OutputGroup>& utxo_pool,
+                                             CAmount target_value,
+                                             CAmount change_fee,
+                                             FastRandomContext& rng,
                                              int max_selection_weight);
 
 // Original coin selection algorithm as a fallback
-util::Result<SelectionResult> KnapsackSolver(std::vector<OutputGroup>& groups, const CAmount& nTargetValue,
-                                             CAmount change_target, FastRandomContext& rng, int max_selection_weight);
+util::Result<SelectionResult> KnapsackSolver(std::vector<OutputGroup>& groups,
+                                             const CAmount& nTargetValue,
+                                             CAmount change_target,
+                                             FastRandomContext& rng,
+                                             int max_selection_weight);
+
 } // namespace wallet
 
 #endif // BITCOIN_WALLET_COINSELECTION_H
