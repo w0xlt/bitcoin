@@ -45,6 +45,42 @@ TRACEPOINT_SEMAPHORE(coin_selection, aps_create_tx_internal);
 namespace wallet {
 static constexpr size_t OUTPUT_GROUP_MAX_ENTRIES{100};
 
+namespace {
+
+/** Adapter to use interfaces::Chain as a CoinSelectionSource. */
+class ChainCoinSelectionSource final : public CoinSelectionSource
+{
+    interfaces::Chain& m_chain;
+
+public:
+    explicit ChainCoinSelectionSource(interfaces::Chain& chain) : m_chain(chain) {}
+
+    void GetTransactionAncestry(const Txid& txid,
+                                size_t& ancestors,
+                                size_t& descendants) const override
+    {
+        m_chain.getTransactionAncestry(txid, ancestors, descendants);
+    }
+
+    std::optional<CAmount> CalculateCombinedBumpFee(
+        const std::vector<COutPoint>& outpoints,
+        const CFeeRate& feerate) const override
+    {
+        return m_chain.calculateCombinedBumpFee(outpoints, feerate);
+    }
+
+    void GetPackageLimits(unsigned int& limit_ancestor_count,
+                          unsigned int& limit_descendant_count) const override
+    {
+        m_chain.getPackageLimits(limit_ancestor_count, limit_descendant_count);
+    }
+};
+
+// Returns true if the result contains an error and the message is not empty
+static bool HasErrorMsg(const util::Result<SelectionResult>& res) { return !util::ErrorString(res).empty(); }
+
+} // namespace
+
 /** Whether the descriptor represents, directly or not, a witness program. */
 static bool IsSegwit(const Descriptor& desc) {
     if (const auto typ = desc.GetOutputType()) return *typ != OutputType::LEGACY;
@@ -104,6 +140,7 @@ int CalculateMaximumSignedInputSize(const CTxOut& txout, const COutPoint outpoin
 
 int CalculateMaximumSignedInputSize(const CTxOut& txout, const CWallet* wallet, const CCoinControl* coin_control)
 {
+    if (!wallet) return -1;
     const std::unique_ptr<SigningProvider> provider = wallet->GetSolvingProvider(txout.scriptPubKey);
     return CalculateMaximumSignedInputSize(txout, COutPoint(), provider.get(), wallet->CanGrindR(), coin_control);
 }
@@ -565,7 +602,7 @@ std::map<CTxDestination, std::vector<COutput>> ListCoins(const CWallet& wallet)
     return result;
 }
 
-FilteredOutputGroups GroupOutputs(const CWallet& wallet,
+FilteredOutputGroups GroupOutputs(const CoinSelectionSource& source,
                           const CoinsResult& coins,
                           const CoinSelectionParams& coin_sel_params,
                           const std::vector<SelectionFilter>& filters,
@@ -579,7 +616,7 @@ FilteredOutputGroups GroupOutputs(const CWallet& wallet,
             for (const COutput& output : outputs) {
                 // Get mempool info
                 size_t ancestors, descendants;
-                wallet.chain().getTransactionAncestry(output.outpoint.hash, ancestors, descendants);
+                source.GetTransactionAncestry(output.outpoint.hash, ancestors, descendants);
 
                 // Create a new group per output and add it to the all groups vector
                 OutputGroup group(coin_sel_params);
@@ -636,7 +673,7 @@ FilteredOutputGroups GroupOutputs(const CWallet& wallet,
     for (const auto& [type, outs] : coins.coins) {
         for (const COutput& output : outs) {
             size_t ancestors, descendants;
-            wallet.chain().getTransactionAncestry(output.outpoint.hash, ancestors, descendants);
+            source.GetTransactionAncestry(output.outpoint.hash, ancestors, descendants);
 
             const auto& shared_output = std::make_shared<COutput>(output);
             // Filter for positive only before adding the output
@@ -683,25 +720,31 @@ FilteredOutputGroups GroupOutputs(const CWallet& wallet,
     return filtered_groups;
 }
 
-FilteredOutputGroups GroupOutputs(const CWallet& wallet,
+FilteredOutputGroups GroupOutputs(const CoinSelectionSource& source,
                                   const CoinsResult& coins,
                                   const CoinSelectionParams& params,
                                   const std::vector<SelectionFilter>& filters)
 {
     std::vector<OutputGroup> unused;
-    return GroupOutputs(wallet, coins, params, filters, unused);
+    return GroupOutputs(source, coins, params, filters, unused);
 }
 
-// Returns true if the result contains an error and the message is not empty
-static bool HasErrorMsg(const util::Result<SelectionResult>& res) { return !util::ErrorString(res).empty(); }
+FilteredOutputGroups GroupOutputs(const CWallet& wallet,
+                                  const CoinsResult& coins,
+                                  const CoinSelectionParams& params,
+                                  const std::vector<SelectionFilter>& filters)
+{
+    CWalletCoinSelectionSource source(wallet);
+    return GroupOutputs(source, coins, params, filters);
+}
 
-util::Result<SelectionResult> AttemptSelection(interfaces::Chain& chain, const CAmount& nTargetValue, OutputGroupTypeMap& groups,
+util::Result<SelectionResult> AttemptSelection(const CoinSelectionSource& source, const CAmount& nTargetValue, OutputGroupTypeMap& groups,
                                const CoinSelectionParams& coin_selection_params, bool allow_mixed_output_types)
 {
     // Run coin selection on each OutputType and compute the Waste Metric
     std::vector<SelectionResult> results;
     for (auto& [type, group] : groups.groups_by_type) {
-        auto result{ChooseSelectionResult(chain, nTargetValue, group, coin_selection_params)};
+        auto result{ChooseSelectionResult(source, nTargetValue, group, coin_selection_params)};
         // If any specific error message appears here, then something particularly wrong happened.
         if (HasErrorMsg(result)) return result; // So let's return the specific error.
         // Append the favorable result.
@@ -715,14 +758,21 @@ util::Result<SelectionResult> AttemptSelection(interfaces::Chain& chain, const C
     // over all available coins, which would allow mixing.
     // If TypesCount() <= 1, there is nothing to mix.
     if (allow_mixed_output_types && groups.TypesCount() > 1) {
-        return ChooseSelectionResult(chain, nTargetValue, groups.all_groups, coin_selection_params);
+        return ChooseSelectionResult(source, nTargetValue, groups.all_groups, coin_selection_params);
     }
     // Either mixing is not allowed and we couldn't find a solution from any single OutputType, or mixing was allowed and we still couldn't
     // find a solution using all available coins
     return util::Error();
+}
+
+util::Result<SelectionResult> AttemptSelection(interfaces::Chain& chain, const CAmount& nTargetValue, OutputGroupTypeMap& groups,
+                               const CoinSelectionParams& coin_selection_params, bool allow_mixed_output_types)
+{
+    ChainCoinSelectionSource source(chain);
+    return AttemptSelection(source, nTargetValue, groups, coin_selection_params, allow_mixed_output_types);
 };
 
-util::Result<SelectionResult> ChooseSelectionResult(interfaces::Chain& chain, const CAmount& nTargetValue, Groups& groups, const CoinSelectionParams& coin_selection_params)
+util::Result<SelectionResult> ChooseSelectionResult(const CoinSelectionSource& source, const CAmount& nTargetValue, Groups& groups, const CoinSelectionParams& coin_selection_params)
 {
     // Vector of results. We will choose the best one based on waste.
     std::vector<SelectionResult> results;
@@ -791,7 +841,7 @@ util::Result<SelectionResult> ChooseSelectionResult(interfaces::Chain& chain, co
             outpoints.push_back(coin->outpoint);
             summed_bump_fees += coin->ancestor_bump_fees;
         }
-        std::optional<CAmount> combined_bump_fee = chain.calculateCombinedBumpFee(outpoints, coin_selection_params.m_effective_feerate);
+        std::optional<CAmount> combined_bump_fee = source.CalculateCombinedBumpFee(outpoints, coin_selection_params.m_effective_feerate);
         if (!combined_bump_fee.has_value()) {
             return util::Error{_("Failed to calculate bump fees, because unconfirmed UTXOs depend on an enormous cluster of unconfirmed transactions.")};
         }
@@ -807,7 +857,14 @@ util::Result<SelectionResult> ChooseSelectionResult(interfaces::Chain& chain, co
     return *std::min_element(results.begin(), results.end());
 }
 
-util::Result<SelectionResult> SelectCoins(const CWallet& wallet, CoinsResult& available_coins, const PreSelectedInputs& pre_set_inputs,
+util::Result<SelectionResult> ChooseSelectionResult(interfaces::Chain& chain, const CAmount& nTargetValue, Groups& groups, const CoinSelectionParams& coin_selection_params)
+{
+    ChainCoinSelectionSource source(chain);
+    return ChooseSelectionResult(source, nTargetValue, groups, coin_selection_params);
+}
+
+util::Result<SelectionResult> SelectCoins(const CoinSelectionSource& source, const CoinSelectionOptions& options,
+                                          CoinsResult& available_coins, const PreSelectedInputs& pre_set_inputs,
                                           const CAmount& nTargetValue, const CCoinControl& coin_control,
                                           const CoinSelectionParams& coin_selection_params)
 {
@@ -837,7 +894,7 @@ util::Result<SelectionResult> SelectCoins(const CWallet& wallet, CoinsResult& av
     }
 
     // Start wallet Coin Selection procedure
-    auto op_selection_result = AutomaticCoinSelection(wallet, available_coins, selection_target, coin_selection_params);
+    auto op_selection_result = AutomaticCoinSelection(source, options, available_coins, selection_target, coin_selection_params);
     if (!op_selection_result) return op_selection_result;
 
     // If needed, add preset inputs to the automatic coin selection result
@@ -859,14 +916,25 @@ util::Result<SelectionResult> SelectCoins(const CWallet& wallet, CoinsResult& av
     return op_selection_result;
 }
 
-util::Result<SelectionResult> AutomaticCoinSelection(const CWallet& wallet, CoinsResult& available_coins, const CAmount& value_to_select, const CoinSelectionParams& coin_selection_params)
+util::Result<SelectionResult> SelectCoins(const CWallet& wallet, CoinsResult& available_coins, const PreSelectedInputs& pre_set_inputs,
+                                          const CAmount& nTargetValue, const CCoinControl& coin_control,
+                                          const CoinSelectionParams& coin_selection_params)
+{
+    CWalletCoinSelectionSource source(wallet);
+    CoinSelectionOptions options(wallet.m_spend_zero_conf_change, gArgs.GetBoolArg("-walletrejectlongchains", DEFAULT_WALLET_REJECT_LONG_CHAINS));
+    return SelectCoins(source, options, available_coins, pre_set_inputs, nTargetValue, coin_control, coin_selection_params);
+}
+
+util::Result<SelectionResult> AutomaticCoinSelection(const CoinSelectionSource& source, const CoinSelectionOptions& options,
+                                                     CoinsResult& available_coins, const CAmount& value_to_select,
+                                                     const CoinSelectionParams& coin_selection_params)
 {
     unsigned int limit_ancestor_count = 0;
     unsigned int limit_descendant_count = 0;
-    wallet.chain().getPackageLimits(limit_ancestor_count, limit_descendant_count);
+    source.GetPackageLimits(limit_ancestor_count, limit_descendant_count);
     const size_t max_ancestors = (size_t)std::max<int64_t>(1, limit_ancestor_count);
     const size_t max_descendants = (size_t)std::max<int64_t>(1, limit_descendant_count);
-    const bool fRejectLongChains = gArgs.GetBoolArg("-walletrejectlongchains", DEFAULT_WALLET_REJECT_LONG_CHAINS);
+    const bool fRejectLongChains = options.reject_long_chains;
 
     // Cases where we have 101+ outputs all pointing to the same destination may result in
     // privacy leaks as they will potentially be deterministically sorted. We solve that by
@@ -888,7 +956,7 @@ util::Result<SelectionResult> AutomaticCoinSelection(const CWallet& wallet, Coin
         };
         // Fall back to using zero confirmation change (but with as few ancestors in the mempool as
         // possible) if we cannot fund the transaction otherwise.
-        if (wallet.m_spend_zero_conf_change) {
+        if (options.spend_zero_conf_change) {
             ordered_filters.push_back({CoinEligibilityFilter(0, 1, 2)});
             ordered_filters.push_back({CoinEligibilityFilter(0, 1, std::min(size_t{4}, max_ancestors/3), std::min(size_t{4}, max_descendants/3))});
             ordered_filters.push_back({CoinEligibilityFilter(0, 1, max_ancestors/2, max_descendants/2)});
@@ -913,7 +981,7 @@ util::Result<SelectionResult> AutomaticCoinSelection(const CWallet& wallet, Coin
 
         // Group outputs and map them by coin eligibility filter
         std::vector<OutputGroup> discarded_groups;
-        FilteredOutputGroups filtered_groups = GroupOutputs(wallet, available_coins, coin_selection_params, ordered_filters, discarded_groups);
+        FilteredOutputGroups filtered_groups = GroupOutputs(source, available_coins, coin_selection_params, ordered_filters, discarded_groups);
 
         // Check if we still have enough balance after applying filters (some coins might be discarded)
         CAmount total_discarded = 0;
@@ -944,7 +1012,7 @@ util::Result<SelectionResult> AutomaticCoinSelection(const CWallet& wallet, Coin
                     updated_selection_params.m_max_tx_weight = TRUC_CHILD_MAX_WEIGHT;
                 }
             }
-            if (auto res{AttemptSelection(wallet.chain(), value_to_select, it->second,
+            if (auto res{AttemptSelection(source, value_to_select, it->second,
                                           updated_selection_params, select_filter.allow_mixed_output_types)}) {
                 return res; // result found
             } else {
@@ -962,6 +1030,13 @@ util::Result<SelectionResult> AutomaticCoinSelection(const CWallet& wallet, Coin
         // General "Insufficient Funds"
         return util::Error{};
     }
+}
+
+util::Result<SelectionResult> AutomaticCoinSelection(const CWallet& wallet, CoinsResult& available_coins, const CAmount& value_to_select, const CoinSelectionParams& coin_selection_params)
+{
+    CWalletCoinSelectionSource source(wallet);
+    CoinSelectionOptions options(wallet.m_spend_zero_conf_change, gArgs.GetBoolArg("-walletrejectlongchains", DEFAULT_WALLET_REJECT_LONG_CHAINS));
+    return AutomaticCoinSelection(source, options, available_coins, value_to_select, coin_selection_params);
 }
 
 static bool IsCurrentForAntiFeeSniping(interfaces::Chain& chain, const uint256& block_hash)
@@ -1509,5 +1584,22 @@ util::Result<CreatedTransactionResult> FundTransaction(CWallet& wallet, const CM
     }
 
     return res;
+}
+
+/** CWalletCoinSelectionSource implementation **/
+
+void CWalletCoinSelectionSource::GetTransactionAncestry(const Txid& txid, size_t& ancestors, size_t& descendants) const
+{
+    m_wallet.chain().getTransactionAncestry(txid, ancestors, descendants);
+}
+
+std::optional<CAmount> CWalletCoinSelectionSource::CalculateCombinedBumpFee(const std::vector<COutPoint>& outpoints, const CFeeRate& feerate) const
+{
+    return m_wallet.chain().calculateCombinedBumpFee(outpoints, feerate);
+}
+
+void CWalletCoinSelectionSource::GetPackageLimits(unsigned int& limit_ancestor_count, unsigned int& limit_descendant_count) const
+{
+    m_wallet.chain().getPackageLimits(limit_ancestor_count, limit_descendant_count);
 }
 } // namespace wallet
