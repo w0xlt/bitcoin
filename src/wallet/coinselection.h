@@ -195,6 +195,66 @@ struct CoinSelectionParams {
         : rng_fast{rng_fast} {}
 };
 
+/**
+ * Interface providing the chain information needed for coin selection.
+ * This abstraction allows coin selection to be used without a wallet dependency.
+ *
+ * The wallet implementation (CWalletCoinSelectionSource) wraps CWallet and
+ * interfaces::Chain to provide this interface. External users can implement
+ * their own version.
+ */
+struct CoinSelectionSource {
+    virtual ~CoinSelectionSource() = default;
+
+    /**
+     * Get the ancestor and descendant count for a transaction.
+     * Used for grouping outputs and checking mempool chain limits.
+     *
+     * @param[in]  txid         The transaction id to query
+     * @param[out] ancestors    The number of in-mempool ancestors
+     * @param[out] descendants  The number of in-mempool descendants
+     */
+    virtual void GetTransactionAncestry(const Txid& txid, size_t& ancestors, size_t& descendants) const = 0;
+
+    /**
+     * Calculate the combined bump fee for a set of unconfirmed UTXOs.
+     * This accounts for shared ancestry when multiple UTXOs are selected.
+     *
+     * @param[in] outpoints    The set of outpoints to calculate bump fee for
+     * @param[in] feerate      The target feerate
+     * @return The combined bump fee, or std::nullopt on failure (e.g., cluster too large)
+     */
+    virtual std::optional<CAmount> CalculateCombinedBumpFee(
+        const std::vector<COutPoint>& outpoints,
+        const CFeeRate& feerate) const = 0;
+
+    /**
+     * Get the mempool package limits (max ancestors and max descendants).
+     *
+     * @param[out] limit_ancestor_count   Maximum number of ancestors
+     * @param[out] limit_descendant_count Maximum number of descendants
+     */
+    virtual void GetPackageLimits(unsigned int& limit_ancestor_count,
+                                  unsigned int& limit_descendant_count) const = 0;
+};
+
+/**
+ * Options/settings for coin selection that are typically sourced from wallet configuration.
+ * These are separated from CoinSelectionParams to allow library users to configure
+ * coin selection behavior without a wallet.
+ */
+struct CoinSelectionOptions {
+    /** Whether to allow spending zero-confirmation change outputs. */
+    bool spend_zero_conf_change{true};
+
+    /** Whether to reject transactions with long mempool chains. */
+    bool reject_long_chains{false};
+
+    CoinSelectionOptions() = default;
+    CoinSelectionOptions(bool spend_zero_conf, bool reject_long)
+        : spend_zero_conf_change(spend_zero_conf), reject_long_chains(reject_long) {}
+};
+
 /** Parameters for filtering which OutputGroups we may use in coin selection.
  * We start by being very selective and requiring multiple confirmations and
  * then get more permissive if we cannot fund the transaction. */
@@ -290,7 +350,7 @@ struct OutputGroupTypeMap
     size_t TypesCount() { return groups_by_type.size(); }
 };
 
-typedef std::map<CoinEligibilityFilter, OutputGroupTypeMap> FilteredOutputGroups;
+using FilteredOutputGroups = std::map<CoinEligibilityFilter, OutputGroupTypeMap>;
 
 /** Choose a random change target for each transaction to make it harder to fingerprint the Core
  * wallet based on the change output values of transactions it creates.
@@ -335,7 +395,7 @@ private:
     /** False if algorithm was cut short by hitting limit of attempts and solution is non-optimal */
     bool m_algo_completed{true};
     /** The count of selections that were evaluated by this coin selection attempt */
-    size_t m_selections_evaluated;
+    size_t m_selections_evaluated{0};
     /** Total weight of the selected inputs */
     int m_weight{0};
     /** How much individual inputs overestimated the bump fees for the shared ancestry */

@@ -24,8 +24,49 @@ namespace {
 /** Standard P2WPKH input size */
 constexpr int P2WPKH_INPUT_BYTES = 68;
 
+/** Standard P2WPKH output size (change output) */
+constexpr int P2WPKH_OUTPUT_BYTES = 31;
+
 /** Test feerate: 10 sat/vB = 10000 sat/kvB */
 constexpr int64_t TEST_FEERATE_SAT_PER_KVB = 10000;
+
+/** Default long-term feerate: ~3.3 sat/vB = 3333 sat/kvB */
+constexpr int64_t DEFAULT_LT_FEERATE_SAT_PER_KVB = TEST_FEERATE_SAT_PER_KVB / 3;
+
+/** Default discard feerate: 3 sat/vB = 3000 sat/kvB */
+constexpr int64_t DEFAULT_DISCARD_FEERATE_SAT_PER_KVB = 3000;
+
+// ==========================================================================
+// Helper functions for fee calculations
+// ==========================================================================
+
+/** Calculate fee for a given size at a given feerate */
+inline Amount CalculateFee(int bytes, int64_t feerate_sat_per_kvb) {
+    return (static_cast<int64_t>(bytes) * feerate_sat_per_kvb) / 1000;
+}
+
+/** Calculate the fee for spending an input at effective feerate */
+inline Amount GetInputFee(int input_bytes, int64_t effective_feerate_sat_per_kvb = TEST_FEERATE_SAT_PER_KVB) {
+    return CalculateFee(input_bytes, effective_feerate_sat_per_kvb);
+}
+
+/** Calculate the fee for creating a change output */
+inline Amount GetChangeFee(int64_t effective_feerate_sat_per_kvb = TEST_FEERATE_SAT_PER_KVB) {
+    return CalculateFee(P2WPKH_OUTPUT_BYTES, effective_feerate_sat_per_kvb);
+}
+
+/** Calculate the cost of creating and later spending change */
+inline Amount GetCostOfChange(int64_t effective_feerate_sat_per_kvb = TEST_FEERATE_SAT_PER_KVB,
+                               int64_t discard_feerate_sat_per_kvb = DEFAULT_DISCARD_FEERATE_SAT_PER_KVB) {
+    // Cost = change_output_fee + discard_spend_fee
+    return CalculateFee(P2WPKH_OUTPUT_BYTES, effective_feerate_sat_per_kvb) +
+           CalculateFee(P2WPKH_INPUT_BYTES, discard_feerate_sat_per_kvb);
+}
+
+/** Get a FeeRate object for the test feerate */
+inline FeeRate GetEffectiveFeeRate(int64_t feerate_sat_per_kvb = TEST_FEERATE_SAT_PER_KVB) {
+    return FeeRate(feerate_sat_per_kvb);
+}
 
 } // anonymous namespace
 
@@ -77,40 +118,36 @@ BOOST_AUTO_TEST_CASE(make_txid_helper)
 }
 
 // ==========================================================================
-// CoinSelectionParams Tests
+// Fee Calculation Tests
 // ==========================================================================
 
-BOOST_AUTO_TEST_CASE(params_from_feerate)
+BOOST_AUTO_TEST_CASE(fee_calculations)
 {
-    CoinSelectionParams params(TEST_FEERATE_SAT_PER_KVB);
-
     // Change fee = 31 * 10000 / 1000 = 310 sats
-    BOOST_CHECK_EQUAL(params.GetChangeFee(), 310);
+    BOOST_CHECK_EQUAL(GetChangeFee(), 310);
 
     // Cost of change = change_fee + discard_spend_fee
     // = 310 + (68 * 3000 / 1000) = 310 + 204 = 514 sats
-    BOOST_CHECK_EQUAL(params.GetCostOfChange(), 514);
+    BOOST_CHECK_EQUAL(GetCostOfChange(), 514);
 
     // Input fee at 10 sat/vB for 68 byte input = 680 sats
-    BOOST_CHECK_EQUAL(params.GetInputFee(P2WPKH_INPUT_BYTES), 680);
+    BOOST_CHECK_EQUAL(GetInputFee(P2WPKH_INPUT_BYTES), 680);
 
     // Long-term fee at ~3.3 sat/vB for 68 byte input ≈ 226 sats
-    Amount lt_fee = params.GetInputLongTermFee(P2WPKH_INPUT_BYTES);
+    Amount lt_fee = CalculateFee(P2WPKH_INPUT_BYTES, DEFAULT_LT_FEERATE_SAT_PER_KVB);
     BOOST_CHECK_GT(lt_fee, 0);
-    BOOST_CHECK_LT(lt_fee, params.GetInputFee(P2WPKH_INPUT_BYTES));
+    BOOST_CHECK_LT(lt_fee, GetInputFee(P2WPKH_INPUT_BYTES));
 }
 
-BOOST_AUTO_TEST_CASE(params_explicit)
+BOOST_AUTO_TEST_CASE(explicit_feerates)
 {
     FeeRate effective(10000);  // 10 sat/vB
     FeeRate long_term(5000);   // 5 sat/vB
     FeeRate discard(3000);     // 3 sat/vB
 
-    CoinSelectionParams params(effective, long_term, discard, 31, 68);
-
-    BOOST_CHECK_EQUAL(params.EffectiveFeeRate().GetFeePerK(), 10000);
-    BOOST_CHECK_EQUAL(params.LongTermFeeRate().GetFeePerK(), 5000);
-    BOOST_CHECK_EQUAL(params.DiscardFeeRate().GetFeePerK(), 3000);
+    BOOST_CHECK_EQUAL(effective.GetFeePerK(), 10000);
+    BOOST_CHECK_EQUAL(long_term.GetFeePerK(), 5000);
+    BOOST_CHECK_EQUAL(discard.GetFeePerK(), 3000);
 }
 
 // ==========================================================================
@@ -138,10 +175,10 @@ BOOST_AUTO_TEST_CASE(utxo_pool_add_with_fees)
 BOOST_AUTO_TEST_CASE(utxo_pool_add_with_feerate)
 {
     UtxoPool pool;
-    CoinSelectionParams params(TEST_FEERATE_SAT_PER_KVB);
+    FeeRate effective_feerate = GetEffectiveFeeRate();
     auto txid = MakeTxid(1);
 
-    pool.Add(txid, 0, 100000, P2WPKH_INPUT_BYTES, 6, params.EffectiveFeeRate());
+    pool.Add(txid, 0, 100000, P2WPKH_INPUT_BYTES, 6, effective_feerate);
 
     BOOST_CHECK_EQUAL(pool.Size(), 1u);
 }
@@ -149,13 +186,13 @@ BOOST_AUTO_TEST_CASE(utxo_pool_add_with_feerate)
 BOOST_AUTO_TEST_CASE(utxo_pool_add_multiple)
 {
     UtxoPool pool;
-    CoinSelectionParams params(TEST_FEERATE_SAT_PER_KVB);
+    FeeRate effective_feerate = GetEffectiveFeeRate();
 
     std::vector<Amount> values = {50000, 100000, 250000, 500000, 1000000};
 
     for (size_t i = 0; i < values.size(); ++i) {
         auto txid = MakeTxid(static_cast<uint32_t>(i));
-        pool.Add(txid, 0, values[i], P2WPKH_INPUT_BYTES, 6, params.EffectiveFeeRate());
+        pool.Add(txid, 0, values[i], P2WPKH_INPUT_BYTES, 6, effective_feerate);
     }
 
     BOOST_CHECK_EQUAL(pool.Size(), values.size());
@@ -164,12 +201,12 @@ BOOST_AUTO_TEST_CASE(utxo_pool_add_multiple)
 BOOST_AUTO_TEST_CASE(utxo_pool_chaining)
 {
     UtxoPool pool;
-    CoinSelectionParams params(TEST_FEERATE_SAT_PER_KVB);
+    FeeRate effective_feerate = GetEffectiveFeeRate();
 
     // Test fluent builder pattern
-    pool.Add(MakeTxid(0), 0, 100000, P2WPKH_INPUT_BYTES, 6, params.EffectiveFeeRate())
-        .Add(MakeTxid(1), 0, 200000, P2WPKH_INPUT_BYTES, 6, params.EffectiveFeeRate())
-        .Add(MakeTxid(2), 0, 300000, P2WPKH_INPUT_BYTES, 6, params.EffectiveFeeRate());
+    pool.Add(MakeTxid(0), 0, 100000, P2WPKH_INPUT_BYTES, 6, effective_feerate)
+        .Add(MakeTxid(1), 0, 200000, P2WPKH_INPUT_BYTES, 6, effective_feerate)
+        .Add(MakeTxid(2), 0, 300000, P2WPKH_INPUT_BYTES, 6, effective_feerate);
 
     BOOST_CHECK_EQUAL(pool.Size(), 3u);
 }
@@ -177,9 +214,9 @@ BOOST_AUTO_TEST_CASE(utxo_pool_chaining)
 BOOST_AUTO_TEST_CASE(utxo_pool_clear)
 {
     UtxoPool pool;
-    CoinSelectionParams params(TEST_FEERATE_SAT_PER_KVB);
+    FeeRate effective_feerate = GetEffectiveFeeRate();
 
-    pool.Add(MakeTxid(0), 0, 100000, P2WPKH_INPUT_BYTES, 6, params.EffectiveFeeRate());
+    pool.Add(MakeTxid(0), 0, 100000, P2WPKH_INPUT_BYTES, 6, effective_feerate);
     BOOST_CHECK_EQUAL(pool.Size(), 1u);
 
     pool.Clear();
@@ -190,9 +227,9 @@ BOOST_AUTO_TEST_CASE(utxo_pool_clear)
 BOOST_AUTO_TEST_CASE(utxo_pool_groups_access)
 {
     UtxoPool pool;
-    CoinSelectionParams params(TEST_FEERATE_SAT_PER_KVB);
+    FeeRate effective_feerate = GetEffectiveFeeRate();
 
-    pool.Add(MakeTxid(0), 0, 100000, P2WPKH_INPUT_BYTES, 6, params.EffectiveFeeRate());
+    pool.Add(MakeTxid(0), 0, 100000, P2WPKH_INPUT_BYTES, 6, effective_feerate);
 
     // Direct access to groups
     BOOST_CHECK_EQUAL(pool.Groups().size(), 1u);
@@ -208,9 +245,8 @@ BOOST_AUTO_TEST_CASE(utxo_pool_groups_access)
 BOOST_AUTO_TEST_CASE(bnb_empty_pool)
 {
     UtxoPool pool;
-    CoinSelectionParams params(TEST_FEERATE_SAT_PER_KVB);
 
-    auto result = pool.SelectBnB(100000, params.GetCostOfChange());
+    auto result = pool.SelectBnB(100000, GetCostOfChange());
 
     BOOST_CHECK(!result.has_value());
 }
@@ -218,13 +254,13 @@ BOOST_AUTO_TEST_CASE(bnb_empty_pool)
 BOOST_AUTO_TEST_CASE(bnb_insufficient_funds)
 {
     UtxoPool pool;
-    CoinSelectionParams params(TEST_FEERATE_SAT_PER_KVB);
+    FeeRate effective_feerate = GetEffectiveFeeRate();
 
     // Add small UTXO
-    pool.Add(MakeTxid(0), 0, 10000, P2WPKH_INPUT_BYTES, 6, params.EffectiveFeeRate());
+    pool.Add(MakeTxid(0), 0, 10000, P2WPKH_INPUT_BYTES, 6, effective_feerate);
 
     // Try to select more than available
-    auto result = pool.SelectBnB(1000000, params.GetCostOfChange());
+    auto result = pool.SelectBnB(1000000, GetCostOfChange());
 
     BOOST_CHECK(!result.has_value());
 }
@@ -232,16 +268,16 @@ BOOST_AUTO_TEST_CASE(bnb_insufficient_funds)
 BOOST_AUTO_TEST_CASE(bnb_exact_match)
 {
     UtxoPool pool;
-    CoinSelectionParams params(TEST_FEERATE_SAT_PER_KVB);
+    FeeRate effective_feerate = GetEffectiveFeeRate();
 
     // Calculate effective value for exact match
-    Amount fee = params.GetInputFee(P2WPKH_INPUT_BYTES);
+    Amount fee = GetInputFee(P2WPKH_INPUT_BYTES);
     Amount target_effective = 100000;
     Amount utxo_value = target_effective + fee;
 
-    pool.Add(MakeTxid(0), 0, utxo_value, P2WPKH_INPUT_BYTES, 6, params.EffectiveFeeRate());
+    pool.Add(MakeTxid(0), 0, utxo_value, P2WPKH_INPUT_BYTES, 6, effective_feerate);
 
-    auto result = pool.SelectBnB(target_effective, params.GetCostOfChange());
+    auto result = pool.SelectBnB(target_effective, GetCostOfChange());
 
     if (result) {
         BOOST_CHECK_EQUAL(result->GetInputSet().size(), 1u);
@@ -261,16 +297,16 @@ BOOST_AUTO_TEST_CASE(bnb_exact_match)
 BOOST_AUTO_TEST_CASE(bnb_multiple_utxos)
 {
     UtxoPool pool;
-    CoinSelectionParams params(TEST_FEERATE_SAT_PER_KVB);
+    FeeRate effective_feerate = GetEffectiveFeeRate();
 
     std::vector<Amount> values = {50000, 100000, 150000, 200000, 250000};
     for (size_t i = 0; i < values.size(); ++i) {
         pool.Add(MakeTxid(static_cast<uint32_t>(i)), 0, values[i],
-                 P2WPKH_INPUT_BYTES, 6, params.EffectiveFeeRate());
+                 P2WPKH_INPUT_BYTES, 6, effective_feerate);
     }
 
     // BnB tries to find changeless solution
-    auto result = pool.SelectBnB(148640, params.GetCostOfChange());
+    auto result = pool.SelectBnB(148640, GetCostOfChange());
 
     if (result) {
         BOOST_CHECK_GE(result->GetInputSet().size(), 1u);
@@ -285,10 +321,9 @@ BOOST_AUTO_TEST_CASE(bnb_multiple_utxos)
 BOOST_AUTO_TEST_CASE(srd_empty_pool)
 {
     UtxoPool pool;
-    CoinSelectionParams params(TEST_FEERATE_SAT_PER_KVB);
     FastRandomContext rng;
 
-    auto result = pool.SelectSRD(100000, params.GetChangeFee(), rng);
+    auto result = pool.SelectSRD(100000, GetChangeFee(), rng);
 
     BOOST_CHECK(!result.has_value());
 }
@@ -296,17 +331,17 @@ BOOST_AUTO_TEST_CASE(srd_empty_pool)
 BOOST_AUTO_TEST_CASE(srd_success)
 {
     UtxoPool pool;
-    CoinSelectionParams params(TEST_FEERATE_SAT_PER_KVB);
+    FeeRate effective_feerate = GetEffectiveFeeRate();
     FastRandomContext rng;
 
     std::vector<Amount> values = {50000, 100000, 250000, 500000, 1000000};
     for (size_t i = 0; i < values.size(); ++i) {
         pool.Add(MakeTxid(static_cast<uint32_t>(i)), 0, values[i],
-                 P2WPKH_INPUT_BYTES, 6, params.EffectiveFeeRate());
+                 P2WPKH_INPUT_BYTES, 6, effective_feerate);
     }
 
     Amount target = 300000;
-    auto result = pool.SelectSRD(target, params.GetChangeFee(), rng);
+    auto result = pool.SelectSRD(target, GetChangeFee(), rng);
 
     BOOST_REQUIRE(result.has_value());
     BOOST_CHECK_GE(result->GetInputSet().size(), 1u);
@@ -320,7 +355,7 @@ BOOST_AUTO_TEST_CASE(srd_success)
 
 BOOST_AUTO_TEST_CASE(srd_deterministic_with_seed)
 {
-    CoinSelectionParams params(TEST_FEERATE_SAT_PER_KVB);
+    FeeRate effective_feerate = GetEffectiveFeeRate();
     std::vector<Amount> values = {50000, 100000, 250000, 500000, 1000000};
     Amount target = 300000;
 
@@ -336,10 +371,10 @@ BOOST_AUTO_TEST_CASE(srd_deterministic_with_seed)
 
         for (size_t i = 0; i < values.size(); ++i) {
             pool.Add(MakeTxid(static_cast<uint32_t>(i)), 0, values[i],
-                     P2WPKH_INPUT_BYTES, 6, params.EffectiveFeeRate());
+                     P2WPKH_INPUT_BYTES, 6, effective_feerate);
         }
 
-        auto result = pool.SelectSRD(target, params.GetChangeFee(), rng);
+        auto result = pool.SelectSRD(target, GetChangeFee(), rng);
 
         if (result) {
             Amount total = 0;
@@ -371,17 +406,17 @@ BOOST_AUTO_TEST_CASE(coingrinder_empty_pool)
 BOOST_AUTO_TEST_CASE(coingrinder_success)
 {
     UtxoPool pool;
-    CoinSelectionParams params(TEST_FEERATE_SAT_PER_KVB);
+    FeeRate effective_feerate = GetEffectiveFeeRate();
     FastRandomContext rng;
 
     std::vector<Amount> values = {50000, 100000, 250000, 500000, 1000000};
     for (size_t i = 0; i < values.size(); ++i) {
         pool.Add(MakeTxid(static_cast<uint32_t>(i)), 0, values[i],
-                 P2WPKH_INPUT_BYTES, 6, params.EffectiveFeeRate());
+                 P2WPKH_INPUT_BYTES, 6, effective_feerate);
     }
 
     Amount target = 300000;
-    Amount change_target = GenerateChangeTarget(target, params.GetChangeFee(), rng);
+    Amount change_target = GenerateChangeTarget(target, GetChangeFee(), rng);
 
     auto result = pool.SelectCoinGrinder(target, change_target);
 
@@ -392,17 +427,17 @@ BOOST_AUTO_TEST_CASE(coingrinder_success)
 BOOST_AUTO_TEST_CASE(coingrinder_minimizes_weight)
 {
     UtxoPool pool;
-    CoinSelectionParams params(TEST_FEERATE_SAT_PER_KVB);
+    FeeRate effective_feerate = GetEffectiveFeeRate();
     FastRandomContext rng;
 
     // Add a large UTXO and several small ones
-    pool.Add(MakeTxid(0), 0, 1000000, P2WPKH_INPUT_BYTES, 6, params.EffectiveFeeRate());
+    pool.Add(MakeTxid(0), 0, 1000000, P2WPKH_INPUT_BYTES, 6, effective_feerate);
     for (uint32_t i = 1; i <= 10; ++i) {
-        pool.Add(MakeTxid(i), 0, 50000, P2WPKH_INPUT_BYTES, 6, params.EffectiveFeeRate());
+        pool.Add(MakeTxid(i), 0, 50000, P2WPKH_INPUT_BYTES, 6, effective_feerate);
     }
 
     Amount target = 300000;
-    Amount change_target = GenerateChangeTarget(target, params.GetChangeFee(), rng);
+    Amount change_target = GenerateChangeTarget(target, GetChangeFee(), rng);
 
     auto result = pool.SelectCoinGrinder(target, change_target);
 
@@ -430,17 +465,17 @@ BOOST_AUTO_TEST_CASE(knapsack_empty_pool)
 BOOST_AUTO_TEST_CASE(knapsack_success)
 {
     UtxoPool pool;
-    CoinSelectionParams params(TEST_FEERATE_SAT_PER_KVB);
+    FeeRate effective_feerate = GetEffectiveFeeRate();
     FastRandomContext rng;
 
     std::vector<Amount> values = {50000, 100000, 250000, 500000, 1000000};
     for (size_t i = 0; i < values.size(); ++i) {
         pool.Add(MakeTxid(static_cast<uint32_t>(i)), 0, values[i],
-                 P2WPKH_INPUT_BYTES, 6, params.EffectiveFeeRate());
+                 P2WPKH_INPUT_BYTES, 6, effective_feerate);
     }
 
     Amount target = 300000;
-    Amount change_target = GenerateChangeTarget(target, params.GetChangeFee(), rng);
+    Amount change_target = GenerateChangeTarget(target, GetChangeFee(), rng);
 
     auto result = pool.SelectKnapsack(target, change_target, rng);
 
@@ -461,14 +496,14 @@ BOOST_AUTO_TEST_CASE(knapsack_success)
 BOOST_AUTO_TEST_CASE(selection_result_getters)
 {
     UtxoPool pool;
-    CoinSelectionParams params(TEST_FEERATE_SAT_PER_KVB);
+    FeeRate effective_feerate = GetEffectiveFeeRate();
     FastRandomContext rng;
 
     Amount value = 1000000;
-    pool.Add(MakeTxid(0), 0, value, P2WPKH_INPUT_BYTES, 6, params.EffectiveFeeRate());
+    pool.Add(MakeTxid(0), 0, value, P2WPKH_INPUT_BYTES, 6, effective_feerate);
 
     Amount target = 100000;
-    Amount change_target = GenerateChangeTarget(target, params.GetChangeFee(), rng);
+    Amount change_target = GenerateChangeTarget(target, GetChangeFee(), rng);
 
     auto result = pool.SelectKnapsack(target, change_target, rng);
 
@@ -489,7 +524,7 @@ BOOST_AUTO_TEST_CASE(selection_result_getters)
         total_effective += coin->GetEffectiveValue();
     }
     BOOST_CHECK_EQUAL(total_value, value);
-    BOOST_CHECK_EQUAL(total_effective, value - params.GetInputFee(P2WPKH_INPUT_BYTES));
+    BOOST_CHECK_EQUAL(total_effective, value - GetInputFee(P2WPKH_INPUT_BYTES));
 }
 
 // ==========================================================================
@@ -544,11 +579,11 @@ BOOST_AUTO_TEST_CASE(example_values_match)
 {
     // This test uses the same values as main.cpp to verify consistency
     constexpr int64_t FEERATE_SAT_PER_KVB = 10000; // 10 sat/vB
-    CoinSelectionParams params(FEERATE_SAT_PER_KVB);
+    FeeRate effective_feerate(FEERATE_SAT_PER_KVB);
 
     // Verify parameter calculations
-    BOOST_CHECK_EQUAL(params.GetCostOfChange(), 514);
-    BOOST_CHECK_EQUAL(params.GetChangeFee(), 310);
+    BOOST_CHECK_EQUAL(GetCostOfChange(FEERATE_SAT_PER_KVB), 514);
+    BOOST_CHECK_EQUAL(GetChangeFee(FEERATE_SAT_PER_KVB), 310);
 
     UtxoPool pool;
     FastRandomContext rng;
@@ -565,20 +600,20 @@ BOOST_AUTO_TEST_CASE(example_values_match)
 
     for (size_t i = 0; i < utxo_values.size(); ++i) {
         auto txid = MakeTxid(static_cast<uint32_t>(i));
-        pool.Add(txid, 0, utxo_values[i], P2WPKH_INPUT_BYTES, 6,
-                 params.EffectiveFeeRate());
+        pool.Add(txid, 0, utxo_values[i], P2WPKH_INPUT_BYTES, 6, effective_feerate);
 
         // Verify effective value
-        Amount fee = params.GetInputFee(P2WPKH_INPUT_BYTES);
+        Amount fee = GetInputFee(P2WPKH_INPUT_BYTES, FEERATE_SAT_PER_KVB);
         BOOST_CHECK_EQUAL(fee, 680); // 68 * 10000 / 1000
     }
 
     BOOST_CHECK_EQUAL(pool.Size(), utxo_values.size());
 
     constexpr Amount TARGET = 300000;
+    Amount change_fee = GetChangeFee(FEERATE_SAT_PER_KVB);
 
     // Test SRD
-    auto srd_result = pool.SelectSRD(TARGET, params.GetChangeFee(), rng);
+    auto srd_result = pool.SelectSRD(TARGET, change_fee, rng);
     BOOST_CHECK(srd_result.has_value());
     if (srd_result) {
         Amount total = 0;
@@ -589,7 +624,7 @@ BOOST_AUTO_TEST_CASE(example_values_match)
     }
 
     // Test CoinGrinder
-    Amount change_target = GenerateChangeTarget(TARGET, params.GetChangeFee(), rng);
+    Amount change_target = GenerateChangeTarget(TARGET, change_fee, rng);
     auto cg_result = pool.SelectCoinGrinder(TARGET, change_target);
     BOOST_CHECK(cg_result.has_value());
     if (cg_result) {
@@ -619,22 +654,21 @@ BOOST_AUTO_TEST_CASE(example_values_match)
 BOOST_AUTO_TEST_CASE(large_utxo_pool)
 {
     UtxoPool pool;
-    CoinSelectionParams params(TEST_FEERATE_SAT_PER_KVB);
+    FeeRate effective_feerate = GetEffectiveFeeRate();
     FastRandomContext rng;
 
     // Add many UTXOs
     for (uint32_t i = 0; i < 100; ++i) {
-        pool.Add(MakeTxid(i), 0, 10000 + i * 1000, P2WPKH_INPUT_BYTES, 6,
-                 params.EffectiveFeeRate());
+        pool.Add(MakeTxid(i), 0, 10000 + i * 1000, P2WPKH_INPUT_BYTES, 6, effective_feerate);
     }
 
     BOOST_CHECK_EQUAL(pool.Size(), 100u);
 
     Amount target = 500000;
-    Amount change_target = GenerateChangeTarget(target, params.GetChangeFee(), rng);
+    Amount change_target = GenerateChangeTarget(target, GetChangeFee(), rng);
 
     // All algorithms should handle large pools
-    auto srd_result = pool.SelectSRD(target, params.GetChangeFee(), rng);
+    auto srd_result = pool.SelectSRD(target, GetChangeFee(), rng);
     BOOST_CHECK(srd_result.has_value());
 
     auto cg_result = pool.SelectCoinGrinder(target, change_target);
@@ -647,20 +681,20 @@ BOOST_AUTO_TEST_CASE(large_utxo_pool)
 BOOST_AUTO_TEST_CASE(repeated_selection)
 {
     UtxoPool pool;
-    CoinSelectionParams params(TEST_FEERATE_SAT_PER_KVB);
+    FeeRate effective_feerate = GetEffectiveFeeRate();
     FastRandomContext rng;
 
     std::vector<Amount> values = {100000, 200000, 300000, 400000, 500000};
     for (size_t i = 0; i < values.size(); ++i) {
         pool.Add(MakeTxid(static_cast<uint32_t>(i)), 0, values[i],
-                 P2WPKH_INPUT_BYTES, 6, params.EffectiveFeeRate());
+                 P2WPKH_INPUT_BYTES, 6, effective_feerate);
     }
 
     // Repeated selections should all succeed
     for (int i = 0; i < 10; ++i) {
         Amount target = 150000 + i * 10000;
 
-        auto result = pool.SelectSRD(target, params.GetChangeFee(), rng);
+        auto result = pool.SelectSRD(target, GetChangeFee(), rng);
         BOOST_CHECK(result.has_value());
     }
 }
