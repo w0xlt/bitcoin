@@ -110,12 +110,93 @@ struct SelectionFilter {
 };
 
 /**
+ * Interface providing the chain information needed for coin selection.
+ * This abstraction allows coin selection to be used without a wallet dependency.
+ *
+ * The wallet implementation (CWalletCoinSelectionSource) wraps CWallet and
+ * interfaces::Chain to provide this interface. External users can implement
+ * their own version.
+ */
+struct CoinSelectionSource {
+    virtual ~CoinSelectionSource() = default;
+
+    /**
+     * Get the ancestor and descendant count for a transaction.
+     * Used for grouping outputs and checking mempool chain limits.
+     *
+     * @param[in]  txid         The transaction id to query
+     * @param[out] ancestors    The number of in-mempool ancestors
+     * @param[out] descendants  The number of in-mempool descendants
+     */
+    virtual void GetTransactionAncestry(const Txid& txid, size_t& ancestors, size_t& descendants) const = 0;
+
+    /**
+     * Calculate the combined bump fee for a set of unconfirmed UTXOs.
+     * This accounts for shared ancestry when multiple UTXOs are selected.
+     *
+     * @param[in] outpoints    The set of outpoints to calculate bump fee for
+     * @param[in] feerate      The target feerate
+     * @return The combined bump fee, or std::nullopt on failure (e.g., cluster too large)
+     */
+    virtual std::optional<CAmount> CalculateCombinedBumpFee(
+        const std::vector<COutPoint>& outpoints,
+        const CFeeRate& feerate) const = 0;
+
+    /**
+     * Get the mempool package limits (max ancestors and max descendants).
+     *
+     * @param[out] limit_ancestor_count   Maximum number of ancestors
+     * @param[out] limit_descendant_count Maximum number of descendants
+     */
+    virtual void GetPackageLimits(unsigned int& limit_ancestor_count,
+                                  unsigned int& limit_descendant_count) const = 0;
+};
+
+/**
+ * Options/settings for coin selection that are typically sourced from wallet configuration.
+ * These are separated from CoinSelectionParams to allow library users to configure
+ * coin selection behavior without a wallet.
+ */
+struct CoinSelectionOptions {
+    /** Whether to allow spending zero-confirmation change outputs. */
+    bool spend_zero_conf_change{true};
+
+    /** Whether to reject transactions with long mempool chains. */
+    bool reject_long_chains{false};
+
+    CoinSelectionOptions() = default;
+    CoinSelectionOptions(bool spend_zero_conf, bool reject_long)
+        : spend_zero_conf_change(spend_zero_conf), reject_long_chains(reject_long) {}
+};
+
+/**
+ * Group coins by the provided filters.
+ * This overload does not depend on wallet and can be used by libbitcoincoinselection.
+ */
+FilteredOutputGroups GroupOutputs(const CoinSelectionSource& source,
+                                  const CoinsResult& coins,
+                                  const CoinSelectionParams& coin_sel_params,
+                                  const std::vector<SelectionFilter>& filters,
+                                  std::vector<OutputGroup>& ret_discarded_groups);
+
+/**
+ * Convenience overload without discarded groups output.
+ */
+FilteredOutputGroups GroupOutputs(const CoinSelectionSource& source,
+                                  const CoinsResult& coins,
+                                  const CoinSelectionParams& coin_sel_params,
+                                  const std::vector<SelectionFilter>& filters);
+
+/**
 * Group coins by the provided filters.
 */
 FilteredOutputGroups GroupOutputs(const CWallet& wallet,
                           const CoinsResult& coins,
                           const CoinSelectionParams& coin_sel_params,
                           const std::vector<SelectionFilter>& filters);
+
+util::Result<SelectionResult> AttemptSelection(const CoinSelectionSource& source, const CAmount& nTargetValue, OutputGroupTypeMap& groups,
+                        const CoinSelectionParams& coin_selection_params, bool allow_mixed_output_types);
 
 /**
  * Attempt to find a valid input set that preserves privacy by not mixing OutputTypes.
@@ -135,6 +216,8 @@ FilteredOutputGroups GroupOutputs(const CWallet& wallet,
  */
 util::Result<SelectionResult> AttemptSelection(interfaces::Chain& chain, const CAmount& nTargetValue, OutputGroupTypeMap& groups,
                         const CoinSelectionParams& coin_selection_params, bool allow_mixed_output_types);
+
+util::Result<SelectionResult> ChooseSelectionResult(const CoinSelectionSource& source, const CAmount& nTargetValue, Groups& groups, const CoinSelectionParams& coin_selection_params);
 
 /**
  * Attempt to find a valid input set that meets the provided eligibility filter and target.
@@ -179,6 +262,10 @@ struct PreSelectedInputs
 util::Result<PreSelectedInputs> FetchSelectedInputs(const CWallet& wallet, const CCoinControl& coin_control,
                                                     const CoinSelectionParams& coin_selection_params) EXCLUSIVE_LOCKS_REQUIRED(wallet.cs_wallet);
 
+util::Result<SelectionResult> AutomaticCoinSelection(const CoinSelectionSource& source, const CoinSelectionOptions& options,
+                 CoinsResult& available_coins, const CAmount& nTargetValue,
+                 const CoinSelectionParams& coin_selection_params);
+
 /**
  * Select a set of coins such that nTargetValue is met; never select unconfirmed coins if they are not ours
  * @param[in]   wallet                 The wallet which provides data necessary to spend the selected coins
@@ -198,9 +285,29 @@ util::Result<SelectionResult> AutomaticCoinSelection(const CWallet& wallet, Coin
  * Select all coins from coin_control, and if coin_control 'm_allow_other_inputs=true', call 'AutomaticCoinSelection' to
  * select a set of coins such that nTargetValue - pre_set_inputs.total_amount is met.
  */
+util::Result<SelectionResult> SelectCoins(const CoinSelectionSource& source, const CoinSelectionOptions& options,
+                                          CoinsResult& available_coins, const PreSelectedInputs& pre_set_inputs,
+                                          const CAmount& nTargetValue, const CCoinControl& coin_control,
+                                          const CoinSelectionParams& coin_selection_params);
+
 util::Result<SelectionResult> SelectCoins(const CWallet& wallet, CoinsResult& available_coins, const PreSelectedInputs& pre_set_inputs,
                                           const CAmount& nTargetValue, const CCoinControl& coin_control,
                                           const CoinSelectionParams& coin_selection_params) EXCLUSIVE_LOCKS_REQUIRED(wallet.cs_wallet);
+
+/**
+ * Adapter that wraps a CWallet to implement CoinSelectionSource.
+ * Used internally to bridge wallet code to the wallet-independent coin selection.
+ */
+class CWalletCoinSelectionSource : public CoinSelectionSource {
+    const CWallet& m_wallet;
+
+public:
+    explicit CWalletCoinSelectionSource(const CWallet& wallet) : m_wallet(wallet) {}
+
+    void GetTransactionAncestry(const Txid& txid, size_t& ancestors, size_t& descendants) const override;
+    std::optional<CAmount> CalculateCombinedBumpFee(const std::vector<COutPoint>& outpoints, const CFeeRate& feerate) const override;
+    void GetPackageLimits(unsigned int& limit_ancestor_count, unsigned int& limit_descendant_count) const override;
+};
 
 struct CreatedTransactionResult
 {
