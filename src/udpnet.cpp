@@ -968,13 +968,17 @@ static void StartLocalBackfillThread() {
                 {
                     std::set<Txid> txids_to_send;
                     LOCK(g_node_context->mempool->cs);
-                    for (const auto& iter : g_node_context->mempool->mapTx.get<ancestor_score>()) {
+                    const auto vtxinfo = g_node_context->mempool->infoAll();
+                    for (const auto& txinfo : vtxinfo) {
                         if (txn_to_send.size() >= send_txn)
                             break;
-                        if (txids_to_send.count(iter.GetTx().GetHash()) || sent_txn_bloom.contains(MakeUCharSpan(iter.GetTx().GetHash())))
+                        const CTransactionRef& tx = txinfo.tx;
+                        if (!tx) continue;
+                        const Txid& txid = tx->GetHash();
+                        if (txids_to_send.count(txid) || sent_txn_bloom.contains(MakeUCharSpan(txid)))
                             continue;
 
-                        std::vector<CTransactionRef> to_add{iter.GetSharedTx()};
+                        std::vector<CTransactionRef> to_add{tx};
                         while (!to_add.empty()) {
                             bool has_dep = false;
                             for (const CTxIn& txin : to_add.back()->vin) {
