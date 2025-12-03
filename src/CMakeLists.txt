@@ -421,6 +421,9 @@ if(BUILD_KERNEL_LIB)
   endif()
 endif()
 
+if(BUILD_COINSELECTION_LIB)
+  add_subdirectory(coinselection)
+endif()
 
 add_subdirectory(test/util)
 if(BUILD_BENCH)

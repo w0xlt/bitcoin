@@ -1,0 +1,12 @@
+prefix=@CMAKE_INSTALL_PREFIX@
+exec_prefix=${prefix}
+libdir=${prefix}/@CMAKE_INSTALL_LIBDIR@
+includedir=${prefix}/@CMAKE_INSTALL_INCLUDEDIR@
+
+Name: libbitcoincoinselection
+Description: Bitcoin Core Coin Selection Library
+URL: https://bitcoincore.org/
+Version: @PROJECT_VERSION@
+Cflags: -I${includedir}
+Libs: -L${libdir} -lbitcoincoinselection
+Libs.private: @LIBS_PRIVATE@
