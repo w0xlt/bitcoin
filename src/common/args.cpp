@@ -180,46 +180,55 @@ bool ArgsManager::ProcessOptionKey(std::string& key, std::optional<std::string>&
     std::string original_input{key};
     if (val) original_input += "=" + *val;
 
-    // Transform --foo to -foo
+    // Normalize leading dashes
     if (key.length() > 1 && key[1] == '-') {
-        key.erase(0, 1);
+        key.erase(0, 1);   // `--foo` -> `-foo`
         double_dash = true;
     }
-
-    // Transform -foo to foo
-    key.erase(0, 1);
+    key.erase(0, 1);       // `-foo`  -> `foo`
 
     KeyInfo keyinfo = InterpretKey(key);
     std::optional<unsigned int> flags = GetArgFlags_('-' + keyinfo.name);
-    // Unknown command line options and command line options with dot characters
-    // (which are returned from InterpretKey with nonempty section strings)are not valid.
-    if (!flags || !keyinfo.section.empty()) {
-        if (double_dash && found_after_non_option) {
-            KeyInfo named_keyinfo = InterpretKey("named");
-            if (auto named_flags = GetArgFlags_('-' + named_keyinfo.name); named_flags && named_keyinfo.section.empty()) {
-                auto named_value = InterpretValue(named_keyinfo, nullptr, *named_flags, error);
-                if (!named_value) return false;
+    const bool known_option = flags.has_value() && keyinfo.section.empty();
 
-                m_settings.command_line_options[named_keyinfo.name].push_back(*named_value);
-                m_command.emplace_back(original_input.substr(2));
-                return true;
-            }
-        }
+    // Handle the special "named RPC" case early.
+    if (double_dash && found_after_non_option && !known_option) {
+        // Try to map this to `-named`, if supported by the binary.
+        KeyInfo named_keyinfo = InterpretKey("named");
+        std::optional<unsigned int> named_flags = GetArgFlags_('-' + named_keyinfo.name);
 
-        if (found_after_non_option) {
-            m_command.emplace_back(original_input);
+        if (named_flags && named_keyinfo.section.empty()) {
+            // Binary supports -named: enable it and append the stripped parameter.
+            std::optional<common::SettingsValue> named_value =
+                InterpretValue(named_keyinfo, nullptr, *named_flags, error);
+            if (!named_value) return false;
+
+            m_settings.command_line_options[named_keyinfo.name].push_back(*named_value);
+            // Strip the leading "--" before passing to the command as a named param.
+            m_command.emplace_back(original_input.substr(2));
             return true;
         }
-
-        error = strprintf("Invalid parameter %s", original_input);
-        return false;
     }
 
-    std::optional<common::SettingsValue> value = InterpretValue(keyinfo, val ? &*val : nullptr, *flags, error);
+    // Unknown command line options and command line options with dot characters
+    // (which are returned from InterpretKey with nonempty section strings) are
+    // not valid unless they are command arguments following a non-option.
+    if (!known_option) {
+        if (!found_after_non_option) {
+            error = strprintf("Invalid parameter %s", original_input);
+            return false;
+        }
+
+        m_command.emplace_back(original_input);
+        return true;
+    }
+
+    // Known option (including `--datadir`, `--signet`, etc.)
+    std::optional<common::SettingsValue> value =
+        InterpretValue(keyinfo, val ? &*val : nullptr, *flags, error);
     if (!value) return false;
 
     m_settings.command_line_options[keyinfo.name].push_back(*value);
-
     return true;
 }
 
