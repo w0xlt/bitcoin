@@ -37,30 +37,34 @@ check_cxx_source_compiles("
   " HAVE_MM_PREFETCH
 )
 
-# Check for SSE4.2 support in the compiler.
-if(MSVC)
-  set(SSE42_CXXFLAGS /arch:AVX)
-else()
-  set(SSE42_CXXFLAGS -msse4.2)
-endif()
-check_cxx_source_compiles_with_flags("
-  #include <cstdint>
-  #if defined(_MSC_VER)
-  #include <intrin.h>
-  #elif defined(__GNUC__) && defined(__SSE4_2__)
-  #include <nmmintrin.h>
-  #endif
+# Check for SSE4.2 support in the compiler (x86/x64 only).
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|i686|i386")
+  if(MSVC)
+    set(SSE42_CXXFLAGS /arch:AVX)
+  else()
+    set(SSE42_CXXFLAGS -msse4.2)
+  endif()
+  check_cxx_source_compiles_with_flags("
+    #include <cstdint>
+    #if defined(_MSC_VER)
+    #include <intrin.h>
+    #elif defined(__GNUC__) && defined(__SSE4_2__)
+    #include <nmmintrin.h>
+    #endif
 
-  int main() {
-    uint64_t l = 0;
-    l = _mm_crc32_u8(l, 0);
-    l = _mm_crc32_u32(l, 0);
-    l = _mm_crc32_u64(l, 0);
-    return l;
-  }
-  " HAVE_SSE42
-  CXXFLAGS ${SSE42_CXXFLAGS}
-)
+    int main() {
+      uint64_t l = 0;
+      l = _mm_crc32_u8(l, 0);
+      l = _mm_crc32_u32(l, 0);
+      l = _mm_crc32_u64(l, 0);
+      return l;
+    }
+    " HAVE_SSE42
+    CXXFLAGS ${SSE42_CXXFLAGS}
+  )
+else()
+  set(HAVE_SSE42 FALSE)
+endif()
 
 # Check for ARMv8 w/ CRC and CRYPTO extensions support in the compiler.
 set(ARM64_CRC_CXXFLAGS -march=armv8-a+crc+crypto)
