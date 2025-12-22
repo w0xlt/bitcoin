@@ -610,7 +610,10 @@ public:
      * @return next transaction order id
      */
     int64_t IncOrderPosNext(WalletBatch *batch = nullptr) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
-    DBErrors ReorderTransactions();
+    static DBErrors ReorderTransactions(
+        std::unordered_map<Txid, CWalletTx, SaltedTxidHasher>& mapWallet,
+        int64_t& nOrderPosNext,
+        WalletDatabase& database);
 
     void MarkDirty();
 

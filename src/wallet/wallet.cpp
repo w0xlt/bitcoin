@@ -835,10 +835,13 @@ bool CWallet::EncryptWallet(const SecureString& strWalletPassphrase)
     return true;
 }
 
-DBErrors CWallet::ReorderTransactions()
+DBErrors CWallet::ReorderTransactions(
+    std::unordered_map<Txid, CWalletTx, SaltedTxidHasher>& mapWallet,
+    int64_t& nOrderPosNext,
+    WalletDatabase& database)
 {
-    LOCK(cs_wallet);
-    WalletBatch batch(GetDatabase());
+    // WalletBatch::LoadWallet already acquires LOCK(cs_wallet)
+    WalletBatch batch(database);
 
     // Old wallets didn't have any defined order for transactions
     // Probably a bad idea to change the output of this

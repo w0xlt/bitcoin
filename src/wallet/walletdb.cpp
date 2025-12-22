@@ -1177,8 +1177,9 @@ DBErrors WalletBatch::LoadWallet(CWallet* pwallet)
     if (!has_last_client || last_client != CLIENT_VERSION) // Update
         m_batch->Write(DBKeys::VERSION, CLIENT_VERSION);
 
-    if (any_unordered)
-        result = pwallet->ReorderTransactions();
+    if (any_unordered) {
+        result = CWallet::ReorderTransactions(pwallet->mapWallet, pwallet->nOrderPosNext, pwallet->GetDatabase());
+    }
 
     // Upgrade all of the descriptor caches to cache the last hardened xpub
     // This operation is not atomic, but if it fails, only new entries are added so it is backwards compatible
