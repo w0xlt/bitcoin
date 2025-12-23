@@ -603,8 +603,6 @@ public:
     bool ChangeWalletPassphrase(const SecureString& strOldWalletPassphrase, const SecureString& strNewWalletPassphrase);
     bool EncryptWallet(const SecureString& strWalletPassphrase);
 
-    unsigned int ComputeTimeSmart(const CWalletTx& wtx, bool rescanning_old_block) const;
-
     /**
      * Increment the next transaction order id
      * @return next transaction order id
