@@ -795,7 +795,9 @@ public:
     bool IsMine(const CTxOut& txout) const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
     bool IsMine(const CTransaction& tx) const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
     bool IsMine(const COutPoint& outpoint) const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
-    /** should probably be renamed to IsRelevantToMe */
+    /** Check if any input of this transaction spends a coin owned by this wallet.
+     * * @return true if at least one input spends our coins, false otherwise.
+     */
     bool IsFromMe(const CTransaction& tx) const;
     CAmount GetDebit(const CTransaction& tx) const;
 
