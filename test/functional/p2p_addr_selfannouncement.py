@@ -5,6 +5,9 @@
 """
 Test that a node sends a self-announcement with its external IP to
 in- and outbound peers after connection open and again sometime later.
+
+Additionally, test that self-announcements can be disabled with -advertiselocal=0
+for privacy (allowing inbound connections while not advertising the address).
 """
 
 import time
@@ -54,19 +57,29 @@ class SelfAnnouncementReceiver(P2PInterface):
 
 class AddrSelfAnnouncementTest(BitcoinTestFramework):
     def set_test_params(self):
-        self.num_nodes = 1
-        self.extra_args = [[f"-externalip={IP_TO_ANNOUNCE}"]]
+        self.num_nodes = 2
+        self.extra_args = [
+            [f"-externalip={IP_TO_ANNOUNCE}"],
+            [f"-externalip={IP_TO_ANNOUNCE}", "-advertiselocal=0"],
+        ]
+
+    def setup_network(self):
+        # Don't connect nodes together - we test P2P connections individually
+        self.setup_nodes()
 
     def run_test(self):
         # populate addrman to have some addresses for a GETADDR response
         for i in range(50):
             a = f"{1 + i}.{i}.1.1"
             self.nodes[0].addpeeraddress(a, 8333)
+            self.nodes[1].addpeeraddress(a, 8333)
 
         self.self_announcement_test(outbound=False, addrv2=False)
         self.self_announcement_test(outbound=False, addrv2=True)
         self.self_announcement_test(outbound=True, addrv2=False)
         self.self_announcement_test(outbound=True, addrv2=True)
+
+        self.test_no_self_announcement_when_disabled()
 
     def inbound_connection_open_assertions(self, addr_receiver):
         # We expect one self-announcement and multiple other addresses in
@@ -137,6 +150,72 @@ class AddrSelfAnnouncementTest(BitcoinTestFramework):
             assert_equal(addr_receiver.addresses_received, last_addresses_received + 1)
 
         self.nodes[0].disconnect_p2ps()
+
+    def test_no_self_announcement_when_disabled(self):
+        """Test that -advertiselocal=0 prevents self-announcements."""
+        self.log.info("Test that -advertiselocal=0 disables self-announcements")
+        node = self.nodes[1]  # Node with -advertiselocal=0
+
+        # Ensure we're past IBD
+        assert not node.getblockchaininfo()["initialblockdownload"]
+
+        netinfo = node.getnetworkinfo()
+        port = netinfo["localaddresses"][0]["port"]
+        node.setmocktime(int(time.time()))
+
+        expected = CAddress()
+        expected.nServices = int(netinfo["localservices"], 16)
+        expected.ip = IP_TO_ANNOUNCE
+        expected.port = port
+        expected.time = node.mocktime
+
+        self.log.info("Check that no self-announcement is sent on inbound connection")
+        addr_receiver = node.add_p2p_connection(SelfAnnouncementReceiver(expected=expected, addrv2=False))
+        addr_receiver.sync_with_ping()
+
+        # We should receive addresses from GETADDR response, but NOT our self-announcement
+        assert_greater_than(addr_receiver.addresses_received, 0)
+        assert_equal(addr_receiver.self_announcements_received, 0)
+
+        self.log.info("Check that no self-announcement is sent after time passes")
+        for _ in range(3):
+            # Advance time by 20 days (same as in self_announcement_test)
+            node.bumpmocktime(20 * ONE_DAY)
+            addr_receiver.sync_with_ping()
+
+        # Still no self-announcements should have been received
+        assert_equal(addr_receiver.self_announcements_received, 0)
+
+        node.disconnect_p2ps()
+
+        self.log.info("Check that no self-announcement is sent on outbound connection")
+        addr_receiver = node.add_outbound_p2p_connection(
+            SelfAnnouncementReceiver(expected=expected, addrv2=False),
+            p2p_idx=0,
+            connection_type="outbound-full-relay"
+        )
+        addr_receiver.sync_with_ping()
+
+        # No addresses should be received at all on outbound (no GETADDR response)
+        # and specifically no self-announcement
+        assert_equal(addr_receiver.self_announcements_received, 0)
+        assert_equal(addr_receiver.addresses_received, 0)
+
+        # Protect the outbound peer from eviction by announcing the most recent header
+        tip_header = from_hex(CBlockHeader(), node.getblockheader(node.getbestblockhash(), False))
+        addr_receiver.send_and_ping(msg_headers([tip_header]))
+
+        self.log.info("Check that no self-announcement is sent on outbound after time passes")
+        for _ in range(3):
+            node.bumpmocktime(20 * ONE_DAY)
+            addr_receiver.sync_with_ping()
+
+        assert_equal(addr_receiver.self_announcements_received, 0)
+
+        node.disconnect_p2ps()
+
+        self.log.info("-advertiselocal=0 correctly prevents self-announcements")
+
 
 if __name__ == '__main__':
     AddrSelfAnnouncementTest(__file__).main()
