@@ -429,12 +429,7 @@ def main():
     logging.basicConfig(format='%(message)s', level=logging_level)
 
     # Create base test directory
-    # Special case for tests using old binaries (e.g. version v0.14.3) that don't handle Unicode on Windows
-    has_migration_tests = any('wallet_ancient_migration' in script for script in BASE_SCRIPTS)
-    if platform.system() == 'Windows' and has_migration_tests:
-        tmpdir = "%s/test_runner_btc_run_%s" % (args.tmpdirprefix, datetime.datetime.now().strftime("%Y%m%d_%H%M%S"))
-    else:
-        tmpdir = "%s/test_runner_₿_🏃_%s" % (args.tmpdirprefix, datetime.datetime.now().strftime("%Y%m%d_%H%M%S"))
+    tmpdir = "%s/test_runner_₿_🏃_%s" % (args.tmpdirprefix, datetime.datetime.now().strftime("%Y%m%d_%H%M%S"))
 
     os.makedirs(tmpdir)
 
