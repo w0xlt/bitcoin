@@ -4,9 +4,9 @@
 # file COPYING or http://www.opensource.org/licenses/mit-license.php.
 """
 Test wallet migration from ancient versions to current version.
-Tests two wallet types that are actually testable:
-1. Non-HD wallet from v0.14.3
-2. HD wallet from v0.14.3 (VERSION_HD_BASE)
+Tests two wallet types:
+1. Non-HD wallet from v0.14.3 (FEATURE_COMPRPUBKEY, version 60000)
+2. HD wallet from v0.14.3 (FEATURE_HD / VERSION_HD_BASE, version 130000)
 """
 import os
 import shutil
@@ -17,6 +17,10 @@ from test_framework.util import (
     get_datadir_path,
     initialize_datadir,
 )
+
+# Wallet version constants (from src/wallet/walletutil.h)
+FEATURE_COMPRPUBKEY = 60000  # Non-HD wallet version
+FEATURE_HD = 130000          # HD wallet version (VERSION_HD_BASE)
 
 class WalletMigrationTest(BitcoinTestFramework):
     def set_test_params(self):
@@ -50,7 +54,7 @@ class WalletMigrationTest(BitcoinTestFramework):
         # Clear the nodes list
         self.nodes = []
 
-    def migrate_wallet(self, wallet_type, extra_args_old):
+    def migrate_wallet(self, wallet_type, extra_args_old, expected_wallet_version):
         """Common migration test logic"""
         self.log.info(f"Testing {wallet_type} wallet migration from v0.14.3")
 
@@ -59,7 +63,7 @@ class WalletMigrationTest(BitcoinTestFramework):
 
         # Setup fresh nodes for this test
         self.add_nodes(
-            2,
+            self.num_nodes,
             versions=[
                 140300,     # v0.14.3 node
                 None,       # Current version for testing migration
@@ -85,18 +89,24 @@ class WalletMigrationTest(BitcoinTestFramework):
         # Get some wallet info before migration
         old_wallet_info = self.nodes[0].getwalletinfo()
         hdmasterkeyid = old_wallet_info.get('hdmasterkeyid', 'Not HD')
-        self.log.info(f"Old wallet info: HD master key = {hdmasterkeyid}")
-        assert('keypoolsize_hd_internal' not in old_wallet_info) # Ensure we are testing non-HD or single-chain (VERSION_HD_BASE) wallets
+        wallet_version = old_wallet_info.get('walletversion')
+        self.log.info(f"Old wallet info: HD master key = {hdmasterkeyid}, version = {wallet_version}")
+
+        # Verify wallet version matches expected
+        assert_equal(wallet_version, expected_wallet_version)
+
+        # Ensure we are testing non-HD or single-chain (VERSION_HD_BASE) wallets
+        assert 'keypoolsize_hd_internal' not in old_wallet_info
 
         # Verify wallet type
         if "non-HD" in wallet_type:
-            assert('hdmasterkeyid' not in old_wallet_info)
+            assert 'hdmasterkeyid' not in old_wallet_info
         else:
-            assert('hdmasterkeyid' in old_wallet_info)
+            assert 'hdmasterkeyid' in old_wallet_info
 
         # Generate some blocks to the first address to have balance
         self.log.info("Generating blocks to create balance...")
-        self.generatetoaddress(self.nodes[0], 101, old_addresses[0], sync_fun=lambda: None)
+        self.generatetoaddress(self.nodes[0], 101, old_addresses[0], sync_fun=self.no_op)
 
         # Send some transactions to create history
         self.log.info("Creating transaction history...")
@@ -105,7 +115,7 @@ class WalletMigrationTest(BitcoinTestFramework):
         self.nodes[0].sendtoaddress(old_addresses[3], 0.3)
 
         # Mine the transactions
-        self.generatetoaddress(self.nodes[0], 1, old_addresses[0], sync_fun=lambda: None)
+        self.generatetoaddress(self.nodes[0], 1, old_addresses[0], sync_fun=self.no_op)
 
         # Get the balance and transaction count
         old_balance = self.nodes[0].getbalance()
@@ -113,8 +123,8 @@ class WalletMigrationTest(BitcoinTestFramework):
         old_tx_count = len(old_txs)
         self.log.info(f"Old wallet balance: {old_balance} BTC")
         self.log.info(f"Old wallet transaction count: {old_tx_count}")
-        assert(old_balance > 0)
-        assert(old_tx_count > 0)
+        assert old_balance > 0
+        assert old_tx_count > 0
 
         # Get all addresses from transactions
         all_old_addresses = set()
@@ -147,7 +157,7 @@ class WalletMigrationTest(BitcoinTestFramework):
         if os.path.exists(old_blocks_dir):
             shutil.copytree(old_blocks_dir, new_blocks_dir)
             self.log.info("  Copied blocks directory")
-        assert(os.path.exists(new_blocks_dir))
+        assert os.path.exists(new_blocks_dir)
 
         # Start the modern node with -reindex-chainstate
         self.log.info("Starting modern node with -reindex-chainstate...")
@@ -178,21 +188,17 @@ class WalletMigrationTest(BitcoinTestFramework):
         os.makedirs(migrated_wallet_dir, exist_ok=True)
         migrated_wallet_path = os.path.join(migrated_wallet_dir, "wallet.dat")
         shutil.copy2(old_wallet_path, migrated_wallet_path)
-        assert(os.path.exists(migrated_wallet_path))
+        assert os.path.exists(migrated_wallet_path)
 
         # Perform wallet migration
         self.log.info("Performing wallet migration to descriptor wallet...")
         migration_result = self.nodes[1].migratewallet("migrated_wallet")
         self.log.info(f"Migration result: {migration_result}")
 
-        assert('wallet_name' in migration_result)
-        assert('backup_path' in migration_result)
+        assert 'wallet_name' in migration_result
+        assert 'backup_path' in migration_result
         self.log.info(f"Backup created at: {migration_result['backup_path']}")
-        assert(os.path.exists(migration_result['backup_path']))
-
-        # Rescan the blockchain
-        self.log.info("Rescanning blockchain...")
-        self.nodes[1].rescanblockchain()
+        assert os.path.exists(migration_result['backup_path'])
 
         # Verify the migration
         self.log.info("Verifying migration...")
@@ -210,7 +216,7 @@ class WalletMigrationTest(BitcoinTestFramework):
         if "non-HD" not in wallet_type:
             # After migration to descriptors, hdmasterkeyid might not be present but wallet should still be HD
             # Check if wallet can derive new addresses (indicator of HD functionality)
-            assert(new_wallet_info.get('descriptors')) # HD wallet should be descriptor-based after migration
+            assert new_wallet_info.get('descriptors')  # HD wallet should be descriptor-based after migration
 
         # Verify balance is preserved
         new_balance = self.nodes[1].getbalance()
@@ -229,13 +235,13 @@ class WalletMigrationTest(BitcoinTestFramework):
         self.log.info("Verifying all addresses are still valid...")
         for addr in old_addresses:
             addr_info = self.nodes[1].getaddressinfo(addr)
-            assert(addr_info['ismine'])  # Address should still belong to the wallet after migration
+            assert addr_info['ismine']  # Address should still belong to the wallet after migration
 
         # Verify change addresses if any
         if change_addresses:
             for change_addr in change_addresses:
                 addr_info = self.nodes[1].getaddressinfo(change_addr)
-                assert(addr_info['ismine']) # Change address should still belong to the wallet
+                assert addr_info['ismine']  # Change address should still belong to the wallet
 
         self.log.info("✓ All addresses verified as owned after migration")
 
@@ -243,16 +249,16 @@ class WalletMigrationTest(BitcoinTestFramework):
         self.log.info("Testing wallet functionality after migration...")
         new_addr = self.nodes[1].getnewaddress()
         self.log.info(f"New address after migration: {new_addr}")
-        assert(len(new_addr) > 0)
+        assert len(new_addr) > 0
 
         new_addr_info = self.nodes[1].getaddressinfo(new_addr)
-        assert('desc' in new_addr_info) # New address should have descriptor
+        assert 'desc' in new_addr_info  # New address should have descriptor
 
         # Create a test transaction
         test_addr = self.nodes[1].getnewaddress()
         txid = self.nodes[1].sendtoaddress(test_addr, 0.1)
         self.log.info(f"✓ Test transaction created successfully: {txid}")
-        assert(len(txid) == 64)
+        assert len(txid) == 64
 
         # Cleanup for next test
         self.stop_node(1)
@@ -265,18 +271,20 @@ class WalletMigrationTest(BitcoinTestFramework):
         self.log.info("="*60)
         self.migrate_wallet(
             wallet_type="non-HD",
-            extra_args_old=["-usehd=0", "-keypool=10"]
+            extra_args_old=["-usehd=0", "-keypool=10"],
+            expected_wallet_version=FEATURE_COMPRPUBKEY,
         )
 
     def test_hd_chain_split_migration(self):
-        """Test migration of HD wallet from v0.14.3 (VERSION_HD_CHAIN_SPLIT)"""
+        """Test migration of HD wallet from v0.14.3 (VERSION_HD_BASE)"""
         self.log.info("\n" + "="*60)
-        self.log.info("TEST 2: HD wallet migration from v0.14.3 (VERSION_HD_CHAIN_SPLIT)")
+        self.log.info("TEST 2: HD wallet migration from v0.14.3 (VERSION_HD_BASE)")
         self.log.info("="*60)
         self.migrate_wallet(
-            wallet_type="HD (VERSION_HD_CHAIN_SPLIT)",
-            # Explicitly enable HD wallet (HD should be default in v0.14.3, but be explicit)
-            extra_args_old=["-keypool=10"]  # HD is default in v0.14.3, no need for -usehd=1
+            wallet_type="HD (VERSION_HD_BASE)",
+            # HD is default in v0.14.3, no need for -usehd=1
+            extra_args_old=["-keypool=10"],
+            expected_wallet_version=FEATURE_HD,
         )
 
     def run_test(self):
@@ -285,7 +293,7 @@ class WalletMigrationTest(BitcoinTestFramework):
         # Test 1: Non-HD wallet from v0.14.3
         self.test_non_hd_migration()
 
-        # Test 2: HD wallet from v0.14.3 (VERSION_HD_CHAIN_SPLIT)
+        # Test 2: HD wallet from v0.14.3 (VERSION_HD_BASE)
         self.test_hd_chain_split_migration()
 
 if __name__ == '__main__':
