@@ -428,18 +428,6 @@ def main():
     logging_level = logging.INFO if args.quiet else logging.DEBUG
     logging.basicConfig(format='%(message)s', level=logging_level)
 
-    # Create base test directory
-    # Special case for tests using old binaries (e.g. version v0.14.3) that don't handle Unicode on Windows
-    has_migration_tests = any('wallet_ancient_migration' in script for script in BASE_SCRIPTS)
-    if platform.system() == 'Windows' and has_migration_tests:
-        tmpdir = "%s/test_runner_btc_run_%s" % (args.tmpdirprefix, datetime.datetime.now().strftime("%Y%m%d_%H%M%S"))
-    else:
-        tmpdir = "%s/test_runner_₿_🏃_%s" % (args.tmpdirprefix, datetime.datetime.now().strftime("%Y%m%d_%H%M%S"))
-
-    os.makedirs(tmpdir)
-
-    logging.debug("Temporary test directory at %s" % tmpdir)
-
     results_filepath = None
     if args.resultsfile:
         results_filepath = pathlib.Path(args.resultsfile)
@@ -515,6 +503,18 @@ def main():
         print("No valid test scripts specified. Check that your test is in one "
               "of the test lists in test_runner.py, or run test_runner.py with no arguments to run all tests")
         sys.exit(1)
+
+    # Create base test directory
+    # Use ASCII-only path when running tests with old binaries (e.g. v0.14.3) that
+    # don't handle Unicode on Windows. Only affects runs that include such tests.
+    uses_old_binaries = any('wallet_ancient_migration' in script for script in test_list)
+    if platform.system() == 'Windows' and uses_old_binaries:
+        tmpdir = "%s/test_runner_btc_run_%s" % (args.tmpdirprefix, datetime.datetime.now().strftime("%Y%m%d_%H%M%S"))
+    else:
+        tmpdir = "%s/test_runner_₿_🏃_%s" % (args.tmpdirprefix, datetime.datetime.now().strftime("%Y%m%d_%H%M%S"))
+
+    os.makedirs(tmpdir)
+    logging.debug("Temporary test directory at %s" % tmpdir)
 
     if args.help:
         # Print help for test_runner.py, then print help of the first script (with args removed) and exit.
