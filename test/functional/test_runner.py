@@ -447,13 +447,6 @@ def main():
     logging_level = logging.INFO if args.quiet else logging.DEBUG
     logging.basicConfig(format='%(message)s', level=logging_level)
 
-    # Create base test directory
-    tmpdir = "%s/test_runner_₿_🏃_%s" % (args.tmpdirprefix, datetime.datetime.now().strftime("%Y%m%d_%H%M%S"))
-
-    os.makedirs(tmpdir)
-
-    logging.debug("Temporary test directory at %s" % tmpdir)
-
     results_filepath = None
     if args.resultsfile:
         results_filepath = pathlib.Path(args.resultsfile)
@@ -546,6 +539,19 @@ def main():
         parser.print_help()
         subprocess.check_call([sys.executable, os.path.join(config["environment"]["SRCDIR"], 'test', 'functional', test_list[0].split()[0]), '-h'])
         sys.exit(0)
+
+    # Create base test directory
+    # Use ASCII-only path when running tests with old binaries (e.g. v0.14.3) that
+    # don't handle Unicode on Windows. Only affects runs that include such tests.
+    old_binary_tests = ('feature_unsupported_utxo_db')
+    uses_old_binaries = any(test in script for script in test_list for test in old_binary_tests)
+    if platform.system() == 'Windows' and uses_old_binaries:
+        tmpdir = "%s/test_runner_btc_run_%s" % (args.tmpdirprefix, datetime.datetime.now().strftime("%Y%m%d_%H%M%S"))
+    else:
+        tmpdir = "%s/test_runner_₿_🏃_%s" % (args.tmpdirprefix, datetime.datetime.now().strftime("%Y%m%d_%H%M%S"))
+
+    os.makedirs(tmpdir)
+    logging.debug("Temporary test directory at %s" % tmpdir)
 
     # Warn if there is not enough space on tmpdir to run the tests with --nocleanup
     if args.nocleanup:
