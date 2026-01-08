@@ -447,13 +447,6 @@ def main():
     logging_level = logging.INFO if args.quiet else logging.DEBUG
     logging.basicConfig(format='%(message)s', level=logging_level)
 
-    # Create base test directory
-    tmpdir = "%s/test_runner_₿_🏃_%s" % (args.tmpdirprefix, datetime.datetime.now().strftime("%Y%m%d_%H%M%S"))
-
-    os.makedirs(tmpdir)
-
-    logging.debug("Temporary test directory at %s" % tmpdir)
-
     results_filepath = None
     if args.resultsfile:
         results_filepath = pathlib.Path(args.resultsfile)
@@ -546,6 +539,12 @@ def main():
         parser.print_help()
         subprocess.check_call([sys.executable, os.path.join(config["environment"]["SRCDIR"], 'test', 'functional', test_list[0].split()[0]), '-h'])
         sys.exit(0)
+
+    # Create base test directory
+    tmpdir = "%s/test_runner_₿_🏃_%s" % (args.tmpdirprefix, datetime.datetime.now().strftime("%Y%m%d_%H%M%S"))
+
+    os.makedirs(tmpdir)
+    logging.debug("Temporary test directory at %s" % tmpdir)
 
     # Warn if there is not enough space on tmpdir to run the tests with --nocleanup
     if args.nocleanup:
@@ -757,7 +756,13 @@ class TestHandler:
             log_stdout = tempfile.SpooledTemporaryFile(max_size=2**16)
             log_stderr = tempfile.SpooledTemporaryFile(max_size=2**16)
             test_argv = test.split()
-            testdir = "{}/{}_{}".format(self.tmpdir, re.sub(".py$", "", test_argv[0]), portseed)
+            # On Windows, use ASCII-only path for tests that use old binaries (e.g. v0.14.3)
+            # which don't handle Unicode paths properly.
+            if platform.system() == 'Windows' and test_argv[0] == 'feature_unsupported_utxo_db.py':
+                ascii_tmpdir = "{}/test_runner_ascii_{}".format(tempfile.gettempdir(), datetime.datetime.now().strftime("%Y%m%d_%H%M%S"))
+                testdir = "{}/{}_{}".format(ascii_tmpdir, re.sub(".py$", "", test_argv[0]), portseed)
+            else:
+                testdir = "{}/{}_{}".format(self.tmpdir, re.sub(".py$", "", test_argv[0]), portseed)
             tmpdir_arg = ["--tmpdir={}".format(testdir)]
 
             def proc_wait(task):
