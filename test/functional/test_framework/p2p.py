@@ -787,19 +787,16 @@ class NetworkThread(threading.Thread):
                 cls.protos[(addr, port)] = None
             return response
 
-        if (addr, port) not in cls.listeners:
+        if port == 0 or (addr, port) not in cls.listeners:
             # When creating a listener on a given (addr, port) we only need to
             # do it once. If we want different behaviors for different
             # connections, we can accomplish this by providing different
             # `proto` functions
 
             listener = await cls.network_event_loop.create_server(peer_protocol, addr, port)
-            # When port=0, the OS assigns an available ephemeral port. Retrieve
-            # the actual port so callers know where the server is listening.
-            actual_port = listener.sockets[0].getsockname()[1]
-            logger.debug("Listening server on %s:%d should be started" % (addr, actual_port))
-            cls.listeners[(addr, actual_port)] = listener
-            port = actual_port
+            port = listener.sockets[0].getsockname()[1]
+            logger.debug("Listening server on %s:%d should be started" % (addr, port))
+            cls.listeners[(addr, port)] = listener
 
         cls.protos[(addr, port)] = proto
         callback(addr, port)
