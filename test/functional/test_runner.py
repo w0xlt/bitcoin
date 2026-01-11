@@ -253,6 +253,7 @@ BASE_SCRIPTS = [
     'example_test.py',
     'mempool_truc.py',
     'wallet_multisig_descriptor_psbt.py',
+    'wallet_multisig_derivehdkey.py',
     'wallet_miniscript_decaying_multisig_descriptor_psbt.py',
     'wallet_txn_doublespend.py',
     'wallet_backwards_compatibility.py',
