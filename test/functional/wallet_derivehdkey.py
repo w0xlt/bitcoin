@@ -2,10 +2,15 @@
 # Copyright (c) 2026 The Bitcoin Core developers
 # Distributed under the MIT software license, see the accompanying
 # file COPYING or http://www.opensource.org/licenses/mit-license.php.
-"""Test wallet derivehdkey RPC."""
+"""Test wallet derivehdkey RPC.
+
+Also tests PSBT signing using derivehdkey-exported xpubs at non-standard paths,
+verifying that wallets can sign when keys are derived at paths not in the keypool.
+"""
 
 from test_framework.test_framework import BitcoinTestFramework
 from test_framework.util import (
+    assert_approx,
     assert_equal,
     assert_raises_rpc_error,
 )
@@ -16,7 +21,7 @@ from test_framework.wallet_util import WalletUnlock
 class WalletDeriveHDKeyTest(BitcoinTestFramework):
     def set_test_params(self):
         self.setup_clean_chain = True
-        self.num_nodes = 2
+        self.num_nodes = 3
 
     def skip_test_if_missing_module(self):
         self.skip_if_no_wallet()
@@ -30,6 +35,7 @@ class WalletDeriveHDKeyTest(BitcoinTestFramework):
         self.test_path_formats()
         self.test_noprivs_blank()
         self.test_export_import()
+        self.test_ecdsa_multisig()
 
     def test_basic_derivehdkey(self):
         self.log.info("Test derivehdkey basics")
@@ -163,6 +169,108 @@ class WalletDeriveHDKeyTest(BitcoinTestFramework):
         signer_addr = signer.getnewaddress(address_type="bech32")
         watcher_addr = watcher.getnewaddress(address_type="bech32")
         assert_equal(signer_addr, watcher_addr)
+
+    def test_ecdsa_multisig(self):
+        """Test ECDSA multisig signing with keys at non-standard BIP 87 path.
+
+        This tests on-the-fly key derivation using hd_keypaths in the PSBT.
+        """
+        self.log.info("Test 2-of-3 multisig with derivehdkey at BIP 87 path")
+
+        # Create participant wallets (signers)
+        signers = []
+        for i in range(self.num_nodes):
+            self.nodes[i].createwallet(wallet_name=f"participant_{i}")
+            signers.append(self.nodes[i].get_wallet_rpc(f"participant_{i}"))
+
+        # Use derivehdkey to get xpubs at BIP 87 path (m/87'/1'/0' for testnet multisig)
+        # This path is NOT in the wallet's default keypool, which uses paths like m/84'/1'/0'
+        xpubs = []
+        for signer in signers:
+            derived = signer.derivehdkey("m/87'/1'/0'")
+            # Format: [fingerprint/87'/1'/0']xpub/<0;1>/*
+            xpub_with_origin = f"{derived['origin']}{derived['xpub']}/<0;1>/*"
+            xpubs.append(xpub_with_origin)
+
+        # Create watch-only multisig wallets for each participant
+        multisigs = []
+        multisig_desc = f"wsh(sortedmulti(2,{','.join(xpubs)}))"
+        for i, node in enumerate(self.nodes):
+            node.createwallet(wallet_name=f"multisig_{i}", blank=True, disable_private_keys=True)
+            multisig = node.get_wallet_rpc(f"multisig_{i}")
+            checksum = multisig.getdescriptorinfo(multisig_desc)["checksum"]
+            result = multisig.importdescriptors([{
+                "desc": f"{multisig_desc}#{checksum}",
+                "active": True,
+                "timestamp": "now",
+                "range": [0, 100],
+            }])
+            assert all(r["success"] for r in result)
+            multisigs.append(multisig)
+
+        # Verify all multisigs generate the same addresses
+        for _ in range(3):
+            addresses = [m.getnewaddress() for m in multisigs]
+            assert all(addr == addresses[0] for addr in addresses)
+
+        # Fund the multisig
+        self.generatetoaddress(self.nodes[0], 101, signers[0].getnewaddress())
+        deposit_amount = 5.0
+        multisig_addr = multisigs[0].getnewaddress()
+        signers[0].sendtoaddress(multisig_addr, deposit_amount)
+        self.generate(self.nodes[0], 1)
+        assert_approx(multisigs[0].getbalance(), deposit_amount, vspan=0.001)
+
+        # Create and sign a PSBT
+        destination = signers[self.num_nodes - 1].getnewaddress()
+        send_amount = 1.0
+        psbt = multisigs[0].walletcreatefundedpsbt(
+            inputs=[],
+            outputs={destination: send_amount},
+            feeRate=0.0001
+        )
+
+        # Have 2 signers sign the PSBT
+        # This is the key test: signing should work even though the keys at
+        # m/87'/1'/0'/0/X are NOT in the signers' keypools
+        psbts = []
+        for i in range(2):
+            signed = signers[i].walletprocesspsbt(psbt["psbt"])
+            psbts.append(signed["psbt"])
+            # Individual signatures should not complete the multisig
+            assert_equal(signed["complete"], False)
+
+        # Combine, finalize, and broadcast
+        combined = signers[0].combinepsbt(psbts)
+        finalized = signers[0].finalizepsbt(combined)
+        assert_equal(finalized["complete"], True)
+
+        signers[0].sendrawtransaction(finalized["hex"])
+        self.generate(self.nodes[0], 1)
+
+        # Verify balances
+        assert_approx(multisigs[0].getbalance(), deposit_amount - send_amount, vspan=0.001)
+        assert_equal(signers[self.num_nodes - 1].getbalance(), send_amount)
+
+        # Test daisy-chain signing (sequential)
+        self.log.info("Test sequential (daisy-chain) signing")
+        psbt2 = multisigs[0].walletcreatefundedpsbt(
+            inputs=[],
+            outputs={destination: send_amount},
+            feeRate=0.0001
+        )
+        current_psbt = psbt2["psbt"]
+        for i in range(2):
+            result = signers[i].walletprocesspsbt(current_psbt)
+            current_psbt = result["psbt"]
+            # Should be complete after 2 signatures
+            assert_equal(result["complete"], i == 1)
+
+        signers[0].sendrawtransaction(result["hex"])
+        self.generate(self.nodes[0], 1)
+
+        assert_approx(multisigs[0].getbalance(), deposit_amount - (send_amount * 2), vspan=0.001)
+        assert_equal(signers[self.num_nodes - 1].getbalance(), send_amount * 2)
 
 
 if __name__ == '__main__':
