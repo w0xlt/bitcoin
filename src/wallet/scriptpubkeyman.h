@@ -318,6 +318,11 @@ private:
     // Fetch the SigningProvider for a given index and optionally include private keys. Called by the above functions.
     std::unique_ptr<FlatSigningProvider> GetSigningProvider(int32_t index, bool include_private = false) const EXCLUSIVE_LOCKS_REQUIRED(cs_desc_man);
 
+    //! Try to derive a signing provider using BIP 32 key origin info from a PSBT.
+    //! This enables signing when the key path is not in the wallet's keypool but the
+    //! wallet has the master key that can derive to the specified path.
+    std::unique_ptr<FlatSigningProvider> GetSigningProviderFromKeyOrigin(const CPubKey& pubkey, const KeyOriginInfo& key_origin) const EXCLUSIVE_LOCKS_REQUIRED(cs_desc_man);
+
 protected:
     WalletDescriptor m_wallet_descriptor GUARDED_BY(cs_desc_man);
 
