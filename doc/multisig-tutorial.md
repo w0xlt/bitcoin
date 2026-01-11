@@ -12,10 +12,6 @@ Before starting this tutorial, start the bitcoin node on the signet network.
 ./build/bin/bitcoind -signet -daemon
 ```
 
-This tutorial also uses the default WPKH derivation path to get the xpubs and does not conform to [BIP 45](https://github.com/bitcoin/bips/blob/master/bip-0045.mediawiki) or [BIP 87](https://github.com/bitcoin/bips/blob/master/bip-0087.mediawiki).
-
-At the time of writing, there is no way to extract a specific path from wallets in Bitcoin Core. For this, an external signer/xpub can be used.
-
 ## 1.1 Basic Multisig Workflow
 
 ### 1.1 Create the Descriptor Wallets
@@ -31,37 +27,24 @@ do
 done
 ```
 
-Extract the xpub of each wallet. To do this, the `listdescriptors` RPC is used. By default, Bitcoin Core single-sig wallets are created using path `m/44'/1'/0'` for PKH, `m/84'/1'/0'` for WPKH, `m/49'/1'/0'` for P2WPKH-nested-in-P2SH and `m/86'/1'/0'` for P2TR based accounts. Each of them uses the chain 0 for external addresses and chain 1 for internal ones, as shown in the example below.
+Extract the xpub of each wallet using the `derivehdkey` RPC. This tutorial uses the [BIP 87](https://github.com/bitcoin/bips/blob/master/bip-0087.mediawiki) derivation path for multisig: `m/87'/1'/0'` (where `1'` is the coin type for signet/testnet).
 
-```
-wpkh([1004658e/84'/1'/0']tpubDCBEcmVKbfC9KfdydyLbJ2gfNL88grZu1XcWSW9ytTM6fitvaRmVyr8Ddf7SjZ2ZfMx9RicjYAXhuh3fmLiVLPodPEqnQQURUfrBKiiVZc8/0/*)#g8l47ngv
-
-wpkh([1004658e/84'/1'/0']tpubDCBEcmVKbfC9KfdydyLbJ2gfNL88grZu1XcWSW9ytTM6fitvaRmVyr8Ddf7SjZ2ZfMx9RicjYAXhuh3fmLiVLPodPEqnQQURUfrBKiiVZc8/1/*)#en65rxc5
-```
-
-The suffix (after #) is the checksum. Descriptors can optionally be suffixed with a checksum to protect against typos or copy-paste errors.
-All RPCs in Bitcoin Core will include the checksum in their output.
-
-Note that previously at least two descriptors were usually used, one for external derivation paths and one for internal ones. Since https://github.com/bitcoin/bitcoin/pull/22838 this redundancy has been eliminated by a multipath descriptor with <code><0;1></code> at the [BIP-44](https://github.com/bitcoin/bips/blob/master/bip-0044.mediawiki#change) change level expanding to external and internal descriptors when imported.
+The `derivehdkey` RPC derives a key at any BIP32 path from the wallet's HD seed and returns the xpub with origin info in descriptor format, ready for use in multisig descriptors.
 
 ```bash
 declare -A xpubs
 
 for ((n=1;n<=3;n++))
 do
- xpubs["xpub_${n}"]=$(./build/bin/bitcoin rpc -signet -rpcwallet="participant_${n}" listdescriptors | jq '.descriptors | [.[] | select(.desc | startswith("wpkh") and contains("/0/*") )][0] | .desc' | grep -Po '(?<=\().*(?=\))' | sed 's /0/\* /<0;1>/* ')
+ xpubs["xpub_${n}"]=$(./build/bin/bitcoin rpc -signet -rpcwallet="participant_${n}" derivehdkey "m/87'/1'/0'" | jq -r '.origin + .xpub + "/<0;1>/*"')
 done
 ```
-
-`jq` is used to extract the xpub from the `wpkh` descriptor.
 
 The following command can be used to verify if the xpub was generated correctly.
 
 ```bash
 for x in "${!xpubs[@]}"; do printf "[%s]=%s\n" "$x" "${xpubs[$x]}" ; done
 ```
-
-As previously mentioned, this step extracts the `m/84'/1'/0'` account instead of the path defined in [BIP 45](https://github.com/bitcoin/bips/blob/master/bip-0045.mediawiki) or [BIP 87](https://github.com/bitcoin/bips/blob/master/bip-0087.mediawiki), since there is no way to extract a specific path in Bitcoin Core at the time of writing.
 
 ### 1.2 Define the Multisig Descriptor
 
