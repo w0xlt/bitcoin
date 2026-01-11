@@ -1265,6 +1265,61 @@ std::unique_ptr<FlatSigningProvider> DescriptorScriptPubKeyMan::GetSigningProvid
     return out_keys;
 }
 
+std::unique_ptr<FlatSigningProvider> DescriptorScriptPubKeyMan::GetSigningProviderFromKeyOrigin(const CPubKey& pubkey, const KeyOriginInfo& key_origin) const
+{
+    LOCK(cs_desc_man);
+
+    // Early-reject excessively long derivation paths to avoid wasting CPU on
+    // repeated Derive() calls that would eventually fail when CExtKey::nDepth
+    // hits its unsigned char maximum.
+    if (key_origin.path.size() > std::numeric_limits<unsigned char>::max()) {
+        return nullptr;
+    }
+
+    // Get all extended pubkeys from this descriptor
+    std::set<CPubKey> desc_pubkeys;
+    std::set<CExtPubKey> desc_xpubs;
+    m_wallet_descriptor.descriptor->GetPubKeys(desc_pubkeys, desc_xpubs);
+
+    // Look for an extended pubkey with matching fingerprint
+    for (const CExtPubKey& xpub : desc_xpubs) {
+        // Compute fingerprint of this extended pubkey (first 4 bytes of hash160)
+        CKeyID xpub_key_id = xpub.pubkey.GetID();
+        if (!std::equal(key_origin.fingerprint, key_origin.fingerprint + 4, xpub_key_id.begin())) {
+            continue;
+        }
+
+        // Fingerprint matches! Try to get the private key
+        auto keys = GetKeys();
+        auto it = keys.find(xpub_key_id);
+        if (it == keys.end()) {
+            // Don't have the private key (wallet might be locked)
+            continue;
+        }
+
+        // Derive from the master key to the target path
+        CExtKey ext_key(xpub, it->second);
+        for (uint32_t child : key_origin.path) {
+            if (!ext_key.Derive(ext_key, child)) {
+                return nullptr;
+            }
+        }
+
+        // Verify the derived public key matches the expected pubkey
+        if (ext_key.key.GetPubKey() != pubkey) {
+            continue;
+        }
+
+        // Create a signing provider with the derived key
+        auto out = std::make_unique<FlatSigningProvider>();
+        out->keys[pubkey.GetID()] = ext_key.key;
+        out->pubkeys[pubkey.GetID()] = pubkey;
+        return out;
+    }
+
+    return nullptr;
+}
+
 std::unique_ptr<SigningProvider> DescriptorScriptPubKeyMan::GetSolvingProvider(const CScript& script) const
 {
     return GetSigningProvider(script, false);
@@ -1340,24 +1395,32 @@ std::optional<PSBTError> DescriptorScriptPubKeyMan::FillPSBT(PartiallySignedTran
             keys->Merge(std::move(*script_keys));
         } else {
             // Maybe there are pubkeys listed that we can sign for
-            std::vector<CPubKey> pubkeys;
-            pubkeys.reserve(input.hd_keypaths.size() + 2);
 
-            // ECDSA Pubkeys
-            for (const auto& [pk, _] : input.hd_keypaths) {
-                pubkeys.push_back(pk);
+            // ECDSA Pubkeys - try lookup first, then on-the-fly derivation using BIP 32 path
+            for (const auto& [pk, key_origin] : input.hd_keypaths) {
+                std::unique_ptr<FlatSigningProvider> pk_keys = GetSigningProvider(pk);
+                if (!pk_keys) {
+                    // Pubkey not in keypool; try deriving using BIP 32 path from PSBT
+                    pk_keys = GetSigningProviderFromKeyOrigin(pk, key_origin);
+                }
+                if (pk_keys) {
+                    keys->Merge(std::move(*pk_keys));
+                }
             }
+
+            // Taproot pubkeys
+            std::vector<CPubKey> taproot_pubkeys;
 
             // Taproot output pubkey
             std::vector<std::vector<unsigned char>> sols;
             if (Solver(script, sols) == TxoutType::WITNESS_V1_TAPROOT) {
                 sols[0].insert(sols[0].begin(), 0x02);
-                pubkeys.emplace_back(sols[0]);
+                taproot_pubkeys.emplace_back(sols[0]);
                 sols[0][0] = 0x03;
-                pubkeys.emplace_back(sols[0]);
+                taproot_pubkeys.emplace_back(sols[0]);
             }
 
-            // Taproot pubkeys
+            // Taproot pubkeys from m_tap_bip32_paths
             for (const auto& pk_pair : input.m_tap_bip32_paths) {
                 const XOnlyPubKey& pubkey = pk_pair.first;
                 for (unsigned char prefix : {0x02, 0x03}) {
@@ -1365,11 +1428,11 @@ std::optional<PSBTError> DescriptorScriptPubKeyMan::FillPSBT(PartiallySignedTran
                     std::copy(pubkey.begin(), pubkey.end(), b + 1);
                     CPubKey fullpubkey;
                     fullpubkey.Set(b, b + 33);
-                    pubkeys.push_back(fullpubkey);
+                    taproot_pubkeys.push_back(fullpubkey);
                 }
             }
 
-            for (const auto& pubkey : pubkeys) {
+            for (const auto& pubkey : taproot_pubkeys) {
                 std::unique_ptr<FlatSigningProvider> pk_keys = GetSigningProvider(pubkey);
                 if (pk_keys) {
                     keys->Merge(std::move(*pk_keys));
