@@ -1267,7 +1267,7 @@ std::unique_ptr<FlatSigningProvider> DescriptorScriptPubKeyMan::GetSigningProvid
 
 std::unique_ptr<FlatSigningProvider> DescriptorScriptPubKeyMan::GetSigningProviderFromKeyOrigin(const CPubKey& pubkey, const KeyOriginInfo& key_origin) const
 {
-    AssertLockHeld(cs_desc_man);
+    LOCK(cs_desc_man);
 
     // Get all extended pubkeys from this descriptor
     std::set<CPubKey> desc_pubkeys;
