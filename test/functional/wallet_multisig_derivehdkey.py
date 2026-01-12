@@ -2,12 +2,15 @@
 # Copyright (c) 2026 The Bitcoin Core developers
 # Distributed under the MIT software license, see the accompanying
 # file COPYING or http://www.opensource.org/licenses/mit-license.php.
-"""Test multisig signing using derivehdkey-exported xpubs at non-standard paths.
+"""Test signing using derivehdkey-exported xpubs at non-standard paths.
 
-This test verifies that wallets can sign PSBTs for multisig outputs when the
-xpubs were derived at paths not in the wallet's keypool (e.g., BIP 87 path
-m/87'/1'/0' for multisig). The signing works because Bitcoin Core uses the
-BIP 32 derivation path from the PSBT's hd_keypaths to derive keys on-the-fly.
+This test verifies that wallets can sign PSBTs for outputs when the xpubs were
+derived at paths not in the wallet's keypool. The signing works because Bitcoin
+Core uses the BIP 32 derivation path from the PSBT to derive keys on-the-fly.
+
+Two scenarios are tested:
+1. ECDSA multisig (wsh(sortedmulti(...))) using BIP 87 path - uses hd_keypaths
+2. Taproot (tr(...)) using custom path - uses tap_bip32_paths (m_tap_bip32_paths)
 
 This mirrors the workflow in doc/multisig-tutorial.md.
 """
@@ -29,6 +32,11 @@ class WalletMultisigDeriveHDKeyTest(BitcoinTestFramework):
         self.skip_if_no_wallet()
 
     def run_test(self):
+        self.test_ecdsa_multisig()
+        self.test_taproot_custom_path()
+
+    def test_ecdsa_multisig(self):
+        """Test ECDSA multisig signing with keys at non-standard BIP 87 path."""
         self.M = 2
         self.N = self.num_nodes
         self.log.info(f"Testing {self.M}-of-{self.N} multisig with derivehdkey at BIP 87 path...")
@@ -142,7 +150,96 @@ class WalletMultisigDeriveHDKeyTest(BitcoinTestFramework):
         assert_approx(multisigs[0].getbalance(), deposit_amount - (send_amount * 2), vspan=0.001)
         assert_equal(signers[self.N - 1].getbalance(), send_amount * 2)
 
-        self.log.info("All tests passed!")
+        self.log.info("ECDSA multisig test passed!")
+
+    def test_taproot_custom_path(self):
+        """Test Taproot signing with keys at non-standard derivation path.
+
+        This tests on-the-fly key derivation using tap_bip32_paths (m_tap_bip32_paths)
+        in the PSBT, which is the Taproot equivalent of hd_keypaths for ECDSA.
+        """
+        self.log.info("Testing Taproot signing with derivehdkey at custom path...")
+
+        # Create a signer wallet and fund it
+        self.log.info("Creating Taproot signer wallet...")
+        self.nodes[0].createwallet(wallet_name="taproot_signer")
+        signer = self.nodes[0].get_wallet_rpc("taproot_signer")
+        self.generatetoaddress(self.nodes[0], 101, signer.getnewaddress())
+
+        # Derive xpub at a custom path NOT in the default keypool
+        # Using m/86'/1'/99' as a non-standard taproot path (standard is m/86'/1'/0')
+        custom_path = "m/86'/1'/99'"
+        self.log.info(f"Deriving xpub at custom path {custom_path} using derivehdkey...")
+        derived = signer.derivehdkey(custom_path)
+        xpub_with_origin = f"{derived['origin']}{derived['xpub']}/<0;1>/*"
+        self.log.info(f"  {xpub_with_origin[:60]}...")
+
+        # Create a watch-only Taproot wallet with this xpub
+        self.log.info("Creating watch-only Taproot wallet...")
+        self.nodes[0].createwallet(wallet_name="taproot_watchonly", blank=True, disable_private_keys=True)
+        watchonly = self.nodes[0].get_wallet_rpc("taproot_watchonly")
+
+        # Import the taproot descriptor
+        taproot_desc = f"tr({xpub_with_origin})"
+        checksum = watchonly.getdescriptorinfo(taproot_desc)["checksum"]
+        result = watchonly.importdescriptors([{
+            "desc": f"{taproot_desc}#{checksum}",
+            "active": True,
+            "timestamp": "now",
+            "range": [0, 100],
+        }])
+        assert all(r["success"] for r in result)
+
+        # Verify we get taproot addresses (bc1p... on mainnet, bcrt1p... on regtest)
+        taproot_addr = watchonly.getnewaddress(address_type="bech32m")
+        addr_info = watchonly.getaddressinfo(taproot_addr)
+        assert_equal(addr_info["iswitness"], True)
+        assert_equal(addr_info["witness_version"], 1)
+        self.log.info(f"  Generated Taproot address: {taproot_addr}")
+
+        # Fund the taproot address
+        self.log.info("Funding the Taproot wallet...")
+        deposit_amount = 1.0
+        signer.sendtoaddress(taproot_addr, deposit_amount)
+        self.generate(self.nodes[0], 1)
+        assert_approx(watchonly.getbalance(), deposit_amount, vspan=0.001)
+
+        # Create a PSBT to spend from the taproot output
+        self.log.info("Creating PSBT to spend from Taproot output...")
+        destination = signer.getnewaddress()
+        send_amount = 0.5
+        psbt = watchonly.walletcreatefundedpsbt(
+            inputs=[],
+            outputs={destination: send_amount},
+            feeRate=0.0001
+        )
+
+        # Verify the PSBT has tap_bip32_paths (taproot derivation info)
+        decoded = self.nodes[0].decodepsbt(psbt["psbt"])
+        assert "taproot_bip32_derivs" in decoded["inputs"][0], "PSBT should have taproot_bip32_derivs"
+        self.log.info(f"  PSBT has {len(decoded['inputs'][0]['taproot_bip32_derivs'])} taproot derivation path(s)")
+
+        # Sign the PSBT with the signer wallet
+        # This is the key test: signing should work even though the keys at
+        # m/86'/1'/99'/0/X are NOT in the signer's keypool
+        self.log.info("Signing PSBT with signer wallet (using on-the-fly derivation)...")
+        signed = signer.walletprocesspsbt(psbt["psbt"])
+        assert_equal(signed["complete"], True)
+
+        # Broadcast and verify
+        self.log.info("Broadcasting Taproot transaction...")
+        txid = signer.sendrawtransaction(signed["hex"])
+        self.generate(self.nodes[0], 1)
+
+        # Verify the transaction was confirmed
+        tx_info = signer.gettransaction(txid)
+        assert_equal(tx_info["confirmations"], 1)
+
+        # Verify balances
+        self.log.info("Verifying final balances...")
+        assert_approx(watchonly.getbalance(), deposit_amount - send_amount, vspan=0.001)
+
+        self.log.info("Taproot custom path test passed!")
 
 
 if __name__ == "__main__":
