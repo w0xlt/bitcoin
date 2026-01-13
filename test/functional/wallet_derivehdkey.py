@@ -16,6 +16,7 @@ from test_framework.util import (
 )
 from test_framework.descriptors import descsum_create
 from test_framework.wallet_util import WalletUnlock
+from test_framework.key import H_POINT
 
 
 class WalletDeriveHDKeyTest(BitcoinTestFramework):
@@ -38,6 +39,7 @@ class WalletDeriveHDKeyTest(BitcoinTestFramework):
         self.test_export_import()
         self.test_ecdsa_multisig()
         self.test_taproot_custom_path()
+        self.test_taproot_script_path()
         self.test_locked_wallet_cannot_sign()
         self.test_wrong_wallet_cannot_sign()
 
@@ -399,6 +401,115 @@ class WalletDeriveHDKeyTest(BitcoinTestFramework):
 
         # Verify balances
         assert_approx(watchonly.getbalance(), deposit_amount - send_amount, vspan=0.001)
+
+    def test_taproot_script_path(self):
+        """Test Taproot SCRIPT PATH signing with keys at non-standard derivation path.
+
+        This tests on-the-fly key derivation for script path spending, where the
+        leaf script contains a key that needs to be derived using tap_bip32_paths.
+        We use an unspendable internal key to force script path spending.
+        """
+        self.log.info("Test Taproot script path signing with derivehdkey at custom path")
+
+        # Create a signer wallet and fund it
+        self.nodes[0].createwallet(wallet_name="taproot_script_signer")
+        signer = self.nodes[0].get_wallet_rpc("taproot_script_signer")
+        self.generatetoaddress(self.nodes[0], 101, signer.getnewaddress())
+
+        # Derive xpub at a custom path NOT in the default keypool
+        # Using m/86'/1'/88' as a non-standard taproot path
+        custom_path = "m/86'/1'/88'"
+        derived = signer.derivehdkey(custom_path)
+        xpub_with_origin = f"{derived['origin']}{derived['xpub']}/<0;1>/*"
+
+        # Use an unspendable internal key (NUMS point from BIP-341)
+        # This is H = lift_x(0x50929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d547bfee9ace803ac0)
+        # which has no known discrete log, forcing script path spending
+        unspendable_internal_key = H_POINT
+
+        # Create a watch-only Taproot wallet with a script tree
+        # The descriptor uses the unspendable internal key and a simple pk() leaf
+        self.nodes[0].createwallet(wallet_name="taproot_script_watchonly", blank=True, disable_private_keys=True)
+        watchonly = self.nodes[0].get_wallet_rpc("taproot_script_watchonly")
+
+        # Import the taproot descriptor with script tree: tr(unspendable, pk(derived_key))
+        taproot_desc = f"tr({unspendable_internal_key},pk({xpub_with_origin}))"
+        checksum = watchonly.getdescriptorinfo(taproot_desc)["checksum"]
+        result = watchonly.importdescriptors([{
+            "desc": f"{taproot_desc}#{checksum}",
+            "active": True,
+            "timestamp": "now",
+            "range": [0, 100],
+        }])
+        assert all(r["success"] for r in result)
+
+        # Get a taproot address - this will be spendable only via script path
+        taproot_addr = watchonly.getnewaddress(address_type="bech32m")
+        addr_info = watchonly.getaddressinfo(taproot_addr)
+        assert_equal(addr_info["iswitness"], True)
+        assert_equal(addr_info["witness_version"], 1)
+
+        # Fund the taproot address
+        deposit_amount = 1.0
+        signer.sendtoaddress(taproot_addr, deposit_amount)
+        self.generate(self.nodes[0], 1)
+        assert_approx(watchonly.getbalance(), deposit_amount, vspan=0.001)
+
+        # Create a PSBT to spend from the taproot output
+        destination = signer.getnewaddress()
+        send_amount = 0.5
+        psbt = watchonly.walletcreatefundedpsbt(
+            inputs=[],
+            outputs={destination: send_amount},
+            feeRate=0.0001
+        )
+
+        # Verify the PSBT has tap_bip32_paths with leaf hashes (script path indicator)
+        decoded = self.nodes[0].decodepsbt(psbt["psbt"])
+        assert "taproot_bip32_derivs" in decoded["inputs"][0], "PSBT should have taproot_bip32_derivs"
+        # For script path, the derivs should include leaf hashes
+        tap_derivs = decoded["inputs"][0]["taproot_bip32_derivs"]
+        assert len(tap_derivs) > 0, "Should have at least one taproot derivation"
+        # At least one entry should have leaf_hashes (indicating script path key)
+        has_leaf_hashes = any(len(d.get("leaf_hashes", [])) > 0 for d in tap_derivs)
+        assert has_leaf_hashes, "Script path keys should have leaf_hashes in tap_bip32_derivs"
+
+        # Verify the PSBT has the tap_scripts (the leaf script)
+        assert "taproot_scripts" in decoded["inputs"][0], "PSBT should have taproot_scripts for script path"
+
+        # Sign the PSBT with the signer wallet
+        # This tests script path signing with on-the-fly key derivation
+        signed = signer.walletprocesspsbt(psbt["psbt"])
+        assert_equal(signed["complete"], True)
+
+        # Verify that script path was used by checking the final witness structure
+        decoded_signed = self.nodes[0].decodepsbt(signed["psbt"])
+        input0 = decoded_signed["inputs"][0]
+
+        # The PSBT should be finalized with a script path witness
+        # Script path witness structure: [signature, script, control_block]
+        # Key path witness would only have: [signature]
+        assert "final_scriptwitness" in input0, "PSBT should be finalized"
+        witness = input0["final_scriptwitness"]
+        assert len(witness) == 3, \
+            f"Script path witness should have exactly 3 elements (sig, script, control_block), got {len(witness)}"
+
+        # Verify it's NOT a key path signature (which would have only 1 element)
+        assert "taproot_key_path_sig" not in input0, \
+            "Should not have key path signature (internal key is unspendable)"
+
+        # Broadcast and verify
+        txid = signer.sendrawtransaction(signed["hex"])
+        self.generate(self.nodes[0], 1)
+
+        # Verify the transaction was confirmed
+        tx_info = signer.gettransaction(txid)
+        assert_equal(tx_info["confirmations"], 1)
+
+        # Verify balances
+        assert_approx(watchonly.getbalance(), deposit_amount - send_amount, vspan=0.001)
+
+        self.log.info("Taproot script path signing with custom derivation path succeeded")
 
     def test_locked_wallet_cannot_sign(self):
         """Test that a locked encrypted wallet cannot sign PSBTs using on-the-fly derivation.
