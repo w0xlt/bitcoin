@@ -36,6 +36,7 @@ class WalletDeriveHDKeyTest(BitcoinTestFramework):
         self.test_noprivs_blank()
         self.test_export_import()
         self.test_ecdsa_multisig()
+        self.test_taproot_custom_path()
 
     def test_basic_derivehdkey(self):
         self.log.info("Test derivehdkey basics")
@@ -271,6 +272,82 @@ class WalletDeriveHDKeyTest(BitcoinTestFramework):
 
         assert_approx(multisigs[0].getbalance(), deposit_amount - (send_amount * 2), vspan=0.001)
         assert_equal(signers[self.num_nodes - 1].getbalance(), send_amount * 2)
+
+    def test_taproot_custom_path(self):
+        """Test Taproot signing with keys at non-standard derivation path.
+
+        This tests on-the-fly key derivation using tap_bip32_paths (m_tap_bip32_paths)
+        in the PSBT, which is the Taproot equivalent of hd_keypaths for ECDSA.
+        """
+        self.log.info("Test Taproot signing with derivehdkey at custom path")
+
+        # Create a signer wallet and fund it
+        self.nodes[0].createwallet(wallet_name="taproot_signer")
+        signer = self.nodes[0].get_wallet_rpc("taproot_signer")
+        self.generatetoaddress(self.nodes[0], 101, signer.getnewaddress())
+
+        # Derive xpub at a custom path NOT in the default keypool
+        # Using m/86'/1'/99' as a non-standard taproot path (standard is m/86'/1'/0')
+        custom_path = "m/86'/1'/99'"
+        derived = signer.derivehdkey(custom_path)
+        xpub_with_origin = f"{derived['origin']}{derived['xpub']}/<0;1>/*"
+
+        # Create a watch-only Taproot wallet with this xpub
+        self.nodes[0].createwallet(wallet_name="taproot_watchonly", blank=True, disable_private_keys=True)
+        watchonly = self.nodes[0].get_wallet_rpc("taproot_watchonly")
+
+        # Import the taproot descriptor
+        taproot_desc = f"tr({xpub_with_origin})"
+        checksum = watchonly.getdescriptorinfo(taproot_desc)["checksum"]
+        result = watchonly.importdescriptors([{
+            "desc": f"{taproot_desc}#{checksum}",
+            "active": True,
+            "timestamp": "now",
+            "range": [0, 100],
+        }])
+        assert all(r["success"] for r in result)
+
+        # Verify we get taproot addresses (bc1p... on mainnet, bcrt1p... on regtest)
+        taproot_addr = watchonly.getnewaddress(address_type="bech32m")
+        addr_info = watchonly.getaddressinfo(taproot_addr)
+        assert_equal(addr_info["iswitness"], True)
+        assert_equal(addr_info["witness_version"], 1)
+
+        # Fund the taproot address
+        deposit_amount = 1.0
+        signer.sendtoaddress(taproot_addr, deposit_amount)
+        self.generate(self.nodes[0], 1)
+        assert_approx(watchonly.getbalance(), deposit_amount, vspan=0.001)
+
+        # Create a PSBT to spend from the taproot output
+        destination = signer.getnewaddress()
+        send_amount = 0.5
+        psbt = watchonly.walletcreatefundedpsbt(
+            inputs=[],
+            outputs={destination: send_amount},
+            feeRate=0.0001
+        )
+
+        # Verify the PSBT has tap_bip32_paths (taproot derivation info)
+        decoded = self.nodes[0].decodepsbt(psbt["psbt"])
+        assert "taproot_bip32_derivs" in decoded["inputs"][0], "PSBT should have taproot_bip32_derivs"
+
+        # Sign the PSBT with the signer wallet
+        # This is the key test: signing should work even though the keys at
+        # m/86'/1'/99'/0/X are NOT in the signer's keypool
+        signed = signer.walletprocesspsbt(psbt["psbt"])
+        assert_equal(signed["complete"], True)
+
+        # Broadcast and verify
+        txid = signer.sendrawtransaction(signed["hex"])
+        self.generate(self.nodes[0], 1)
+
+        # Verify the transaction was confirmed
+        tx_info = signer.gettransaction(txid)
+        assert_equal(tx_info["confirmations"], 1)
+
+        # Verify balances
+        assert_approx(watchonly.getbalance(), deposit_amount - send_amount, vspan=0.001)
 
 
 if __name__ == '__main__':
