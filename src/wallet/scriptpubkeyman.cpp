@@ -1269,6 +1269,13 @@ std::unique_ptr<FlatSigningProvider> DescriptorScriptPubKeyMan::GetSigningProvid
 {
     LOCK(cs_desc_man);
 
+    // Early-reject excessively long derivation paths to avoid wasting CPU on
+    // repeated Derive() calls that would eventually fail when CExtKey::nDepth 
+    // hits its unsigned char maximum.
+    if (key_origin.path.size() > std::numeric_limits<unsigned char>::max()) {
+        return nullptr;
+    }
+
     // Get all extended pubkeys from this descriptor
     std::set<CPubKey> desc_pubkeys;
     std::set<CExtPubKey> desc_xpubs;
@@ -1413,6 +1420,7 @@ std::optional<PSBTError> DescriptorScriptPubKeyMan::FillPSBT(PartiallySignedTran
                     std::unique_ptr<FlatSigningProvider> pk_keys = GetSigningProvider(pubkey);
                     if (pk_keys) {
                         keys->Merge(std::move(*pk_keys));
+                        break; // Both prefixes represent the same x-coordinate
                     }
                 }
             }
@@ -1432,6 +1440,7 @@ std::optional<PSBTError> DescriptorScriptPubKeyMan::FillPSBT(PartiallySignedTran
                     }
                     if (pk_keys) {
                         keys->Merge(std::move(*pk_keys));
+                        break; // Both prefixes represent the same x-coordinate
                     }
                 }
             }
