@@ -1314,6 +1314,7 @@ std::unique_ptr<FlatSigningProvider> DescriptorScriptPubKeyMan::GetSigningProvid
         auto out = std::make_unique<FlatSigningProvider>();
         out->keys[pubkey.GetID()] = ext_key.key;
         out->pubkeys[pubkey.GetID()] = pubkey;
+        out->musig2_secnonces = &m_musig2_secnonces;
         return out;
     }
 
@@ -1408,34 +1409,39 @@ std::optional<PSBTError> DescriptorScriptPubKeyMan::FillPSBT(PartiallySignedTran
                 }
             }
 
-            // Taproot pubkeys
-            std::vector<CPubKey> taproot_pubkeys;
-
-            // Taproot output pubkey
+            // Taproot output pubkey (no key origin info available, only try keypool lookup)
             std::vector<std::vector<unsigned char>> sols;
             if (Solver(script, sols) == TxoutType::WITNESS_V1_TAPROOT) {
                 sols[0].insert(sols[0].begin(), 0x02);
-                taproot_pubkeys.emplace_back(sols[0]);
+                CPubKey pk1(sols[0]);
                 sols[0][0] = 0x03;
-                taproot_pubkeys.emplace_back(sols[0]);
-            }
-
-            // Taproot pubkeys from m_tap_bip32_paths
-            for (const auto& pk_pair : input.m_tap_bip32_paths) {
-                const XOnlyPubKey& pubkey = pk_pair.first;
-                for (unsigned char prefix : {0x02, 0x03}) {
-                    unsigned char b[33] = {prefix};
-                    std::copy(pubkey.begin(), pubkey.end(), b + 1);
-                    CPubKey fullpubkey;
-                    fullpubkey.Set(b, b + 33);
-                    taproot_pubkeys.push_back(fullpubkey);
+                CPubKey pk2(sols[0]);
+                for (const auto& pubkey : {pk1, pk2}) {
+                    std::unique_ptr<FlatSigningProvider> pk_keys = GetSigningProvider(pubkey);
+                    if (pk_keys) {
+                        keys->Merge(std::move(*pk_keys));
+                        break; // Both prefixes represent the same x-coordinate
+                    }
                 }
             }
 
-            for (const auto& pubkey : taproot_pubkeys) {
-                std::unique_ptr<FlatSigningProvider> pk_keys = GetSigningProvider(pubkey);
-                if (pk_keys) {
-                    keys->Merge(std::move(*pk_keys));
+            // Taproot pubkeys from m_tap_bip32_paths - try lookup first, then on-the-fly derivation
+            for (const auto& [xonly, leaf_origin] : input.m_tap_bip32_paths) {
+                const auto& [leaf_hashes, key_origin] = leaf_origin;
+                for (unsigned char prefix : {0x02, 0x03}) {
+                    unsigned char b[33] = {prefix};
+                    std::copy(xonly.begin(), xonly.end(), b + 1);
+                    CPubKey fullpubkey;
+                    fullpubkey.Set(b, b + 33);
+                    std::unique_ptr<FlatSigningProvider> pk_keys = GetSigningProvider(fullpubkey);
+                    if (!pk_keys) {
+                        // Pubkey not in keypool; try deriving using BIP 32 path from PSBT
+                        pk_keys = GetSigningProviderFromKeyOrigin(fullpubkey, key_origin);
+                    }
+                    if (pk_keys) {
+                        keys->Merge(std::move(*pk_keys));
+                        break; // Both prefixes represent the same x-coordinate
+                    }
                 }
             }
         }
