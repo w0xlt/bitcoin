@@ -37,6 +37,8 @@ class WalletDeriveHDKeyTest(BitcoinTestFramework):
         self.test_export_import()
         self.test_ecdsa_multisig()
         self.test_taproot_custom_path()
+        self.test_locked_wallet_cannot_sign()
+        self.test_wrong_wallet_cannot_sign()
 
     def test_basic_derivehdkey(self):
         self.log.info("Test derivehdkey basics")
@@ -348,6 +350,119 @@ class WalletDeriveHDKeyTest(BitcoinTestFramework):
 
         # Verify balances
         assert_approx(watchonly.getbalance(), deposit_amount - send_amount, vspan=0.001)
+
+    def test_locked_wallet_cannot_sign(self):
+        """Test that a locked encrypted wallet cannot sign PSBTs using on-the-fly derivation.
+
+        When the wallet is locked, walletprocesspsbt requires passphrase and signing fails.
+        """
+        self.log.info("Test locked wallet cannot sign with on-the-fly derivation")
+
+        # Create an encrypted signer wallet
+        self.nodes[0].createwallet(wallet_name="locked_signer", passphrase="testpassword")
+        signer = self.nodes[0].get_wallet_rpc("locked_signer")
+
+        # Fund the signer
+        fund_addr = signer.getnewaddress()
+        self.generatetoaddress(self.nodes[0], 1, fund_addr)
+        self.generate(self.nodes[0], 100)
+
+        # Derive xpub at custom path and create watch-only wallet
+        with WalletUnlock(signer, "testpassword"):
+            derived = signer.derivehdkey("m/87'/1'/0'")
+        xpub_with_origin = f"{derived['origin']}{derived['xpub']}/<0;1>/*"
+
+        self.nodes[0].createwallet(wallet_name="locked_watchonly", blank=True, disable_private_keys=True)
+        watchonly = self.nodes[0].get_wallet_rpc("locked_watchonly")
+        desc = f"wpkh({xpub_with_origin})"
+        checksum = watchonly.getdescriptorinfo(desc)["checksum"]
+        watchonly.importdescriptors([{
+            "desc": f"{desc}#{checksum}",
+            "active": True,
+            "timestamp": "now",
+            "range": [0, 100],
+        }])
+
+        # Fund the watch-only address
+        watchonly_addr = watchonly.getnewaddress()
+        with WalletUnlock(signer, "testpassword"):
+            signer.sendtoaddress(watchonly_addr, 0.5)
+        self.generate(self.nodes[0], 1)
+
+        # Create PSBT
+        destination = signer.getnewaddress()
+        psbt = watchonly.walletcreatefundedpsbt(
+            inputs=[],
+            outputs={destination: 0.1},
+            feeRate=0.0001
+        )
+
+        # Try to sign with LOCKED wallet - should fail with passphrase required error
+        # (wallet is locked by default after creation with passphrase)
+        assert_raises_rpc_error(-13, "Please enter the wallet passphrase", signer.walletprocesspsbt, psbt["psbt"])
+
+        # Unlock and sign - should now complete
+        with WalletUnlock(signer, "testpassword"):
+            signed = signer.walletprocesspsbt(psbt["psbt"])
+        assert_equal(signed["complete"], True)
+
+    def test_wrong_wallet_cannot_sign(self):
+        """Test that a wallet with different master key cannot sign.
+
+        Even if the PSBT contains valid BIP 32 paths, a wallet with a different
+        master key (different fingerprint) should not be able to sign.
+        """
+        self.log.info("Test wallet with wrong master key cannot sign")
+
+        # Create two separate wallets with different master keys
+        self.nodes[0].createwallet(wallet_name="correct_signer")
+        correct_signer = self.nodes[0].get_wallet_rpc("correct_signer")
+
+        self.nodes[0].createwallet(wallet_name="wrong_signer")
+        wrong_signer = self.nodes[0].get_wallet_rpc("wrong_signer")
+
+        # Fund correct_signer so it can fund transactions
+        self.generatetoaddress(self.nodes[0], 1, correct_signer.getnewaddress())
+        self.generate(self.nodes[0], 100)
+
+        # Derive xpub from correct_signer at custom path
+        derived = correct_signer.derivehdkey("m/87'/1'/0'")
+        xpub_with_origin = f"{derived['origin']}{derived['xpub']}/<0;1>/*"
+
+        # Create watch-only wallet with correct_signer's xpub
+        self.nodes[0].createwallet(wallet_name="wrong_test_watchonly", blank=True, disable_private_keys=True)
+        watchonly = self.nodes[0].get_wallet_rpc("wrong_test_watchonly")
+        desc = f"wpkh({xpub_with_origin})"
+        checksum = watchonly.getdescriptorinfo(desc)["checksum"]
+        watchonly.importdescriptors([{
+            "desc": f"{desc}#{checksum}",
+            "active": True,
+            "timestamp": "now",
+            "range": [0, 100],
+        }])
+
+        # Fund the watch-only address
+        watchonly_addr = watchonly.getnewaddress()
+        correct_signer.sendtoaddress(watchonly_addr, 0.5)
+        self.generate(self.nodes[0], 1)
+
+        # Create PSBT
+        destination = correct_signer.getnewaddress()
+        psbt = watchonly.walletcreatefundedpsbt(
+            inputs=[],
+            outputs={destination: 0.1},
+            feeRate=0.0001
+        )
+
+        # Try to sign with WRONG wallet (different master key) - should not complete
+        # The PSBT contains paths with correct_signer's fingerprint, which won't match
+        # wrong_signer's fingerprint
+        signed = wrong_signer.walletprocesspsbt(psbt["psbt"])
+        assert_equal(signed["complete"], False)
+
+        # Verify correct_signer CAN sign
+        signed = correct_signer.walletprocesspsbt(psbt["psbt"])
+        assert_equal(signed["complete"], True)
 
 
 if __name__ == '__main__':
