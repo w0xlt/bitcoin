@@ -796,6 +796,9 @@ static RPCHelpMan derivehdkey()
             if (!ParseHDKeypath(path_str, path)) {
                 throw JSONRPCError(RPC_INVALID_PARAMETER, "Invalid BIP32 keypath: " + path_str);
             }
+            if (path.size() > std::numeric_limits<unsigned char>::max()) {
+                throw JSONRPCError(RPC_INVALID_PARAMETER, "Path exceeds maximum BIP32 depth");
+            }
 
             // Get the active HD key from the wallet
             std::set<CExtPubKey> active_xpubs = pwallet->GetActiveHDPubKeys();
