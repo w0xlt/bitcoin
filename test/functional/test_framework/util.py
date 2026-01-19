@@ -17,6 +17,7 @@ import platform
 import random
 import re
 import shlex
+import socket
 import time
 import types
 
@@ -449,15 +450,67 @@ def util_xor(data, key, *, offset):
 
 # The maximum number of nodes a single test can spawn
 MAX_NODES = 12
-# Don't assign p2p, rpc or tor ports lower than this
+# Don't assign p2p, rpc or tor ports lower than this (used as fallback only)
 PORT_MIN = int(os.getenv('TEST_RUNNER_PORT_MIN', default=11000))
-# The number of ports to "reserve" for p2p, rpc and tor, each
+# The number of ports to "reserve" for p2p, rpc and tor, each (used as fallback only)
 PORT_RANGE = 5000
 
 
 class PortSeed:
     # Must be initialized with a unique integer for each process
     n = None
+
+
+class PortAllocator:
+    """Allocates ports dynamically by binding to port 0, letting the OS assign available ports.
+
+    This avoids port collisions on systems like FreeBSD where the ephemeral port range
+    (10000-65535) overlaps with the test framework's static port range.
+    """
+    _sockets = {}  # Maps (port_type, seed, node_index) -> socket
+    _ports = {}    # Maps (port_type, seed, node_index) -> port number
+
+    @classmethod
+    def allocate(cls, port_type, seed, node_index, host='127.0.0.1'):
+        """Allocate an available port by binding to it.
+
+        The socket is kept open to reserve the port until release() is called.
+        Subsequent calls with the same arguments return the cached port.
+        """
+        key = (port_type, seed, node_index)
+        if key in cls._ports:
+            return cls._ports[key]
+
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.bind((host, 0))
+        port = sock.getsockname()[1]
+
+        cls._sockets[key] = sock
+        cls._ports[key] = port
+        return port
+
+    @classmethod
+    def release(cls, port_type, seed, node_index):
+        """Release a port reservation just before the consumer binds to it."""
+        key = (port_type, seed, node_index)
+        if key in cls._sockets:
+            cls._sockets[key].close()
+            del cls._sockets[key]
+
+    @classmethod
+    def release_ports_for_node(cls, seed, node_index):
+        """Release all port reservations for a specific node."""
+        for port_type in ('p2p', 'rpc', 'tor'):
+            cls.release(port_type, seed, node_index)
+
+    @classmethod
+    def reset(cls):
+        """Release all port reservations. Called at test cleanup."""
+        for sock in cls._sockets.values():
+            sock.close()
+        cls._sockets.clear()
+        cls._ports.clear()
 
 
 def get_rpc_proxy(url: str, node_number: int, *, timeout: Optional[int]=None, coveragedir: Optional[str]=None) -> coverage.AuthServiceProxyWrapper:
@@ -487,15 +540,17 @@ def get_rpc_proxy(url: str, node_number: int, *, timeout: Optional[int]=None, co
 
 def p2p_port(n):
     assert n <= MAX_NODES
-    return PORT_MIN + n + (MAX_NODES * PortSeed.n) % (PORT_RANGE - 1 - MAX_NODES)
+    return PortAllocator.allocate('p2p', PortSeed.n, n)
 
 
 def rpc_port(n):
-    return p2p_port(n) + PORT_RANGE
+    assert n <= MAX_NODES
+    return PortAllocator.allocate('rpc', PortSeed.n, n)
 
 
 def tor_port(n):
-    return p2p_port(n) + PORT_RANGE * 2
+    assert n <= MAX_NODES
+    return PortAllocator.allocate('tor', PortSeed.n, n)
 
 
 def rpc_url(datadir, i, chain, rpchost):

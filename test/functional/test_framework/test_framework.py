@@ -28,6 +28,7 @@ from .test_node import TestNode
 from .util import (
     Binaries,
     MAX_NODES,
+    PortAllocator,
     PortSeed,
     assert_equal,
     check_json_precision,
@@ -272,6 +273,9 @@ class BitcoinTestFramework(metaclass=BitcoinTestMetaClass):
 
     def shutdown(self):
         """Call this method to shut down the test framework object."""
+
+        # Release any remaining port reservations
+        PortAllocator.reset()
 
         if self.success == TestStatus.FAILED and self.options.pdbonfailure:
             print("Testcase failed. Attaching python debugger. Enter ? for help")

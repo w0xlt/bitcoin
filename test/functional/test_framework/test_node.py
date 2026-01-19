@@ -32,6 +32,8 @@ from .messages import NODE_P2P_V2
 from .p2p import P2P_SERVICES, P2P_SUBVERSION
 from .util import (
     MAX_NODES,
+    PortAllocator,
+    PortSeed,
     assert_equal,
     assert_not_equal,
     append_config,
@@ -286,6 +288,10 @@ class TestNode():
         subp_env = dict(os.environ, LIBC_FATAL_STDERR_="1")
         if env is not None:
             subp_env.update(env)
+
+        # Release reserved ports just before starting bitcoind so it can bind to them.
+        # This minimizes the race window between release and bind.
+        PortAllocator.release_ports_for_node(PortSeed.n, self.index)
 
         self.process = subprocess.Popen(self.args + extra_args, env=subp_env, stdout=stdout, stderr=stderr, cwd=cwd, **kwargs)
 
