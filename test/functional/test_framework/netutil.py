@@ -191,7 +191,11 @@ def set_freebsd_high_port_range(sock):
     this overlap when binding to port 0 for dynamic port allocation.
     '''
     if sys.platform.startswith('freebsd'):
-        # Constants from FreeBSD's netinet/in.h
+        # Constants from FreeBSD's netinet/in.h and netinet6/in6.h
         IP_PORTRANGE = 19
-        IP_PORTRANGE_HIGH = 1
-        sock.setsockopt(socket.IPPROTO_IP, IP_PORTRANGE, IP_PORTRANGE_HIGH)
+        IPV6_PORTRANGE = 14
+        IP_PORTRANGE_HIGH = 1  # Same value for both IPv4 and IPv6
+        if sock.family == socket.AF_INET6:
+            sock.setsockopt(socket.IPPROTO_IPV6, IPV6_PORTRANGE, IP_PORTRANGE_HIGH)
+        else:
+            sock.setsockopt(socket.IPPROTO_IP, IP_PORTRANGE, IP_PORTRANGE_HIGH)
