@@ -18,6 +18,7 @@ import random
 import re
 import shlex
 import socket
+import sys
 import time
 import types
 
@@ -466,9 +467,18 @@ class PortAllocator:
 
     This avoids port collisions on systems like FreeBSD where the ephemeral port range
     (10000-65535) overlaps with the test framework's static port range.
+
+    On FreeBSD, we use IP_PORTRANGE_HIGH to request ports from the high range
+    (49152-65535) which doesn't overlap with the test framework's port range.
     """
     _sockets = {}  # Maps (port_type, seed, node_index) -> socket
     _ports = {}    # Maps (port_type, seed, node_index) -> port number
+
+    # FreeBSD-specific constants from netinet/in.h for port range selection.
+    # IP_PORTRANGE_HIGH requests ports from 49152-65535, avoiding overlap with
+    # the test framework's static port range (11000-26000).
+    _IP_PORTRANGE = 19
+    _IP_PORTRANGE_HIGH = 1
 
     @classmethod
     def allocate(cls, port_type, seed, node_index, host='127.0.0.1'):
@@ -483,6 +493,13 @@ class PortAllocator:
 
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+
+        # On FreeBSD, the default ephemeral port range (10000-65535) overlaps with
+        # the test framework's static port range. Use IP_PORTRANGE_HIGH to request
+        # ports from the high range (49152-65535) instead.
+        if sys.platform.startswith('freebsd'):
+            sock.setsockopt(socket.IPPROTO_IP, cls._IP_PORTRANGE, cls._IP_PORTRANGE_HIGH)
+
         sock.bind((host, 0))
         port = sock.getsockname()[1]
 
