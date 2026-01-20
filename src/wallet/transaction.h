@@ -20,7 +20,6 @@
 #include <cstdint>
 #include <map>
 #include <utility>
-#include <unordered_map>
 #include <variant>
 #include <vector>
 
@@ -188,8 +187,6 @@ public:
     }
 };
 
-class WalletTXO;
-
 /**
  * A transaction with a bunch of additional info that only the owner cares about.
  * It includes any unrecorded transactions needed to link it back to the block chain.
@@ -252,8 +249,6 @@ public:
     mutable bool m_is_cache_empty{true};
     mutable bool fChangeCached;
     mutable CAmount nChangeCached;
-
-    mutable std::unordered_map<uint32_t, WalletTXO*> m_txos;
 
     CWalletTx(CTransactionRef tx, const TxState& state) : tx(std::move(tx)), m_state(state)
     {
@@ -367,7 +362,7 @@ public:
 
     template<typename T> const T* state() const { return std::get_if<T>(&m_state); }
     template<typename T> T* state() { return std::get_if<T>(&m_state); }
-    void SetState(const TxState& state);
+    void SetState(const TxState& state) { m_state = state; }
     const TxState& GetState() const { return m_state; }
 
     //! Update transaction state when attaching to a chain, filling in heights

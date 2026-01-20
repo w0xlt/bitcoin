@@ -436,12 +436,14 @@ private:
     //! Cache of descriptor ScriptPubKeys used for IsMine. Maps ScriptPubKey to set of spkms
     std::unordered_map<CScript, std::vector<ScriptPubKeyMan*>, SaltedSipHasher> m_cached_spks;
 
-    //! Set of both spent and unspent transaction outputs owned by this wallet
+    //! Set of both spent and unspent transaction outputs owned by this wallet.
+    //! Mutable because TXO state must stay in sync with CWalletTx state, and some
+    //! const methods (e.g. SubmitTxMemoryPoolAndRelay) update transaction state.
     using TXOMap = std::unordered_map<COutPoint, WalletTXO, SaltedOutpointHasher>;
-    TXOMap m_txos GUARDED_BY(cs_wallet);
-    //! Set of transaction outputs that are definitely no longer usable
-    //! These outputs may already be spent in a confirmed tx, or are the outputs of a conflicted tx
-    TXOMap m_unusable_txos GUARDED_BY(cs_wallet);
+    mutable TXOMap m_txos GUARDED_BY(cs_wallet);
+    //! Set of transaction outputs that are definitely no longer usable.
+    //! These outputs may already be spent in a confirmed tx, or are the outputs of a conflicted tx.
+    mutable TXOMap m_unusable_txos GUARDED_BY(cs_wallet);
 
     /**
      * Catch wallet up to current chain, scanning new blocks, updating the best
@@ -533,7 +535,7 @@ public:
     std::optional<WalletTXO> GetTXO(const COutPoint& outpoint) const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
 
     /** Cache outputs that belong to the wallet from a single transaction */
-    void RefreshTXOsFromTx(const CWalletTx& wtx) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+    void RefreshTXOsFromTx(const CWalletTx& wtx) const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
     /** Cache outputs that belong to the wallet for all transactions in the wallet */
     void RefreshAllTXOs(WalletBatch* batch = nullptr) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
     void PruneSpentTXOs() EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
