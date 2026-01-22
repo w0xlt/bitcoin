@@ -125,6 +125,7 @@ add_executable(test_bitcoin
   util_string_tests.cpp
   util_tests.cpp
   util_threadnames_tests.cpp
+  utreexo_tests.cpp
   util_trace_tests.cpp
   validation_block_tests.cpp
   validation_chainstate_tests.cpp
@@ -159,6 +160,7 @@ target_link_libraries(test_bitcoin
   bitcoin_cli
   bitcoin_node
   bitcoin_consensus
+  bitcoin_utreexo
   minisketch
   secp256k1
   Boost::headers

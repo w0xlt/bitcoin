@@ -54,6 +54,7 @@ add_dependencies(bitcoin_clientversion generate_build_info)
 
 add_subdirectory(crypto)
 add_subdirectory(util)
+add_subdirectory(utreexo)
 if(ENABLE_IPC)
   add_subdirectory(ipc)
 endif()
