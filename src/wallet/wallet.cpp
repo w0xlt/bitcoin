@@ -27,6 +27,7 @@
 #include <key.h>
 #include <key_io.h>
 #include <logging.h>
+#include <net.h>
 #include <node/types.h>
 #include <outputtype.h>
 #include <policy/feerate.h>
@@ -2343,8 +2344,16 @@ void CWallet::CommitTransaction(CTransactionRef tx, mapValue_t mapValue, std::ve
     }
 
     std::string err_string;
-    if (!SubmitTxMemoryPoolAndRelay(*wtx, err_string, node::TxBroadcast::MEMPOOL_AND_BROADCAST_TO_ALL)) {
+    const bool private_broadcast{gArgs.GetBoolArg("-privatebroadcast", DEFAULT_PRIVATE_BROADCAST)};
+    const auto method = private_broadcast ? node::TxBroadcast::NO_MEMPOOL_PRIVATE_BROADCAST
+                                          : node::TxBroadcast::MEMPOOL_AND_BROADCAST_TO_ALL;
+    if (!SubmitTxMemoryPoolAndRelay(*wtx, err_string, method)) {
         WalletLogPrintf("CommitTransaction(): Transaction cannot be broadcast immediately, %s\n", err_string);
+        // For private broadcast failures with an error (e.g., Tor/I2P not reachable), this is a
+        // permanent failure that the user should know about. Throw instead of silently continuing.
+        if (private_broadcast && !err_string.empty()) {
+            throw std::runtime_error(std::string(__func__) + ": " + err_string);
+        }
         // TODO: if we expect the failure to be long term or permanent, instead delete wtx from the wallet and return failure.
     }
 }
