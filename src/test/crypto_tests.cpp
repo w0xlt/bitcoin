@@ -14,6 +14,7 @@
 #include <crypto/sha256.h>
 #include <crypto/sha3.h>
 #include <crypto/sha512.h>
+#include <crypto/sha512_256.h>
 #include <crypto/muhash.h>
 #include <random.h>
 #include <streams.h>
@@ -63,6 +64,7 @@ void TestVector(const Hasher &h, const In &in, const Out &out) {
 void TestSHA1(const std::string &in, const std::string &hexout) { TestVector(CSHA1(), in, ParseHex(hexout));}
 void TestSHA256(const std::string &in, const std::string &hexout) { TestVector(CSHA256(), in, ParseHex(hexout));}
 void TestSHA512(const std::string &in, const std::string &hexout) { TestVector(CSHA512(), in, ParseHex(hexout));}
+void TestSHA512_256(const std::string &in, const std::string &hexout) { TestVector(CSHA512_256(), in, ParseHex(hexout));}
 void TestRIPEMD160(const std::string &in, const std::string &hexout) { TestVector(CRIPEMD160(), in, ParseHex(hexout));}
 
 void TestHMACSHA256(const std::string &hexkey, const std::string &hexin, const std::string &hexout) {
@@ -464,6 +466,21 @@ BOOST_AUTO_TEST_CASE(sha512_testvectors) {
     TestSHA512(test1,
                "40cac46c147e6131c5193dd5f34e9d8bb4951395f27b08c558c65ff4ba2de594"
                "37de8c3ef5459d76a52cedc02dc499a3c9ed9dedbfb3281afd9653b8a112fafc");
+}
+
+BOOST_AUTO_TEST_CASE(sha512_256_testvectors) {
+    // Test vectors from NIST FIPS 180-4
+    TestSHA512_256("",
+               "c672b8d1ef56ed28ab87c3622c5114069bdd3ad7b8f9737498d0c01ecef0967a");
+    TestSHA512_256("abc",
+               "53048e2681941ef99b2e29b76b4c7dabe4c2d0c634fc6d46e0e2f13107e7af23");
+    TestSHA512_256("abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq",
+               "bde8e1f9f19bb9fd3406c90ec6bc47bd36d8ada9f11880dbc8a22a7078b6a461");
+    TestSHA512_256("abcdefghbcdefghicdefghijdefghijkefghijklfghijklmghijklmnhijklmno"
+               "ijklmnopjklmnopqklmnopqrlmnopqrsmnopqrstnopqrstu",
+               "3928e184fb8690f840da3988121d31be65cb9d3ef83ee6146feac861e19b563a");
+    TestSHA512_256(std::string(1000000, 'a'),
+               "9a59a052930187a97038cae692f30708aa6491923ef5194394dc68d56c74fb21");
 }
 
 BOOST_AUTO_TEST_CASE(hmac_sha256_testvectors) {
