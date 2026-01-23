@@ -390,9 +390,9 @@ EOF
     # Load wallet
     cli0 loadwallet "test_wallet"
 
-    # Connect to Node 1
+    # Connect to Node 1's onion-bound port (the only port Node 1 listens on)
     info "Connecting Node 0 to Node 1..."
-    cli0 addnode "127.0.0.1:$NODE1_PORT" "onetry"
+    cli0 addnode "127.0.0.1:$NODE1_ONION_PORT" "onetry"
 
     # Wait for peer connection
     local conn_wait=0
