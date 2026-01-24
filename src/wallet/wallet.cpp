@@ -2124,6 +2124,22 @@ void CWallet::ResubmitWalletTransactions(node::TxBroadcast broadcast_method, boo
             // Attempt to rebroadcast all txes more than 5 minutes older than
             // the last block, or all txs if forcing.
             if (!force && wtx.nTimeReceived > m_best_block_time - 5 * 60) continue;
+
+            // Skip transactions if the broadcast method doesn't match the original method.
+            // This prevents privacy leaks in both directions:
+            // 1. Don't broadcast privately-sent txs publicly (would leak tx origin)
+            // 2. Don't broadcast publicly-sent txs privately (would leak that user has -privatebroadcast)
+            const bool was_private = wtx.mapValue.count("private_broadcast") && wtx.mapValue.at("private_broadcast") == "1";
+            if (broadcast_method == node::TxBroadcast::MEMPOOL_AND_BROADCAST_TO_ALL && was_private) {
+                WalletLogPrintf("%s: skipping tx %s originally sent via private broadcast\n",
+                                __func__, wtx.GetHash().ToString());
+                continue;
+            }
+            if (broadcast_method == node::TxBroadcast::NO_MEMPOOL_PRIVATE_BROADCAST && !was_private) {
+                WalletLogPrintf("%s: skipping tx %s originally sent via public broadcast\n",
+                                __func__, wtx.GetHash().ToString());
+                continue;
+            }
             to_submit.insert(&wtx);
         }
         // Now try submitting the transactions to the memory pool and (optionally) relay them.
@@ -2322,6 +2338,14 @@ void CWallet::CommitTransaction(CTransactionRef tx, mapValue_t mapValue, std::ve
     LOCK(cs_wallet);
     WalletLogPrintf("CommitTransaction:\n%s\n", util::RemoveSuffixView(tx->ToString(), "\n"));
 
+    // Mark the transaction if it will be sent via private broadcast, so that
+    // rebroadcast logic can preserve privacy even if the node restarts without
+    // -privatebroadcast enabled.
+    const bool private_broadcast{gArgs.GetBoolArg("-privatebroadcast", DEFAULT_PRIVATE_BROADCAST)};
+    if (private_broadcast) {
+        mapValue["private_broadcast"] = "1";
+    }
+
     // Add tx to wallet, because if it has change it's also ours,
     // otherwise just for transaction history.
     CWalletTx* wtx = AddToWallet(tx, TxStateInactive{}, [&](CWalletTx& wtx, bool new_tx) {
@@ -2350,7 +2374,6 @@ void CWallet::CommitTransaction(CTransactionRef tx, mapValue_t mapValue, std::ve
     }
 
     std::string err_string;
-    const bool private_broadcast{gArgs.GetBoolArg("-privatebroadcast", DEFAULT_PRIVATE_BROADCAST)};
     const auto method = private_broadcast ? node::TxBroadcast::NO_MEMPOOL_PRIVATE_BROADCAST
                                           : node::TxBroadcast::MEMPOOL_AND_BROADCAST_TO_ALL;
     if (!SubmitTxMemoryPoolAndRelay(*wtx, err_string, method)) {
