@@ -2099,9 +2099,10 @@ NodeClock::time_point CWallet::GetDefaultNextResend() { return FastRandomContext
 // The `force` option results in all unconfirmed transactions being submitted to
 // the mempool. This does not necessarily result in those transactions being relayed,
 // that depends on the `broadcast_method` option. Periodic rebroadcast uses the pattern
-// broadcast_method=TxBroadcast::MEMPOOL_AND_BROADCAST_TO_ALL force=false, while loading into
-// the mempool (on start, or after import) uses
-// broadcast_method=TxBroadcast::MEMPOOL_NO_BROADCAST force=true.
+// broadcast_method=TxBroadcast::MEMPOOL_AND_BROADCAST_TO_ALL force=false (or
+// broadcast_method=TxBroadcast::NO_MEMPOOL_PRIVATE_BROADCAST force=false when
+// -privatebroadcast is enabled), while loading into the mempool (on start, or after
+// import) uses broadcast_method=TxBroadcast::MEMPOOL_NO_BROADCAST force=true.
 void CWallet::ResubmitWalletTransactions(node::TxBroadcast broadcast_method, bool force)
 {
     // Don't attempt to resubmit if the wallet is configured to not broadcast,
@@ -2143,7 +2144,12 @@ void MaybeResendWalletTxs(WalletContext& context)
 {
     for (const std::shared_ptr<CWallet>& pwallet : GetWallets(context)) {
         if (!pwallet->ShouldResend()) continue;
-        pwallet->ResubmitWalletTransactions(node::TxBroadcast::MEMPOOL_AND_BROADCAST_TO_ALL, /*force=*/false);
+        // Use private broadcast if configured, to preserve privacy for transactions
+        // that were originally sent via private broadcast.
+        const bool private_broadcast{gArgs.GetBoolArg("-privatebroadcast", DEFAULT_PRIVATE_BROADCAST)};
+        const auto method = private_broadcast ? node::TxBroadcast::NO_MEMPOOL_PRIVATE_BROADCAST
+                                              : node::TxBroadcast::MEMPOOL_AND_BROADCAST_TO_ALL;
+        pwallet->ResubmitWalletTransactions(method, /*force=*/false);
         pwallet->SetNextResend();
     }
 }
