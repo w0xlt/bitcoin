@@ -49,6 +49,7 @@
 #include <util/fs.h>
 #include <util/strencodings.h>
 #include <util/syserror.h>
+#include <util/time.h>
 #include <util/translation.h>
 #include <validation.h>
 #include <validationinterface.h>
@@ -1051,6 +1052,10 @@ static RPCHelpMan gettxoutsetinfo()
         LOCK(::cs_main);
         coins_view = &active_chainstate.CoinsDB();
         blockman = &active_chainstate.m_blockman;
+    }
+
+    if (HasTestOption(gArgs, "gettxoutsetinfo_race_sleep")) {
+        UninterruptibleSleep(std::chrono::milliseconds{100});
     }
 
     if (!request.params[1].isNull()) {
