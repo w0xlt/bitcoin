@@ -103,6 +103,12 @@ private:
     CSHA256 ctx;
 
 public:
+    HashWriter(CSHA256 ctx = CSHA256()) : ctx{ctx} {}
+
+    CSHA256 GetHashCtx() {
+        return ctx;
+    }
+
     void write(std::span<const std::byte> src)
     {
         ctx.Write(UCharCast(src.data()), src.size());
