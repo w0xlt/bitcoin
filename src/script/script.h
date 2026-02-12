@@ -63,6 +63,9 @@ static constexpr int64_t VALIDATION_WEIGHT_PER_SIGOP_PASSED{50};
 // How much weight budget is added to the witness size (Tapscript only, see BIP 342).
 static constexpr int64_t VALIDATION_WEIGHT_OFFSET{50};
 
+// Validation weight per OP_TXHASH execution (Tapscript only, see BIP 346).
+static constexpr int64_t VALIDATION_WEIGHT_PER_TXHASH{25};
+
 template <typename T>
 std::vector<unsigned char> ToByteVector(const T& in)
 {
@@ -208,6 +211,9 @@ enum opcodetype
 
     // Opcode added by BIP 342 (Tapscript)
     OP_CHECKSIGADD = 0xba,
+
+    // Opcode added by BIP 346 (TxHash)
+    OP_TXHASH = 0xbd,
 
     OP_INVALIDOPCODE = 0xff,
 };
