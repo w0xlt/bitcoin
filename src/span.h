@@ -70,6 +70,15 @@
  *   is useless in that context.
  */
 
+/** Pop the first element off a span, and return a reference to that element. */
+template <typename T>
+T& SpanPopFront(std::span<T>& span)
+{
+    T& front = span.front();
+    span = span.subspan(1);
+    return front;
+}
+
 /** Pop the last element off a span, and return a reference to that element. */
 template <typename T>
 T& SpanPopBack(std::span<T>& span)
