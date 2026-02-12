@@ -156,6 +156,21 @@ std::optional<uintN_t> FromHex(std::string_view str)
     return rv;
 }
 /**
+ * Writes the hex string (in big-endian / forward byte order) into a new uintN_t object.
+ * Needed for BIP 346 test vectors which use big-endian hex encoding.
+ */
+template <class uintN_t>
+std::optional<uintN_t> FromHexBE(std::string_view str)
+{
+    if (uintN_t::size() * 2 != str.size() || !IsHex(str)) return std::nullopt;
+    uintN_t rv;
+    unsigned char* p = rv.begin();
+    for (size_t i = 0; i < str.size(); i += 2) {
+        *p++ = (::HexDigit(str[i]) << 4) | ::HexDigit(str[i + 1]);
+    }
+    return rv;
+}
+/**
  * @brief Like FromHex(std::string_view str), but allows an "0x" prefix
  *        and pads the input with leading zeroes if it is shorter than
  *        the expected length of uintN_t::size()*2.
@@ -195,6 +210,7 @@ public:
 class uint256 : public base_blob<256> {
 public:
     static std::optional<uint256> FromHex(std::string_view str) { return detail::FromHex<uint256>(str); }
+    static std::optional<uint256> FromHexBE(std::string_view str) { return detail::FromHexBE<uint256>(str); }
     static std::optional<uint256> FromUserHex(std::string_view str) { return detail::FromUserHex<uint256>(str); }
     constexpr uint256() = default;
     consteval explicit uint256(std::string_view hex_str) : base_blob<256>(hex_str) {}
