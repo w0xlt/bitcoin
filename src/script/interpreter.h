@@ -20,6 +20,7 @@
 #include <vector>
 
 class CPubKey;
+struct TxHashCache;
 class CScript;
 class CScriptNum;
 class XOnlyPubKey;
@@ -144,6 +145,9 @@ enum class script_verify_flag_name : uint8_t {
 
     // Making unknown public key versions (in BIP 342 scripts) non-standard
     SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_PUBKEYTYPE,
+
+    // Verify OP_TXHASH (BIP 346)
+    SCRIPT_VERIFY_TXHASH,
 
     // Constants to point to the highest flag in use. Add new flags above this line.
     //
@@ -294,6 +298,11 @@ public:
          return false;
     }
 
+    virtual bool CalculateTxHash(uint256& hash_out, std::span<const unsigned char> field_selector, uint32_t codeseparator_pos) const
+    {
+         return false;
+    }
+
     virtual ~BaseSignatureChecker() = default;
 };
 
@@ -318,6 +327,7 @@ private:
     unsigned int nIn;
     const CAmount amount;
     const PrecomputedTransactionData* txdata;
+    TxHashCache* m_txhash_cache{nullptr};
     mutable SigHashCache m_sighash_cache;
 
 protected:
@@ -327,10 +337,12 @@ protected:
 public:
     GenericTransactionSignatureChecker(const T* txToIn, unsigned int nInIn, const CAmount& amountIn, MissingDataBehavior mdb) : txTo(txToIn), m_mdb(mdb), nIn(nInIn), amount(amountIn), txdata(nullptr) {}
     GenericTransactionSignatureChecker(const T* txToIn, unsigned int nInIn, const CAmount& amountIn, const PrecomputedTransactionData& txdataIn, MissingDataBehavior mdb) : txTo(txToIn), m_mdb(mdb), nIn(nInIn), amount(amountIn), txdata(&txdataIn) {}
+    GenericTransactionSignatureChecker(const T* txToIn, unsigned int nInIn, const CAmount& amountIn, const PrecomputedTransactionData& txdataIn, MissingDataBehavior mdb, TxHashCache* txhash_cache) : txTo(txToIn), m_mdb(mdb), nIn(nInIn), amount(amountIn), txdata(&txdataIn), m_txhash_cache(txhash_cache) {}
     bool CheckECDSASignature(const std::vector<unsigned char>& scriptSig, const std::vector<unsigned char>& vchPubKey, const CScript& scriptCode, SigVersion sigversion) const override;
     bool CheckSchnorrSignature(std::span<const unsigned char> sig, std::span<const unsigned char> pubkey, SigVersion sigversion, ScriptExecutionData& execdata, ScriptError* serror = nullptr) const override;
     bool CheckLockTime(const CScriptNum& nLockTime) const override;
     bool CheckSequence(const CScriptNum& nSequence) const override;
+    bool CalculateTxHash(uint256& hash_out, std::span<const unsigned char> field_selector, uint32_t codeseparator_pos) const override;
 };
 
 using TransactionSignatureChecker = GenericTransactionSignatureChecker<CTransaction>;
@@ -361,6 +373,10 @@ public:
     bool CheckSequence(const CScriptNum& nSequence) const override
     {
         return m_checker.CheckSequence(nSequence);
+    }
+    bool CalculateTxHash(uint256& hash_out, std::span<const unsigned char> field_selector, uint32_t codeseparator_pos) const override
+    {
+        return m_checker.CalculateTxHash(hash_out, field_selector, codeseparator_pos);
     }
 };
 
