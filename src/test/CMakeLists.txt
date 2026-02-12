@@ -114,6 +114,7 @@ add_executable(test_bitcoin
   translation_tests.cpp
   txdownload_tests.cpp
   txgraph_tests.cpp
+  txhash_tests.cpp
   txindex_tests.cpp
   txpackage_tests.cpp
   txreconciliation_tests.cpp
@@ -147,6 +148,7 @@ target_json_data_sources(test_bitcoin
   data/sighash.json
   data/tx_invalid.json
   data/tx_valid.json
+  data/txhash_tests.json
 )
 target_raw_data_sources(test_bitcoin NAMESPACE test::data
   data/asmap.raw
