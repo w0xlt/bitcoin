@@ -76,8 +76,9 @@ struct TxHashCache
     const void* cached_prevouts_ref GUARDED_BY(mtx){nullptr};
     size_t cached_num_inputs GUARDED_BY(mtx){0};
     size_t cached_num_outputs GUARDED_BY(mtx){0};
-    // Content fingerprints are used for mutable transaction contexts where
-    // pointer identity and shape are insufficient to detect in-place mutation.
+    // Content fingerprints are only populated for mutable transaction contexts,
+    // where pointer identity and shape are insufficient to detect in-place
+    // mutation.
     uint256 cached_tx_content_fingerprint GUARDED_BY(mtx);
     uint256 cached_prevouts_content_fingerprint GUARDED_BY(mtx);
 
@@ -121,6 +122,16 @@ struct TxHashCache
 };
 
 template <class T>
+/**
+ * Compute the BIP 346 TransactionHash for the provided transaction context.
+ *
+ * Cache contract:
+ * - Reusing `cache` with `CMutableTransaction` tolerates in-place mutation of
+ *   both `tx` and `prevout_outputs` (content fingerprints invalidate entries).
+ * - Reusing `cache` with `CTransaction` requires `tx` and `prevout_outputs` to
+ *   remain immutable for that cache context. If `prevout_outputs` is mutated in
+ *   place, callers must use a fresh cache instance.
+ */
 bool calculate_txhash(
     uint256& hash_out,
     std::span<const unsigned char> field_selector,

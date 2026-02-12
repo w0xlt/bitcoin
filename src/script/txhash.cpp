@@ -233,43 +233,57 @@ static void ensure_cache_context_compatible(TxHashCache& cache, const T& tx, con
     const void* tx_ref = std::addressof(tx);
     const void* prevouts_ref = std::addressof(prev_outputs);
 
-    bool content_matches = true;
-    if constexpr (std::is_same_v<T, CMutableTransaction>) {
-        const uint256 tx_fingerprint = tx_content_fingerprint(tx);
-        const uint256 prevouts_fingerprint = hash_prevouts_content(prev_outputs);
-        content_matches = cache.cached_tx_content_fingerprint == tx_fingerprint &&
-            cache.cached_prevouts_content_fingerprint == prevouts_fingerprint;
-        if (!content_matches) {
-            clear_cached_hashes(cache);
-            cache.context_initialized = true;
-            cache.cached_tx_ref = tx_ref;
-            cache.cached_prevouts_ref = prevouts_ref;
-            cache.cached_num_inputs = num_inputs;
-            cache.cached_num_outputs = num_outputs;
-            cache.cached_tx_content_fingerprint = tx_fingerprint;
-            cache.cached_prevouts_content_fingerprint = prevouts_fingerprint;
-            return;
-        }
-    }
-
-    if (cache.context_initialized &&
+    const bool context_matches =
+        cache.context_initialized &&
         cache.cached_tx_ref == tx_ref &&
         cache.cached_prevouts_ref == prevouts_ref &&
         cache.cached_num_inputs == num_inputs &&
-        cache.cached_num_outputs == num_outputs &&
-        content_matches) {
-        return;
-    }
+        cache.cached_num_outputs == num_outputs;
 
-    clear_cached_hashes(cache);
-    cache.context_initialized = true;
-    cache.cached_tx_ref = tx_ref;
-    cache.cached_prevouts_ref = prevouts_ref;
-    cache.cached_num_inputs = num_inputs;
-    cache.cached_num_outputs = num_outputs;
-    if constexpr (std::is_same_v<T, CMutableTransaction>) {
-        cache.cached_tx_content_fingerprint = tx_content_fingerprint(tx);
-        cache.cached_prevouts_content_fingerprint = hash_prevouts_content(prev_outputs);
+    // OP_TXHASH execution in script evaluation always goes through immutable
+    // transaction contexts (CTransaction + precomputed spent outputs). Keep
+    // compatibility checks O(1) there by relying on reference identity.
+    if constexpr (!std::is_same_v<T, CMutableTransaction>) {
+#ifdef DEBUG
+        // Debug-only misuse detector: reusing a cache with the same immutable
+        // context while mutating prevouts in place is unsupported.
+        const uint256 prevouts_fingerprint = hash_prevouts_content(prev_outputs);
+#endif
+        if (context_matches) {
+#ifdef DEBUG
+            Assert(cache.cached_prevouts_content_fingerprint == prevouts_fingerprint);
+#endif
+            return;
+        }
+
+        clear_cached_hashes(cache);
+        cache.context_initialized = true;
+        cache.cached_tx_ref = tx_ref;
+        cache.cached_prevouts_ref = prevouts_ref;
+        cache.cached_num_inputs = num_inputs;
+        cache.cached_num_outputs = num_outputs;
+#ifdef DEBUG
+        cache.cached_prevouts_content_fingerprint = prevouts_fingerprint;
+#endif
+        return;
+    } else {
+        // Mutable contexts may be reused after in-place mutation.
+        const uint256 tx_fingerprint = tx_content_fingerprint(tx);
+        const uint256 prevouts_fingerprint = hash_prevouts_content(prev_outputs);
+        if (context_matches &&
+            cache.cached_tx_content_fingerprint == tx_fingerprint &&
+            cache.cached_prevouts_content_fingerprint == prevouts_fingerprint) {
+            return;
+        }
+
+        clear_cached_hashes(cache);
+        cache.context_initialized = true;
+        cache.cached_tx_ref = tx_ref;
+        cache.cached_prevouts_ref = prevouts_ref;
+        cache.cached_num_inputs = num_inputs;
+        cache.cached_num_outputs = num_outputs;
+        cache.cached_tx_content_fingerprint = tx_fingerprint;
+        cache.cached_prevouts_content_fingerprint = prevouts_fingerprint;
     }
 }
 
