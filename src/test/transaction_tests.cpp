@@ -373,6 +373,17 @@ BOOST_AUTO_TEST_CASE(tx_oversized)
     }
 }
 
+BOOST_AUTO_TEST_CASE(decode_hex_txout_rejects_trailing_bytes)
+{
+    CTxOut txout;
+    BOOST_CHECK(DecodeHexTxOut(txout, "01000000000000000151"));
+    BOOST_CHECK_EQUAL(txout.nValue, 1);
+    BOOST_CHECK(txout.scriptPubKey == CScript{} << OP_TRUE);
+
+    // Reject trailing bytes after a fully valid CTxOut encoding.
+    BOOST_CHECK(!DecodeHexTxOut(txout, "0100000000000000015100"));
+}
+
 BOOST_AUTO_TEST_CASE(basic_transaction_tests)
 {
     // Random real transaction (e2769b09e784f32f62ef849763d4f45b98e07ba658647343b915ff832b110436)
