@@ -139,6 +139,7 @@ BASE_SCRIPTS = [
     'feature_assumevalid.py',
     'wallet_taproot.py',
     'feature_bip68_sequence.py',
+    'feature_txhash_activation.py',
     'rpc_packages.py',
     'rpc_bind.py --ipv4',
     'rpc_bind.py --ipv6',
