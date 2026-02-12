@@ -10,6 +10,7 @@
 #include <crypto/sha256.h>
 #include <pubkey.h>
 #include <script/script.h>
+#include <script/txhash.h>
 #include <tinyformat.h>
 #include <uint256.h>
 
@@ -1102,6 +1103,32 @@ bool EvalScript(std::vector<std::vector<unsigned char> >& stack, const CScript& 
                 }
                 break;
 
+                case OP_TXHASH:
+                {
+                    // OP_TXHASH is only available in Tapscript (BIP 346)
+                    if (sigversion == SigVersion::BASE || sigversion == SigVersion::WITNESS_V0) return set_error(serror, SCRIPT_ERR_BAD_OPCODE);
+                    if (!(flags & SCRIPT_VERIFY_TXHASH)) return set_error(serror, SCRIPT_ERR_BAD_OPCODE);
+
+                    if (stack.size() < 1) return set_error(serror, SCRIPT_ERR_INVALID_STACK_OPERATION);
+
+                    valtype& vchTxFieldSelector = stacktop(-1);
+
+                    // Deduct validation weight
+                    assert(execdata.m_validation_weight_left_init);
+                    execdata.m_validation_weight_left -= VALIDATION_WEIGHT_PER_TXHASH;
+                    if (execdata.m_validation_weight_left < 0) {
+                        return set_error(serror, SCRIPT_ERR_TAPSCRIPT_VALIDATION_WEIGHT);
+                    }
+
+                    uint256 hash;
+                    if (!checker.CalculateTxHash(hash, vchTxFieldSelector, execdata.m_codeseparator_pos)) {
+                        return set_error(serror, SCRIPT_ERR_INVALID_TXFIELDSELECTOR);
+                    }
+                    popstack(stack);
+                    stack.emplace_back(hash.begin(), hash.end());
+                }
+                break;
+
                 case OP_CHECKMULTISIG:
                 case OP_CHECKMULTISIGVERIFY:
                 {
@@ -1829,6 +1856,13 @@ bool GenericTransactionSignatureChecker<T>::CheckSequence(const CScriptNum& nSeq
     return true;
 }
 
+template <class T>
+bool GenericTransactionSignatureChecker<T>::CalculateTxHash(uint256& hash_out, std::span<const unsigned char> field_selector, uint32_t codeseparator_pos) const
+{
+    if (!m_txhash_cache || !txdata || !txdata->m_spent_outputs_ready) return false;
+    return calculate_txhash(hash_out, field_selector, *m_txhash_cache, *txTo, txdata->m_spent_outputs, codeseparator_pos, nIn);
+}
+
 // explicit instantiation
 template class GenericTransactionSignatureChecker<CTransaction>;
 template class GenericTransactionSignatureChecker<CMutableTransaction>;
@@ -1847,7 +1881,7 @@ static bool ExecuteWitnessScript(const std::span<const valtype>& stack_span, con
                 return set_error(serror, SCRIPT_ERR_BAD_OPCODE);
             }
             // New opcodes will be listed here. May use a different sigversion to modify existing opcodes.
-            if (IsOpSuccess(opcode)) {
+            if (IsOpSuccess(opcode) || (opcode == OP_TXHASH && !(flags & SCRIPT_VERIFY_TXHASH))) {
                 if (flags & SCRIPT_VERIFY_DISCOURAGE_OP_SUCCESS) {
                     return set_error(serror, SCRIPT_ERR_DISCOURAGE_OP_SUCCESS);
                 }
@@ -2194,6 +2228,7 @@ const std::map<std::string, script_verify_flag_name>& ScriptFlagNamesToEnum()
         FLAG_NAME(DISCOURAGE_UPGRADABLE_PUBKEYTYPE),
         FLAG_NAME(DISCOURAGE_OP_SUCCESS),
         FLAG_NAME(DISCOURAGE_UPGRADABLE_TAPROOT_VERSION),
+        FLAG_NAME(TXHASH),
     };
 #undef FLAG_NAME
     return g_names_to_enum;
