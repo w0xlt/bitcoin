@@ -51,6 +51,7 @@ add_library(bitcoinkernel
   ../script/script.cpp
   ../script/script_error.cpp
   ../script/sigcache.cpp
+  ../script/txhash.cpp
   ../script/solver.cpp
   ../signet.cpp
   ../streams.cpp
