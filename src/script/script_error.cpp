@@ -117,6 +117,8 @@ std::string ScriptErrorString(const ScriptError serror)
             return "Using OP_CODESEPARATOR in non-witness script";
         case SCRIPT_ERR_SIG_FINDANDDELETE:
             return "Signature is found in scriptCode";
+        case SCRIPT_ERR_INVALID_TXFIELDSELECTOR:
+            return "Invalid TxFieldSelector for OP_TXHASH";
         case SCRIPT_ERR_SCRIPTNUM:
             return "Script number overflowed or is non-minimally encoded";
         case SCRIPT_ERR_UNKNOWN_ERROR:

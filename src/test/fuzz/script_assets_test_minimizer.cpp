@@ -98,13 +98,14 @@ const std::map<std::string, script_verify_flag_name> FLAG_NAMES = {
     {std::string("CHECKSEQUENCEVERIFY"), SCRIPT_VERIFY_CHECKSEQUENCEVERIFY},
     {std::string("WITNESS"), SCRIPT_VERIFY_WITNESS},
     {std::string("TAPROOT"), SCRIPT_VERIFY_TAPROOT},
+    {std::string("TXHASH"), SCRIPT_VERIFY_TXHASH},
 };
 
 std::vector<script_verify_flags> AllFlags()
 {
     std::vector<script_verify_flags> ret;
 
-    for (unsigned int i = 0; i < 128; ++i) {
+    for (unsigned int i = 0; i < 256; ++i) {
         script_verify_flags flag = 0;
         if (i & 1) flag |= SCRIPT_VERIFY_P2SH;
         if (i & 2) flag |= SCRIPT_VERIFY_DERSIG;
@@ -113,11 +114,14 @@ std::vector<script_verify_flags> AllFlags()
         if (i & 16) flag |= SCRIPT_VERIFY_CHECKSEQUENCEVERIFY;
         if (i & 32) flag |= SCRIPT_VERIFY_WITNESS;
         if (i & 64) flag |= SCRIPT_VERIFY_TAPROOT;
+        if (i & 128) flag |= SCRIPT_VERIFY_TXHASH;
 
         // SCRIPT_VERIFY_WITNESS requires SCRIPT_VERIFY_P2SH
         if (flag & SCRIPT_VERIFY_WITNESS && !(flag & SCRIPT_VERIFY_P2SH)) continue;
         // SCRIPT_VERIFY_TAPROOT requires SCRIPT_VERIFY_WITNESS
         if (flag & SCRIPT_VERIFY_TAPROOT && !(flag & SCRIPT_VERIFY_WITNESS)) continue;
+        // SCRIPT_VERIFY_TXHASH requires SCRIPT_VERIFY_TAPROOT
+        if (flag & SCRIPT_VERIFY_TXHASH && !(flag & SCRIPT_VERIFY_TAPROOT)) continue;
 
         ret.push_back(flag);
     }
