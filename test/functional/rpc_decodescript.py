@@ -138,6 +138,15 @@ class DecodeScriptTest(BitcoinTestFramework):
         cltv_script_hash = sha256(bytes.fromhex(cltv_script)).hex()
         assert_equal('0 ' + cltv_script_hash, rpc_result['segwit']['asm'])
 
+        self.log.info("- OP_TXHASH script")
+        rpc_result = self.nodes[0].decodescript('bd')
+        assert_equal('OP_TXHASH', rpc_result['asm'])
+        assert_equal('nonstandard', rpc_result['type'])
+        # OP_TXHASH is tapscript-only and should never be suggested as a
+        # legacy/P2WSH-wrappable script.
+        assert 'p2sh' not in rpc_result
+        assert 'segwit' not in rpc_result
+
         self.log.info("- P2PK with uncompressed pubkey")
         # <pubkey> OP_CHECKSIG
         rpc_result = self.nodes[0].decodescript(push_uncompressed_public_key + 'ac')
