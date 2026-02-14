@@ -207,6 +207,37 @@ std::vector<CBlockIndex*> BlockManager::GetAllBlockIndices()
     return rv;
 }
 
+void BlockManager::AddBlockDataLocation(CBlockIndex& block)
+{
+    AssertLockHeld(cs_main);
+    assert(block.nStatus & BLOCK_HAVE_DATA);
+    m_blocks_with_data_by_file[block.nFile].push_back(&block);
+}
+
+void BlockManager::RemoveBlockDataLocation(CBlockIndex& block)
+{
+    AssertLockHeld(cs_main);
+    auto it = m_blocks_with_data_by_file.find(block.nFile);
+    if (it == m_blocks_with_data_by_file.end()) return;
+
+    std::erase(it->second, &block);
+    if (it->second.empty()) {
+        m_blocks_with_data_by_file.erase(it);
+    }
+}
+
+void BlockManager::RebuildBlocksWithDataByFileIndex()
+{
+    AssertLockHeld(cs_main);
+    m_blocks_with_data_by_file.clear();
+    m_blocks_with_data_by_file.reserve(m_blockfile_info.size());
+    for (auto& [_, block_index] : m_block_index) {
+        if (block_index.nStatus & BLOCK_HAVE_DATA) {
+            AddBlockDataLocation(block_index);
+        }
+    }
+}
+
 CBlockIndex* BlockManager::LookupBlockIndex(const uint256& hash)
 {
     AssertLockHeld(cs_main);
@@ -260,9 +291,16 @@ void BlockManager::PruneOneBlockFile(const int fileNumber)
     AssertLockHeld(cs_main);
     LOCK(cs_LastBlockFile);
 
-    for (auto& entry : m_block_index) {
-        CBlockIndex* pindex = &entry.second;
-        if (pindex->nFile == fileNumber) {
+    auto blocks_it = m_blocks_with_data_by_file.find(fileNumber);
+    if (blocks_it != m_blocks_with_data_by_file.end()) {
+        std::vector<CBlockIndex*> blocks{std::move(blocks_it->second)};
+        m_blocks_with_data_by_file.erase(blocks_it);
+
+        for (CBlockIndex* pindex : blocks) {
+            if (!(pindex->nStatus & BLOCK_HAVE_DATA) || pindex->nFile != fileNumber) {
+                continue;
+            }
+
             pindex->nStatus &= ~BLOCK_HAVE_DATA;
             pindex->nStatus &= ~BLOCK_HAVE_UNDO;
             pindex->nFile = 0;
@@ -495,6 +533,8 @@ bool BlockManager::LoadBlockIndex(const std::optional<uint256>& snapshot_blockha
             pindex->BuildSkip();
         }
     }
+
+    RebuildBlocksWithDataByFileIndex();
 
     return true;
 }

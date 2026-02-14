@@ -312,6 +312,17 @@ protected:
     /** Dirty block file entries. */
     std::set<int> m_dirty_fileinfo;
 
+    /**
+     * Reverse index for blocks that currently have data, keyed by block file number.
+     *
+     * This avoids repeated full scans of m_block_index when pruning a file.
+     */
+    std::unordered_map<int, std::vector<CBlockIndex*>> m_blocks_with_data_by_file GUARDED_BY(cs_main);
+
+    void AddBlockDataLocation(CBlockIndex& block) EXCLUSIVE_LOCKS_REQUIRED(cs_main);
+    void RemoveBlockDataLocation(CBlockIndex& block) EXCLUSIVE_LOCKS_REQUIRED(cs_main);
+    void RebuildBlocksWithDataByFileIndex() EXCLUSIVE_LOCKS_REQUIRED(cs_main);
+
 public:
     using Options = kernel::BlockManagerOpts;
     using ReadRawBlockResult = util::Expected<std::vector<std::byte>, ReadRawError>;

@@ -17,6 +17,7 @@ void TestBlockManager::CleanupForFuzzing()
     m_dirty_blockindex.clear();
     m_dirty_fileinfo.clear();
     m_blockfile_info.resize(1);
+    m_blocks_with_data_by_file.clear();
 }
 
 void TestChainstateManager::DisableNextWrite()

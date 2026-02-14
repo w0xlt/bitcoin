@@ -3811,6 +3811,9 @@ void Chainstate::TryAddBlockIndexCandidate(CBlockIndex* pindex)
 void ChainstateManager::ReceivedBlockTransactions(const CBlock& block, CBlockIndex* pindexNew, const FlatFilePos& pos)
 {
     AssertLockHeld(cs_main);
+    if (pindexNew->nStatus & BLOCK_HAVE_DATA) {
+        m_blockman.RemoveBlockDataLocation(*pindexNew);
+    }
     pindexNew->nTx = block.vtx.size();
     // Typically m_chain_tx_count will be 0 at this point, but it can be nonzero if this
     // is a pruned block which is being downloaded again, or if this is an
@@ -3828,6 +3831,7 @@ void ChainstateManager::ReceivedBlockTransactions(const CBlock& block, CBlockInd
     pindexNew->nDataPos = pos.nPos;
     pindexNew->nUndoPos = 0;
     pindexNew->nStatus |= BLOCK_HAVE_DATA;
+    m_blockman.AddBlockDataLocation(*pindexNew);
     if (DeploymentActiveAt(*pindexNew, *this, Consensus::DEPLOYMENT_SEGWIT)) {
         pindexNew->nStatus |= BLOCK_OPT_WITNESS;
     }
