@@ -862,6 +862,12 @@ protected:
     void CheckForkWarningConditions() EXCLUSIVE_LOCKS_REQUIRED(cs_main);
     void InvalidChainFound(CBlockIndex* pindexNew) EXCLUSIVE_LOCKS_REQUIRED(cs_main);
 
+    /** Remove transactions in the block from the mempool and disconnect pool. */
+    void UpdateMempoolForBlock(const std::vector<CTransactionRef>& vtx,
+                               unsigned int block_height,
+                               DisconnectedBlockTransactions& disconnectpool)
+        EXCLUSIVE_LOCKS_REQUIRED(cs_main, m_mempool->cs);
+
     /**
      * Make mempool consistent after a reorg, by re-adding or recursively erasing
      * disconnected block transactions from the mempool, and also removing any

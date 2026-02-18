@@ -293,6 +293,17 @@ static bool IsCurrentForFeeEstimation(Chainstate& active_chainstate) EXCLUSIVE_L
     return true;
 }
 
+void Chainstate::UpdateMempoolForBlock(const std::vector<CTransactionRef>& vtx,
+                                       unsigned int block_height,
+                                       DisconnectedBlockTransactions& disconnectpool)
+{
+    if (!m_mempool) return;
+    AssertLockHeld(cs_main);
+    AssertLockHeld(m_mempool->cs);
+    m_mempool->removeForBlock(vtx, block_height);
+    disconnectpool.removeForBlock(vtx);
+}
+
 void Chainstate::MaybeUpdateMempoolForReorg(
     DisconnectedBlockTransactions& disconnectpool,
     bool fAddToMempool)
@@ -3106,11 +3117,8 @@ bool Chainstate::ConnectTip(
              Ticks<MillisecondsDouble>(time_5 - time_4),
              Ticks<SecondsDouble>(m_chainman.time_chainstate),
              Ticks<MillisecondsDouble>(m_chainman.time_chainstate) / m_chainman.num_blocks_total);
-    // Remove conflicting transactions from the mempool.;
-    if (m_mempool) {
-        m_mempool->removeForBlock(block_to_connect->vtx, pindexNew->nHeight);
-        disconnectpool.removeForBlock(block_to_connect->vtx);
-    }
+    // Remove conflicting transactions from the mempool.
+    UpdateMempoolForBlock(block_to_connect->vtx, pindexNew->nHeight, disconnectpool);
     // Update m_chain & related variables.
     m_chain.SetTip(*pindexNew);
     m_chainman.UpdateIBDStatus();
