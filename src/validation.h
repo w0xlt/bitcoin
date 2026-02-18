@@ -868,6 +868,11 @@ protected:
                                DisconnectedBlockTransactions& disconnectpool)
         EXCLUSIVE_LOCKS_REQUIRED(cs_main, m_mempool->cs);
 
+    /** Save block transactions to disconnect pool, removing evicted entries from mempool. */
+    void UpdateMempoolForDisconnectedBlock(const std::vector<CTransactionRef>& vtx,
+                                           DisconnectedBlockTransactions& disconnectpool)
+        EXCLUSIVE_LOCKS_REQUIRED(cs_main, m_mempool->cs);
+
     /**
      * Make mempool consistent after a reorg, by re-adding or recursively erasing
      * disconnected block transactions from the mempool, and also removing any

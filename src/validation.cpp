@@ -304,6 +304,20 @@ void Chainstate::UpdateMempoolForBlock(const std::vector<CTransactionRef>& vtx,
     disconnectpool.removeForBlock(vtx);
 }
 
+void Chainstate::UpdateMempoolForDisconnectedBlock(const std::vector<CTransactionRef>& vtx,
+                                                   DisconnectedBlockTransactions& disconnectpool)
+{
+    if (!m_mempool) return;
+    AssertLockHeld(cs_main);
+    AssertLockHeld(m_mempool->cs);
+    // Save transactions to re-add to mempool at end of reorg. If any entries
+    // are evicted for exceeding memory limits, remove them and their
+    // descendants from the mempool.
+    for (auto&& evicted_tx : disconnectpool.AddTransactionsFromBlock(vtx)) {
+        m_mempool->removeRecursive(*evicted_tx, MemPoolRemovalReason::REORG);
+    }
+}
+
 void Chainstate::MaybeUpdateMempoolForReorg(
     DisconnectedBlockTransactions& disconnectpool,
     bool fAddToMempool)
@@ -2984,12 +2998,8 @@ bool Chainstate::DisconnectTip(BlockValidationState& state, DisconnectedBlockTra
         return false;
     }
 
-    if (disconnectpool && m_mempool) {
-        // Save transactions to re-add to mempool at end of reorg. If any entries are evicted for
-        // exceeding memory limits, remove them and their descendants from the mempool.
-        for (auto&& evicted_tx : disconnectpool->AddTransactionsFromBlock(block.vtx)) {
-            m_mempool->removeRecursive(*evicted_tx, MemPoolRemovalReason::REORG);
-        }
+    if (disconnectpool) {
+        UpdateMempoolForDisconnectedBlock(block.vtx, *disconnectpool);
     }
 
     m_chain.SetTip(*pindexDelete->pprev);
