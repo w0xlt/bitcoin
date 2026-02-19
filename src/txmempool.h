@@ -779,4 +779,11 @@ public:
     /** Clear m_temp_added and m_non_base_coins. */
     void Reset();
 };
+
+/**
+ * Limit mempool size by evicting expired and then excess entries.
+ */
+void LimitMempoolSize(CTxMemPool& pool, CCoinsViewCache& coins_cache)
+    EXCLUSIVE_LOCKS_REQUIRED(::cs_main, pool.cs);
+
 #endif // BITCOIN_TXMEMPOOL_H

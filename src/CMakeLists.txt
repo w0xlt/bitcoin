@@ -265,6 +265,7 @@ add_library(bitcoin_node STATIC EXCLUDE_FROM_ALL
   txgraph.cpp
   txmempool.cpp
   txrequest.cpp
+  mempool_accept.cpp
   validation.cpp
   validationinterface.cpp
   versionbits.cpp
