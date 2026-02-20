@@ -801,12 +801,13 @@ BOOST_AUTO_TEST_CASE(CreateNewBlock_validity)
     for (const auto& bi : BLOCKINFO) {
         const int current_height{mining->getTip()->height};
 
+        const int height_mod{current_height % 3};
         /**
          * Simple block creation, nothing special yet.
-         * If current_height is odd, block_template will have already been
-         * set at the end of the previous loop.
+         * If height_mod is not 0, block_template will have already been set at
+         * the end of the previous loop.
          */
-        if (current_height % 2 == 0) {
+        if (height_mod == 0) {
             block_template = mining->createNewBlock(options, /*cooldown=*/false);
             BOOST_REQUIRE(block_template);
         }
@@ -830,13 +831,25 @@ BOOST_AUTO_TEST_CASE(CreateNewBlock_validity)
             block.nNonce = bi.nonce;
         }
         std::shared_ptr<const CBlock> shared_pblock = std::make_shared<const CBlock>(block);
-        // Alternate calls between Chainman's ProcessNewBlock and submitSolution
-        // via the Mining interface. The former is used by net_processing as well
-        // as the submitblock RPC.
-        if (current_height % 2 == 0) {
-            BOOST_REQUIRE(Assert(m_node.chainman)->ProcessNewBlock(shared_pblock, /*force_processing=*/true, /*min_pow_checked=*/true, nullptr));
-        } else {
+        // Cycle block submission between submitSolution, submitBlock, and
+        // ChainstateManager::ProcessNewBlock. The direct ProcessNewBlock path
+        // is used by net_processing.
+        if (height_mod == 0) {
             BOOST_REQUIRE(block_template->submitSolution(block.nVersion, block.nTime, block.nNonce, MakeTransactionRef(txCoinbase)));
+        } else if (height_mod == 1) {
+            std::string reason{"stale reason"};
+            std::string debug{"stale debug"};
+            BOOST_REQUIRE(mining->submitBlock(block, reason, debug));
+            BOOST_REQUIRE_EQUAL(reason, "");
+            BOOST_REQUIRE_EQUAL(debug, "");
+
+            reason = "stale reason";
+            debug = "stale debug";
+            BOOST_REQUIRE(!mining->submitBlock(block, reason, debug));
+            BOOST_REQUIRE_EQUAL(reason, "duplicate");
+            BOOST_REQUIRE_EQUAL(debug, "");
+        } else {
+            BOOST_REQUIRE(Assert(m_node.chainman)->ProcessNewBlock(shared_pblock, /*force_processing=*/true, /*min_pow_checked=*/true, nullptr));
         }
         {
             LOCK(cs_main);
@@ -845,7 +858,7 @@ BOOST_AUTO_TEST_CASE(CreateNewBlock_validity)
             auto maybe_new_tip{Assert(m_node.chainman)->ActiveChain().Tip()};
             BOOST_REQUIRE_EQUAL(maybe_new_tip->GetBlockHash(), block.GetHash());
         }
-        if (current_height % 2 == 0) {
+        if (height_mod != 2) {
             block_template = block_template->waitNext();
             BOOST_REQUIRE(block_template);
         } else {
