@@ -24,6 +24,7 @@ interface Mining $Proxy.wrap("interfaces::Mining") {
     waitTipChanged @3 (context :Proxy.Context, currentTip: Data, timeout: Float64 = .maxDouble) -> (result: Common.BlockRef);
     createNewBlock @4 (context :Proxy.Context, options: BlockCreateOptions) -> (result: BlockTemplate);
     checkBlock @5 (context :Proxy.Context, block: Data, options: BlockCheckOptions) -> (reason: Text, debug: Text, result: Bool);
+    submitBlock @6 (context :Proxy.Context, block: Data) -> (reason: Text, debug: Text, result: Bool);
 }
 
 interface BlockTemplate $Proxy.wrap("interfaces::BlockTemplate") {
