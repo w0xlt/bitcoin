@@ -1012,6 +1012,14 @@ public:
         return state.IsValid();
     }
 
+    bool submitBlock(const CBlock& block_in, std::string& reason, std::string& debug) override
+    {
+        auto block = std::make_shared<const CBlock>(block_in);
+        bool new_block;
+        const bool accepted = SubmitBlock(chainman(), block, &new_block, reason, debug);
+        return accepted && new_block && reason.empty();
+    }
+
     NodeContext* context() override { return &m_node; }
     ChainstateManager& chainman() { return *Assert(m_node.chainman); }
     KernelNotifications& notifications() { return *Assert(m_node.notifications); }
