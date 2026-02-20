@@ -34,13 +34,9 @@ add_library(bitcoinkernel
   ../node/blockstorage.cpp
   ../node/chainstate.cpp
   ../node/utxo_snapshot.cpp
-  ../policy/ephemeral_policy.cpp
   ../policy/feerate.cpp
-  ../policy/packages.cpp
   ../policy/policy.cpp
-  ../policy/rbf.cpp
   ../policy/settings.cpp
-  ../policy/truc_policy.cpp
   ../pow.cpp
   ../primitives/block.cpp
   ../primitives/transaction.cpp
