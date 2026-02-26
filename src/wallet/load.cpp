@@ -147,9 +147,15 @@ bool LoadWallets(WalletContext& context)
                 }
             }
             chain.initMessage(_("Loading wallet…"));
-            std::shared_ptr<CWallet> pwallet = database ? CWallet::LoadExisting(context, name, std::move(database), error, warnings) : nullptr;
+            std::optional<int> rescan_height;
+            std::shared_ptr<CWallet> pwallet = database ? CWallet::LoadExisting(context, name, std::move(database), error, warnings, rescan_height) : nullptr;
             if (!warnings.empty()) chain.initWarning(Join(warnings, Untranslated("\n")));
             if (!pwallet) {
+                chain.initError(error);
+                return false;
+            }
+
+            if (rescan_height && !CWallet::SyncToChainTip(pwallet, *rescan_height, error, warnings)) {
                 chain.initError(error);
                 return false;
             }

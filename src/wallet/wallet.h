@@ -438,17 +438,12 @@ private:
     std::unordered_map<COutPoint, WalletTXO, SaltedOutpointHasher> m_txos GUARDED_BY(cs_wallet);
 
     /**
-     * Catch wallet up to current chain, scanning new blocks, updating the best
-     * block locator and m_last_block_processed, and registering for
-     * notifications about new blocks and transactions.
+     * Attach the wallet to a chain, registering for notifications and
+     * setting last block processed. If a rescan is needed, returns the
+     * rescan start height via rescan_height_out. The caller is
+     * responsible for calling SyncToChainTip separately.
      */
-    static bool AttachChain(const std::shared_ptr<CWallet>& wallet, interfaces::Chain& chain, bool rescan_required, bilingual_str& error, std::vector<bilingual_str>& warnings);
-
-    /**
-     * Rescan the wallet to catch up with the chain tip. Handles birth-time
-     * optimization, pruning/assumeutxo checks, and the actual scan.
-     */
-    static bool SyncToChainTip(const std::shared_ptr<CWallet>& wallet, int rescan_height, bilingual_str& error, std::vector<bilingual_str>& warnings);
+    static bool AttachChain(const std::shared_ptr<CWallet>& wallet, interfaces::Chain& chain, bool rescan_required, bilingual_str& error, std::vector<bilingual_str>& warnings, std::optional<int>& rescan_height_out);
 
     static NodeClock::time_point GetDefaultNextResend();
 
@@ -459,6 +454,12 @@ private:
     void UpdateTrucSiblingConflicts(const CWalletTx& parent_wtx, const Txid& child_txid, bool add_conflict) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
 
 public:
+    /**
+     * Rescan the wallet to catch up with the chain tip. Handles birth-time
+     * optimization, pruning/assumeutxo checks, and the actual scan.
+     */
+    static bool SyncToChainTip(const std::shared_ptr<CWallet>& wallet, int rescan_height, bilingual_str& error, std::vector<bilingual_str>& warnings);
+
     /**
      * Main wallet lock.
      * This lock protects all the fields added by CWallet.
@@ -879,8 +880,10 @@ public:
     /* Initializes, creates and returns a new CWallet; returns a null pointer in case of an error */
     static std::shared_ptr<CWallet> CreateNew(WalletContext& context, const std::string& name, std::unique_ptr<WalletDatabase> database, uint64_t wallet_creation_flags, bilingual_str& error, std::vector<bilingual_str>& warnings);
 
-    /* Initializes, loads, and returns a CWallet from an existing wallet; returns a null pointer in case of an error */
-    static std::shared_ptr<CWallet> LoadExisting(WalletContext& context, const std::string& name, std::unique_ptr<WalletDatabase> database, bilingual_str& error, std::vector<bilingual_str>& warnings);
+    /* Initializes, loads, and returns a CWallet from an existing wallet; returns a null pointer in case of an error.
+     * If a rescan is needed, rescan_height_out is set to the height to rescan from.
+     * The caller is responsible for calling SyncToChainTip separately. */
+    static std::shared_ptr<CWallet> LoadExisting(WalletContext& context, const std::string& name, std::unique_ptr<WalletDatabase> database, bilingual_str& error, std::vector<bilingual_str>& warnings, std::optional<int>& rescan_height_out);
 
     /**
      * Wallet post-init setup

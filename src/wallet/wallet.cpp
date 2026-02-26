@@ -283,10 +283,16 @@ std::shared_ptr<CWallet> LoadWalletInternal(WalletContext& context, const std::s
         }
 
         context.chain->initMessage(_("Loading wallet…"));
-        std::shared_ptr<CWallet> wallet = CWallet::LoadExisting(context, name, std::move(database), error, warnings);
+        std::optional<int> rescan_height;
+        std::shared_ptr<CWallet> wallet = CWallet::LoadExisting(context, name, std::move(database), error, warnings, rescan_height);
         if (!wallet) {
             error = Untranslated("Wallet loading failed.") + Untranslated(" ") + error;
             status = DatabaseStatus::FAILED_LOAD;
+            return nullptr;
+        }
+
+        if (rescan_height && !CWallet::SyncToChainTip(wallet, *rescan_height, error, warnings)) {
+            wallet->m_chain_notifications_handler.reset();
             return nullptr;
         }
 
@@ -3116,15 +3122,18 @@ std::shared_ptr<CWallet> CWallet::CreateNew(WalletContext& context, const std::s
     // Try to top up keypool. No-op if the wallet is locked.
     walletInstance->TopUpKeyPool();
 
-    if (chain && !AttachChain(walletInstance, *chain, /*rescan_required=*/false, error, warnings)) {
+    std::optional<int> rescan_height;
+    if (chain && !AttachChain(walletInstance, *chain, /*rescan_required=*/false, error, warnings, rescan_height)) {
         walletInstance->m_chain_notifications_handler.reset(); // Reset this pointer so that the wallet will actually be unloaded
         return nullptr;
     }
+    // New wallets never need a rescan.
+    assert(!rescan_height);
 
     return walletInstance;
 }
 
-std::shared_ptr<CWallet> CWallet::LoadExisting(WalletContext& context, const std::string& name, std::unique_ptr<WalletDatabase> database, bilingual_str& error, std::vector<bilingual_str>& warnings)
+std::shared_ptr<CWallet> CWallet::LoadExisting(WalletContext& context, const std::string& name, std::unique_ptr<WalletDatabase> database, bilingual_str& error, std::vector<bilingual_str>& warnings, std::optional<int>& rescan_height_out)
 {
     interfaces::Chain* chain = context.chain;
     const std::string& walletFile = database->Filename();
@@ -3157,7 +3166,7 @@ std::shared_ptr<CWallet> CWallet::LoadExisting(WalletContext& context, const std
     // Try to top up keypool. No-op if the wallet is locked.
     walletInstance->TopUpKeyPool();
 
-    if (chain && !AttachChain(walletInstance, *chain, rescan_required, error, warnings)) {
+    if (chain && !AttachChain(walletInstance, *chain, rescan_required, error, warnings, rescan_height_out)) {
         walletInstance->m_chain_notifications_handler.reset(); // Reset this pointer so that the wallet will actually be unloaded
         return nullptr;
     }
@@ -3168,7 +3177,7 @@ std::shared_ptr<CWallet> CWallet::LoadExisting(WalletContext& context, const std
 }
 
 
-bool CWallet::AttachChain(const std::shared_ptr<CWallet>& walletInstance, interfaces::Chain& chain, const bool rescan_required, bilingual_str& error, std::vector<bilingual_str>& warnings)
+bool CWallet::AttachChain(const std::shared_ptr<CWallet>& walletInstance, interfaces::Chain& chain, const bool rescan_required, bilingual_str& error, std::vector<bilingual_str>& warnings, std::optional<int>& rescan_height_out)
 {
     LOCK(walletInstance->cs_wallet);
     // allow setting the chain if it hasn't been set already but prevent changing it
@@ -3217,10 +3226,11 @@ bool CWallet::AttachChain(const std::shared_ptr<CWallet>& walletInstance, interf
         walletInstance->SetLastBlockProcessedInMem(-1, uint256());
     }
 
+    // Signal to the caller that a rescan is needed, rather than running it
+    // here. This allows the caller to register the wallet in the context
+    // before rescanning, making progress queryable via getwalletinfo.
     if (tip_height && *tip_height != rescan_height) {
-        if (!SyncToChainTip(walletInstance, rescan_height, error, warnings)) {
-            return false;
-        }
+        rescan_height_out = rescan_height;
     }
 
     return true;
@@ -4298,7 +4308,9 @@ util::Result<MigrationResult> MigrateLegacyToDescriptor(const std::string& walle
     }
 
     // Make the local wallet
-    std::shared_ptr<CWallet> local_wallet = CWallet::LoadExisting(empty_context, wallet_name, std::move(database), error, warnings);
+    // No chain in empty_context, so no rescan will be triggered.
+    std::optional<int> rescan_height;
+    std::shared_ptr<CWallet> local_wallet = CWallet::LoadExisting(empty_context, wallet_name, std::move(database), error, warnings, rescan_height);
     if (!local_wallet) {
         return util::Error{Untranslated("Wallet loading failed.") + Untranslated(" ") + error};
     }
