@@ -444,6 +444,12 @@ private:
      */
     static bool AttachChain(const std::shared_ptr<CWallet>& wallet, interfaces::Chain& chain, bool rescan_required, bilingual_str& error, std::vector<bilingual_str>& warnings);
 
+    /**
+     * Rescan the wallet to catch up with the chain tip. Handles birth-time
+     * optimization, pruning/assumeutxo checks, and the actual scan.
+     */
+    static bool SyncToChainTip(const std::shared_ptr<CWallet>& wallet, int rescan_height, bilingual_str& error, std::vector<bilingual_str>& warnings);
+
     static NodeClock::time_point GetDefaultNextResend();
 
     // Update last block processed in memory only
