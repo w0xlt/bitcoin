@@ -78,10 +78,10 @@ std::shared_ptr<CWallet> TestLoadWallet(std::unique_ptr<WalletDatabase> database
     std::vector<bilingual_str> warnings;
     std::optional<int> rescan_height;
     auto wallet = CWallet::LoadExisting(context, "", std::move(database), error, warnings, rescan_height);
+    NotifyWalletLoaded(context, wallet);
     if (wallet && rescan_height) {
         CWallet::SyncToChainTip(wallet, *rescan_height, error, warnings);
     }
-    NotifyWalletLoaded(context, wallet);
     if (context.chain) {
         wallet->postInitProcess();
     }

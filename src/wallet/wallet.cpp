@@ -291,13 +291,17 @@ std::shared_ptr<CWallet> LoadWalletInternal(WalletContext& context, const std::s
             return nullptr;
         }
 
+        // Register the wallet in the context before rescanning so that
+        // getwalletinfo and abortrescan RPCs work during the rescan.
+        NotifyWalletLoaded(context, wallet);
+        AddWallet(context, wallet);
+
         if (rescan_height && !CWallet::SyncToChainTip(wallet, *rescan_height, error, warnings)) {
-            wallet->m_chain_notifications_handler.reset();
+            error = Untranslated("Wallet loading failed.") + Untranslated(" ") + error;
+            RemoveWallet(context, wallet, /*load_on_start=*/std::nullopt);
             return nullptr;
         }
 
-        NotifyWalletLoaded(context, wallet);
-        AddWallet(context, wallet);
         wallet->postInitProcess();
 
         // Write the wallet setting
@@ -3306,6 +3310,7 @@ bool CWallet::SyncToChainTip(const std::shared_ptr<CWallet>& walletInstance, int
         // Set and update the best block record
         // Set last block scanned as the last block processed as it may be different in case of a reorg.
         // Also save the best block locator because rescanning only updates it intermittently.
+        LOCK(walletInstance->cs_wallet);
         walletInstance->SetLastBlockProcessed(*scan_res.last_scanned_height, scan_res.last_scanned_block);
     }
 

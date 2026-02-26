@@ -155,13 +155,15 @@ bool LoadWallets(WalletContext& context)
                 return false;
             }
 
+            // Register the wallet in the context before rescanning so that
+            // getwalletinfo and abortrescan RPCs work during the rescan.
+            NotifyWalletLoaded(context, pwallet);
+            AddWallet(context, pwallet);
+
             if (rescan_height && !CWallet::SyncToChainTip(pwallet, *rescan_height, error, warnings)) {
                 chain.initError(error);
                 return false;
             }
-
-            NotifyWalletLoaded(context, pwallet);
-            AddWallet(context, pwallet);
         }
         return true;
     } catch (const std::runtime_error& e) {
