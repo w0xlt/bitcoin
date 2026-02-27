@@ -593,6 +593,7 @@ static RPCHelpMan migratewallet()
         {
             {"wallet_name", RPCArg::Type::STR, RPCArg::DefaultHint{"the wallet name from the RPC endpoint"}, "The name of the wallet to migrate. If provided both here and in the RPC endpoint, the two must be identical."},
             {"passphrase", RPCArg::Type::STR, RPCArg::Optional::OMITTED, "The wallet passphrase"},
+            {"skip_rescan", RPCArg::Type::BOOL, RPCArg::Default{false}, "Skip the blockchain rescan after migration. When set to true, the migrated wallet will be loaded without rescanning, which is significantly faster. Use rescanblockchain to scan for the wallet's transactions after migration."},
         },
         RPCResult{
             RPCResult::Type::OBJ, "", "",
@@ -617,8 +618,10 @@ static RPCHelpMan migratewallet()
                 wallet_pass = std::string_view{request.params[1].get_str()};
             }
 
+            const bool skip_rescan{request.params[2].isNull() ? false : request.params[2].get_bool()};
+
             WalletContext& context = EnsureWalletContext(request.context);
-            util::Result<MigrationResult> res = MigrateLegacyToDescriptor(wallet_name, wallet_pass, context);
+            util::Result<MigrationResult> res = MigrateLegacyToDescriptor(wallet_name, wallet_pass, context, skip_rescan);
             if (!res) {
                 throw JSONRPCError(RPC_WALLET_ERROR, util::ErrorString(res).original);
             }
