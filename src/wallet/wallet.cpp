@@ -273,7 +273,7 @@ void WaitForDeleteWallet(std::shared_ptr<CWallet>&& wallet)
 }
 
 namespace {
-std::shared_ptr<CWallet> LoadWalletInternal(WalletContext& context, const std::string& name, std::optional<bool> load_on_start, const DatabaseOptions& options, DatabaseStatus& status, bilingual_str& error, std::vector<bilingual_str>& warnings)
+std::shared_ptr<CWallet> LoadWalletInternal(WalletContext& context, const std::string& name, std::optional<bool> load_on_start, const DatabaseOptions& options, DatabaseStatus& status, bilingual_str& error, std::vector<bilingual_str>& warnings, const bool skip_rescan = false)
 {
     try {
         std::unique_ptr<WalletDatabase> database = MakeWalletDatabase(name, options, status, error);
@@ -283,7 +283,7 @@ std::shared_ptr<CWallet> LoadWalletInternal(WalletContext& context, const std::s
         }
 
         context.chain->initMessage(_("Loading wallet…"));
-        std::shared_ptr<CWallet> wallet = CWallet::LoadExisting(context, name, std::move(database), error, warnings);
+        std::shared_ptr<CWallet> wallet = CWallet::LoadExisting(context, name, std::move(database), error, warnings, skip_rescan);
         if (!wallet) {
             error = Untranslated("Wallet loading failed.") + Untranslated(" ") + error;
             status = DatabaseStatus::FAILED_LOAD;
@@ -361,7 +361,7 @@ private:
 };
 } // namespace
 
-std::shared_ptr<CWallet> LoadWallet(WalletContext& context, const std::string& name, std::optional<bool> load_on_start, const DatabaseOptions& options, DatabaseStatus& status, bilingual_str& error, std::vector<bilingual_str>& warnings)
+std::shared_ptr<CWallet> LoadWallet(WalletContext& context, const std::string& name, std::optional<bool> load_on_start, const DatabaseOptions& options, DatabaseStatus& status, bilingual_str& error, std::vector<bilingual_str>& warnings, const bool skip_rescan)
 {
     auto result = WITH_LOCK(g_loading_wallet_mutex, return g_loading_wallet_set.insert(name));
     if (!result.second) {
@@ -369,7 +369,7 @@ std::shared_ptr<CWallet> LoadWallet(WalletContext& context, const std::string& n
         status = DatabaseStatus::FAILED_LOAD;
         return nullptr;
     }
-    auto wallet = LoadWalletInternal(context, name, load_on_start, options, status, error, warnings);
+    auto wallet = LoadWalletInternal(context, name, load_on_start, options, status, error, warnings, skip_rescan);
     WITH_LOCK(g_loading_wallet_mutex, g_loading_wallet_set.erase(result.first));
     return wallet;
 }
@@ -3124,7 +3124,7 @@ std::shared_ptr<CWallet> CWallet::CreateNew(WalletContext& context, const std::s
     return walletInstance;
 }
 
-std::shared_ptr<CWallet> CWallet::LoadExisting(WalletContext& context, const std::string& name, std::unique_ptr<WalletDatabase> database, bilingual_str& error, std::vector<bilingual_str>& warnings)
+std::shared_ptr<CWallet> CWallet::LoadExisting(WalletContext& context, const std::string& name, std::unique_ptr<WalletDatabase> database, bilingual_str& error, std::vector<bilingual_str>& warnings, const bool skip_rescan)
 {
     interfaces::Chain* chain = context.chain;
     const std::string& walletFile = database->Filename();
@@ -3157,7 +3157,7 @@ std::shared_ptr<CWallet> CWallet::LoadExisting(WalletContext& context, const std
     // Try to top up keypool. No-op if the wallet is locked.
     walletInstance->TopUpKeyPool();
 
-    if (chain && !AttachChain(walletInstance, *chain, rescan_required, error, warnings)) {
+    if (chain && !AttachChain(walletInstance, *chain, rescan_required, error, warnings, skip_rescan)) {
         walletInstance->m_chain_notifications_handler.reset(); // Reset this pointer so that the wallet will actually be unloaded
         return nullptr;
     }
@@ -3168,7 +3168,7 @@ std::shared_ptr<CWallet> CWallet::LoadExisting(WalletContext& context, const std
 }
 
 
-bool CWallet::AttachChain(const std::shared_ptr<CWallet>& walletInstance, interfaces::Chain& chain, const bool rescan_required, bilingual_str& error, std::vector<bilingual_str>& warnings)
+bool CWallet::AttachChain(const std::shared_ptr<CWallet>& walletInstance, interfaces::Chain& chain, const bool rescan_required, bilingual_str& error, std::vector<bilingual_str>& warnings, const bool skip_rescan)
 {
     LOCK(walletInstance->cs_wallet);
     // allow setting the chain if it hasn't been set already but prevent changing it
@@ -3233,55 +3233,59 @@ bool CWallet::AttachChain(const std::shared_ptr<CWallet>& walletInstance, interf
             }
         }
 
-        // Technically we could execute the code below in any case, but performing the
-        // `while` loop below can make startup very slow, so only check blocks on disk
-        // if necessary.
-        if (chain.havePruned() || chain.hasAssumedValidChain()) {
-            int block_height = *tip_height;
-            while (block_height > 0 && chain.haveBlockOnDisk(block_height - 1) && rescan_height != block_height) {
-                --block_height;
+        if (skip_rescan) {
+            walletInstance->WalletLogPrintf("Rescan skipped, wallet may be behind chain tip.\n");
+        } else {
+            // Technically we could execute the code below in any case, but performing the
+            // `while` loop below can make startup very slow, so only check blocks on disk
+            // if necessary.
+            if (chain.havePruned() || chain.hasAssumedValidChain()) {
+                int block_height = *tip_height;
+                while (block_height > 0 && chain.haveBlockOnDisk(block_height - 1) && rescan_height != block_height) {
+                    --block_height;
+                }
+
+                if (rescan_height != block_height) {
+                    // We can't rescan beyond blocks we don't have data for, stop and throw an error.
+                    // This might happen if a user uses an old wallet within a pruned node
+                    // or if they ran -disablewallet for a longer time, then decided to re-enable
+                    // Exit early and print an error.
+                    // It also may happen if an assumed-valid chain is in use and therefore not
+                    // all block data is available.
+                    // If a block is pruned after this check, we will load the wallet,
+                    // but fail the rescan with a generic error.
+
+                    error = chain.havePruned() ?
+                         _("Prune: last wallet synchronisation goes beyond pruned data. You need to -reindex (download the whole blockchain again in case of a pruned node)") :
+                         strprintf(_(
+                            "Error loading wallet. Wallet requires blocks to be downloaded, "
+                            "and software does not currently support loading wallets while "
+                            "blocks are being downloaded out of order when using assumeutxo "
+                            "snapshots. Wallet should be able to load successfully after "
+                            "node sync reaches height %s"), block_height);
+                    return false;
+                }
             }
 
-            if (rescan_height != block_height) {
-                // We can't rescan beyond blocks we don't have data for, stop and throw an error.
-                // This might happen if a user uses an old wallet within a pruned node
-                // or if they ran -disablewallet for a longer time, then decided to re-enable
-                // Exit early and print an error.
-                // It also may happen if an assumed-valid chain is in use and therefore not
-                // all block data is available.
-                // If a block is pruned after this check, we will load the wallet,
-                // but fail the rescan with a generic error.
+            chain.initMessage(_("Rescanning…"));
+            walletInstance->WalletLogPrintf("Rescanning last %i blocks (from block %i)...\n", *tip_height - rescan_height, rescan_height);
 
-                error = chain.havePruned() ?
-                     _("Prune: last wallet synchronisation goes beyond pruned data. You need to -reindex (download the whole blockchain again in case of a pruned node)") :
-                     strprintf(_(
-                        "Error loading wallet. Wallet requires blocks to be downloaded, "
-                        "and software does not currently support loading wallets while "
-                        "blocks are being downloaded out of order when using assumeutxo "
-                        "snapshots. Wallet should be able to load successfully after "
-                        "node sync reaches height %s"), block_height);
-                return false;
+            {
+                WalletRescanReserver reserver(*walletInstance);
+                if (!reserver.reserve()) {
+                    error = _("Failed to acquire rescan reserver during wallet initialization");
+                    return false;
+                }
+                ScanResult scan_res = walletInstance->ScanForWalletTransactions(chain.getBlockHash(rescan_height), rescan_height, /*max_height=*/{}, reserver, /*fUpdate=*/true, /*save_progress=*/true);
+                if (ScanResult::SUCCESS != scan_res.status) {
+                    error = _("Failed to rescan the wallet during initialization");
+                    return false;
+                }
+                // Set and update the best block record
+                // Set last block scanned as the last block processed as it may be different in case of a reorg.
+                // Also save the best block locator because rescanning only updates it intermittently.
+                walletInstance->SetLastBlockProcessed(*scan_res.last_scanned_height, scan_res.last_scanned_block);
             }
-        }
-
-        chain.initMessage(_("Rescanning…"));
-        walletInstance->WalletLogPrintf("Rescanning last %i blocks (from block %i)...\n", *tip_height - rescan_height, rescan_height);
-
-        {
-            WalletRescanReserver reserver(*walletInstance);
-            if (!reserver.reserve()) {
-                error = _("Failed to acquire rescan reserver during wallet initialization");
-                return false;
-            }
-            ScanResult scan_res = walletInstance->ScanForWalletTransactions(chain.getBlockHash(rescan_height), rescan_height, /*max_height=*/{}, reserver, /*fUpdate=*/true, /*save_progress=*/true);
-            if (ScanResult::SUCCESS != scan_res.status) {
-                error = _("Failed to rescan the wallet during initialization");
-                return false;
-            }
-            // Set and update the best block record
-            // Set last block scanned as the last block processed as it may be different in case of a reorg.
-            // Also save the best block locator because rescanning only updates it intermittently.
-            walletInstance->SetLastBlockProcessed(*scan_res.last_scanned_height, scan_res.last_scanned_block);
         }
     }
 
