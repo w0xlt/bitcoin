@@ -1629,6 +1629,51 @@ class WalletMigrationTest(BitcoinTestFramework):
         self.start_node(self.old_node.index)
         self.connect_nodes(1, 0)
 
+    def test_skip_rescan(self):
+        self.log.info("Test migratewallet skip_rescan option")
+        default = self.master_node.get_wallet_rpc(self.default_wallet_name)
+
+        # Create a legacy wallet and get an address, but do NOT fund it yet.
+        wallet = self.create_legacy_wallet("skip_rescan")
+        addr = wallet.getnewaddress()
+
+        # Reload to ensure best block is written, then unload and copy to master_node.
+        # At this point the wallet's BestBlock matches the current chain tip.
+        self.old_node.unloadwallet("skip_rescan")
+        self.old_node.loadwallet("skip_rescan")
+        self.old_node.unloadwallet("skip_rescan")
+        shutil.copytree(
+            self.old_node.wallets_path / "skip_rescan",
+            self.master_node.wallets_path / "skip_rescan",
+            dirs_exist_ok=True,
+        )
+
+        # Fund the address AFTER the wallet snapshot was taken.
+        # The wallet on disk has never seen this transaction.
+        default.sendtoaddress(addr, 5)
+        self.generate(self.master_node, 1)
+
+        # Migrate with skip_rescan=true. The wallet's BestBlock is behind the
+        # chain tip, so AttachChain enters the rescan path. With skip_rescan
+        # the actual ScanForWalletTransactions call is skipped.
+        with self.master_node.assert_debug_log(expected_msgs=["Rescan skipped"], unexpected_msgs=["Rescanning"]):
+            migrate_info = self.master_node.migratewallet("skip_rescan", skip_rescan=True)
+
+        wallet = self.master_node.get_wallet_rpc(migrate_info["wallet_name"])
+        info = wallet.getwalletinfo()
+        assert_equal(info["descriptors"], True)
+        # Wallet should not be actively scanning
+        assert_equal(info["scanning"], False)
+        # Balance is zero because rescan was skipped and the funding tx
+        # occurred after the wallet's last processed block.
+        assert_equal(wallet.getbalance(), 0)
+
+        # Rescan recovers the balance
+        wallet.rescanblockchain()
+        assert_equal(wallet.getbalance(), 5)
+
+        wallet.unloadwallet()
+
     def unsynced_wallet_on_pruned_node_fails(self):
         self.log.info("Test migration of an unsynced wallet on a pruned node fails gracefully")
         wallet = self.create_legacy_wallet("", load_on_startup=False)
@@ -1708,6 +1753,7 @@ class WalletMigrationTest(BitcoinTestFramework):
         self.test_taproot()
         self.test_solvable_no_privs()
         self.test_loading_failure_after_migration()
+        self.test_skip_rescan()
 
         # Note: After this test the first 250 blocks of 'master_node' are pruned
         self.unsynced_wallet_on_pruned_node_fails()
