@@ -31,9 +31,17 @@
 namespace ohttp {
 
 // ---- Suite identifiers we support (fixed to the HPKE code you added) ----
-static constexpr uint16_t KEM_SECP256K1 = 0x0016; // matches SUITE_ID in dhkem_secp256k1.h :contentReference[oaicite:6]{index=6}
+static constexpr uint16_t KEM_SECP256K1 = 0x0016; // matches SUITE_ID in dhkem_secp256k1.h
 static constexpr uint16_t KDF_HKDF_SHA256 = 0x0001;
 static constexpr uint16_t AEAD_CHACHA20POLY1305 = 0x0003;
+
+// ---- BIP 77 fixed-size constants ----
+/** Total size of an OHTTP-encapsulated message for BIP 77 compliance. */
+static constexpr size_t ENCAPSULATED_MESSAGE_BYTES = 8192;
+/** OHTTP request header size: key_id(1) + kem_id(2) + kdf_id(2) + aead_id(2) = 7 bytes. */
+static constexpr size_t OHTTP_REQ_HEADER_BYTES = 7;
+/** Target size for padded bHTTP request inside OHTTP (8192 - 65 enc - 16 tag - 7 hdr). */
+static constexpr size_t PADDED_BHTTP_REQ_BYTES = ENCAPSULATED_MESSAGE_BYTES - dhkem_secp256k1::NENC - 16 - OHTTP_REQ_HEADER_BYTES; // 8104
 
 struct SymmetricAlg {
     uint16_t kdf_id;
@@ -89,6 +97,15 @@ public:
     // Open a message/ohttp-res (response) using the stored HPKE exporter.
     // Returns the decrypted bHTTP response or nullopt.
     std::optional<std::vector<uint8_t>> OpenResponse(std::span<const uint8_t> enc_response) const;
+
+    /**
+     * Encapsulate a bHTTP request with BIP 77 fixed-size padding.
+     * The bhttp_request is first random-padded to PADDED_BHTTP_REQ_BYTES,
+     * then OHTTP-encapsulated to produce exactly ENCAPSULATED_MESSAGE_BYTES (8192).
+     * Returns nullopt if the bhttp_request exceeds PADDED_BHTTP_REQ_BYTES.
+     */
+    std::optional<std::vector<uint8_t>> EncapsulateRequestPadded(const KeyConfig& cfg,
+                                                                  std::span<const uint8_t> bhttp_request);
 };
 
 // ------------- Gateway side -------------

@@ -21,6 +21,8 @@ class uint160;
 class uint256;
 struct CBlockLocator;
 
+namespace payjoin { struct PayjoinSession; }
+
 namespace wallet {
 class CMasterKey;
 class CWallet;
@@ -85,6 +87,8 @@ extern const std::string WALLETDESCRIPTORCKEY;
 extern const std::string WALLETDESCRIPTORKEY;
 extern const std::string WATCHMETA;
 extern const std::string WATCHS;
+
+extern const std::string PAYJOIN_SESSION;
 
 // Keys in this set pertain only to the legacy wallet (LegacyScriptPubKeyMan) and are removed during migration from legacy to descriptors.
 extern const std::unordered_set<std::string> LEGACY_TYPES;
@@ -254,6 +258,12 @@ public:
 
     bool WriteLockedUTXO(const COutPoint& output);
     bool EraseLockedUTXO(const COutPoint& output);
+
+    // Payjoin session persistence
+    bool WritePayjoinSession(const uint256& session_id, const payjoin::PayjoinSession& session);
+    bool ReadPayjoinSession(const uint256& session_id, payjoin::PayjoinSession& session);
+    bool ErasePayjoinSession(const uint256& session_id);
+    bool ListPayjoinSessions(std::vector<std::pair<uint256, payjoin::PayjoinSession>>& sessions);
 
     bool WriteAddressPreviouslySpent(const CTxDestination& dest, bool previously_spent);
     bool WriteAddressReceiveRequest(const CTxDestination& dest, const std::string& id, const std::string& receive_request);

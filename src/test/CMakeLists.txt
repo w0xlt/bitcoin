@@ -70,6 +70,10 @@ add_executable(test_bitcoin
   node_init_tests.cpp
   node_warnings_tests.cpp
   ohttp_tests.cpp
+  payjoin_messages_tests.cpp
+  payjoin_session_tests.cpp
+  payjoin_shortid_tests.cpp
+  payjoin_uri_tests.cpp
   orphanage_tests.cpp
   pcp_tests.cpp
   peerman_tests.cpp
@@ -225,3 +229,14 @@ endfunction()
 add_all_test_targets()
 
 install_binary_component(test_bitcoin INTERNAL)
+
+# Minimal OHTTP-aware mock directory for payjoin functional tests.
+add_executable(test_payjoin_directory
+  test_payjoin_directory.cpp
+)
+target_link_libraries(test_payjoin_directory
+  core_interface
+  bitcoin_common
+  bitcoin_util
+  secp256k1
+)

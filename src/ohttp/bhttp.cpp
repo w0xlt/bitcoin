@@ -4,6 +4,8 @@
 
 #include <ohttp/bhttp.h>
 
+#include <random.h>
+
 #include <algorithm>
 #include <cstring> // memcpy
 
@@ -109,6 +111,27 @@ static std::vector<uint8_t> SerializeFieldSection(const std::vector<std::pair<st
     return out;
 }
 
+std::optional<std::vector<uint8_t>> EncodeKnownLengthRequestPadded(const Request& r, size_t target_size)
+{
+    // First encode the request normally
+    auto encoded = EncodeKnownLengthRequest(r);
+    if (!encoded) return std::nullopt;
+    if (encoded->size() > target_size) return std::nullopt;
+
+    // Create a buffer pre-filled with random bytes for padding.
+    // GetRandBytes() supports at most 32 bytes per call, so fill in chunks.
+    std::vector<uint8_t> padded(target_size);
+    for (size_t i = 0; i < target_size; i += 32) {
+        size_t chunk = std::min<size_t>(32, target_size - i);
+        GetRandBytes(std::span<uint8_t>(padded.data() + i, chunk));
+    }
+
+    // Copy the encoded request at the start (overwriting random bytes)
+    std::memcpy(padded.data(), encoded->data(), encoded->size());
+
+    return padded;
+}
+
 std::optional<std::vector<uint8_t>> EncodeKnownLengthRequest(const Request& r)
 {
     // bHTTP known-length request layout (RFC 9292 §3.1, §3.4, §3.6). Framing=0. :contentReference[oaicite:5]{index=5}
@@ -167,6 +190,51 @@ static bool ParseFieldSection_Known(const uint8_t*& p, const uint8_t* end,
 
     p = qend;
     return true;
+}
+
+std::optional<Request> DecodeKnownLengthRequest(std::span<const uint8_t> in)
+{
+    const uint8_t* p = in.data();
+    const uint8_t* end = in.data() + in.size();
+
+    // Framing Indicator must be 0 (request, known-length). (RFC 9292 §3.3)
+    uint64_t framing = 0;
+    if (!ReadVarInt(p, end, framing)) return std::nullopt;
+    if (framing != 0) return std::nullopt;
+
+    // Request Control Data: Method, Scheme, Authority, Path (each length-prefixed) (RFC 9292 §3.4).
+    auto readLenPrefixed = [&](std::string& out) -> bool {
+        uint64_t len = 0;
+        if (!ReadVarInt(p, end, len)) return false;
+        if (len > static_cast<uint64_t>(end - p)) return false;
+        out.assign(reinterpret_cast<const char*>(p), reinterpret_cast<const char*>(p + len));
+        p += len;
+        return true;
+    };
+
+    Request r;
+    if (!readLenPrefixed(r.method)) return std::nullopt;
+    if (!readLenPrefixed(r.scheme)) return std::nullopt;
+    if (!readLenPrefixed(r.authority)) return std::nullopt;
+    if (!readLenPrefixed(r.path)) return std::nullopt;
+
+    // Header Section
+    if (!ParseFieldSection_Known(p, end, r.headers)) return std::nullopt;
+
+    // Content
+    uint64_t content_len = 0;
+    if (!ReadVarInt(p, end, content_len)) return std::nullopt;
+    if (content_len > static_cast<uint64_t>(end - p)) return std::nullopt;
+    r.body.resize(content_len);
+    if (content_len) { std::memcpy(r.body.data(), p, content_len); }
+    p += content_len;
+
+    // Trailer Section (ignore)
+    std::vector<std::pair<std::string, std::string>> trailers;
+    if (!ParseFieldSection_Known(p, end, trailers)) return std::nullopt;
+
+    // Any remaining bytes are padding; safe to ignore (RFC 9292 §3.8).
+    return r;
 }
 
 std::optional<Response> DecodeKnownLengthResponse(std::span<const uint8_t> in)

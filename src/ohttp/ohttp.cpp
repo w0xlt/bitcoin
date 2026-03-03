@@ -292,6 +292,32 @@ std::optional<std::vector<uint8_t>> ClientContext::OpenResponse(std::span<const 
     return *pt;
 }
 
+std::optional<std::vector<uint8_t>> ClientContext::EncapsulateRequestPadded(const KeyConfig& cfg,
+                                                                            std::span<const uint8_t> bhttp_request)
+{
+    // Validate that the bHTTP request fits within the padded target
+    if (bhttp_request.size() > PADDED_BHTTP_REQ_BYTES) return std::nullopt;
+
+    // Pad the bHTTP request to exactly PADDED_BHTTP_REQ_BYTES with random bytes.
+    // Random padding after the bHTTP trailer is ignored by decoders (RFC 9292 §3.8).
+    // GetRandBytes() supports at most 32 bytes per call, so fill in chunks.
+    std::vector<uint8_t> padded(PADDED_BHTTP_REQ_BYTES);
+    for (size_t i = 0; i < PADDED_BHTTP_REQ_BYTES; i += 32) {
+        size_t chunk = std::min<size_t>(32, PADDED_BHTTP_REQ_BYTES - i);
+        GetRandBytes(std::span<uint8_t>(padded.data() + i, chunk));
+    }
+    std::copy(bhttp_request.begin(), bhttp_request.end(), padded.begin());
+
+    // Encapsulate with standard OHTTP
+    auto result = EncapsulateRequest(cfg, padded);
+    if (!result) return std::nullopt;
+
+    // Verify the output is exactly the expected BIP 77 size
+    if (result->size() != ENCAPSULATED_MESSAGE_BYTES) return std::nullopt;
+
+    return result;
+}
+
 // ----- Gateway -----
 
 static bool ParseRequestHeader(const uint8_t*& p, const uint8_t* end,

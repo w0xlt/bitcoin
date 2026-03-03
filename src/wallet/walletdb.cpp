@@ -8,6 +8,8 @@
 #include <wallet/walletdb.h>
 
 #include <common/system.h>
+#include <logging.h>
+#include <payjoin/session.h>
 #include <key_io.h>
 #include <primitives/transaction_identifier.h>
 #include <protocol.h>
@@ -60,6 +62,7 @@ const std::string WALLETDESCRIPTORCKEY{"walletdescriptorckey"};
 const std::string WALLETDESCRIPTORKEY{"walletdescriptorkey"};
 const std::string WATCHMETA{"watchmeta"};
 const std::string WATCHS{"watchs"};
+const std::string PAYJOIN_SESSION{"pjsession"};
 const std::unordered_set<std::string> LEGACY_TYPES{CRYPTED_KEY, CSCRIPT, DEFAULTKEY, HDCHAIN, KEYMETA, KEY, OLD_KEY, POOL, WATCHMETA, WATCHS};
 } // namespace DBKeys
 
@@ -293,6 +296,60 @@ bool WalletBatch::WriteLockedUTXO(const COutPoint& output)
 bool WalletBatch::EraseLockedUTXO(const COutPoint& output)
 {
     return EraseIC(std::make_pair(DBKeys::LOCKED_UTXO, std::make_pair(output.hash, output.n)));
+}
+
+bool WalletBatch::WritePayjoinSession(const uint256& session_id, const payjoin::PayjoinSession& session)
+{
+    return WriteIC(std::make_pair(DBKeys::PAYJOIN_SESSION, session_id), session);
+}
+
+bool WalletBatch::ReadPayjoinSession(const uint256& session_id, payjoin::PayjoinSession& session)
+{
+    try {
+        return m_batch->Read(std::make_pair(DBKeys::PAYJOIN_SESSION, session_id), session);
+    } catch (const std::exception& e) {
+        LogPrintf("payjoin: ReadPayjoinSession exception: %s\n", e.what());
+        return false;
+    } catch (...) {
+        LogPrintf("payjoin: ReadPayjoinSession unknown exception\n");
+        return false;
+    }
+}
+
+bool WalletBatch::ErasePayjoinSession(const uint256& session_id)
+{
+    return EraseIC(std::make_pair(DBKeys::PAYJOIN_SESSION, session_id));
+}
+
+bool WalletBatch::ListPayjoinSessions(std::vector<std::pair<uint256, payjoin::PayjoinSession>>& sessions)
+{
+    DataStream prefix;
+    prefix << DBKeys::PAYJOIN_SESSION;
+    auto cursor = m_batch->GetNewPrefixCursor(prefix);
+    if (!cursor) return false;
+
+    DataStream ssKey, ssValue;
+    DatabaseCursor::Status status;
+    while ((status = cursor->Next(ssKey, ssValue)) == DatabaseCursor::Status::MORE) {
+        try {
+            std::string key_type;
+            uint256 session_id;
+            ssKey >> key_type >> session_id;
+
+            payjoin::PayjoinSession session;
+            ssValue >> session;
+
+            sessions.emplace_back(session_id, std::move(session));
+        } catch (const std::exception& e) {
+            LogPrintf("payjoin: ListPayjoinSessions deserialization error: %s\n", e.what());
+            continue;
+        } catch (...) {
+            LogPrintf("payjoin: ListPayjoinSessions unknown deserialization error\n");
+            continue;
+        }
+    }
+
+    return status != DatabaseCursor::Status::FAIL;
 }
 
 bool LoadKey(CWallet* pwallet, DataStream& ssKey, DataStream& ssValue, std::string& strErr)

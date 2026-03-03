@@ -124,6 +124,12 @@ add_library(bitcoin_common STATIC EXCLUDE_FROM_ALL
   ohttp/bhttp.cpp
   ohttp/ohttp.cpp
   outputtype.cpp
+  payjoin/messages.cpp
+  payjoin/net.cpp
+  payjoin/receiver.cpp
+  payjoin/sender.cpp
+  payjoin/shortid.cpp
+  payjoin/uri.cpp
   policy/feerate.cpp
   policy/policy.cpp
   pow.cpp

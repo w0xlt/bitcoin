@@ -896,6 +896,14 @@ RPCHelpMan signrawtransactionwithwallet();
 // signmessage
 RPCHelpMan signmessage();
 
+// payjoin
+RPCHelpMan sendpayjoin();
+RPCHelpMan receivepayjoin();
+RPCHelpMan payjoininfo();
+RPCHelpMan listpayjoin();
+RPCHelpMan cancelpayjoin();
+RPCHelpMan advancepayjoin();
+
 // transactions
 RPCHelpMan listreceivedbyaddress();
 RPCHelpMan listreceivedbylabel();
@@ -968,6 +976,12 @@ std::span<const CRPCCommand> GetWalletRPCCommands()
         {"wallet", &walletpassphrase},
         {"wallet", &walletpassphrasechange},
         {"wallet", &walletprocesspsbt},
+        {"wallet", &sendpayjoin},
+        {"wallet", &receivepayjoin},
+        {"wallet", &payjoininfo},
+        {"wallet", &listpayjoin},
+        {"wallet", &cancelpayjoin},
+        {"wallet", &advancepayjoin},
     };
     return commands;
 }
