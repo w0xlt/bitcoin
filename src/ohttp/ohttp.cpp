@@ -56,43 +56,61 @@ static inline bool ReadBE16(const uint8_t*& p, const uint8_t* end, uint16_t& out
     return true;
 }
 
-// RFC 9458 §3.2 application/ohttp-keys list
+// Parse a single KeyConfig from raw bytes (no length prefix). RFC 9458 §3.1
+static bool ParseSingleKeyConfig(const uint8_t* q, const uint8_t* qend, KeyConfig& cfg)
+{
+    const size_t need = size_t{1} + 2u + dhkem_secp256k1::NPK + 2u;
+    if (static_cast<size_t>(qend - q) < need) return false;
+
+    cfg.key_id = *q++;
+    ReadBE16(q, qend, cfg.kem_id);
+    std::copy(q, q + dhkem_secp256k1::NPK, cfg.pkR.begin()); q += dhkem_secp256k1::NPK;
+    uint16_t syms_len = 0; ReadBE16(q, qend, syms_len);
+    if (qend - q != syms_len) return false;
+    if (syms_len % 4) return false;
+    for (; q < qend; ) {
+        SymmetricAlg s{};
+        if (!ReadBE16(q, qend, s.kdf_id)) return false;
+        if (!ReadBE16(q, qend, s.aead_id)) return false;
+        cfg.syms.push_back(s);
+    }
+    return true;
+}
+
+// RFC 9458 §3.2 application/ohttp-keys list, OR a single raw KeyConfig.
+// Tries list format first; falls back to single-config (as served by
+// rust-payjoin's bitcoin-ohttp KeyConfig::encode()).
 std::vector<KeyConfig> ParseKeyConfigList(std::span<const uint8_t> data)
 {
     std::vector<KeyConfig> out;
     const uint8_t* p = data.data();
     const uint8_t* end = data.data() + data.size();
+
+    // Try RFC 9458 §3.2 list format: sequence of (uint16_be length | KeyConfig).
+    bool list_ok = true;
     while (p < end) {
         uint16_t len = 0;
-        if (!ReadBE16(p, end, len)) return {}; // strict: discard on encoding error (§3.2)
-        if (end - p < len) return {};
+        if (!ReadBE16(p, end, len)) { list_ok = false; break; }
+        if (end - p < len) { list_ok = false; break; }
         const uint8_t* q = p;
         const uint8_t* qend = p + len;
 
         KeyConfig cfg;
-        {
-            const size_t need = size_t{1} + 2u + dhkem_secp256k1::NPK + 2u;
-            if (static_cast<size_t>(qend - q) < need) return {};
-        }
-        cfg.key_id = *q++;                             // 8-bit Key Identifier (§3.1)
-        ReadBE16(q, qend, cfg.kem_id);
-        std::copy(q, q + dhkem_secp256k1::NPK, cfg.pkR.begin()); q += dhkem_secp256k1::NPK;
-        uint16_t syms_len = 0; ReadBE16(q, qend, syms_len);
-        if (qend - q != syms_len) return {};
-        if (syms_len % 4) return {};
-        for (; q < qend; ) {
-            SymmetricAlg s{};
-            if (!ReadBE16(q, qend, s.kdf_id)) return {};
-            if (!ReadBE16(q, qend, s.aead_id)) return {};
-            cfg.syms.push_back(s);
-        }
-        if (!cfg.IsSupported()) {
-            // Ignore unsupported keys per RFC guidance; but for strictness in Core,
-            // we only push supported configs.
-        } else {
+        if (!ParseSingleKeyConfig(q, qend, cfg)) { list_ok = false; break; }
+        if (cfg.IsSupported()) {
             out.push_back(cfg);
         }
         p += len;
+    }
+    if (list_ok && !out.empty()) return out;
+
+    // Fallback: try as a single raw KeyConfig (no length prefix).
+    out.clear();
+    KeyConfig cfg;
+    if (ParseSingleKeyConfig(data.data(), data.data() + data.size(), cfg)) {
+        if (cfg.IsSupported()) {
+            out.push_back(cfg);
+        }
     }
     return out;
 }
