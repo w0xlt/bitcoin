@@ -79,6 +79,7 @@ struct PayjoinSession {
     ohttp::KeyConfig ohttp_keys;   //!< Directory OHTTP key config
     std::optional<uint256> final_txid;
     std::string error_message;
+    int64_t last_poll_time{0};     //!< Unix timestamp of last background poll
 
     /** Check if the session is in a terminal state. */
     bool IsTerminal() const
@@ -107,6 +108,34 @@ struct PayjoinSession {
                    receiver_state == ReceiverState::ProposalSent ||
                    receiver_state == ReceiverState::Monitoring;
         }
+    }
+
+    /** Return a human-readable string for the current state. */
+    std::string GetStateString() const
+    {
+        if (role == SessionRole::Sender) {
+            switch (sender_state) {
+            case SenderState::Created: return "created";
+            case SenderState::PostedOriginal: return "posted_original";
+            case SenderState::PollingForProposal: return "polling";
+            case SenderState::Completed: return "completed";
+            case SenderState::Failed: return "failed";
+            case SenderState::Expired: return "expired";
+            case SenderState::Cancelled: return "cancelled";
+            }
+        } else {
+            switch (receiver_state) {
+            case ReceiverState::Initialized: return "initialized";
+            case ReceiverState::ReceivedOriginal: return "received_original";
+            case ReceiverState::ProposalSent: return "proposal_sent";
+            case ReceiverState::Monitoring: return "monitoring";
+            case ReceiverState::Completed: return "completed";
+            case ReceiverState::Failed: return "failed";
+            case ReceiverState::Expired: return "expired";
+            case ReceiverState::Cancelled: return "cancelled";
+            }
+        }
+        return "unknown";
     }
 
     /** Custom serialization for wallet database persistence.
@@ -154,6 +183,8 @@ struct PayjoinSession {
         if (has_txid) s << *final_txid;
 
         s << error_message;
+
+        s << last_poll_time;
     }
 
     template <typename Stream>
@@ -203,6 +234,14 @@ struct PayjoinSession {
         }
 
         s >> error_message;
+
+        // last_poll_time was added after initial format; gracefully handle
+        // old sessions that don't have it.
+        try {
+            s >> last_poll_time;
+        } catch (...) {
+            last_poll_time = 0;
+        }
     }
 
 private:

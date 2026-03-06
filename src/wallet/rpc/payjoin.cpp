@@ -15,6 +15,7 @@
 #include <rpc/util.h>
 #include <uint256.h>
 #include <util/time.h>
+#include <wallet/payjoin.h>
 #include <wallet/rpc/util.h>
 #include <wallet/wallet.h>
 #include <wallet/walletdb.h>
@@ -465,61 +466,7 @@ RPCHelpMan advancepayjoin()
         throw JSONRPCError(RPC_INVALID_PARAMETER, "Session is already in a terminal state");
     }
 
-    auto http_client = GetPayjoinHttpClient();
-
-    if (session->role == payjoin::SessionRole::Sender) {
-        payjoin::Sender sender(session, *pwallet, http_client);
-
-        switch (session->sender_state) {
-        case payjoin::SenderState::PostedOriginal:
-        case payjoin::SenderState::PollingForProposal:
-        {
-            auto poll_result = sender.PollForProposal();
-            if (!poll_result.has_value()) {
-                // Error or expiration - session state already updated
-            } else if (*poll_result) {
-                // Got proposal - try to finalize
-                auto txid = sender.FinalizeAndBroadcast();
-                if (!txid) {
-                    // Finalization failed - session state already updated
-                }
-            }
-            // else: not ready yet, state stays as polling
-            break;
-        }
-        default:
-            throw JSONRPCError(RPC_INVALID_PARAMETER,
-                "Sender session cannot be advanced from current state");
-        }
-    } else {
-        payjoin::Receiver receiver(session, *pwallet, http_client);
-
-        switch (session->receiver_state) {
-        case payjoin::ReceiverState::Initialized:
-        {
-            auto poll_result = receiver.PollForOriginal();
-            if (!poll_result.has_value()) {
-                // Error or expiration
-            }
-            // else: got original or not ready yet
-            break;
-        }
-        case payjoin::ReceiverState::ReceivedOriginal:
-        {
-            receiver.ProcessAndRespond();
-            break;
-        }
-        case payjoin::ReceiverState::ProposalSent:
-        case payjoin::ReceiverState::Monitoring:
-        {
-            receiver.CheckPayment();
-            break;
-        }
-        default:
-            throw JSONRPCError(RPC_INVALID_PARAMETER,
-                "Receiver session cannot be advanced from current state");
-        }
-    }
+    AdvancePayjoinSession(*pwallet, session);
 
     // Persist updated session
     {

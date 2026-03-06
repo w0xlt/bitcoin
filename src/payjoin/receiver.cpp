@@ -314,38 +314,56 @@ bool Receiver::ProcessAndRespond()
     }
 
     // 3. Select a receiver UTXO to contribute
+    //    Manual iteration with null-safety instead of AvailableCoins to
+    //    tolerate wallet entries with corrupt CTransactionRef fields.
     std::optional<wallet::COutput> selected_coin;
 
     {
         LOCK(m_wallet.cs_wallet);
-        auto available = wallet::AvailableCoins(m_wallet);
-        auto all_coins = available.All();
 
-        // Prefer coins matching the sender's script type
-        // Also prefer amount close to payment amount (UIH2 avoidance)
         CAmount best_distance = std::numeric_limits<CAmount>::max();
 
-        for (const auto& coin : all_coins) {
-            if (coin.depth < 1) continue; // require at least 1 confirmation
+        for (const auto& [outpoint, txo] : m_wallet.GetTXOs()) {
+            const wallet::CWalletTx& wtx = txo.GetWalletTx();
 
-            OutputType coin_type = ClassifyScript(coin.txout.scriptPubKey);
+            // Guard against corrupt wallet entries (null or invalid tx)
+            if (!wtx.tx) {
+                LogPrintf("payjoin receiver: skipping corrupt wallet tx %s (null tx)\n",
+                          outpoint.hash.ToString());
+                continue;
+            }
 
-            // Prefer matching script type
+            int depth = m_wallet.GetTxDepthInMainChain(wtx);
+            if (depth < 1) continue;  // require at least 1 confirmation
+
+            if (m_wallet.IsSpent(outpoint)) continue;
+            if (m_wallet.IsLockedCoin(outpoint)) continue;
+
+            const CTxOut& output = txo.GetTxOut();
+
+            OutputType coin_type = ClassifyScript(output.scriptPubKey);
+
+            int input_bytes = wallet::CalculateMaximumSignedInputSize(
+                output, &m_wallet, /*coin_control=*/nullptr);
+
+            wallet::COutput coin(outpoint, output, depth, input_bytes,
+                                  /*solvable=*/input_bytes > -1,
+                                  /*safe=*/true, wtx.GetTxTime(),
+                                  /*from_me=*/false, /*fees=*/std::nullopt);
+
+            // Prefer coins matching the sender's script type
+            // Also prefer amount close to payment amount (UIH2 avoidance)
             if (coin_type == sender_input_type) {
-                CAmount distance = std::abs(coin.txout.nValue - receiver_amount);
+                CAmount distance = std::abs(output.nValue - receiver_amount);
                 if (distance < best_distance) {
                     best_distance = distance;
                     selected_coin = coin;
                 }
             }
-        }
 
-        // Fallback: any confirmed coin if no type match
-        if (!selected_coin) {
-            for (const auto& coin : all_coins) {
-                if (coin.depth < 1) continue;
+            // Fallback: any confirmed coin
+            if (!selected_coin) {
                 selected_coin = coin;
-                break;
             }
         }
     }

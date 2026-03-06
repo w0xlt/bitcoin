@@ -13,6 +13,7 @@
 #include <util/string.h>
 #include <util/translation.h>
 #include <wallet/context.h>
+#include <wallet/payjoin.h>
 #include <wallet/spend.h>
 #include <wallet/wallet.h>
 #include <wallet/walletdb.h>
@@ -171,6 +172,9 @@ void StartWallets(WalletContext& context)
     }
 
     context.scheduler->scheduleEvery([&context] { MaybeResendWalletTxs(context); }, 1min);
+
+    // Advance payjoin sessions every 30 seconds
+    context.scheduler->scheduleEvery([&context] { MaybeAdvancePayjoinSessions(context); }, 30s);
 }
 
 void UnloadWallets(WalletContext& context)

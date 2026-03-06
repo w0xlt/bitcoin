@@ -12,6 +12,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <map>
@@ -19,6 +20,7 @@
 #include <optional>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace payjoin {
@@ -170,12 +172,19 @@ static std::optional<HttpResponse> DoRequest(const Proxy& proxy, int /*timeout_m
     auto parsed = ParseUrl(url);
     if (!parsed) return std::nullopt;
 
-    // Connect through Tor SOCKS5 proxy
-    bool proxy_failed = false;
-    auto sock = ConnectThroughProxy(proxy, parsed->host, parsed->port, proxy_failed);
+    // Connect through Tor SOCKS5 proxy (retry on transient failures)
+    std::unique_ptr<Sock> sock;
+    for (int attempt = 0; attempt < 3; ++attempt) {
+        bool proxy_failed = false;
+        sock = ConnectThroughProxy(proxy, parsed->host, parsed->port, proxy_failed);
+        if (sock) break;
+        LogPrintf("payjoin: Connection attempt %d/3 failed for %s:%d (proxy_failed=%d)\n",
+                  attempt + 1, parsed->host, parsed->port, proxy_failed);
+        if (attempt < 2) {
+            std::this_thread::sleep_for(std::chrono::seconds(2));
+        }
+    }
     if (!sock) {
-        LogPrintf("payjoin: Failed to connect through proxy to %s:%d (proxy_failed=%d)\n",
-                  parsed->host, parsed->port, proxy_failed);
         return std::nullopt;
     }
 

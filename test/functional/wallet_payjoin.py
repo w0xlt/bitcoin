@@ -16,6 +16,7 @@ Tests the payjoin RPC interface with a C++ OHTTP-aware mock directory:
 
 import os
 import subprocess
+import time
 
 from test_framework.blocktools import COINBASE_MATURITY
 from test_framework.test_framework import BitcoinTestFramework
@@ -104,6 +105,7 @@ class PayjoinTest(BitcoinTestFramework):
         self.test_sendpayjoin()
         self.test_end_to_end_payjoin()
         self.test_session_lifecycle()
+        self.test_background_polling()
 
     # ------------------------------------------------------------------
     # Error case tests
@@ -311,6 +313,84 @@ class PayjoinTest(BitcoinTestFramework):
         assert_raises_rpc_error(-8, "terminal state",
                                 self.nodes[1].cancelpayjoin,
                                 new_session_id)
+
+
+    # ------------------------------------------------------------------
+    # Background polling: sessions auto-advance without advancepayjoin
+    # ------------------------------------------------------------------
+
+    def wait_for_payjoin_state(self, node, session_id, target_state, bump_nodes=None):
+        """Wait for a payjoin session to reach target_state, using mockscheduler
+        and setmocktime to fast-forward both the scheduler and NodeClock."""
+        mock_time = int(time.time())
+        for n in (bump_nodes or [node]):
+            n.setmocktime(mock_time)
+        for _ in range(20):
+            # Advance mock time to satisfy per-session poll throttle
+            mock_time += 31
+            for n in (bump_nodes or [node]):
+                n.setmocktime(mock_time)
+                n.mockscheduler(31)
+            time.sleep(0.5)  # Brief pause for scheduler thread to execute
+            info = node.payjoininfo(session_id)
+            self.log.info(f"  session {session_id[:8]}... state: {info['state']}")
+            if info["state"] == target_state:
+                # Reset mock time so subsequent operations use real time
+                for n in (bump_nodes or [node]):
+                    n.setmocktime(0)
+                return info
+            if info.get("is_terminal", False) and info["state"] != target_state:
+                for n in (bump_nodes or [node]):
+                    n.setmocktime(0)
+                raise AssertionError(f"Session reached terminal state {info['state']} instead of {target_state}")
+        for n in (bump_nodes or [node]):
+            n.setmocktime(0)
+        raise AssertionError(f"Session {session_id} did not reach {target_state} after 20 scheduler bumps")
+
+    def test_background_polling(self):
+        self.log.info("Testing background polling (sessions auto-advance)...")
+
+        sender_node = self.nodes[0]
+        receiver_node = self.nodes[1]
+
+        # Fund receiver with fresh UTXOs for this test
+        sender_node.sendtoaddress(receiver_node.getnewaddress(), 0.5)
+        self.generate(sender_node, 1)
+        self.sync_all()
+
+        # Create receiver session
+        recv_result = receiver_node.receivepayjoin(0.001)
+        recv_id = recv_result["session_id"]
+        uri = recv_result["payjoin_uri"]
+        self.log.info(f"Receiver session: {recv_id}")
+
+        # Create sender session (posts original to directory)
+        send_result = sender_node.sendpayjoin(uri)
+        send_id = send_result["session_id"]
+        self.log.info(f"Sender session: {send_id}")
+
+        # Do NOT call advancepayjoin — use mockscheduler to fast-forward
+        both_nodes = [sender_node, receiver_node]
+
+        self.log.info("Waiting for background polling to complete sender...")
+        self.wait_for_payjoin_state(sender_node, send_id, "completed", both_nodes)
+        self.log.info("Sender completed via background polling")
+
+        # Mine a block so receiver can confirm payment
+        self.generate(sender_node, 1)
+        self.sync_all()
+
+        self.log.info("Waiting for background polling to complete receiver...")
+        self.wait_for_payjoin_state(receiver_node, recv_id, "completed", both_nodes)
+        self.log.info("Receiver completed via background polling")
+
+        # Verify the payjoin tx has inputs from both wallets
+        txid = sender_node.payjoininfo(send_id)["txid"]
+        wallet_tx = sender_node.gettransaction(txid)
+        decoded = sender_node.decoderawtransaction(wallet_tx["hex"])
+        assert len(decoded["vin"]) >= 2, "Payjoin tx should have inputs from both wallets"
+
+        self.log.info("Background polling test PASSED!")
 
 
 if __name__ == "__main__":
