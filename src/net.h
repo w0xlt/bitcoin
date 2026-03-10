@@ -172,6 +172,8 @@ bool IsLocal(const CService& addr);
 CService GetLocalAddress(const CNode& peer);
 
 extern bool fDiscover;
+/** Allow CJDNS local address discovery when -externalip soft-disables -discover. */
+extern bool fDiscoverCJDNS;
 extern bool fListen;
 
 /** Subversion as sent to the P2P network in `version` messages */

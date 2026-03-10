@@ -786,6 +786,8 @@ static bool AppInitServers(NodeContext& node)
 // Parameter interaction based on rules
 void InitParameterInteraction(ArgsManager& args)
 {
+    fDiscoverCJDNS = false;
+
     // when specifying an explicit binding address, you want to listen on it
     // even when -connect or -proxy is specified
     if (!args.GetArgs("-bind").empty()) {
@@ -837,8 +839,10 @@ void InitParameterInteraction(ArgsManager& args)
 
     if (!args.GetArgs("-externalip").empty()) {
         // if an explicit public IP is specified, do not try to find others
-        if (args.SoftSetBoolArg("-discover", false))
+        if (args.SoftSetBoolArg("-discover", false)) {
+            fDiscoverCJDNS = true;
             LogInfo("parameter interaction: -externalip set -> setting -discover=0\n");
+        }
     }
 
     if (args.GetBoolArg("-blocksonly", DEFAULT_BLOCKSONLY)) {
