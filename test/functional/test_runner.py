@@ -306,6 +306,7 @@ BASE_SCRIPTS = [
     'feature_cltv.py',
     'rpc_uptime.py',
     'feature_discover.py',
+    'feature_cjdns_externalip.py',
     'wallet_resendwallettransactions.py',
     'wallet_fallbackfee.py',
     'rpc_dumptxoutset.py',
