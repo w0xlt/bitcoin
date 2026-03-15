@@ -2396,11 +2396,9 @@ void PeerManagerImpl::ProcessGetBlockData(CNode& pfrom, Peer& peer, const CInv& 
             bool sendMerkleBlock = false;
             CMerkleBlock merkleBlock;
             if (auto tx_relay = peer.GetTxRelay(); tx_relay != nullptr) {
-                LOCK(tx_relay->m_bloom_filter_mutex);
-                if (tx_relay->m_bloom_filter) {
-                    sendMerkleBlock = true;
-                    merkleBlock = CMerkleBlock(*pblock, *tx_relay->m_bloom_filter);
-                }
+                sendMerkleBlock = tx_relay->WithBloomFilterIfSet([&](CBloomFilter& bloom_filter) {
+                    merkleBlock = CMerkleBlock(*pblock, bloom_filter);
+                });
             }
             if (sendMerkleBlock) {
                 MakeAndPushMessage(pfrom, NetMsgType::MERKLEBLOCK, merkleBlock);
@@ -5909,7 +5907,7 @@ bool PeerManagerImpl::SendMessages(CNode& node)
         }
 
         if (auto tx_relay = peer.GetTxRelay(); tx_relay != nullptr) {
-                LOCK(tx_relay->m_tx_inventory_mutex);
+                LOCK(tx_relay->GetTxInventoryMutex());
                 // Check whether periodic sends should happen
                 bool fSendTrickle = node.HasPermission(NetPermissionFlags::NoBan);
                 if (tx_relay->m_next_inv_send_time < current_time) {
@@ -5923,7 +5921,7 @@ bool PeerManagerImpl::SendMessages(CNode& node)
 
                 // Time to send but the peer has requested we not relay transactions.
                 if (fSendTrickle) {
-                    LOCK(tx_relay->m_bloom_filter_mutex);
+                    LOCK(tx_relay->GetBloomFilterMutex());
                     if (!tx_relay->m_relay_txs) tx_relay->m_tx_inventory_to_send.clear();
                 }
 
@@ -5933,7 +5931,7 @@ bool PeerManagerImpl::SendMessages(CNode& node)
                     tx_relay->m_send_mempool = false;
                     const CFeeRate filterrate{tx_relay->m_fee_filter_received.load()};
 
-                    LOCK(tx_relay->m_bloom_filter_mutex);
+                    LOCK(tx_relay->GetBloomFilterMutex());
 
                     for (const auto& txinfo : vtxinfo) {
                         const Txid& txid{txinfo.tx->GetHash()};
@@ -5975,7 +5973,7 @@ bool PeerManagerImpl::SendMessages(CNode& node)
                     // No reason to drain out at many times the network's capacity,
                     // especially since we have many peers and some will draw much shorter delays.
                     unsigned int nRelayedTransactions = 0;
-                    LOCK(tx_relay->m_bloom_filter_mutex);
+                    LOCK(tx_relay->GetBloomFilterMutex());
                     size_t broadcast_max{INVENTORY_BROADCAST_TARGET + (tx_relay->m_tx_inventory_to_send.size()/1000)*5};
                     broadcast_max = std::min<size_t>(INVENTORY_BROADCAST_MAX, broadcast_max);
                     while (!vInvTx.empty() && nRelayedTransactions < broadcast_max) {
