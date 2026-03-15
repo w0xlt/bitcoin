@@ -8,6 +8,7 @@
 #include <common/bloom.h>
 #include <consensus/amount.h>
 #include <merkleblock.h>
+#include <primitives/transaction.h>
 #include <primitives/transaction_identifier.h>
 #include <sync.h>
 
@@ -18,6 +19,7 @@
 #include <optional>
 #include <set>
 #include <span>
+#include <vector>
 
 namespace node {
 using namespace std::chrono_literals;
@@ -25,13 +27,19 @@ using namespace std::chrono_literals;
 /**
  * Per-peer state for transaction relay. Manages bloom filter and
  * transaction inventory data, each protected by its own mutex.
+ *
+ * Methods are grouped by locking convention: self-locking methods take the
+ * relevant mutex themselves and require callers NOT to hold it
+ * (EXCLUSIVE_LOCKS_REQUIRED(!mutex)), while caller-locked methods require it
+ * to be held (EXCLUSIVE_LOCKS_REQUIRED(mutex)) and exist for the
+ * SendMessages() sections that hold a lock across batched work.
  */
-struct TxRelay {
+class TxRelay
+{
 private:
     mutable Mutex m_bloom_filter_mutex ACQUIRED_AFTER(m_tx_inventory_mutex);
     mutable Mutex m_tx_inventory_mutex ACQUIRED_BEFORE(m_bloom_filter_mutex);
 
-public:
     /** Whether we relay transactions to this peer. */
     bool m_relay_txs GUARDED_BY(m_bloom_filter_mutex){false};
     /** A bloom filter for which transactions to announce to the peer. See BIP37. */
@@ -59,6 +67,18 @@ public:
     /** Minimum fee rate with which to filter transaction announcements to this node. See BIP133. */
     std::atomic<CAmount> m_fee_filter_received{0};
 
+public:
+    // Mutex accessors, exposing the mutexes for thread-safety annotations at
+    // call sites and for the SendMessages() sections that hold a lock across
+    // batched work.
+
+    Mutex& GetBloomFilterMutex() const LOCK_RETURNED(m_bloom_filter_mutex) { return m_bloom_filter_mutex; }
+
+    Mutex& GetTxInventoryMutex() const LOCK_RETURNED(m_tx_inventory_mutex) { return m_tx_inventory_mutex; }
+
+    // Self-locking methods: the method takes the relevant mutex itself, so
+    // callers must not hold it.
+
     bool GetRelayTxs() const EXCLUSIVE_LOCKS_REQUIRED(!m_bloom_filter_mutex)
     {
         return WITH_LOCK(m_bloom_filter_mutex, return m_relay_txs);
@@ -68,37 +88,6 @@ public:
     {
         LOCK(m_bloom_filter_mutex);
         m_relay_txs = relay_txs;
-    }
-
-    Mutex& GetBloomFilterMutex() const LOCK_RETURNED(m_bloom_filter_mutex) { return m_bloom_filter_mutex; }
-
-    /** Compute a BIP37 merkle block from `block`, filtered through this
-     *  peer's bloom filter, or std::nullopt if no filter is set. Matched
-     *  transactions are added to the filter (see CMerkleBlock). */
-    std::optional<CMerkleBlock> MakeMerkleBlock(const CBlock& block) EXCLUSIVE_LOCKS_REQUIRED(!m_bloom_filter_mutex)
-    {
-        LOCK(m_bloom_filter_mutex);
-        if (!m_bloom_filter) return std::nullopt;
-        return CMerkleBlock{block, *m_bloom_filter};
-    }
-
-    void AddKnownTx(const uint256& hash) EXCLUSIVE_LOCKS_REQUIRED(!m_tx_inventory_mutex)
-    {
-        LOCK(m_tx_inventory_mutex);
-        m_tx_inventory_known_filter.insert(hash);
-    }
-
-    Mutex& GetTxInventoryMutex() const LOCK_RETURNED(m_tx_inventory_mutex) { return m_tx_inventory_mutex; }
-
-    uint64_t GetLastInvSequence() const EXCLUSIVE_LOCKS_REQUIRED(!m_tx_inventory_mutex)
-    {
-        return WITH_LOCK(m_tx_inventory_mutex, return m_last_inv_sequence);
-    }
-
-    void SetSendMempool() EXCLUSIVE_LOCKS_REQUIRED(!m_tx_inventory_mutex)
-    {
-        LOCK(m_tx_inventory_mutex);
-        m_send_mempool = true;
     }
 
     void SetBloomFilter(CBloomFilter filter) EXCLUSIVE_LOCKS_REQUIRED(!m_bloom_filter_mutex)
@@ -122,6 +111,33 @@ public:
         LOCK(m_bloom_filter_mutex);
         m_bloom_filter = nullptr;
         m_relay_txs = true;
+    }
+
+    /** Compute a BIP37 merkle block from `block`, filtered through this
+     *  peer's bloom filter, or std::nullopt if no filter is set. Matched
+     *  transactions are added to the filter (see CMerkleBlock). */
+    std::optional<CMerkleBlock> MakeMerkleBlock(const CBlock& block) EXCLUSIVE_LOCKS_REQUIRED(!m_bloom_filter_mutex)
+    {
+        LOCK(m_bloom_filter_mutex);
+        if (!m_bloom_filter) return std::nullopt;
+        return CMerkleBlock{block, *m_bloom_filter};
+    }
+
+    void AddKnownTx(const uint256& hash) EXCLUSIVE_LOCKS_REQUIRED(!m_tx_inventory_mutex)
+    {
+        LOCK(m_tx_inventory_mutex);
+        TxInventoryKnownInsert(hash);
+    }
+
+    uint64_t GetLastInvSequence() const EXCLUSIVE_LOCKS_REQUIRED(!m_tx_inventory_mutex)
+    {
+        return WITH_LOCK(m_tx_inventory_mutex, return m_last_inv_sequence);
+    }
+
+    void SetSendMempool() EXCLUSIVE_LOCKS_REQUIRED(!m_tx_inventory_mutex)
+    {
+        LOCK(m_tx_inventory_mutex);
+        m_send_mempool = true;
     }
 
     struct InventoryStats {
@@ -155,6 +171,93 @@ public:
     {
         LOCK(m_tx_inventory_mutex);
         return m_tx_inventory_to_send.empty() && m_next_inv_send_time == 0s;
+    }
+
+    // Lock-free methods.
+
+    CAmount GetFeeFilterReceived() const
+    {
+        return m_fee_filter_received.load();
+    }
+
+    void SetFeeFilterReceived(CAmount fee_filter_received)
+    {
+        m_fee_filter_received = fee_filter_received;
+    }
+
+    // Caller-locked methods: callers must hold the relevant mutex.
+
+    bool IsTxRelevantAndUpdate(const CTransaction& tx) EXCLUSIVE_LOCKS_REQUIRED(m_bloom_filter_mutex)
+    {
+        return !m_bloom_filter || m_bloom_filter->IsRelevantAndUpdate(tx);
+    }
+
+    void SetLastInvSequence(uint64_t sequence) EXCLUSIVE_LOCKS_REQUIRED(m_tx_inventory_mutex)
+    {
+        m_last_inv_sequence = sequence;
+    }
+
+    bool IsInvSendTimeReached(std::chrono::microseconds current_time) const EXCLUSIVE_LOCKS_REQUIRED(m_tx_inventory_mutex)
+    {
+        return m_next_inv_send_time < current_time;
+    }
+
+    void SetNextInvSendTime(std::chrono::microseconds next_time) EXCLUSIVE_LOCKS_REQUIRED(m_tx_inventory_mutex)
+    {
+        m_next_inv_send_time = next_time;
+    }
+
+    bool ConsumeSendMempool() EXCLUSIVE_LOCKS_REQUIRED(m_tx_inventory_mutex)
+    {
+        if (!m_send_mempool) return false;
+        m_send_mempool = false;
+        return true;
+    }
+
+    /** Clears the announcement queue if the peer has requested we not relay
+     *  transactions. Takes the bloom filter mutex itself, in the documented
+     *  m_tx_inventory_mutex -> m_bloom_filter_mutex order. */
+    void ClearTxInventoryToSendIfNoRelayTxs() EXCLUSIVE_LOCKS_REQUIRED(m_tx_inventory_mutex, !m_bloom_filter_mutex)
+    {
+        LOCK(m_bloom_filter_mutex);
+        if (!m_relay_txs) m_tx_inventory_to_send.clear();
+    }
+
+    using TxInventoryIterator = std::set<Wtxid>::iterator;
+
+    std::vector<TxInventoryIterator> GetTxInventoryToSendIterators() EXCLUSIVE_LOCKS_REQUIRED(m_tx_inventory_mutex)
+    {
+        std::vector<TxInventoryIterator> iters;
+        iters.reserve(m_tx_inventory_to_send.size());
+        for (TxInventoryIterator it = m_tx_inventory_to_send.begin(); it != m_tx_inventory_to_send.end(); ++it) {
+            iters.push_back(it);
+        }
+        return iters;
+    }
+
+    size_t TxInventoryToSendSize() const EXCLUSIVE_LOCKS_REQUIRED(m_tx_inventory_mutex)
+    {
+        return m_tx_inventory_to_send.size();
+    }
+
+    void TxInventoryToSendErase(const Wtxid& wtxid) EXCLUSIVE_LOCKS_REQUIRED(m_tx_inventory_mutex)
+    {
+        m_tx_inventory_to_send.erase(wtxid);
+    }
+
+    void TxInventoryToSendErase(TxInventoryIterator it) EXCLUSIVE_LOCKS_REQUIRED(m_tx_inventory_mutex)
+    {
+        m_tx_inventory_to_send.erase(it);
+    }
+
+    bool TxInventoryKnownContains(const uint256& hash) const EXCLUSIVE_LOCKS_REQUIRED(m_tx_inventory_mutex)
+    {
+        return m_tx_inventory_known_filter.contains(hash);
+    }
+
+    void TxInventoryKnownInsert(const uint256& hash) EXCLUSIVE_LOCKS_REQUIRED(m_tx_inventory_mutex)
+    {
+        m_tx_inventory_known_filter.insert(hash);
     }
 };
 } // namespace node
