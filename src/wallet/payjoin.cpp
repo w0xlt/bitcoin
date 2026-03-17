@@ -22,6 +22,11 @@ namespace wallet {
 /** Minimum seconds between background polls of the same session. */
 static constexpr int64_t POLL_INTERVAL_SECS = 15;
 
+/** Maximum sessions to advance per scheduler tick.
+ *  Each session requires a Tor round-trip (~3-5s), so this caps the
+ *  scheduler callback duration at roughly MAX_SESSIONS_PER_TICK * 5s. */
+static constexpr int MAX_SESSIONS_PER_TICK = 4;
+
 /** Mark session as failed after this many consecutive advance errors. */
 static constexpr int MAX_CONSECUTIVE_ERRORS = 5;
 
@@ -136,6 +141,7 @@ void MaybeAdvancePayjoinSessions(WalletContext& context)
             batch.ListPayjoinSessions(sessions);
         }
 
+        int advanced_count = 0;
         for (auto& [session_id, session] : sessions) {
             if (session.IsTerminal()) continue;
 
@@ -145,6 +151,11 @@ void MaybeAdvancePayjoinSessions(WalletContext& context)
             // Throttle: skip if polled too recently
             int64_t now = TicksSinceEpoch<std::chrono::seconds>(NodeClock::now());
             if (now - session.last_poll_time < POLL_INTERVAL_SECS) continue;
+
+            // Cap sessions per tick to bound scheduler callback duration
+            if (advanced_count >= MAX_SESSIONS_PER_TICK) break;
+            ++advanced_count;
+
             session.last_poll_time = now;
 
             auto session_ptr = std::make_shared<payjoin::PayjoinSession>(std::move(session));

@@ -107,6 +107,15 @@ class PayjoinTest(BitcoinTestFramework):
         self.test_session_lifecycle()
         self.test_background_polling()
 
+        # Fund receiver with extra UTXOs for per-tick cap tests (need 10)
+        for _ in range(10):
+            self.nodes[0].sendtoaddress(self.nodes[1].getnewaddress(), 0.2)
+        self.generate(self.nodes[0], 1)
+        self.sync_all()
+
+        self.test_per_tick_cap_limits_advancement()
+        self.test_per_tick_cap_all_eventually_complete()
+
     # ------------------------------------------------------------------
     # Error case tests
     # ------------------------------------------------------------------
@@ -391,6 +400,132 @@ class PayjoinTest(BitcoinTestFramework):
         assert len(decoded["vin"]) >= 2, "Payjoin tx should have inputs from both wallets"
 
         self.log.info("Background polling test PASSED!")
+
+    # ------------------------------------------------------------------
+    # Per-tick cap: only MAX_SESSIONS_PER_TICK (4) sessions advance per tick
+    # ------------------------------------------------------------------
+
+    def test_per_tick_cap_limits_advancement(self):
+        self.log.info("Testing per-tick cap limits advancement...")
+
+        sender_node = self.nodes[0]
+        receiver_node = self.nodes[1]
+
+        # Create 10 receiver+sender session pairs.
+        # MAX_SESSIONS_PER_TICK is 4. mockscheduler(31) triggers two
+        # MockForward calls on the same scheduler (node + wallet chain
+        # client), so the callback fires twice per mockscheduler call,
+        # advancing at most 2*4 = 8 sessions. With 10 pairs, at least
+        # 2 must remain un-advanced.
+        num_pairs = 10
+        self.cap_recv_ids = []
+        self.cap_send_ids = []
+        for i in range(num_pairs):
+            recv = receiver_node.receivepayjoin(0.001)
+            self.cap_recv_ids.append(recv["session_id"])
+            send = sender_node.sendpayjoin(recv["payjoin_uri"])
+            self.cap_send_ids.append(send["session_id"])
+            self.log.info(f"  Pair {i}: recv={recv['session_id'][:8]}... send={send['session_id'][:8]}...")
+
+        # Verify all receivers start as initialized
+        for rid in self.cap_recv_ids:
+            assert_equal(receiver_node.payjoininfo(rid)["state"], "initialized")
+
+        # Fire ONE scheduler tick on the receiver node only.
+        # Advance mock time so the poll throttle is satisfied for all sessions.
+        mock_time = int(time.time()) + 60
+        receiver_node.setmocktime(mock_time)
+        receiver_node.mockscheduler(31)
+        time.sleep(2)  # Allow scheduler thread to process
+
+        # Count how many receiver sessions advanced past initialized
+        advanced_count = 0
+        for rid in self.cap_recv_ids:
+            info = receiver_node.payjoininfo(rid)
+            if info["state"] != "initialized":
+                advanced_count += 1
+                self.log.info(f"  Session {rid[:8]}... advanced to {info['state']}")
+
+        self.log.info(f"  Advanced {advanced_count} of {num_pairs} sessions in one tick")
+
+        # The cap is 4 per callback invocation. mockscheduler causes 2
+        # invocations, so at most 8 can advance. With 10 sessions, at
+        # least 2 must remain.
+        max_per_tick = 8  # 2 invocations * MAX_SESSIONS_PER_TICK(4)
+        assert advanced_count <= max_per_tick, \
+            f"Expected at most {max_per_tick} sessions advanced, got {advanced_count}"
+        assert advanced_count > 0, "Expected at least some sessions to advance"
+        assert advanced_count < num_pairs, \
+            f"Cap should prevent all {num_pairs} from advancing in one tick"
+
+        # Reset mock time
+        receiver_node.setmocktime(0)
+        self.log.info("Per-tick cap negative test PASSED!")
+
+    def test_per_tick_cap_all_eventually_complete(self):
+        self.log.info("Testing capped sessions eventually advance in later ticks...")
+
+        receiver_node = self.nodes[1]
+
+        # After the negative test, some receivers are still initialized
+        # (they were capped). The scheduler iterates sessions in sorted
+        # key order, so the same sessions get processed every tick. To
+        # unblock the capped sessions, cancel enough already-advanced
+        # sessions so the capped ones fall within the per-tick budget.
+        still_initialized = [
+            rid for rid in self.cap_recv_ids
+            if receiver_node.payjoininfo(rid)["state"] == "initialized"
+        ]
+        already_advanced = [
+            rid for rid in self.cap_recv_ids
+            if receiver_node.payjoininfo(rid)["state"] != "initialized"
+        ]
+        assert len(still_initialized) > 0, \
+            "Expected some sessions still initialized after cap test"
+        self.log.info(f"  {len(still_initialized)} sessions still initialized")
+
+        # Cancel enough advanced sessions to make room
+        cancel_count = min(len(already_advanced), 6)
+        for rid in already_advanced[:cancel_count]:
+            receiver_node.cancelpayjoin(rid)
+            self.log.info(f"  Cancelled {rid[:8]}... to make room")
+
+        # Fire more ticks — the capped sessions should now advance
+        mock_time = int(time.time()) + 200
+        for attempt in range(10):
+            mock_time += 31
+            receiver_node.setmocktime(mock_time)
+            receiver_node.mockscheduler(31)
+            time.sleep(0.5)
+
+            remaining = sum(
+                1 for rid in still_initialized
+                if receiver_node.payjoininfo(rid)["state"] == "initialized"
+            )
+            if remaining == 0:
+                self.log.info(
+                    f"  All previously-capped sessions advanced after "
+                    f"{attempt + 1} additional ticks"
+                )
+                break
+        else:
+            receiver_node.setmocktime(0)
+            for rid in still_initialized:
+                info = receiver_node.payjoininfo(rid)
+                self.log.info(f"  Still initialized: {rid[:8]}... state={info['state']}")
+            raise AssertionError(
+                "Capped sessions did not advance after additional ticks"
+            )
+
+        receiver_node.setmocktime(0)
+
+        # Verify the previously-capped sessions moved past initialized
+        for rid in still_initialized:
+            info = receiver_node.payjoininfo(rid)
+            assert info["state"] != "initialized", \
+                f"Session {rid[:8]}... should have advanced past initialized"
+
+        self.log.info("Per-tick cap positive test PASSED!")
 
 
 if __name__ == "__main__":
