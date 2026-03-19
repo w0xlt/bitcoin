@@ -23,6 +23,7 @@ bool InputIsMine(const CWallet& wallet, const CTxIn& txin)
 bool AllInputsMine(const CWallet& wallet, const CTransaction& tx)
 {
     LOCK(wallet.cs_wallet);
+    if (tx.vin.empty()) return false;
     for (const CTxIn& txin : tx.vin) {
         if (!InputIsMine(wallet, txin)) return false;
     }
@@ -144,10 +145,11 @@ void CachedTxGetAmounts(const CWallet& wallet, const CWalletTx& wtx,
     nFee = 0;
     listReceived.clear();
     listSent.clear();
+    const bool from_me = CachedTxIsFromMe(wallet, wtx);
 
     // Compute fee:
     CAmount nDebit = CachedTxGetDebit(wallet, wtx, /*avoid_reuse=*/false);
-    if (nDebit > 0) // debit>0 means we signed/sent this transaction
+    if (from_me)
     {
         CAmount nValueOut = wtx.tx->GetValueOut();
         nFee = nDebit - nValueOut;
@@ -159,10 +161,10 @@ void CachedTxGetAmounts(const CWallet& wallet, const CWalletTx& wtx,
     {
         const CTxOut& txout = wtx.tx->vout[i];
         bool ismine = wallet.IsMine(txout);
-        // Only need to handle txouts if AT LEAST one of these is true:
-        //   1) they debit from us (sent)
-        //   2) the output is to us (received)
-        if (nDebit > 0)
+        // Only need to handle txouts if either:
+        //   1) we funded every input, so the transaction is a wallet send
+        //   2) the output is to us, so it is wallet receive data
+        if (from_me)
         {
             if (!include_change && OutputIsChange(wallet, txout))
                 continue;
@@ -182,8 +184,8 @@ void CachedTxGetAmounts(const CWallet& wallet, const CWalletTx& wtx,
 
         COutputEntry output = {address, txout.nValue, (int)i};
 
-        // If we are debited by the transaction, add the output as a "sent" entry
-        if (nDebit > 0)
+        // Only transactions fully funded by the wallet have send entries and fees.
+        if (from_me)
             listSent.push_back(output);
 
         // If we are receiving the output, add it as a "received" entry
@@ -196,7 +198,7 @@ void CachedTxGetAmounts(const CWallet& wallet, const CWalletTx& wtx,
 bool CachedTxIsFromMe(const CWallet& wallet, const CWalletTx& wtx)
 {
     if (!wtx.m_cached_from_me.has_value()) {
-        wtx.m_cached_from_me = wallet.IsFromMe(*wtx.tx);
+        wtx.m_cached_from_me = AllInputsMine(wallet, *wtx.tx);
     }
     return wtx.m_cached_from_me.value();
 }
