@@ -25,8 +25,10 @@
 #include <util/time.h>
 #include <wallet/coincontrol.h>
 #include <wallet/coinselection.h>
+#include <wallet/payjoin.h>
 #include <wallet/spend.h>
 #include <wallet/wallet.h>
+#include <wallet/walletdb.h>
 
 #include <algorithm>
 #include <cstring>
@@ -138,8 +140,8 @@ std::optional<Receiver> Receiver::Create(wallet::CWallet& wallet, HttpClient& ht
     uri.amount = amount;
     uri.output_substitution = true;
 
-    uri.pj.directory_url = directory_url;
     uri.pj.receiver_key = session->receiver_key.GetPubKey();
+    uri.pj.mailbox_url = MailboxUrl(directory_url, uri.pj.receiver_key);
     uri.pj.ohttp_keys = ohttp_keys;
     uri.pj.expiration = session->expires_at;
 
@@ -192,7 +194,7 @@ std::optional<bool> Receiver::PollForOriginal()
     if (!ohttp_req) return std::nullopt;
 
     // 3. POST to directory gateway
-    auto resp = m_http.Post(m_session->directory_url, *ohttp_req, "message/ohttp-req");
+    auto resp = m_http.Post(OhttpGatewayUrl(m_session->directory_url), *ohttp_req, "message/ohttp-req");
     if (!resp) return std::nullopt;
 
     // 4. OHTTP decapsulate
@@ -477,10 +479,14 @@ bool Receiver::ProcessAndRespond()
     }
 
     // 14. POST to directory gateway
-    auto resp = m_http.Post(m_session->directory_url, *ohttp_req, "message/ohttp-req");
+    auto resp = m_http.Post(OhttpGatewayUrl(m_session->directory_url), *ohttp_req, "message/ohttp-req");
     if (!resp || resp->status_code != 200) {
         m_session->receiver_state = ReceiverState::Failed;
-        m_session->error_message = "Directory POST failed for proposal";
+        if (!resp) {
+            m_session->error_message = "Directory POST failed for proposal: no HTTP response";
+        } else {
+            m_session->error_message = "Directory POST failed for proposal: HTTP " + std::to_string(resp->status_code);
+        }
         return false;
     }
 
@@ -515,6 +521,23 @@ std::optional<bool> Receiver::CheckPayment()
     // Instead, search wallet transactions for one that spends the same inputs.
     LOCK(m_wallet.cs_wallet);
 
+    const auto parsed_uri = ParsePayjoinUri(m_session->payjoin_uri);
+    const std::optional<CAmount> payjoin_amount =
+        (parsed_uri && parsed_uri->amount) ? std::optional<CAmount>{*parsed_uri->amount} : std::nullopt;
+
+    auto annotate_final_tx = [&](const CTransaction& final_tx) {
+        if (!payjoin_amount) return;
+        auto it = m_wallet.mapWallet.find(final_tx.GetHash());
+        if (it == m_wallet.mapWallet.end()) return;
+
+        wallet::SetPayjoinTxMetadata(it->second.mapValue, wallet::PayjoinTxRole::Receiver, *payjoin_amount);
+        wallet::WalletBatch batch(m_wallet.GetDatabase());
+        if (!batch.WriteTx(it->second)) {
+            LogPrintf("payjoin receiver: Failed to persist payjoin tx metadata for %s\n",
+                      final_tx.GetHash().ToString());
+        }
+    };
+
     // Collect proposal input outpoints for matching
     std::set<COutPoint> proposal_outpoints;
     if (m_session->proposal_psbt && m_session->proposal_psbt->tx) {
@@ -546,6 +569,7 @@ std::optional<bool> Receiver::CheckPayment()
                 if (!found) { all_found = false; break; }
             }
             if (all_found) {
+                annotate_final_tx(tx);
                 m_session->final_txid = tx.GetHash().ToUint256();
                 m_session->receiver_state = ReceiverState::Completed;
                 LogPrintf("payjoin receiver: Payjoin transaction confirmed: %s\n",
@@ -565,6 +589,7 @@ std::optional<bool> Receiver::CheckPayment()
                 if (!found) { all_found = false; break; }
             }
             if (all_found) {
+                annotate_final_tx(tx);
                 m_session->final_txid = tx.GetHash().ToUint256();
                 m_session->receiver_state = ReceiverState::Completed;
                 LogPrintf("payjoin receiver: Fallback transaction seen: %s\n",

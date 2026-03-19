@@ -135,6 +135,27 @@ static std::map<std::string, std::string> ParseQueryString(const std::string& qu
     return params;
 }
 
+/** Extract scheme + authority from a mailbox endpoint URL with exactly one path segment. */
+std::optional<std::string> DirectoryUrlFromMailboxUrl(const std::string& mailbox_url)
+{
+    size_t scheme_end = mailbox_url.find("://");
+    if (scheme_end == std::string::npos || scheme_end == 0) return std::nullopt;
+
+    size_t authority_start = scheme_end + 3;
+    size_t path_start = mailbox_url.find('/', authority_start);
+    if (path_start == std::string::npos || path_start == authority_start) return std::nullopt;
+
+    size_t query_pos = mailbox_url.find('?', path_start);
+    if (query_pos != std::string::npos) return std::nullopt;
+
+    std::string path = mailbox_url.substr(path_start);
+    if (path.size() <= 1) return std::nullopt;
+    if (path.back() == '/') return std::nullopt;
+    if (path.find('/', 1) != std::string::npos) return std::nullopt;
+
+    return mailbox_url.substr(0, path_start);
+}
+
 // ---------------------------------------------------------------------------
 // BIP 77 fragment parsing
 // ---------------------------------------------------------------------------
@@ -278,10 +299,11 @@ std::optional<PayjoinUri> ParsePayjoinUri(const std::string& uri_str)
     size_t hash_pos = pj_value.find('#');
     if (hash_pos == std::string::npos) return std::nullopt;
 
-    std::string directory_url = pj_value.substr(0, hash_pos);
+    std::string mailbox_url = pj_value.substr(0, hash_pos);
     std::string fragment = pj_value.substr(hash_pos + 1);
 
-    result.pj.directory_url = directory_url;
+    if (!DirectoryUrlFromMailboxUrl(mailbox_url)) return std::nullopt;
+    result.pj.mailbox_url = mailbox_url;
 
     // 7. Parse fragment parameters
     auto frag_params = ParseFragment(fragment);
@@ -393,7 +415,7 @@ std::string BuildPayjoinUri(const PayjoinUri& uri)
     fragment += "RK1" + EncodeReceiverKey(uri.pj.receiver_key);
 
     result += "pj=";
-    result += PercentEncodeFragment(uri.pj.directory_url + "#" + fragment);
+    result += PercentEncodeFragment(uri.pj.mailbox_url + "#" + fragment);
 
     return result;
 }

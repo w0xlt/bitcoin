@@ -18,7 +18,7 @@ namespace payjoin {
 
 /** Parameters extracted from the pj URI fragment (EX, OH, RK). */
 struct PjParam {
-    std::string directory_url;      //!< Full directory URL (scheme + authority + path)
+    std::string mailbox_url;       //!< Full mailbox endpoint URL from the pj parameter
     CPubKey receiver_key;           //!< RK: receiver's ephemeral public key (compressed)
     ohttp::KeyConfig ohttp_keys;   //!< OH: directory OHTTP key config
     int64_t expiration{0};          //!< EX: unix timestamp
@@ -36,15 +36,23 @@ struct PayjoinUri {
  * Parse a BIP 21 URI containing a BIP 77 payjoin `pj` parameter.
  *
  * Expected format:
- *   bitcoin:<address>?amount=<btc>&pjos=<0|1>&pj=HTTPS://PAYJO.IN/<path>%23EX1<data>-OH1<data>-RK1<data>
+ *   bitcoin:<address>?amount=<btc>&pjos=<0|1>&pj=HTTPS://PAYJO.IN/<shortid>%23EX1<data>-OH1<data>-RK1<data>
  *
- * The fragment (after %23) contains EX, OH, RK params separated by '-',
- * each encoded as HRP + '1' + bech32-charset data (no checksum).
+ * The `pj` value is the mailbox endpoint URL itself. The fragment (after %23)
+ * contains EX, OH, RK params separated by '-', each encoded as HRP + '1' +
+ * bech32-charset data (no checksum).
  *
  * @param[in] uri_str The full BIP 21 URI string
  * @return Parsed PayjoinUri or nullopt on failure
  */
 std::optional<PayjoinUri> ParsePayjoinUri(const std::string& uri_str);
+
+/**
+ * Extract the directory base URL (scheme + authority) from a BIP 77 mailbox
+ * endpoint URL. Returns nullopt if the URL does not contain exactly one path
+ * segment for the mailbox Short ID.
+ */
+std::optional<std::string> DirectoryUrlFromMailboxUrl(const std::string& mailbox_url);
 
 /**
  * Build a BIP 21 + BIP 77 payjoin URI string.

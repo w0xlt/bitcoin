@@ -22,6 +22,7 @@
 #include <uint256.h>
 #include <util/time.h>
 #include <wallet/coincontrol.h>
+#include <wallet/payjoin.h>
 #include <wallet/spend.h>
 #include <wallet/wallet.h>
 
@@ -57,6 +58,20 @@ static std::optional<PartiallySignedTransaction> DeserializePSBT(std::span<const
     }
 }
 
+static std::optional<CAmount> GetRequestedPayjoinAmount(wallet::CWallet& wallet,
+                                                        const PartiallySignedTransaction& psbt)
+{
+    if (!psbt.tx) return std::nullopt;
+
+    LOCK(wallet.cs_wallet);
+    for (const auto& txout : psbt.tx->vout) {
+        if (!wallet.IsMine(txout.scriptPubKey)) {
+            return txout.nValue;
+        }
+    }
+    return std::nullopt;
+}
+
 // ---------------------------------------------------------------------------
 // Sender::Create
 // ---------------------------------------------------------------------------
@@ -85,7 +100,12 @@ std::optional<Sender> Sender::Create(wallet::CWallet& wallet, HttpClient& http,
     session->created_at = GetTime();
     session->expires_at = uri->pj.expiration;
     session->receiver_pubkey = uri->pj.receiver_key;
-    session->directory_url = uri->pj.directory_url;
+    auto directory_url = DirectoryUrlFromMailboxUrl(uri->pj.mailbox_url);
+    if (!directory_url) {
+        LogPrintf("payjoin sender: URI mailbox endpoint missing valid short-id path\n");
+        return std::nullopt;
+    }
+    session->directory_url = *directory_url;
     session->ohttp_keys = uri->pj.ohttp_keys;
 
     // 3. Generate ephemeral reply keypair
@@ -185,11 +205,15 @@ bool Sender::PostOriginal()
     }
 
     // 6. POST to directory gateway
-    std::string gateway_url = m_session->directory_url;
+    std::string gateway_url = OhttpGatewayUrl(m_session->directory_url);
     auto resp = m_http.Post(gateway_url, *ohttp_req, "message/ohttp-req");
     if (!resp || resp->status_code != 200) {
         m_session->sender_state = SenderState::Failed;
-        m_session->error_message = "Directory POST failed";
+        if (!resp) {
+            m_session->error_message = "Directory POST failed: no HTTP response";
+        } else {
+            m_session->error_message = "Directory POST failed: HTTP " + std::to_string(resp->status_code);
+        }
         return false;
     }
 
@@ -247,7 +271,7 @@ std::optional<bool> Sender::PollForProposal()
     if (!ohttp_req) return std::nullopt;
 
     // 3. POST to directory gateway
-    auto resp = m_http.Post(m_session->directory_url, *ohttp_req, "message/ohttp-req");
+    auto resp = m_http.Post(OhttpGatewayUrl(m_session->directory_url), *ohttp_req, "message/ohttp-req");
     if (!resp) return std::nullopt;
 
     // 4. OHTTP decapsulate
@@ -361,8 +385,11 @@ std::optional<uint256> Sender::FinalizeAndBroadcast()
     CTransactionRef tx = MakeTransactionRef(std::move(mtx));
 
     // 3. Broadcast
-    std::string err_string;
-    m_wallet.CommitTransaction(tx, /*mapValue=*/{}, /*orderForm=*/{});
+    wallet::mapValue_t map_value;
+    if (auto amount = GetRequestedPayjoinAmount(m_wallet, m_session->original_psbt)) {
+        wallet::SetPayjoinTxMetadata(map_value, wallet::PayjoinTxRole::Sender, *amount);
+    }
+    m_wallet.CommitTransaction(tx, std::move(map_value), /*orderForm=*/{});
 
     m_session->final_txid = tx->GetHash().ToUint256();
     m_session->sender_state = SenderState::Completed;

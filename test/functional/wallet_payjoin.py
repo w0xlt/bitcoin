@@ -17,6 +17,7 @@ Tests the payjoin RPC interface with a C++ OHTTP-aware mock directory:
 import os
 import subprocess
 import time
+from decimal import Decimal
 
 from test_framework.blocktools import COINBASE_MATURITY
 from test_framework.test_framework import BitcoinTestFramework
@@ -278,6 +279,21 @@ class PayjoinTest(BitcoinTestFramework):
         self.log.info(f"Receiver state after check: {info['state']}")
         assert_equal(info["state"], "completed")
         assert "txid" in info
+
+        sender_view = sender_node.gettransaction(txid)
+        assert_equal(sender_view["amount"], Decimal("-0.00100000"))
+        assert sender_view["fee"] < 0
+        assert_equal(len(sender_view["details"]), 1)
+        assert_equal(sender_view["details"][0]["category"], "send")
+        assert_equal(sender_view["details"][0]["amount"], Decimal("-0.00100000"))
+        assert sender_view["details"][0]["fee"] < 0
+
+        receiver_view = receiver_node.gettransaction(txid)
+        assert_equal(receiver_view["amount"], Decimal("0.00100000"))
+        assert "fee" not in receiver_view
+        assert_equal(len(receiver_view["details"]), 1)
+        assert_equal(receiver_view["details"][0]["category"], "receive")
+        assert_equal(receiver_view["details"][0]["amount"], Decimal("0.00100000"))
 
         self.log.info("End-to-end payjoin test PASSED!")
 

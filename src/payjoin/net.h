@@ -60,6 +60,12 @@ public:
 };
 
 /**
+ * Return the RFC 9540 OHTTP gateway URL for a directory origin.
+ * Appends `/.well-known/ohttp-gateway` after trimming any trailing slash.
+ */
+std::string OhttpGatewayUrl(const std::string& directory_url);
+
+/**
  * Fetch OHTTP KeyConfig from a directory's well-known endpoint.
  * GETs {directory_url}/.well-known/ohttp-gateway and parses the
  * application/ohttp-keys response.

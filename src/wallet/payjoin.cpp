@@ -12,12 +12,52 @@
 #include <payjoin/session.h>
 #include <sync.h>
 #include <util/time.h>
+#include <util/strencodings.h>
 #include <wallet/wallet.h>
 #include <wallet/walletdb.h>
 
 #include <map>
 
 namespace wallet {
+
+namespace {
+constexpr std::string_view PAYJOIN_ROLE_KEY{"payjoin_role"};
+constexpr std::string_view PAYJOIN_AMOUNT_KEY{"payjoin_amount_sats"};
+} // namespace
+
+std::optional<PayjoinTxMetadata> GetPayjoinTxMetadata(const mapValue_t& map_value)
+{
+    auto role_it = map_value.find(std::string{PAYJOIN_ROLE_KEY});
+    auto amount_it = map_value.find(std::string{PAYJOIN_AMOUNT_KEY});
+    if (role_it == map_value.end() || amount_it == map_value.end()) return std::nullopt;
+
+    std::optional<PayjoinTxRole> role;
+    if (role_it->second == "sender") {
+        role = PayjoinTxRole::Sender;
+    } else if (role_it->second == "receiver") {
+        role = PayjoinTxRole::Receiver;
+    } else {
+        return std::nullopt;
+    }
+
+    return PayjoinTxMetadata{*role, LocaleIndependentAtoi<CAmount>(amount_it->second)};
+}
+
+std::optional<PayjoinTxMetadata> GetPayjoinTxMetadata(const CWalletTx& wtx)
+{
+    return GetPayjoinTxMetadata(wtx.mapValue);
+}
+
+void SetPayjoinTxMetadata(mapValue_t& map_value, PayjoinTxRole role, CAmount amount)
+{
+    map_value[std::string{PAYJOIN_ROLE_KEY}] = role == PayjoinTxRole::Sender ? "sender" : "receiver";
+    map_value[std::string{PAYJOIN_AMOUNT_KEY}] = std::to_string(amount);
+}
+
+bool IsPayjoinTxMetadataKey(std::string_view key)
+{
+    return key == PAYJOIN_ROLE_KEY || key == PAYJOIN_AMOUNT_KEY;
+}
 
 /** Minimum seconds between background polls of the same session. */
 static constexpr int64_t POLL_INTERVAL_SECS = 15;

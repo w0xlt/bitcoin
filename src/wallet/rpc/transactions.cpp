@@ -9,6 +9,7 @@
 #include <rpc/util.h>
 #include <rpc/blockchain.h>
 #include <util/vector.h>
+#include <wallet/payjoin.h>
 #include <wallet/receive.h>
 #include <wallet/rpc/util.h>
 #include <wallet/wallet.h>
@@ -16,6 +17,8 @@
 using interfaces::FoundBlock;
 
 namespace wallet {
+static void MaybePushAddress(UniValue& entry, const CTxDestination& dest);
+
 static void WalletTxToJSON(const CWallet& wallet, const CWalletTx& wtx, UniValue& entry)
     EXCLUSIVE_LOCKS_REQUIRED(wallet.cs_wallet)
 {
@@ -59,8 +62,88 @@ static void WalletTxToJSON(const CWallet& wallet, const CWalletTx& wtx, UniValue
     }
     entry.pushKV("bip125-replaceable", rbfStatus);
 
-    for (const std::pair<const std::string, std::string>& item : wtx.mapValue)
+    for (const std::pair<const std::string, std::string>& item : wtx.mapValue) {
+        if (IsPayjoinTxMetadataKey(item.first)) continue;
         entry.pushKV(item.first, item.second);
+    }
+}
+
+static std::optional<COutputEntry> GetPayjoinDisplayOutput(const CWallet& wallet,
+                                                           const CWalletTx& wtx,
+                                                           PayjoinTxRole role)
+    EXCLUSIVE_LOCKS_REQUIRED(wallet.cs_wallet)
+{
+    for (unsigned int i = 0; i < wtx.tx->vout.size(); ++i) {
+        const CTxOut& txout = wtx.tx->vout[i];
+        const bool is_mine = wallet.IsMine(txout);
+        if (role == PayjoinTxRole::Sender) {
+            if (is_mine) continue;
+        } else {
+            if (!is_mine || OutputIsChange(wallet, txout)) continue;
+        }
+
+        CTxDestination address;
+        if (!ExtractDestination(txout.scriptPubKey, address) && !txout.scriptPubKey.IsUnspendable()) {
+            wallet.WalletLogPrintf("Payjoin display output had unknown destination, txid %s\n",
+                                   wtx.GetHash().ToString());
+            address = CNoDestination();
+        }
+        return COutputEntry{address, txout.nValue, static_cast<int>(i)};
+    }
+    return std::nullopt;
+}
+
+template <class Vec>
+static bool ListPayjoinTransaction(const CWallet& wallet, const CWalletTx& wtx, int nMinDepth,
+                                   bool fLong, Vec& ret,
+                                   const std::optional<std::string>& filter_label,
+                                   const PayjoinTxMetadata& payjoin)
+    EXCLUSIVE_LOCKS_REQUIRED(wallet.cs_wallet)
+{
+    const auto output = GetPayjoinDisplayOutput(wallet, wtx, payjoin.role);
+    if (!output) return false;
+
+    if (payjoin.role == PayjoinTxRole::Sender) {
+        if (filter_label.has_value()) return true;
+
+        const CAmount nNet = CachedTxGetCredit(wallet, wtx, /*avoid_reuse=*/false) -
+                             CachedTxGetDebit(wallet, wtx, /*avoid_reuse=*/false);
+        const CAmount nFee = nNet + payjoin.amount;
+
+        UniValue entry(UniValue::VOBJ);
+        MaybePushAddress(entry, output->destination);
+        entry.pushKV("category", "send");
+        entry.pushKV("amount", ValueFromAmount(-payjoin.amount));
+        if (const auto* address_book_entry = wallet.FindAddressBookEntry(output->destination)) {
+            entry.pushKV("label", address_book_entry->GetLabel());
+        }
+        entry.pushKV("vout", output->vout);
+        entry.pushKV("fee", ValueFromAmount(nFee));
+        if (fLong) WalletTxToJSON(wallet, wtx, entry);
+        entry.pushKV("abandoned", wtx.isAbandoned());
+        ret.push_back(std::move(entry));
+        return true;
+    }
+
+    if (wallet.GetTxDepthInMainChain(wtx) < nMinDepth) return true;
+
+    std::string label;
+    if (const auto* address_book_entry = wallet.FindAddressBookEntry(output->destination)) {
+        label = address_book_entry->GetLabel();
+    }
+    if (filter_label.has_value() && label != filter_label.value()) return true;
+
+    UniValue entry(UniValue::VOBJ);
+    MaybePushAddress(entry, output->destination);
+    PushParentDescriptors(wallet, wtx.tx->vout.at(output->vout).scriptPubKey, entry);
+    entry.pushKV("category", "receive");
+    entry.pushKV("amount", ValueFromAmount(payjoin.amount));
+    if (!label.empty()) entry.pushKV("label", label);
+    entry.pushKV("vout", output->vout);
+    entry.pushKV("abandoned", wtx.isAbandoned());
+    if (fLong) WalletTxToJSON(wallet, wtx, entry);
+    ret.push_back(std::move(entry));
+    return true;
 }
 
 struct tallyitem
@@ -307,6 +390,12 @@ static void ListTransactions(const CWallet& wallet, const CWalletTx& wtx, int nM
                              bool include_change = false)
     EXCLUSIVE_LOCKS_REQUIRED(wallet.cs_wallet)
 {
+    if (const auto payjoin = GetPayjoinTxMetadata(wtx)) {
+        if (ListPayjoinTransaction(wallet, wtx, nMinDepth, fLong, ret, filter_label, *payjoin)) {
+            return;
+        }
+    }
+
     CAmount nFee;
     std::list<COutputEntry> listReceived;
     std::list<COutputEntry> listSent;
@@ -736,11 +825,19 @@ RPCHelpMan gettransaction()
     CAmount nCredit = CachedTxGetCredit(*pwallet, wtx, /*avoid_reuse=*/false);
     CAmount nDebit = CachedTxGetDebit(*pwallet, wtx, /*avoid_reuse=*/false);
     CAmount nNet = nCredit - nDebit;
-    CAmount nFee = (CachedTxIsFromMe(*pwallet, wtx) ? wtx.tx->GetValueOut() - nDebit : 0);
-
-    entry.pushKV("amount", ValueFromAmount(nNet - nFee));
-    if (CachedTxIsFromMe(*pwallet, wtx))
-        entry.pushKV("fee", ValueFromAmount(nFee));
+    if (const auto payjoin = GetPayjoinTxMetadata(wtx)) {
+        const CAmount amount =
+            payjoin->role == PayjoinTxRole::Sender ? -payjoin->amount : payjoin->amount;
+        entry.pushKV("amount", ValueFromAmount(amount));
+        if (payjoin->role == PayjoinTxRole::Sender) {
+            const CAmount nFee = nNet + payjoin->amount;
+            entry.pushKV("fee", ValueFromAmount(nFee));
+        }
+    } else {
+        CAmount nFee = (CachedTxIsFromMe(*pwallet, wtx) ? wtx.tx->GetValueOut() - nDebit : 0);
+        entry.pushKV("amount", ValueFromAmount(nNet - nFee));
+        if (CachedTxIsFromMe(*pwallet, wtx)) entry.pushKV("fee", ValueFromAmount(nFee));
+    }
 
     WalletTxToJSON(*pwallet, wtx, entry);
 

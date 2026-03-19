@@ -279,17 +279,24 @@ std::optional<HttpResponse> HttpClient::Post(const std::string& url,
 }
 
 // ---------------------------------------------------------------------------
+// OHTTP gateway URL helper
+// ---------------------------------------------------------------------------
+
+std::string OhttpGatewayUrl(const std::string& directory_url)
+{
+    std::string base = directory_url;
+    if (!base.empty() && base.back() == '/') base.pop_back();
+    return base + "/.well-known/ohttp-gateway";
+}
+
+// ---------------------------------------------------------------------------
 // FetchOhttpKeys
 // ---------------------------------------------------------------------------
 
 std::optional<ohttp::KeyConfig> FetchOhttpKeys(HttpClient& client,
                                                 const std::string& directory_url)
 {
-    // Trim trailing slash
-    std::string base = directory_url;
-    if (!base.empty() && base.back() == '/') base.pop_back();
-
-    std::string keys_url = base + "/.well-known/ohttp-gateway";
+    std::string keys_url = OhttpGatewayUrl(directory_url);
     auto resp = client.Get(keys_url);
     if (!resp || resp->status_code != 200) return std::nullopt;
     if (resp->body.empty()) return std::nullopt;
