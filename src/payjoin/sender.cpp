@@ -12,6 +12,7 @@
 #include <ohttp/ohttp.h>
 #include <payjoin/messages.h>
 #include <payjoin/net.h>
+#include <payjoin/original.h>
 #include <payjoin/session.h>
 #include <payjoin/shortid.h>
 #include <payjoin/uri.h>
@@ -33,18 +34,6 @@
 #include <vector>
 
 namespace payjoin {
-
-// ---------------------------------------------------------------------------
-// Helper: serialize PSBT to binary
-// ---------------------------------------------------------------------------
-static std::vector<uint8_t> SerializePSBT(const PartiallySignedTransaction& psbt)
-{
-    DataStream ds;
-    ds << psbt;
-    std::vector<uint8_t> result(ds.size());
-    std::memcpy(result.data(), ds.data(), ds.size());
-    return result;
-}
 
 static std::optional<PartiallySignedTransaction> DeserializePSBT(std::span<const uint8_t> data)
 {
@@ -100,6 +89,7 @@ std::optional<Sender> Sender::Create(wallet::CWallet& wallet, HttpClient& http,
     session->created_at = GetTime();
     session->expires_at = uri->pj.expiration;
     session->receiver_pubkey = uri->pj.receiver_key;
+    session->sender_disable_output_substitution = !uri->output_substitution;
     auto directory_url = DirectoryUrlFromMailboxUrl(uri->pj.mailbox_url);
     if (!directory_url) {
         LogPrintf("payjoin sender: URI mailbox endpoint missing valid short-id path\n");
@@ -153,12 +143,13 @@ bool Sender::PostOriginal()
         return false;
     }
 
-    // 1. Serialize Original PSBT
-    auto psbt_bytes = SerializePSBT(m_session->original_psbt);
+    // 1. Serialize Original PSBT in the BIP 77 Message A plaintext format
+    const std::string sender_query = BuildOriginalPayloadQuery(m_session->sender_disable_output_substitution);
+    auto plaintext = SerializeOriginalPayload(m_session->original_psbt, sender_query);
 
     // 2. Encrypt as Message A
     CPubKey reply_pk = m_session->reply_key.GetPubKey();
-    auto message_a = EncryptMessageA(psbt_bytes, reply_pk, m_session->receiver_pubkey);
+    auto message_a = EncryptMessageA(plaintext, reply_pk, m_session->receiver_pubkey);
     if (!message_a) {
         m_session->sender_state = SenderState::Failed;
         m_session->error_message = "Failed to encrypt Message A";

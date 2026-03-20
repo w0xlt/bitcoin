@@ -13,6 +13,7 @@
 #include <primitives/transaction_identifier.h>
 #include <payjoin/messages.h>
 #include <payjoin/net.h>
+#include <payjoin/original.h>
 #include <payjoin/session.h>
 #include <payjoin/shortid.h>
 #include <payjoin/uri.h>
@@ -49,18 +50,6 @@ static std::vector<uint8_t> SerializePSBT(const PartiallySignedTransaction& psbt
     std::vector<uint8_t> result(ds.size());
     std::memcpy(result.data(), ds.data(), ds.size());
     return result;
-}
-
-static std::optional<PartiallySignedTransaction> DeserializePSBT(std::span<const uint8_t> data)
-{
-    try {
-        DataStream ds(data);
-        PartiallySignedTransaction psbt;
-        ds >> psbt;
-        return psbt;
-    } catch (...) {
-        return std::nullopt;
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -229,15 +218,16 @@ std::optional<bool> Receiver::PollForOriginal()
     // 8. Store sender's reply pubkey
     m_session->sender_reply_pubkey = reply_pk;
 
-    // 9. Deserialize Original PSBT
-    auto original = DeserializePSBT(body);
+    // 9. Parse the BIP 77 Message A plaintext body
+    auto original = DeserializeOriginalPayload(body);
     if (!original) {
         m_session->receiver_state = ReceiverState::Failed;
         m_session->error_message = "Failed to parse Original PSBT";
         return std::nullopt;
     }
 
-    m_session->original_psbt = *original;
+    m_session->original_psbt = std::move(original->psbt);
+    m_session->original_query_params = std::move(original->query_params);
     m_session->receiver_state = ReceiverState::ReceivedOriginal;
     LogPrintf("payjoin receiver: Received Original PSBT from sender\n");
     return true;

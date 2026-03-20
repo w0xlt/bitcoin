@@ -80,6 +80,8 @@ struct PayjoinSession {
     std::optional<uint256> final_txid;
     std::string error_message;
     int64_t last_poll_time{0};     //!< Unix timestamp of last background poll
+    bool sender_disable_output_substitution{false};
+    std::string original_query_params;
 
     /** Check if the session is in a terminal state. */
     bool IsTerminal() const
@@ -185,6 +187,8 @@ struct PayjoinSession {
         s << error_message;
 
         s << last_poll_time;
+        s << sender_disable_output_substitution;
+        s << original_query_params;
     }
 
     template <typename Stream>
@@ -241,6 +245,14 @@ struct PayjoinSession {
             s >> last_poll_time;
         } catch (...) {
             last_poll_time = 0;
+        }
+
+        try {
+            s >> sender_disable_output_substitution;
+            s >> original_query_params;
+        } catch (...) {
+            sender_disable_output_substitution = false;
+            original_query_params.clear();
         }
     }
 
