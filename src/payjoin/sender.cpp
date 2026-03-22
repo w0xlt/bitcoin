@@ -16,6 +16,7 @@
 #include <payjoin/session.h>
 #include <payjoin/shortid.h>
 #include <payjoin/uri.h>
+#include <payjoin/sender_validation.h>
 #include <policy/fees.h>
 #include <psbt.h>
 #include <random.h>
@@ -301,40 +302,18 @@ std::optional<bool> Sender::PollForProposal()
         return std::nullopt;
     }
 
-    // 9. BIP 78 sender validation
-    // Check all original inputs are present
-    if (m_session->original_psbt.tx && proposal->tx) {
-        for (const auto& orig_in : m_session->original_psbt.tx->vin) {
-            bool found = false;
-            for (const auto& prop_in : proposal->tx->vin) {
-                if (orig_in.prevout == prop_in.prevout) {
-                    found = true;
-                    break;
-                }
-            }
-            if (!found) {
-                m_session->sender_state = SenderState::Failed;
-                m_session->error_message = "Proposal missing original input";
-                return std::nullopt;
-            }
-        }
-
-        // Check sender outputs are preserved
-        for (const auto& orig_out : m_session->original_psbt.tx->vout) {
-            bool found = false;
-            for (const auto& prop_out : proposal->tx->vout) {
-                if (orig_out.scriptPubKey == prop_out.scriptPubKey &&
-                    prop_out.nValue >= orig_out.nValue) {
-                    found = true;
-                    break;
-                }
-            }
-            if (!found) {
-                // Check if it's a change output that may have been adjusted
-                // For simplicity, log and continue with a warning
-                LogPrintf("payjoin sender: Warning - original output not found in proposal\n");
-            }
-        }
+    const auto validation_context = detail::BuildSenderProposalValidationContext(
+        m_wallet, m_session->original_psbt, m_session->sender_disable_output_substitution);
+    if (!validation_context) {
+        m_session->sender_state = SenderState::Failed;
+        m_session->error_message = "Failed to build sender proposal validation context";
+        return std::nullopt;
+    }
+    if (const auto validation_error =
+            detail::ValidateSenderProposal(m_session->original_psbt, *proposal, *validation_context)) {
+        m_session->sender_state = SenderState::Failed;
+        m_session->error_message = *validation_error;
+        return std::nullopt;
     }
 
     m_session->proposal_psbt = *proposal;
@@ -353,8 +332,25 @@ std::optional<uint256> Sender::FinalizeAndBroadcast()
         return std::nullopt;
     }
 
+    auto proposal = *m_session->proposal_psbt;
+
+    const auto validation_context = detail::BuildSenderProposalValidationContext(
+        m_wallet, m_session->original_psbt, m_session->sender_disable_output_substitution);
+    if (!validation_context) {
+        m_session->sender_state = SenderState::Failed;
+        m_session->error_message = "Failed to build sender proposal validation context";
+        return std::nullopt;
+    }
+    if (const auto validation_error =
+            detail::ValidateSenderProposal(m_session->original_psbt, proposal, *validation_context)) {
+        m_session->sender_state = SenderState::Failed;
+        m_session->error_message = *validation_error;
+        return std::nullopt;
+    }
+
+    detail::RestoreOriginalSenderData(m_session->original_psbt, proposal);
+
     // 1. Sign sender's inputs in the proposal
-    auto& proposal = *m_session->proposal_psbt;
     bool complete = false;
     auto error = m_wallet.FillPSBT(proposal, complete, /*sighash_type=*/std::nullopt,
                                     /*sign=*/true, /*bip32derivs=*/true);

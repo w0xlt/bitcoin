@@ -72,6 +72,7 @@ add_executable(test_bitcoin
   ohttp_tests.cpp
   payjoin_messages_tests.cpp
   payjoin_original_tests.cpp
+  payjoin_sender_validation_tests.cpp
   payjoin_session_tests.cpp
   payjoin_shortid_tests.cpp
   payjoin_uri_tests.cpp

@@ -374,7 +374,10 @@ bool Receiver::ProcessAndRespond()
     CMutableTransaction proposal_tx(*original.tx);
 
     // 4. Add receiver's input at a random position
-    CTxIn receiver_input(selected_coin->outpoint);
+    CTxIn receiver_input(
+        selected_coin->outpoint,
+        CScript(),
+        original.tx->vin.empty() ? CTxIn::SEQUENCE_FINAL : original.tx->vin.front().nSequence);
     FastRandomContext rng;
     size_t insert_pos = rng.randrange(proposal_tx.vin.size() + 1);
     proposal_tx.vin.insert(proposal_tx.vin.begin() + insert_pos, receiver_input);
@@ -415,7 +418,7 @@ bool Receiver::ProcessAndRespond()
     // 8. Sign the receiver's input
     bool complete = false;
     auto sign_error = m_wallet.FillPSBT(proposal, complete, /*sighash_type=*/std::nullopt,
-                                          /*sign=*/true, /*bip32derivs=*/true);
+                                          /*sign=*/true, /*bip32derivs=*/false);
     if (sign_error) {
         m_session->receiver_state = ReceiverState::Failed;
         m_session->error_message = "Failed to sign receiver's input in proposal";
