@@ -4,6 +4,8 @@
 
 #include <payjoin/receiver.h>
 
+#include <coins.h>
+#include <consensus/validation.h>
 #include <core_io.h>
 #include <key.h>
 #include <logging.h>
@@ -11,18 +13,22 @@
 #include <ohttp/ohttp.h>
 #include <outputtype.h>
 #include <primitives/transaction_identifier.h>
+#include <primitives/transaction.h>
 #include <payjoin/messages.h>
 #include <payjoin/net.h>
 #include <payjoin/original.h>
+#include <payjoin/receiver_validation.h>
 #include <payjoin/session.h>
 #include <payjoin/shortid.h>
 #include <payjoin/uri.h>
+#include <policy/policy.h>
 #include <psbt.h>
 #include <random.h>
 #include <script/script.h>
 #include <script/solver.h>
 #include <streams.h>
 #include <uint256.h>
+#include <util/result.h>
 #include <util/time.h>
 #include <wallet/coincontrol.h>
 #include <wallet/coinselection.h>
@@ -39,6 +45,23 @@
 #include <vector>
 
 namespace payjoin {
+
+namespace {
+
+bool SessionContainsOutPoint(const PayjoinSession& session, const COutPoint& outpoint)
+{
+    const auto has_outpoint = [&](const PartiallySignedTransaction& psbt) {
+        return psbt.tx &&
+               std::any_of(psbt.tx->vin.begin(), psbt.tx->vin.end(), [&](const CTxIn& txin) {
+                   return txin.prevout == outpoint;
+               });
+    };
+
+    if (has_outpoint(session.original_psbt)) return true;
+    return session.proposal_psbt && has_outpoint(*session.proposal_psbt);
+}
+
+} // namespace
 
 // ---------------------------------------------------------------------------
 // Helper: serialize / deserialize PSBT
@@ -246,44 +269,134 @@ bool Receiver::ProcessAndRespond()
         m_session->error_message = "Original PSBT has no transaction";
         return false;
     }
+    const auto original_params = ParseOriginalPayloadQuery(m_session->original_query_params);
+    if (!original_params) {
+        m_session->receiver_state = ReceiverState::Failed;
+        m_session->error_message = "Original query parameters are invalid";
+        return false;
+    }
 
     const CMutableTransaction& orig_tx = *original.tx;
+    OriginalPayloadParams receiver_params = *original_params;
+    receiver_params.min_fee_rate = std::max(receiver_params.min_fee_rate, m_wallet.chain().mempoolMinFee());
 
     // -----------------------------------------------------------------------
     // BIP 78 Receiver Validation
     // -----------------------------------------------------------------------
 
-    // 1. Verify sender's inputs are NOT owned by receiver
+    // 1. Verify the original can serve as a broadcastable fallback transaction.
+    int original_tx_vsize{0};
+    {
+        auto original_copy = original;
+        CMutableTransaction original_final_tx;
+        if (!FinalizeAndExtractPSBT(original_copy, original_final_tx)) {
+            m_session->receiver_state = ReceiverState::Failed;
+            m_session->error_message = "Original PSBT cannot be finalized for fallback broadcast";
+            return false;
+        }
+
+        const CTransactionRef original_final_tx_ref = MakeTransactionRef(original_final_tx);
+        original_tx_vsize = GetVirtualTransactionSize(*original_final_tx_ref);
+
+        if (GetTransactionWeight(*original_final_tx_ref) > MAX_STANDARD_TX_WEIGHT) {
+            m_session->receiver_state = ReceiverState::Failed;
+            m_session->error_message = "Original PSBT exceeds standard transaction weight";
+            return false;
+        }
+
+        const auto original_fee = detail::ComputePSBTFee(original);
+        if (!original_fee) {
+            m_session->receiver_state = ReceiverState::Failed;
+            m_session->error_message = "Original PSBT fee could not be computed";
+            return false;
+        }
+        if (*original_fee < receiver_params.min_fee_rate.GetFee(original_tx_vsize)) {
+            m_session->receiver_state = ReceiverState::Failed;
+            m_session->error_message = "Original PSBT fee rate is too low for broadcast fallback";
+            return false;
+        }
+
+        std::map<COutPoint, Coin> coins;
+        for (const auto& txin : orig_tx.vin) {
+            coins.emplace(txin.prevout, Coin{});
+        }
+        m_wallet.chain().findCoins(coins);
+        for (const auto& [outpoint, coin] : coins) {
+            if (coin.IsSpent()) {
+                m_session->receiver_state = ReceiverState::Failed;
+                m_session->error_message = "Original PSBT spends an unavailable input: " + outpoint.ToString();
+                return false;
+            }
+        }
+
+        if (const auto chain_limits = m_wallet.chain().checkChainLimits(original_final_tx_ref); !chain_limits) {
+            m_session->receiver_state = ReceiverState::Failed;
+            m_session->error_message = "Original PSBT violates mempool chain limits: " +
+                util::ErrorString(chain_limits).original;
+            return false;
+        }
+    }
+
+    // 2. Verify sender's inputs are NOT owned by receiver
     {
         LOCK(m_wallet.cs_wallet);
         for (size_t i = 0; i < original.inputs.size(); ++i) {
-            if (!original.inputs[i].witness_utxo.IsNull()) {
-                if (m_wallet.IsMine(original.inputs[i].witness_utxo.scriptPubKey)) {
-                    m_session->receiver_state = ReceiverState::Failed;
-                    m_session->error_message = "Original contains receiver-owned input";
-                    return false;
-                }
+            CTxOut utxo;
+            if (!detail::GetInputUTXO(original, i, utxo)) {
+                m_session->receiver_state = ReceiverState::Failed;
+                m_session->error_message = "Original input missing UTXO information";
+                return false;
+            }
+            if (m_wallet.IsMine(utxo.scriptPubKey)) {
+                m_session->receiver_state = ReceiverState::Failed;
+                m_session->error_message = "Original contains receiver-owned input";
+                return false;
             }
         }
     }
 
-    // 2. Identify the receiver's output (matching our address)
+    // 3. Reject original inputs already seen in another payjoin session.
+    {
+        LOCK(m_wallet.cs_wallet);
+        wallet::WalletBatch batch(m_wallet.GetDatabase());
+        std::vector<std::pair<uint256, PayjoinSession>> sessions;
+        batch.ListPayjoinSessions(sessions);
+
+        for (const auto& txin : orig_tx.vin) {
+            const auto it = std::find_if(sessions.begin(), sessions.end(), [&](const auto& entry) {
+                return entry.first != m_session->session_id && SessionContainsOutPoint(entry.second, txin.prevout);
+            });
+            if (it != sessions.end()) {
+                m_session->receiver_state = ReceiverState::Failed;
+                m_session->error_message = "Original reuses an input from another payjoin session";
+                return false;
+            }
+        }
+    }
+
+    // 4. Identify the receiver's output (matching our address)
     int receiver_output_idx = -1;
     CAmount receiver_amount = 0;
     OutputType sender_input_type = OutputType::BECH32; // default
+    std::vector<size_t> receiver_output_indexes;
 
     // Determine script type from sender's inputs for matching
-    if (!original.inputs.empty() && !original.inputs[0].witness_utxo.IsNull()) {
-        sender_input_type = ClassifyScript(original.inputs[0].witness_utxo.scriptPubKey);
+    if (!original.inputs.empty()) {
+        CTxOut sender_input_utxo;
+        if (detail::GetInputUTXO(original, 0, sender_input_utxo)) {
+            sender_input_type = ClassifyScript(sender_input_utxo.scriptPubKey);
+        }
     }
 
     {
         LOCK(m_wallet.cs_wallet);
         for (size_t i = 0; i < orig_tx.vout.size(); ++i) {
             if (m_wallet.IsMine(orig_tx.vout[i].scriptPubKey)) {
-                receiver_output_idx = static_cast<int>(i);
-                receiver_amount = orig_tx.vout[i].nValue;
-                break;
+                receiver_output_indexes.push_back(i);
+                if (receiver_output_idx < 0) {
+                    receiver_output_idx = static_cast<int>(i);
+                    receiver_amount = orig_tx.vout[i].nValue;
+                }
             }
         }
     }
@@ -294,7 +407,9 @@ bool Receiver::ProcessAndRespond()
         return false;
     }
 
-    // 3. Select a receiver UTXO to contribute
+    receiver_params = detail::SanitizeReceiverOriginalParams(CTransaction{orig_tx}, receiver_params, receiver_output_indexes);
+
+    // 5. Select a receiver UTXO to contribute
     //    Manual iteration with null-safety instead of AvailableCoins to
     //    tolerate wallet entries with corrupt CTransactionRef fields.
     std::optional<wallet::COutput> selected_coin;
@@ -354,6 +469,11 @@ bool Receiver::ProcessAndRespond()
         m_session->error_message = "No suitable UTXO available for payjoin";
         return false;
     }
+    if (selected_coin->input_bytes <= 0) {
+        m_session->receiver_state = ReceiverState::Failed;
+        m_session->error_message = "Selected receiver input is not solvable for payjoin";
+        return false;
+    }
 
     // -----------------------------------------------------------------------
     // Build Proposal PSBT
@@ -362,7 +482,7 @@ bool Receiver::ProcessAndRespond()
     // Start with a copy of the original transaction
     CMutableTransaction proposal_tx(*original.tx);
 
-    // 4. Add receiver's input at a random position
+    // 6. Add receiver's input at a random position
     CTxIn receiver_input(
         selected_coin->outpoint,
         CScript(),
@@ -371,17 +491,17 @@ bool Receiver::ProcessAndRespond()
     size_t insert_pos = rng.randrange(proposal_tx.vin.size() + 1);
     proposal_tx.vin.insert(proposal_tx.vin.begin() + insert_pos, receiver_input);
 
-    // 5. Adjust receiver's output amount (add the contributed input value)
+    // 7. Adjust receiver's output amount (add the contributed input value)
     // The receiver's output increases by the value of the added input
     proposal_tx.vout[receiver_output_idx].nValue += selected_coin->txout.nValue;
 
-    // 6. Clear all signatures from the proposal (sender will re-sign)
+    // 8. Clear all signatures from the proposal (sender will re-sign)
     for (auto& txin : proposal_tx.vin) {
         txin.scriptSig.clear();
         txin.scriptWitness.SetNull();
     }
 
-    // 7. Build proposal PSBT
+    // 9. Build proposal PSBT
     PartiallySignedTransaction proposal(proposal_tx);
 
     // Copy UTXO info for original inputs
@@ -404,7 +524,15 @@ bool Receiver::ProcessAndRespond()
         }
     }
 
-    // 8. Sign the receiver's input
+    // 10. Apply sender fee contribution rules before signing the proposal.
+    if (const auto fee_error = detail::ApplyReceiverFeeContribution(
+            original, proposal, receiver_params, receiver_output_idx, original_tx_vsize, selected_coin->input_bytes)) {
+        m_session->receiver_state = ReceiverState::Failed;
+        m_session->error_message = *fee_error;
+        return false;
+    }
+
+    // 11. Sign the receiver's input
     bool complete = false;
     auto sign_error = m_wallet.FillPSBT(proposal, complete, /*sighash_type=*/std::nullopt,
                                           /*sign=*/true, /*bip32derivs=*/false);
@@ -421,10 +549,10 @@ bool Receiver::ProcessAndRespond()
     // Send Proposal as Message B
     // -----------------------------------------------------------------------
 
-    // 9. Serialize Proposal PSBT
+    // 12. Serialize Proposal PSBT
     auto psbt_bytes = SerializePSBT(proposal);
 
-    // 10. Encrypt as Message B
+    // 13. Encrypt as Message B
     CPubKey receiver_pk = m_session->receiver_key.GetPubKey();
     auto message_b = EncryptMessageB(psbt_bytes, m_session->receiver_key,
                                       receiver_pk, *m_session->sender_reply_pubkey);
@@ -434,7 +562,7 @@ bool Receiver::ProcessAndRespond()
         return false;
     }
 
-    // 11. Build BHTTP POST to sender's reply mailbox
+    // 14. Build BHTTP POST to sender's reply mailbox
     std::string sender_mailbox = MailboxUrl(m_session->directory_url, *m_session->sender_reply_pubkey);
 
     bhttp::Request bhttp_req;
@@ -447,7 +575,7 @@ bool Receiver::ProcessAndRespond()
     bhttp_req.headers.push_back({"Content-Type", "message/payjoin+psbt"});
     bhttp_req.body.assign(message_b->begin(), message_b->end());
 
-    // 12. Encode bHTTP with padding
+    // 15. Encode bHTTP with padding
     auto bhttp_encoded = bhttp::EncodeKnownLengthRequestPadded(bhttp_req, ohttp::PADDED_BHTTP_REQ_BYTES);
     if (!bhttp_encoded) {
         m_session->receiver_state = ReceiverState::Failed;
@@ -455,7 +583,7 @@ bool Receiver::ProcessAndRespond()
         return false;
     }
 
-    // 13. OHTTP encapsulate
+    // 16. OHTTP encapsulate
     ohttp::ClientContext ohttp_ctx;
     auto ohttp_req = ohttp_ctx.EncapsulateRequest(m_session->ohttp_keys, *bhttp_encoded);
     if (!ohttp_req) {
@@ -464,7 +592,7 @@ bool Receiver::ProcessAndRespond()
         return false;
     }
 
-    // 14. POST to directory gateway
+    // 17. POST to directory gateway
     auto resp = m_http.Post(OhttpGatewayUrl(m_session->directory_url), *ohttp_req, "message/ohttp-req");
     if (!resp || resp->status_code != 200) {
         m_session->receiver_state = ReceiverState::Failed;

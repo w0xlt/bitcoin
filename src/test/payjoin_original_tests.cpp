@@ -93,4 +93,30 @@ BOOST_AUTO_TEST_CASE(build_original_payload_query_defaults_to_v2)
                       "v=2&disableoutputsubstitution=true");
 }
 
+BOOST_AUTO_TEST_CASE(parse_original_payload_query_supports_fee_parameters)
+{
+    const auto parsed = payjoin::ParseOriginalPayloadQuery(
+        "v=2&disableoutputsubstitution=true&additionalfeeoutputindex=1&maxadditionalfeecontribution=250&minfeerate=1.5");
+    BOOST_REQUIRE(parsed.has_value());
+
+    BOOST_CHECK(parsed->disable_output_substitution);
+    BOOST_REQUIRE(parsed->additional_fee_contribution.has_value());
+    BOOST_CHECK_EQUAL(parsed->additional_fee_contribution->additional_fee_output_index, 1U);
+    BOOST_CHECK_EQUAL(parsed->additional_fee_contribution->max_additional_fee_contribution, 250);
+    BOOST_CHECK_EQUAL(parsed->min_fee_rate.GetFeePerK(), 1500);
+}
+
+BOOST_AUTO_TEST_CASE(parse_original_payload_query_ignores_partial_fee_parameters)
+{
+    const auto parsed = payjoin::ParseOriginalPayloadQuery("v=2&maxadditionalfeecontribution=250");
+    BOOST_REQUIRE(parsed.has_value());
+    BOOST_CHECK(!parsed->additional_fee_contribution.has_value());
+}
+
+BOOST_AUTO_TEST_CASE(parse_original_payload_query_rejects_invalid_version_and_fee_rate)
+{
+    BOOST_CHECK(!payjoin::ParseOriginalPayloadQuery("v=1").has_value());
+    BOOST_CHECK(!payjoin::ParseOriginalPayloadQuery("v=2&minfeerate=abc").has_value());
+}
+
 BOOST_AUTO_TEST_SUITE_END()

@@ -5,23 +5,39 @@
 #ifndef BITCOIN_PAYJOIN_ORIGINAL_H
 #define BITCOIN_PAYJOIN_ORIGINAL_H
 
+#include <policy/feerate.h>
 #include <psbt.h>
 
 #include <optional>
 #include <span>
-#include <string>
 #include <string_view>
+#include <string>
 #include <vector>
 
 namespace payjoin {
 
+struct SenderFeeContribution {
+    CAmount max_additional_fee_contribution{0};
+    size_t additional_fee_output_index{0};
+};
+
+struct OriginalPayloadParams {
+    bool disable_output_substitution{false};
+    std::optional<SenderFeeContribution> additional_fee_contribution;
+    CFeeRate min_fee_rate{};
+};
+
 struct OriginalPayload {
     PartiallySignedTransaction psbt;
     std::string query_params;
+    OriginalPayloadParams params;
 };
 
 /** Build the Message A sender-query string for a v2 payjoin request. */
 std::string BuildOriginalPayloadQuery(bool disable_output_substitution);
+
+/** Parse the Message A sender-query string for a v2 payjoin request. */
+std::optional<OriginalPayloadParams> ParseOriginalPayloadQuery(std::string_view query_params);
 
 /** Serialize the Original PSBT body as required by BIP 77 Message A. */
 std::vector<uint8_t> SerializeOriginalPayload(const PartiallySignedTransaction& psbt,
