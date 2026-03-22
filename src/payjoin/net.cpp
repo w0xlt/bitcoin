@@ -29,14 +29,7 @@ namespace payjoin {
 // URL parsing helper
 // ---------------------------------------------------------------------------
 
-struct ParsedUrl {
-    std::string scheme;   // "http" or "https"
-    std::string host;
-    uint16_t port{0};
-    std::string path;     // includes query string
-};
-
-static std::optional<ParsedUrl> ParseUrl(const std::string& url)
+std::optional<ParsedUrl> ParseUrl(const std::string& url)
 {
     ParsedUrl result;
 
@@ -45,32 +38,33 @@ static std::optional<ParsedUrl> ParseUrl(const std::string& url)
     if (scheme_end == std::string::npos) return std::nullopt;
     result.scheme = url.substr(0, scheme_end);
     std::transform(result.scheme.begin(), result.scheme.end(), result.scheme.begin(), ::tolower);
+    if (result.scheme != "http") return std::nullopt;
 
     size_t authority_start = scheme_end + 3;
     size_t path_start = url.find('/', authority_start);
-    std::string authority;
     if (path_start == std::string::npos) {
-        authority = url.substr(authority_start);
+        result.authority = url.substr(authority_start);
         result.path = "/";
     } else {
-        authority = url.substr(authority_start, path_start - authority_start);
+        result.authority = url.substr(authority_start, path_start - authority_start);
         result.path = url.substr(path_start);
     }
+    if (result.authority.empty()) return std::nullopt;
 
     // Host and port
-    size_t colon = authority.rfind(':');
+    size_t colon = result.authority.rfind(':');
     // Handle IPv6 addresses in brackets
-    size_t bracket_close = authority.rfind(']');
+    size_t bracket_close = result.authority.rfind(']');
     if (colon != std::string::npos && (bracket_close == std::string::npos || colon > bracket_close)) {
-        result.host = authority.substr(0, colon);
+        result.host = result.authority.substr(0, colon);
         try {
-            result.port = static_cast<uint16_t>(std::stoi(authority.substr(colon + 1)));
+            result.port = static_cast<uint16_t>(std::stoi(result.authority.substr(colon + 1)));
         } catch (...) {
             return std::nullopt;
         }
     } else {
-        result.host = authority;
-        result.port = (result.scheme == "https") ? 443 : 80;
+        result.host = result.authority;
+        result.port = 80;
     }
 
     // Remove brackets from IPv6
@@ -80,6 +74,22 @@ static std::optional<ParsedUrl> ParseUrl(const std::string& url)
 
     if (result.host.empty()) return std::nullopt;
     return result;
+}
+
+bool IsCleartextHttpUrl(const std::string& url)
+{
+    return ParseUrl(url).has_value();
+}
+
+bool ParseUrlIntoBhttpRequest(const std::string& url, bhttp::Request& req)
+{
+    auto parsed = ParseUrl(url);
+    if (!parsed) return false;
+
+    req.scheme = parsed->scheme;
+    req.authority = parsed->authority;
+    req.path = parsed->path;
+    return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -170,7 +180,10 @@ static std::optional<HttpResponse> DoRequest(const Proxy& proxy, int /*timeout_m
                                               const std::map<std::string, std::string>& headers)
 {
     auto parsed = ParseUrl(url);
-    if (!parsed) return std::nullopt;
+    if (!parsed) {
+        LogPrintf("payjoin: unsupported transport URL (expected http://): %s\n", url);
+        return std::nullopt;
+    }
 
     // Connect through Tor SOCKS5 proxy (retry on transient failures)
     std::unique_ptr<Sock> sock;
@@ -189,15 +202,9 @@ static std::optional<HttpResponse> DoRequest(const Proxy& proxy, int /*timeout_m
     }
 
     // Build HTTP/1.1 request
-    std::string authority = parsed->host;
-    if ((parsed->scheme == "https" && parsed->port != 443) ||
-        (parsed->scheme == "http" && parsed->port != 80)) {
-        authority += ":" + std::to_string(parsed->port);
-    }
-
     std::ostringstream req;
     req << method << " " << parsed->path << " HTTP/1.1\r\n";
-    req << "Host: " << authority << "\r\n";
+    req << "Host: " << parsed->authority << "\r\n";
 
     for (const auto& [name, value] : headers) {
         req << name << ": " << value << "\r\n";
@@ -296,6 +303,10 @@ std::string OhttpGatewayUrl(const std::string& directory_url)
 std::optional<ohttp::KeyConfig> FetchOhttpKeys(HttpClient& client,
                                                 const std::string& directory_url)
 {
+    if (!IsCleartextHttpUrl(directory_url)) {
+        LogPrintf("payjoin: unsupported directory URL for OHTTP keys: %s\n", directory_url);
+        return std::nullopt;
+    }
     std::string keys_url = OhttpGatewayUrl(directory_url);
     auto resp = client.Get(keys_url);
     if (!resp || resp->status_code != 200) return std::nullopt;

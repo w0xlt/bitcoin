@@ -162,19 +162,10 @@ bool Sender::PostOriginal()
 
     bhttp::Request bhttp_req;
     bhttp_req.method = "POST";
-    bhttp_req.scheme = "https";
-    // Extract authority and path from mailbox URL
-    size_t scheme_end = mailbox.find("://");
-    if (scheme_end != std::string::npos) {
-        std::string rest = mailbox.substr(scheme_end + 3);
-        size_t path_start = rest.find('/');
-        if (path_start != std::string::npos) {
-            bhttp_req.authority = rest.substr(0, path_start);
-            bhttp_req.path = rest.substr(path_start);
-        } else {
-            bhttp_req.authority = rest;
-            bhttp_req.path = "/";
-        }
+    if (!ParseUrlIntoBhttpRequest(mailbox, bhttp_req)) {
+        m_session->sender_state = SenderState::Failed;
+        m_session->error_message = "Unsupported mailbox URL transport";
+        return false;
     }
     bhttp_req.headers.push_back({"Content-Type", "message/payjoin+psbt"});
     bhttp_req.body.assign(message_a->begin(), message_a->end());
@@ -240,19 +231,7 @@ std::optional<bool> Sender::PollForProposal()
 
     bhttp::Request bhttp_req;
     bhttp_req.method = "GET";
-    bhttp_req.scheme = "https";
-    size_t scheme_end = mailbox.find("://");
-    if (scheme_end != std::string::npos) {
-        std::string rest = mailbox.substr(scheme_end + 3);
-        size_t path_start = rest.find('/');
-        if (path_start != std::string::npos) {
-            bhttp_req.authority = rest.substr(0, path_start);
-            bhttp_req.path = rest.substr(path_start);
-        } else {
-            bhttp_req.authority = rest;
-            bhttp_req.path = "/";
-        }
-    }
+    if (!ParseUrlIntoBhttpRequest(mailbox, bhttp_req)) return std::nullopt;
 
     // 2. Encode and encapsulate
     auto bhttp_encoded = bhttp::EncodeKnownLengthRequestPadded(bhttp_req, ohttp::PADDED_BHTTP_REQ_BYTES);

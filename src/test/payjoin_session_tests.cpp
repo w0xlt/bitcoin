@@ -26,7 +26,7 @@ BOOST_AUTO_TEST_CASE(session_serialize_roundtrip_sender)
     session.sender_state = payjoin::SenderState::PostedOriginal;
     session.created_at = 1700000000;
     session.expires_at = 1700086400;
-    session.directory_url = "https://payjo.in";
+    session.directory_url = "http://payjo.in";
     session.sender_disable_output_substitution = true;
 
     // Generate keys
@@ -55,7 +55,7 @@ BOOST_AUTO_TEST_CASE(session_serialize_roundtrip_sender)
     BOOST_CHECK(loaded.sender_state == payjoin::SenderState::PostedOriginal);
     BOOST_CHECK_EQUAL(loaded.created_at, 1700000000);
     BOOST_CHECK_EQUAL(loaded.expires_at, 1700086400);
-    BOOST_CHECK_EQUAL(loaded.directory_url, "https://payjo.in");
+    BOOST_CHECK_EQUAL(loaded.directory_url, "http://payjo.in");
     BOOST_CHECK_EQUAL(loaded.sender_disable_output_substitution, true);
     BOOST_CHECK(loaded.reply_key.IsValid());
     BOOST_CHECK(loaded.reply_key.GetPubKey() == session.reply_key.GetPubKey());
@@ -73,7 +73,7 @@ BOOST_AUTO_TEST_CASE(session_serialize_roundtrip_receiver)
     session.original_query_params = "v=2&disableoutputsubstitution=true";
 
     session.receiver_key.MakeNewKey(/*fCompressed=*/true);
-    session.payjoin_uri = "bitcoin:bcrt1q...?pj=HTTPS://PAYJO.IN/...";
+    session.payjoin_uri = "bitcoin:bcrt1q...?pj=HTTP://PAYJO.IN/...";
 
     // OHTTP KeyConfig
     CPubKey pk = session.receiver_key.GetPubKey();

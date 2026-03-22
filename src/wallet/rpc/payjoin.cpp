@@ -110,8 +110,8 @@ RPCHelpMan sendpayjoin()
             },
         },
         RPCExamples{
-            HelpExampleCli("sendpayjoin", "\"bitcoin:bc1q...?pj=HTTPS://PAYJO.IN/...\" 10")
-            + HelpExampleRpc("sendpayjoin", "\"bitcoin:bc1q...?pj=HTTPS://PAYJO.IN/...\", 10")
+            HelpExampleCli("sendpayjoin", "\"bitcoin:bc1q...?pj=HTTP://EXAMPLE.ONION/...\" 10")
+            + HelpExampleRpc("sendpayjoin", "\"bitcoin:bc1q...?pj=HTTP://EXAMPLE.ONION/...\", 10")
         },
         [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
 {
@@ -172,10 +172,13 @@ RPCHelpMan receivepayjoin()
         "receivepayjoin",
         "Create a BIP 77 payjoin receive session.\n"
         "Generates a payjoin URI that can be shared with the sender.\n"
-        "Starts background polling for the sender's original PSBT.\n",
+        "Starts background polling for the sender's original PSBT.\n"
+        "Only cleartext http:// transport URLs are supported. Use an onion\n"
+        "directory or another transport that does not require native TLS in\n"
+        "the wallet.\n",
         {
             {"amount", RPCArg::Type::AMOUNT, RPCArg::Optional::NO, "The amount to request in BTC"},
-            {"directory", RPCArg::Type::STR, RPCArg::Default{"https://payjo.in"}, "The payjoin directory URL"},
+            {"directory", RPCArg::Type::STR, RPCArg::Default{"http://payjo.in"}, "The payjoin directory URL"},
             {"expiry_secs", RPCArg::Type::NUM, RPCArg::Default{86400}, "Session expiration in seconds"},
         },
         RPCResult{
@@ -188,7 +191,7 @@ RPCHelpMan receivepayjoin()
         },
         RPCExamples{
             HelpExampleCli("receivepayjoin", "0.001")
-            + HelpExampleCli("receivepayjoin", "0.001 \"https://payjo.in\" 3600")
+            + HelpExampleCli("receivepayjoin", "0.001 \"http://example.onion\" 3600")
             + HelpExampleRpc("receivepayjoin", "0.001")
         },
         [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
@@ -198,9 +201,13 @@ RPCHelpMan receivepayjoin()
 
     CAmount amount = AmountFromValue(request.params[0]);
 
-    std::string directory_url = "https://payjo.in";
+    std::string directory_url = "http://payjo.in";
     if (!request.params[1].isNull()) {
         directory_url = request.params[1].get_str();
+    }
+    if (!payjoin::IsCleartextHttpUrl(directory_url)) {
+        throw JSONRPCError(RPC_INVALID_PARAMETER,
+            "Unsupported payjoin directory URL. This wallet only supports cleartext http:// transport.");
     }
 
     int64_t expiry_secs = 86400;

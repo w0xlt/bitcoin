@@ -7,6 +7,7 @@
 #include <consensus/amount.h>
 #include <key_io.h>
 #include <ohttp/ohttp.h>
+#include <payjoin/net.h>
 #include <pubkey.h>
 #include <secp256k1.h>
 #include <util/moneystr.h>
@@ -138,6 +139,8 @@ static std::map<std::string, std::string> ParseQueryString(const std::string& qu
 /** Extract scheme + authority from a mailbox endpoint URL with exactly one path segment. */
 std::optional<std::string> DirectoryUrlFromMailboxUrl(const std::string& mailbox_url)
 {
+    if (!IsCleartextHttpUrl(mailbox_url)) return std::nullopt;
+
     size_t scheme_end = mailbox_url.find("://");
     if (scheme_end == std::string::npos || scheme_end == 0) return std::nullopt;
 

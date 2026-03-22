@@ -6,6 +6,7 @@
 #define BITCOIN_PAYJOIN_NET_H
 
 #include <netbase.h>
+#include <ohttp/bhttp.h>
 #include <ohttp/ohttp.h>
 
 #include <cstdint>
@@ -16,6 +17,14 @@
 #include <vector>
 
 namespace payjoin {
+
+struct ParsedUrl {
+    std::string scheme;
+    std::string authority;
+    std::string host;
+    uint16_t port{0};
+    std::string path;
+};
 
 struct HttpResponse {
     int status_code{0};
@@ -31,8 +40,9 @@ struct HttpResponse {
  *  - POST with binary body and content type
  *
  * No TLS: Tor provides transport encryption for .onion addresses, and Tor
- * exit nodes handle TLS for clearnet HTTPS addresses. We send plain HTTP
- * through the SOCKS5 proxy.
+ * or other HTTP endpoints are reached directly over plain HTTP through the
+ * SOCKS5 proxy. `https://` URLs are rejected because this client does not
+ * implement TLS.
  */
 class HttpClient {
     Proxy m_proxy;
@@ -58,6 +68,21 @@ public:
     /** Check if the proxy is configured. */
     bool IsValid() const { return m_proxy.IsValid(); }
 };
+
+/**
+ * Parse a payjoin transport URL. Only cleartext `http://` URLs are supported.
+ * Returns nullopt for unsupported schemes or malformed URLs.
+ */
+std::optional<ParsedUrl> ParseUrl(const std::string& url);
+
+/** Return true if the URL uses the supported cleartext HTTP transport model. */
+bool IsCleartextHttpUrl(const std::string& url);
+
+/**
+ * Populate the bHTTP request target fields from a transport URL.
+ * Returns false if the URL is malformed or uses an unsupported scheme.
+ */
+bool ParseUrlIntoBhttpRequest(const std::string& url, bhttp::Request& req);
 
 /**
  * Return the RFC 9540 OHTTP gateway URL for a directory origin.

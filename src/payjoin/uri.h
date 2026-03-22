@@ -36,11 +36,12 @@ struct PayjoinUri {
  * Parse a BIP 21 URI containing a BIP 77 payjoin `pj` parameter.
  *
  * Expected format:
- *   bitcoin:<address>?amount=<btc>&pjos=<0|1>&pj=HTTPS://PAYJO.IN/<shortid>%23EX1<data>-OH1<data>-RK1<data>
+ *   bitcoin:<address>?amount=<btc>&pjos=<0|1>&pj=HTTP://EXAMPLE.ONION/<shortid>%23EX1<data>-OH1<data>-RK1<data>
  *
  * The `pj` value is the mailbox endpoint URL itself. The fragment (after %23)
  * contains EX, OH, RK params separated by '-', each encoded as HRP + '1' +
- * bech32-charset data (no checksum).
+ * bech32-charset data (no checksum). Only cleartext `http://` transport URLs
+ * are supported by this wallet.
  *
  * @param[in] uri_str The full BIP 21 URI string
  * @return Parsed PayjoinUri or nullopt on failure

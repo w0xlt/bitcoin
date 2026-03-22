@@ -57,9 +57,9 @@ BOOST_AUTO_TEST_CASE(mailbox_url_format)
     sk.MakeNewKey(/*fCompressed=*/true);
     CPubKey pk = sk.GetPubKey();
 
-    std::string url = payjoin::MailboxUrl("https://payjo.in", pk);
-    BOOST_CHECK(url.find("https://payjo.in/") == 0);
-    BOOST_CHECK(url.size() > std::string("https://payjo.in/").size());
+    std::string url = payjoin::MailboxUrl("http://payjo.in", pk);
+    BOOST_CHECK(url.find("http://payjo.in/") == 0);
+    BOOST_CHECK(url.size() > std::string("http://payjo.in/").size());
 }
 
 BOOST_AUTO_TEST_CASE(short_id_is_uppercase)

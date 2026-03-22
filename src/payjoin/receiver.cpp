@@ -74,26 +74,6 @@ static OutputType ClassifyScript(const CScript& script)
 }
 
 // ---------------------------------------------------------------------------
-// Helper: extract bHTTP request fields from a URL
-// ---------------------------------------------------------------------------
-static void ParseUrlIntoBhttp(const std::string& url, bhttp::Request& req)
-{
-    req.scheme = "https";
-    size_t scheme_end = url.find("://");
-    if (scheme_end != std::string::npos) {
-        std::string rest = url.substr(scheme_end + 3);
-        size_t path_start = rest.find('/');
-        if (path_start != std::string::npos) {
-            req.authority = rest.substr(0, path_start);
-            req.path = rest.substr(path_start);
-        } else {
-            req.authority = rest;
-            req.path = "/";
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Receiver::Create
 // ---------------------------------------------------------------------------
 
@@ -103,6 +83,11 @@ std::optional<Receiver> Receiver::Create(wallet::CWallet& wallet, HttpClient& ht
                                           const ohttp::KeyConfig& ohttp_keys,
                                           int64_t expiry_secs)
 {
+    if (!IsCleartextHttpUrl(directory_url)) {
+        LogPrintf("payjoin receiver: Unsupported directory URL transport: %s\n", directory_url);
+        return std::nullopt;
+    }
+
     // 1. Create session
     auto session = std::make_shared<PayjoinSession>();
     GetRandBytes(session->session_id);
@@ -172,7 +157,11 @@ std::optional<bool> Receiver::PollForOriginal()
 
     bhttp::Request bhttp_req;
     bhttp_req.method = "GET";
-    ParseUrlIntoBhttp(mailbox, bhttp_req);
+    if (!ParseUrlIntoBhttpRequest(mailbox, bhttp_req)) {
+        m_session->receiver_state = ReceiverState::Failed;
+        m_session->error_message = "Unsupported mailbox URL transport";
+        return std::nullopt;
+    }
 
     // 2. Encode and OHTTP encapsulate
     auto bhttp_encoded = bhttp::EncodeKnownLengthRequestPadded(bhttp_req, ohttp::PADDED_BHTTP_REQ_BYTES);
@@ -450,7 +439,11 @@ bool Receiver::ProcessAndRespond()
 
     bhttp::Request bhttp_req;
     bhttp_req.method = "POST";
-    ParseUrlIntoBhttp(sender_mailbox, bhttp_req);
+    if (!ParseUrlIntoBhttpRequest(sender_mailbox, bhttp_req)) {
+        m_session->receiver_state = ReceiverState::Failed;
+        m_session->error_message = "Unsupported sender mailbox URL transport";
+        return false;
+    }
     bhttp_req.headers.push_back({"Content-Type", "message/payjoin+psbt"});
     bhttp_req.body.assign(message_b->begin(), message_b->end());
 

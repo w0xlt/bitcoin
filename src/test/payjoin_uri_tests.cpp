@@ -51,7 +51,7 @@ BOOST_AUTO_TEST_CASE(parse_basic_payjoin_uri)
     uri.output_substitution = true;
 
     uri.pj.receiver_key = receiver_pk;
-    uri.pj.mailbox_url = payjoin::MailboxUrl("https://payjo.in", receiver_pk);
+    uri.pj.mailbox_url = payjoin::MailboxUrl("http://payjo.in", receiver_pk);
     uri.pj.expiration = 1700000000;
     uri.pj.ohttp_keys = MakeOhttpKeys();
 
@@ -70,7 +70,7 @@ BOOST_AUTO_TEST_CASE(parse_basic_payjoin_uri)
     BOOST_CHECK_EQUAL(parsed->pj.expiration, 1700000000);
     auto directory_url = payjoin::DirectoryUrlFromMailboxUrl(parsed->pj.mailbox_url);
     BOOST_REQUIRE(directory_url.has_value());
-    BOOST_CHECK_EQUAL(*directory_url, "https://payjo.in");
+    BOOST_CHECK_EQUAL(*directory_url, "http://payjo.in");
 }
 
 BOOST_AUTO_TEST_CASE(parse_missing_pj_param_fails)
@@ -99,7 +99,7 @@ BOOST_AUTO_TEST_CASE(parse_mailbox_without_short_id_fails)
     uri.address = DecodeDestination(TEST_ADDRESS);
     BOOST_REQUIRE(IsValidDestination(uri.address));
     uri.amount = 100000;
-    uri.pj.mailbox_url = "https://payjo.in";
+    uri.pj.mailbox_url = "http://payjo.in";
     uri.pj.receiver_key = receiver_sk.GetPubKey();
     uri.pj.expiration = 1700000000;
     uri.pj.ohttp_keys = MakeOhttpKeys();
@@ -117,7 +117,7 @@ BOOST_AUTO_TEST_CASE(parse_mailbox_with_multiple_path_segments_fails)
     uri.address = DecodeDestination(TEST_ADDRESS);
     BOOST_REQUIRE(IsValidDestination(uri.address));
     uri.amount = 100000;
-    uri.pj.mailbox_url = "https://payjo.in/one/two";
+    uri.pj.mailbox_url = "http://payjo.in/one/two";
     uri.pj.receiver_key = receiver_sk.GetPubKey();
     uri.pj.expiration = 1700000000;
     uri.pj.ohttp_keys = MakeOhttpKeys();
@@ -139,7 +139,7 @@ BOOST_AUTO_TEST_CASE(roundtrip_build_parse)
     uri.output_substitution = false;
 
     uri.pj.receiver_key = pk;
-    uri.pj.mailbox_url = payjoin::MailboxUrl("https://example.onion", pk);
+    uri.pj.mailbox_url = payjoin::MailboxUrl("http://example.onion", pk);
     uri.pj.expiration = 1800000000;
     uri.pj.ohttp_keys = MakeOhttpKeys();
 
@@ -152,6 +152,24 @@ BOOST_AUTO_TEST_CASE(roundtrip_build_parse)
     BOOST_CHECK_EQUAL(parsed->pj.mailbox_url, uri.pj.mailbox_url);
     BOOST_CHECK(parsed->pj.receiver_key == pk);
     BOOST_CHECK_EQUAL(parsed->pj.expiration, 1800000000);
+}
+
+BOOST_AUTO_TEST_CASE(parse_https_mailbox_fails)
+{
+    CKey receiver_sk;
+    receiver_sk.MakeNewKey(/*fCompressed=*/true);
+
+    payjoin::PayjoinUri uri;
+    uri.address = DecodeDestination(TEST_ADDRESS);
+    BOOST_REQUIRE(IsValidDestination(uri.address));
+    uri.amount = 100000;
+    uri.pj.mailbox_url = payjoin::MailboxUrl("https://payjo.in", receiver_sk.GetPubKey());
+    uri.pj.receiver_key = receiver_sk.GetPubKey();
+    uri.pj.expiration = 1700000000;
+    uri.pj.ohttp_keys = MakeOhttpKeys();
+
+    auto parsed = payjoin::ParsePayjoinUri(payjoin::BuildPayjoinUri(uri));
+    BOOST_CHECK(!parsed.has_value());
 }
 
 BOOST_AUTO_TEST_SUITE_END()

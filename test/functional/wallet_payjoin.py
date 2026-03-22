@@ -137,6 +137,10 @@ class PayjoinTest(BitcoinTestFramework):
         assert_raises_rpc_error(-4, "Failed to parse payjoin URI",
                                 self.nodes[0].sendpayjoin, "not-a-valid-uri")
 
+        # receivepayjoin rejects unsupported https transport
+        assert_raises_rpc_error(-8, "only supports cleartext http:// transport",
+                                self.nodes[0].receivepayjoin, 0.001, "https://payjo.in")
+
         # cancelpayjoin fails for non-existent session
         assert_raises_rpc_error(-8, "Session not found",
                                 self.nodes[0].cancelpayjoin, fake_id)
@@ -171,6 +175,7 @@ class PayjoinTest(BitcoinTestFramework):
         self.log.info(f"Payjoin URI: {uri}")
         assert uri.lower().startswith("bitcoin:"), "URI must start with bitcoin:"
         assert "pj=" in uri, "URI must contain pj= parameter"
+        assert "pj=http://" in uri.lower(), "URI must use cleartext http transport"
         assert "amount=" in uri, "URI must contain amount"
 
         # payjoininfo should return the session
