@@ -62,6 +62,7 @@ std::optional<std::string> ApplyReceiverFeeContribution(const PartiallySignedTra
                                                         PartiallySignedTransaction& proposal,
                                                         const OriginalPayloadParams& params,
                                                         size_t receiver_output_index,
+                                                        const std::vector<size_t>& original_receiver_output_indexes,
                                                         int original_tx_vsize,
                                                         int receiver_input_vsize)
 {
@@ -87,8 +88,12 @@ std::optional<std::string> ApplyReceiverFeeContribution(const PartiallySignedTra
     }
 
     if (receiver_additional_fee > 0) {
-        if (params.disable_output_substitution) {
-            return "Receiver cannot pay additional fee with output substitution disabled";
+        const bool drains_original_receiver_output =
+            std::find(original_receiver_output_indexes.begin(),
+                      original_receiver_output_indexes.end(),
+                      receiver_output_index) != original_receiver_output_indexes.end();
+        if (params.disable_output_substitution && drains_original_receiver_output) {
+            return "Receiver cannot pay additional fee from the original receiver output when output substitution is disabled";
         }
         auto& receiver_output = proposal.tx->vout[receiver_output_index];
         if (receiver_output.nValue <= receiver_additional_fee) {

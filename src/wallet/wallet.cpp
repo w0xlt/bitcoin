@@ -2273,7 +2273,9 @@ void CWallet::CommitTransaction(CTransactionRef tx, mapValue_t mapValue, std::ve
 
     // Notify that old coins are spent
     for (const CTxIn& txin : tx->vin) {
-        CWalletTx &coin = mapWallet.at(txin.prevout.hash);
+        auto it = mapWallet.find(txin.prevout.hash);
+        if (it == mapWallet.end()) continue;
+        CWalletTx& coin = it->second;
         coin.MarkDirty();
         NotifyTransactionChanged(coin.GetHash(), CT_UPDATED);
     }

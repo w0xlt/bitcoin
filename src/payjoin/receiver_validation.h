@@ -27,6 +27,7 @@ std::optional<std::string> ApplyReceiverFeeContribution(const PartiallySignedTra
                                                         PartiallySignedTransaction& proposal,
                                                         const OriginalPayloadParams& params,
                                                         size_t receiver_output_index,
+                                                        const std::vector<size_t>& original_receiver_output_indexes,
                                                         int original_tx_vsize,
                                                         int receiver_input_vsize);
 

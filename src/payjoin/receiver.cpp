@@ -4,6 +4,7 @@
 
 #include <payjoin/receiver.h>
 
+#include <addresstype.h>
 #include <coins.h>
 #include <consensus/validation.h>
 #include <core_io.h>
@@ -135,7 +136,8 @@ std::optional<Receiver> Receiver::Create(wallet::CWallet& wallet, HttpClient& ht
     PayjoinUri uri;
     uri.address = *dest_result;
     uri.amount = amount;
-    uri.output_substitution = true;
+    // BIP 77 v2 URIs are expected to disable output substitution explicitly.
+    uri.output_substitution = false;
 
     uri.pj.receiver_key = session->receiver_key.GetPubKey();
     uri.pj.mailbox_url = MailboxUrl(directory_url, uri.pj.receiver_key);
@@ -482,6 +484,21 @@ bool Receiver::ProcessAndRespond()
     // Start with a copy of the original transaction
     CMutableTransaction proposal_tx(*original.tx);
 
+    // When output substitution is disabled, keep the original payment output
+    // untouched and add a dedicated receiver-owned drain output for the
+    // contributed input value and any receiver-paid fees.
+    if (receiver_params.disable_output_substitution) {
+        const OutputType drain_type = ClassifyScript(orig_tx.vout[receiver_output_idx].scriptPubKey);
+        auto drain_dest = m_wallet.GetNewDestination(drain_type, "payjoin");
+        if (!drain_dest) {
+            m_session->receiver_state = ReceiverState::Failed;
+            m_session->error_message = "Failed to create receiver drain output";
+            return false;
+        }
+        proposal_tx.vout.emplace_back(/*nValue=*/0, GetScriptForDestination(*drain_dest));
+        receiver_output_idx = proposal_tx.vout.size() - 1;
+    }
+
     // 6. Add receiver's input at a random position
     CTxIn receiver_input(
         selected_coin->outpoint,
@@ -526,7 +543,8 @@ bool Receiver::ProcessAndRespond()
 
     // 10. Apply sender fee contribution rules before signing the proposal.
     if (const auto fee_error = detail::ApplyReceiverFeeContribution(
-            original, proposal, receiver_params, receiver_output_idx, original_tx_vsize, selected_coin->input_bytes)) {
+            original, proposal, receiver_params, receiver_output_idx, receiver_output_indexes,
+            original_tx_vsize, selected_coin->input_bytes)) {
         m_session->receiver_state = ReceiverState::Failed;
         m_session->error_message = *fee_error;
         return false;

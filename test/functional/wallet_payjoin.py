@@ -176,6 +176,7 @@ class PayjoinTest(BitcoinTestFramework):
         assert uri.lower().startswith("bitcoin:"), "URI must start with bitcoin:"
         assert "pj=" in uri, "URI must contain pj= parameter"
         assert "pj=http://" in uri.lower(), "URI must use cleartext http transport"
+        assert "pjos=0" in uri.lower(), "BIP77 v2 receiver URI must disable output substitution"
         assert "amount=" in uri, "URI must contain amount"
 
         # payjoininfo should return the session

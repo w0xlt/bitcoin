@@ -113,7 +113,8 @@ BOOST_AUTO_TEST_CASE(apply_receiver_fee_contribution_uses_sender_change_when_ava
     };
 
     const auto error = payjoin::detail::ApplyReceiverFeeContribution(
-        original, proposal, params, /*receiver_output_index=*/0, /*original_tx_vsize=*/100, /*receiver_input_vsize=*/100);
+        original, proposal, params, /*receiver_output_index=*/0, /*original_receiver_output_indexes=*/{0},
+        /*original_tx_vsize=*/100, /*receiver_input_vsize=*/100);
     BOOST_CHECK(!error.has_value());
     BOOST_CHECK_EQUAL(proposal.tx->vout[0].nValue, 5960);
     BOOST_CHECK_EQUAL(proposal.tx->vout[1].nValue, 8840);
@@ -130,9 +131,29 @@ BOOST_AUTO_TEST_CASE(apply_receiver_fee_contribution_rejects_receiver_fee_when_d
     params.min_fee_rate = CFeeRate{1000};
 
     const auto error = payjoin::detail::ApplyReceiverFeeContribution(
-        original, proposal, params, /*receiver_output_index=*/0, /*original_tx_vsize=*/100, /*receiver_input_vsize=*/25);
+        original, proposal, params, /*receiver_output_index=*/0, /*original_receiver_output_indexes=*/{0},
+        /*original_tx_vsize=*/100, /*receiver_input_vsize=*/25);
     BOOST_REQUIRE(error.has_value());
-    BOOST_CHECK_EQUAL(*error, "Receiver cannot pay additional fee with output substitution disabled");
+    BOOST_CHECK_EQUAL(*error, "Receiver cannot pay additional fee from the original receiver output when output substitution is disabled");
+}
+
+BOOST_AUTO_TEST_CASE(apply_receiver_fee_contribution_allows_dedicated_drain_when_disabled)
+{
+    const auto original = MakeOriginalPsbt();
+    auto proposal = MakeProposalPsbt();
+    proposal.tx->vout[0].nValue = 1000;
+    proposal.tx->vout.emplace_back(5000, ReceiverScript());
+
+    payjoin::OriginalPayloadParams params;
+    params.disable_output_substitution = true;
+    params.min_fee_rate = CFeeRate{1000};
+
+    const auto error = payjoin::detail::ApplyReceiverFeeContribution(
+        original, proposal, params, /*receiver_output_index=*/2, /*original_receiver_output_indexes=*/{0},
+        /*original_tx_vsize=*/100, /*receiver_input_vsize=*/100);
+    BOOST_CHECK(!error.has_value());
+    BOOST_CHECK_EQUAL(proposal.tx->vout[0].nValue, 1000);
+    BOOST_CHECK_EQUAL(proposal.tx->vout[2].nValue, 4900);
 }
 
 BOOST_AUTO_TEST_CASE(apply_receiver_fee_contribution_enforces_min_fee_rate)
@@ -144,7 +165,8 @@ BOOST_AUTO_TEST_CASE(apply_receiver_fee_contribution_enforces_min_fee_rate)
     params.min_fee_rate = CFeeRate{1000};
 
     const auto error = payjoin::detail::ApplyReceiverFeeContribution(
-        original, proposal, params, /*receiver_output_index=*/0, /*original_tx_vsize=*/300, /*receiver_input_vsize=*/50);
+        original, proposal, params, /*receiver_output_index=*/0, /*original_receiver_output_indexes=*/{0},
+        /*original_tx_vsize=*/300, /*receiver_input_vsize=*/50);
     BOOST_REQUIRE(error.has_value());
     BOOST_CHECK_EQUAL(*error, "Proposal fee rate below sender minimum");
 }

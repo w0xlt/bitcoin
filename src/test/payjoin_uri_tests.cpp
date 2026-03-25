@@ -154,6 +154,30 @@ BOOST_AUTO_TEST_CASE(roundtrip_build_parse)
     BOOST_CHECK_EQUAL(parsed->pj.expiration, 1800000000);
 }
 
+BOOST_AUTO_TEST_CASE(build_uri_with_output_substitution_disabled_emits_pjos0)
+{
+    CKey sk;
+    sk.MakeNewKey(/*fCompressed=*/true);
+    CPubKey pk = sk.GetPubKey();
+
+    payjoin::PayjoinUri uri;
+    uri.address = DecodeDestination(TEST_ADDRESS);
+    BOOST_REQUIRE(IsValidDestination(uri.address));
+    uri.amount = 50000;
+    uri.output_substitution = false;
+
+    uri.pj.receiver_key = pk;
+    uri.pj.mailbox_url = payjoin::MailboxUrl("http://example.onion", pk);
+    uri.pj.expiration = 1800000000;
+    uri.pj.ohttp_keys = MakeOhttpKeys();
+
+    std::string built = payjoin::BuildPayjoinUri(uri);
+    BOOST_CHECK(built.find("pjos=0") != std::string::npos);
+    auto parsed = payjoin::ParsePayjoinUri(built);
+    BOOST_REQUIRE(parsed.has_value());
+    BOOST_CHECK(!parsed->output_substitution);
+}
+
 BOOST_AUTO_TEST_CASE(parse_https_mailbox_fails)
 {
     CKey receiver_sk;
