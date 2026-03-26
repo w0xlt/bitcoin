@@ -490,27 +490,16 @@ class PayjoinTest(BitcoinTestFramework):
         receiver_node = self.nodes[1]
 
         # After the negative test, some receivers are still initialized
-        # (they were capped). The scheduler iterates sessions in sorted
-        # key order, so the same sessions get processed every tick. To
-        # unblock the capped sessions, cancel enough already-advanced
-        # sessions so the capped ones fall within the per-tick budget.
+        # (they were capped). Fair scheduling should rotate the starting
+        # point between ticks so those sessions advance without requiring
+        # any cancellation workaround.
         still_initialized = [
             rid for rid in self.cap_recv_ids
             if receiver_node.payjoininfo(rid)["state"] == "initialized"
         ]
-        already_advanced = [
-            rid for rid in self.cap_recv_ids
-            if receiver_node.payjoininfo(rid)["state"] != "initialized"
-        ]
         assert len(still_initialized) > 0, \
             "Expected some sessions still initialized after cap test"
         self.log.info(f"  {len(still_initialized)} sessions still initialized")
-
-        # Cancel enough advanced sessions to make room
-        cancel_count = min(len(already_advanced), 6)
-        for rid in already_advanced[:cancel_count]:
-            receiver_node.cancelpayjoin(rid)
-            self.log.info(f"  Cancelled {rid[:8]}... to make room")
 
         # Fire more ticks — the capped sessions should now advance
         mock_time = int(time.time()) + 200
