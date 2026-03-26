@@ -127,6 +127,7 @@ add_library(bitcoin_common STATIC EXCLUDE_FROM_ALL
   payjoin/messages.cpp
   payjoin/net.cpp
   payjoin/original.cpp
+  payjoin/psbt_sanitize.cpp
   payjoin/receiver.cpp
   payjoin/receiver_validation.cpp
   payjoin/sender.cpp

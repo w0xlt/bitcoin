@@ -4,6 +4,8 @@
 
 #include <payjoin/original.h>
 
+#include <payjoin/psbt_sanitize.h>
+
 #include <policy/policy.h>
 #include <psbt.h>
 #include <streams.h>
@@ -25,8 +27,11 @@ namespace {
 
 static std::vector<uint8_t> SerializePSBT(const PartiallySignedTransaction& psbt)
 {
+    auto sanitized = psbt;
+    StripUnneededPSBTFields(sanitized);
+
     DataStream ds;
-    ds << psbt;
+    ds << sanitized;
     std::vector<uint8_t> result(ds.size());
     std::memcpy(result.data(), ds.data(), ds.size());
     return result;

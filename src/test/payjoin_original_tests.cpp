@@ -4,6 +4,7 @@
 
 #include <payjoin/messages.h>
 #include <payjoin/original.h>
+#include <payjoin/psbt_sanitize.h>
 
 #include <key.h>
 #include <psbt.h>
@@ -35,6 +36,52 @@ PartiallySignedTransaction CreateTestPsbt()
     mtx.vin.resize(1);
     mtx.vout.emplace_back(12345, CScript() << OP_1);
     return PartiallySignedTransaction(mtx);
+}
+
+PSBTProprietary CreateTestProprietaryField()
+{
+    PSBTProprietary proprietary;
+    proprietary.identifier = {0x01};
+    proprietary.subtype = 7;
+    proprietary.key = {0xfc, 0x01, 0x07};
+    proprietary.value = {0xaa};
+    return proprietary;
+}
+
+PartiallySignedTransaction CreateTestPsbtWithMetadata()
+{
+    auto psbt = CreateTestPsbt();
+    psbt.inputs[0].witness_utxo = CTxOut(20000, CScript() << OP_2);
+    psbt.inputs[0].redeem_script = CScript() << OP_1;
+    psbt.inputs[0].final_script_witness.stack = {{0x01}};
+
+    CKey key;
+    key.MakeNewKey(/*fCompressed=*/true);
+    const CPubKey pubkey = key.GetPubKey();
+    const XOnlyPubKey xonly{pubkey};
+
+    KeyOriginInfo origin;
+    origin.path = {1, 2};
+
+    psbt.m_xpubs[origin].insert(CExtPubKey{});
+    psbt.unknown[{0xfa}] = {0xfb};
+    psbt.m_proprietary.insert(CreateTestProprietaryField());
+
+    psbt.inputs[0].hd_keypaths.emplace(pubkey, origin);
+    psbt.inputs[0].m_tap_internal_key = xonly;
+    psbt.inputs[0].m_tap_bip32_paths.emplace(xonly, std::make_pair(std::set<uint256>{}, origin));
+    psbt.inputs[0].m_tap_key_sig = {0x02};
+    psbt.inputs[0].unknown[{0xfc}] = {0xfd};
+    psbt.inputs[0].m_proprietary.insert(CreateTestProprietaryField());
+
+    psbt.outputs[0].redeem_script = CScript() << OP_2;
+    psbt.outputs[0].hd_keypaths.emplace(pubkey, origin);
+    psbt.outputs[0].m_tap_internal_key = xonly;
+    psbt.outputs[0].m_tap_bip32_paths.emplace(xonly, std::make_pair(std::set<uint256>{}, origin));
+    psbt.outputs[0].unknown[{0xfe}] = {0xff};
+    psbt.outputs[0].m_proprietary.insert(CreateTestProprietaryField());
+
+    return psbt;
 }
 
 } // namespace
@@ -117,6 +164,63 @@ BOOST_AUTO_TEST_CASE(parse_original_payload_query_rejects_invalid_version_and_fe
 {
     BOOST_CHECK(!payjoin::ParseOriginalPayloadQuery("v=1").has_value());
     BOOST_CHECK(!payjoin::ParseOriginalPayloadQuery("v=2&minfeerate=abc").has_value());
+}
+
+BOOST_AUTO_TEST_CASE(strip_unneeded_psbt_fields_clears_metadata_but_preserves_spend_data)
+{
+    auto psbt = CreateTestPsbtWithMetadata();
+
+    payjoin::StripUnneededPSBTFields(psbt);
+
+    BOOST_CHECK(psbt.m_xpubs.empty());
+    BOOST_CHECK(psbt.unknown.empty());
+    BOOST_CHECK(psbt.m_proprietary.empty());
+
+    BOOST_CHECK(psbt.inputs[0].hd_keypaths.empty());
+    BOOST_CHECK(psbt.inputs[0].m_tap_internal_key.IsNull());
+    BOOST_CHECK(psbt.inputs[0].m_tap_bip32_paths.empty());
+    BOOST_CHECK(psbt.inputs[0].m_tap_key_sig.empty());
+    BOOST_CHECK(psbt.inputs[0].unknown.empty());
+    BOOST_CHECK(psbt.inputs[0].m_proprietary.empty());
+
+    BOOST_CHECK(psbt.outputs[0].hd_keypaths.empty());
+    BOOST_CHECK(psbt.outputs[0].m_tap_internal_key.IsNull());
+    BOOST_CHECK(psbt.outputs[0].m_tap_bip32_paths.empty());
+    BOOST_CHECK(psbt.outputs[0].unknown.empty());
+    BOOST_CHECK(psbt.outputs[0].m_proprietary.empty());
+
+    BOOST_CHECK_EQUAL(psbt.inputs[0].witness_utxo.nValue, 20000);
+    BOOST_CHECK(psbt.inputs[0].redeem_script == (CScript() << OP_1));
+    BOOST_CHECK(!psbt.inputs[0].final_script_witness.IsNull());
+    BOOST_CHECK(psbt.outputs[0].redeem_script == (CScript() << OP_2));
+}
+
+BOOST_AUTO_TEST_CASE(serialize_original_payload_strips_metadata_without_mutating_source)
+{
+    const auto original = CreateTestPsbtWithMetadata();
+
+    auto payload = payjoin::SerializeOriginalPayload(original, "v=2");
+    auto parsed = payjoin::DeserializeOriginalPayload(payload);
+    BOOST_REQUIRE(parsed.has_value());
+
+    BOOST_CHECK(parsed->psbt.m_xpubs.empty());
+    BOOST_CHECK(parsed->psbt.unknown.empty());
+    BOOST_CHECK(parsed->psbt.m_proprietary.empty());
+    BOOST_CHECK(parsed->psbt.inputs[0].hd_keypaths.empty());
+    BOOST_CHECK(parsed->psbt.inputs[0].m_tap_internal_key.IsNull());
+    BOOST_CHECK(parsed->psbt.inputs[0].m_tap_bip32_paths.empty());
+    BOOST_CHECK(parsed->psbt.inputs[0].m_tap_key_sig.empty());
+    BOOST_CHECK(parsed->psbt.inputs[0].unknown.empty());
+    BOOST_CHECK(parsed->psbt.inputs[0].m_proprietary.empty());
+    BOOST_CHECK(parsed->psbt.outputs[0].hd_keypaths.empty());
+    BOOST_CHECK(parsed->psbt.outputs[0].m_tap_internal_key.IsNull());
+    BOOST_CHECK(parsed->psbt.outputs[0].m_tap_bip32_paths.empty());
+    BOOST_CHECK(parsed->psbt.outputs[0].unknown.empty());
+    BOOST_CHECK(parsed->psbt.outputs[0].m_proprietary.empty());
+
+    BOOST_CHECK(!original.m_xpubs.empty());
+    BOOST_CHECK(!original.inputs[0].hd_keypaths.empty());
+    BOOST_CHECK(!original.outputs[0].hd_keypaths.empty());
 }
 
 BOOST_AUTO_TEST_SUITE_END()

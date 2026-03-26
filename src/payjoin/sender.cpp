@@ -4,6 +4,7 @@
 
 #include <payjoin/sender.h>
 
+#include <common/messages.h>
 #include <core_io.h>
 #include <key.h>
 #include <logging.h>
@@ -125,7 +126,16 @@ std::optional<Sender> Sender::Create(wallet::CWallet& wallet, HttpClient& http,
 
     PartiallySignedTransaction psbtx(mtx);
     bool complete = false;
-    wallet.FillPSBT(psbtx, complete, /*sighash_type=*/std::nullopt, /*sign=*/true, /*bip32derivs=*/true);
+    if (const auto sign_error = wallet.FillPSBT(
+            psbtx, complete, /*sighash_type=*/std::nullopt, /*sign=*/true, /*bip32derivs=*/false)) {
+        LogPrintf("payjoin sender: Failed to sign original PSBT: %s\n",
+                  common::PSBTErrorString(*sign_error).original);
+        return std::nullopt;
+    }
+    if (!complete) {
+        LogPrintf("payjoin sender: Original PSBT incomplete after signing\n");
+        return std::nullopt;
+    }
 
     session->original_psbt = psbtx;
 
@@ -332,10 +342,15 @@ std::optional<uint256> Sender::FinalizeAndBroadcast()
     // 1. Sign sender's inputs in the proposal
     bool complete = false;
     auto error = m_wallet.FillPSBT(proposal, complete, /*sighash_type=*/std::nullopt,
-                                    /*sign=*/true, /*bip32derivs=*/true);
+                                    /*sign=*/true, /*bip32derivs=*/false);
     if (error) {
         m_session->sender_state = SenderState::Failed;
-        m_session->error_message = "Failed to sign proposal";
+        m_session->error_message = "Failed to sign proposal: " + common::PSBTErrorString(*error).original;
+        return std::nullopt;
+    }
+    if (!complete) {
+        m_session->sender_state = SenderState::Failed;
+        m_session->error_message = "Proposal PSBT incomplete after signing";
         return std::nullopt;
     }
 

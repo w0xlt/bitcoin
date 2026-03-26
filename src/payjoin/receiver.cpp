@@ -18,6 +18,7 @@
 #include <payjoin/messages.h>
 #include <payjoin/net.h>
 #include <payjoin/original.h>
+#include <payjoin/psbt_sanitize.h>
 #include <payjoin/receiver_validation.h>
 #include <payjoin/session.h>
 #include <payjoin/shortid.h>
@@ -69,8 +70,11 @@ bool SessionContainsOutPoint(const PayjoinSession& session, const COutPoint& out
 // ---------------------------------------------------------------------------
 static std::vector<uint8_t> SerializePSBT(const PartiallySignedTransaction& psbt)
 {
+    auto sanitized = psbt;
+    StripUnneededPSBTFields(sanitized);
+
     DataStream ds;
-    ds << psbt;
+    ds << sanitized;
     std::vector<uint8_t> result(ds.size());
     std::memcpy(result.data(), ds.data(), ds.size());
     return result;
