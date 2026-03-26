@@ -8,6 +8,7 @@
 #include <key.h>
 #include <pubkey.h>
 #include <random.h>
+#include <test/util/setup_common.h>
 
 #include <boost/test/unit_test.hpp>
 
@@ -17,7 +18,7 @@
 #include <numeric>
 #include <vector>
 
-BOOST_AUTO_TEST_SUITE(payjoin_messages_tests)
+BOOST_FIXTURE_TEST_SUITE(payjoin_messages_tests, BasicTestingSetup)
 
 BOOST_AUTO_TEST_CASE(message_a_roundtrip)
 {
