@@ -4,6 +4,8 @@
 # file COPYING or http://www.opensource.org/licenses/mit-license.php.
 """Test the getblockfrompeer RPC."""
 
+import re
+
 from test_framework.authproxy import JSONRPCException
 from test_framework.messages import (
     CBlock,
@@ -41,6 +43,12 @@ class GetBlockFromPeerTest(BitcoinTestFramework):
         except JSONRPCException:
             return False
 
+    def assert_log_matches(self, node, regexes):
+        with open(node.debug_log_path, encoding="utf-8", errors="replace") as debug_log:
+            log = debug_log.read()
+        for regex in regexes:
+            assert re.search(regex, log), f"Expected regex not found in debug log: {regex}\n\n{log}"
+
     def run_test(self):
         self.log.info("Mine 4 blocks on Node 0")
         self.generate(self.nodes[0], 4, sync_fun=self.no_op)
@@ -58,6 +66,7 @@ class GetBlockFromPeerTest(BitcoinTestFramework):
         self.log.info("Node 0 should only have the header for node 1's block 3")
         x = next(filter(lambda x: x['hash'] == short_tip, self.nodes[0].getchaintips()))
         assert_equal(x['status'], "headers-only")
+        short_tip_height = x['height']
         assert_raises_rpc_error(-1, "Block not available (not fully downloaded)", self.nodes[0].getblock, short_tip)
 
         self.log.info("Fetch block from node 1")
@@ -91,6 +100,9 @@ class GetBlockFromPeerTest(BitcoinTestFramework):
         result = self.nodes[0].getblockfrompeer(short_tip, peer_0_peer_1_id)
         self.wait_until(lambda: self.check_for_block(node=0, hash=short_tip), timeout=1)
         assert_equal(result, {})
+        self.assert_log_matches(self.nodes[0], [
+            rf"Requesting block {short_tip} \({short_tip_height}\) peer=\d+ reason=manual-fetch",
+        ])
 
         self.log.info("Don't fetch blocks we already have")
         assert_raises_rpc_error(-1, "Block already downloaded", self.nodes[0].getblockfrompeer, short_tip, peer_0_peer_1_id)

@@ -147,6 +147,7 @@ BASE_SCRIPTS = [
     'p2p_feefilter.py',
     'feature_csv_activation.py',
     'p2p_sendheaders.py',
+    'p2p_reorg_logging.py',
     'feature_config_args.py',
     'wallet_listtransactions.py',
     'wallet_miniscript.py',

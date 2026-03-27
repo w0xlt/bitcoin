@@ -4,6 +4,8 @@
 # file COPYING or http://www.opensource.org/licenses/mit-license.php.
 """Test compact blocks (BIP 152)."""
 import random
+import re
+import time
 
 from test_framework.blocktools import (
     COINBASE_MATURITY,
@@ -154,6 +156,12 @@ class CompactBlocksTest(BitcoinTestFramework):
         block = create_block(tmpl=node.getblocktemplate(NORMAL_GBT_REQUEST_PARAMS))
         block.solve()
         return block
+
+    def assert_log_matches(self, node, regexes):
+        with open(node.debug_log_path, encoding="utf-8", errors="replace") as debug_log:
+            log = debug_log.read()
+        for regex in regexes:
+            assert re.search(regex, log), f"Expected regex not found in debug log: {regex}\n\n{log}"
 
     # Create 10 more anyone-can-spend utxo's for testing.
     def make_utxos(self):
@@ -851,6 +859,33 @@ class CompactBlocksTest(BitcoinTestFramework):
         msg.block_transactions.transactions = block.vtx[1:]
         stalling_peer.send_and_ping(msg)
         assert_equal(node.getbestblockhash(), block.hash_hex)
+
+        self.log.info("Test timeout logging for a stalled compact block reconstruction")
+        timeout_peer = node.add_p2p_connection(TestP2PConn())
+        mocktime = int(time.time())
+        node.setmocktime(mocktime)
+
+        timeout_utxo = self.utxos.pop(0)
+        timeout_block = self.build_block_with_transactions(node, timeout_utxo, 5)
+        timeout_height = node.getblockcount() + 1
+        timeout_cmpct_block = HeaderAndShortIDs()
+        timeout_cmpct_block.initialize_from_block(timeout_block)
+        timeout_peer.send_and_ping(msg_cmpctblock(timeout_cmpct_block.to_p2p()))
+        with p2p_lock:
+            assert "getblocktxn" in timeout_peer.last_message
+
+        with node.assert_debug_log(expected_msgs=[
+            f"Timeout downloading block {timeout_block.hash_hex} ({timeout_height}) after ",
+        ], timeout=10):
+            node.setmocktime(mocktime + (11 * 60))
+            timeout_peer.wait_for_disconnect(timeout=10)
+
+        self.assert_log_matches(node, [
+            rf"Timeout downloading block {timeout_block.hash_hex} \({timeout_height}\) after \d+ms reason=compact-block",
+        ])
+
+        self.utxos.append(timeout_utxo)
+        node.setmocktime(0)
 
     def test_highbandwidth_mode_states_via_getpeerinfo(self):
         # create new p2p connection for a fresh state w/o any prior sendcmpct messages sent
