@@ -26,14 +26,11 @@ namespace wallet {
 
 static payjoin::HttpClient GetPayjoinHttpClient()
 {
-    Proxy tor_proxy;
-    if (!GetProxy(NET_ONION, tor_proxy)) {
-        // Fall back to IPv4 proxy
-        if (!GetProxy(NET_IPV4, tor_proxy)) {
-            throw JSONRPCError(RPC_MISC_ERROR, "No Tor/SOCKS5 proxy configured. Set -proxy= or -onion=");
-        }
+    try {
+        return payjoin::HttpClient(GetPayjoinTransportProxy());
+    } catch (const std::runtime_error&) {
+        throw JSONRPCError(RPC_MISC_ERROR, "No Tor/SOCKS5 proxy configured. Set -proxy= or -onion=");
     }
-    return payjoin::HttpClient(tor_proxy);
 }
 
 static UniValue SessionToJSON(const payjoin::PayjoinSession& session)

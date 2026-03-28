@@ -26,6 +26,23 @@ constexpr std::string_view PAYJOIN_ROLE_KEY{"payjoin_role"};
 constexpr std::string_view PAYJOIN_AMOUNT_KEY{"payjoin_amount_sats"};
 } // namespace
 
+Proxy HardenPayjoinTransportProxy(Proxy proxy)
+{
+    proxy.m_tor_stream_isolation = true;
+    return proxy;
+}
+
+Proxy GetPayjoinTransportProxy()
+{
+    Proxy transport_proxy;
+    if (!GetProxy(NET_ONION, transport_proxy)) {
+        if (!GetProxy(NET_IPV4, transport_proxy)) {
+            throw std::runtime_error("No Tor/SOCKS5 proxy configured");
+        }
+    }
+    return HardenPayjoinTransportProxy(transport_proxy);
+}
+
 std::optional<PayjoinTxMetadata> GetPayjoinTxMetadata(const mapValue_t& map_value)
 {
     auto role_it = map_value.find(std::string{PAYJOIN_ROLE_KEY});
@@ -151,13 +168,7 @@ static std::vector<size_t> GetEligibleSessionOrder(
 
 static payjoin::HttpClient MakePayjoinHttpClient()
 {
-    Proxy tor_proxy;
-    if (!GetProxy(NET_ONION, tor_proxy)) {
-        if (!GetProxy(NET_IPV4, tor_proxy)) {
-            throw std::runtime_error("No Tor/SOCKS5 proxy configured");
-        }
-    }
-    return payjoin::HttpClient(tor_proxy);
+    return payjoin::HttpClient(GetPayjoinTransportProxy());
 }
 
 bool AdvancePayjoinSession(CWallet& wallet,

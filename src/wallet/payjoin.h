@@ -6,6 +6,7 @@
 #define BITCOIN_WALLET_PAYJOIN_H
 
 #include <consensus/amount.h>
+#include <netbase.h>
 #include <payjoin/session.h>
 #include <wallet/transaction.h>
 
@@ -26,6 +27,17 @@ struct PayjoinTxMetadata {
     PayjoinTxRole role;
     CAmount amount;
 };
+
+/**
+ * Copy a SOCKS proxy configuration for payjoin transport and force stream
+ * isolation on the copy. This keeps payjoin requests on distinct Tor proxy
+ * identities even if the user disabled credential randomization for other
+ * wallet or P2P traffic.
+ */
+Proxy HardenPayjoinTransportProxy(Proxy proxy);
+
+/** Return the SOCKS proxy used for payjoin transport with stream isolation enabled. */
+Proxy GetPayjoinTransportProxy();
 
 /** Advance a payjoin session one protocol step.
  *  Returns true if session state changed.
