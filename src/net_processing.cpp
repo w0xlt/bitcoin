@@ -4594,6 +4594,10 @@ void PeerManagerImpl::ProcessMessage(Peer& peer, CNode& pfrom, const std::string
                     Misbehaving(peer, "invalid compact block");
                     return;
                 } else if (status == READ_STATUS_FAILED) {
+                    if (partialBlock.ShortIDCollisionDetected()) {
+                        LogDebug(BCLog::CMPCTBLOCK, "Peer %d sent cmpctblock %s with %u duplicate short IDs\n",
+                                 pfrom.GetId(), blockhash.ToString(), partialBlock.GetShortIDCollisionCount());
+                    }
                     if (first_in_flight)  {
                         // Duplicate txindexes, the block is now in-flight, so just request it
                         std::vector<CInv> vInv(1);
@@ -4641,6 +4645,10 @@ void PeerManagerImpl::ProcessMessage(Peer& peer, CNode& pfrom, const std::string
                 PartiallyDownloadedBlock tempBlock(&m_mempool);
                 ReadStatus status = tempBlock.InitData(cmpctblock, vExtraTxnForCompact);
                 if (status != READ_STATUS_OK) {
+                    if (tempBlock.ShortIDCollisionDetected()) {
+                        LogDebug(BCLog::CMPCTBLOCK, "Peer %d sent cmpctblock %s with %u duplicate short IDs\n",
+                                 pfrom.GetId(), blockhash.ToString(), tempBlock.GetShortIDCollisionCount());
+                    }
                     // TODO: don't ignore failures
                     return;
                 }

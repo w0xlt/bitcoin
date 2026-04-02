@@ -59,6 +59,8 @@ uint64_t CBlockHeaderAndShortTxIDs::GetShortID(const Wtxid& wtxid) const
 ReadStatus PartiallyDownloadedBlock::InitData(const CBlockHeaderAndShortTxIDs& cmpctblock, const std::vector<std::pair<Wtxid, CTransactionRef>>& extra_txn)
 {
     LogDebug(BCLog::CMPCTBLOCK, "Initializing PartiallyDownloadedBlock for block %s using a cmpctblock of %u bytes\n", cmpctblock.header.GetHash().ToString(), GetSerializeSize(cmpctblock));
+    m_shortid_collision_detected = false;
+    m_shortid_collision_count = 0;
     if (cmpctblock.header.IsNull() || (cmpctblock.shorttxids.empty() && cmpctblock.prefilledtxn.empty()))
         return READ_STATUS_INVALID;
     if (cmpctblock.shorttxids.size() + cmpctblock.prefilledtxn.size() > MAX_BLOCK_WEIGHT / MIN_SERIALIZABLE_TRANSACTION_WEIGHT)
@@ -96,7 +98,11 @@ ReadStatus PartiallyDownloadedBlock::InitData(const CBlockHeaderAndShortTxIDs& c
     for (size_t i = 0; i < cmpctblock.shorttxids.size(); i++) {
         while (txn_available[i + index_offset])
             index_offset++;
-        shorttxids[cmpctblock.shorttxids[i]] = i + index_offset;
+        const auto [it, inserted] = shorttxids.emplace(cmpctblock.shorttxids[i], i + index_offset);
+        if (!inserted) {
+            ++m_shortid_collision_count;
+            it->second = i + index_offset;
+        }
         // To determine the chance that the number of entries in a bucket exceeds N,
         // we use the fact that the number of elements in a single bucket is
         // binomially distributed (with n = the number of shorttxids S, and p =
@@ -107,13 +113,16 @@ ReadStatus PartiallyDownloadedBlock::InitData(const CBlockHeaderAndShortTxIDs& c
         // Thus: P(max_elements_per_bucket > N) <= S * (1 - cdf(binomial(n=S,p=1/S), N)).
         // If we assume blocks of up to 16000, allowing 12 elements per bucket should
         // only fail once per ~1 million block transfers (per peer and connection).
-        if (shorttxids.bucket_size(shorttxids.bucket(cmpctblock.shorttxids[i])) > 12)
+        if (shorttxids.bucket_size(shorttxids.bucket(cmpctblock.shorttxids[i])) > 12) {
             return READ_STATUS_FAILED;
+        }
     }
     // TODO: in the shortid-collision case, we should instead request both transactions
     // which collided. Falling back to full-block-request here is overkill.
-    if (shorttxids.size() != cmpctblock.shorttxids.size())
+    if (shorttxids.size() != cmpctblock.shorttxids.size()) {
+        m_shortid_collision_detected = true;
         return READ_STATUS_FAILED; // Short ID collision
+    }
 
     std::vector<bool> have_txn(txn_available.size());
     {

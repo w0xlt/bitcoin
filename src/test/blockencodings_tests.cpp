@@ -355,6 +355,28 @@ BOOST_AUTO_TEST_CASE(ReceiveWithExtraTransactions) {
     }
 }
 
+BOOST_AUTO_TEST_CASE(ShortIDCollisionInitDataReporting)
+{
+    CTxMemPool& pool = *Assert(m_node.mempool);
+    auto rand_ctx(FastRandomContext(uint256{42}));
+    const CBlock block(BuildBlockTestCase(rand_ctx));
+
+    TestHeaderAndShortIDs shortIDs(block, rand_ctx);
+    BOOST_REQUIRE_EQUAL(shortIDs.shorttxids.size(), 2U);
+    shortIDs.shorttxids[1] = shortIDs.shorttxids[0];
+
+    DataStream stream{};
+    stream << shortIDs;
+
+    CBlockHeaderAndShortTxIDs shortIDs2;
+    stream >> shortIDs2;
+
+    PartiallyDownloadedBlock partialBlock(&pool);
+    BOOST_CHECK(partialBlock.InitData(shortIDs2, empty_extra_txn) == READ_STATUS_FAILED);
+    BOOST_CHECK(partialBlock.ShortIDCollisionDetected());
+    BOOST_CHECK_EQUAL(partialBlock.GetShortIDCollisionCount(), 1U);
+}
+
 BOOST_AUTO_TEST_CASE(TransactionsRequestSerializationTest) {
     BlockTransactionsRequest req1;
     req1.blockhash = m_rng.rand256();
