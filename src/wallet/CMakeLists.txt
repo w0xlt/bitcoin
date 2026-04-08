@@ -6,6 +6,7 @@
 add_library(bitcoin_wallet STATIC EXCLUDE_FROM_ALL
   coincontrol.cpp
   coinselection.cpp
+  codex32.cpp
   context.cpp
   crypter.cpp
   db.cpp
