@@ -426,6 +426,20 @@ BOOST_AUTO_TEST_CASE(rpc_convert_values_generatetoaddress)
     BOOST_CHECK_EQUAL(result[2].getInt<int>(), 9);
 }
 
+BOOST_AUTO_TEST_CASE(rpc_convert_values_wallet_hd_key_strings)
+{
+    UniValue result;
+
+    const std::string codex32_secret{"wr10f2tvsugydzy9ggegddt5tyamkawpve4ukxvvdntmhwvr2f9se3sf6r54slxj9n4fxe7vmp"};
+    BOOST_CHECK_NO_THROW(result = RPCConvertValues("addhdkey", {codex32_secret}));
+    BOOST_CHECK_EQUAL(result[0].get_str(), codex32_secret);
+
+    const std::string xpub{"xpub661MyMwAqRbcF8rV8hA2oG7x7Vx8nH3UX77YPD6PEw24kTx5cHGNy8JD7BqXc9EwP6KDAdAm8YGtSNYGGyRyvE4s46HoPazTA7kGEXLMaLL"};
+    BOOST_CHECK_NO_THROW(result = RPCConvertNamedValues("createwalletdescriptor", {"type=bech32", "hdkey=" + xpub}));
+    BOOST_CHECK_EQUAL(result["type"].get_str(), "bech32");
+    BOOST_CHECK_EQUAL(result["hdkey"].get_str(), xpub);
+}
+
 BOOST_AUTO_TEST_CASE(rpc_getblockstats_calculate_percentiles_by_weight)
 {
     int64_t total_weight = 200;
