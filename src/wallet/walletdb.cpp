@@ -58,6 +58,8 @@ const std::string WALLETDESCRIPTORCACHE{"walletdescriptorcache"};
 const std::string WALLETDESCRIPTORLHCACHE{"walletdescriptorlhcache"};
 const std::string WALLETDESCRIPTORCKEY{"walletdescriptorckey"};
 const std::string WALLETDESCRIPTORKEY{"walletdescriptorkey"};
+const std::string WALLETHDROOTCKEY{"wallethdrootckey"};
+const std::string WALLETHDROOTKEY{"wallethdrootkey"};
 const std::string WATCHMETA{"watchmeta"};
 const std::string WATCHS{"watchs"};
 const std::unordered_set<std::string> LEGACY_TYPES{CRYPTED_KEY, CSCRIPT, DEFAULTKEY, HDCHAIN, KEYMETA, KEY, OLD_KEY, POOL, WATCHMETA, WATCHS};
@@ -234,6 +236,38 @@ bool WalletBatch::WriteCryptedDescriptorKey(const uint256& desc_id, const CPubKe
 bool WalletBatch::WriteDescriptor(const uint256& desc_id, const WalletDescriptor& descriptor)
 {
     return WriteIC(make_pair(DBKeys::WALLETDESCRIPTOR, desc_id), descriptor);
+}
+
+bool WalletBatch::WriteHDRootKey(const CExtPubKey& xpub, const CPrivKey& privkey)
+{
+    std::vector<unsigned char> ser_xpub(BIP32_EXTKEY_SIZE);
+    xpub.Encode(ser_xpub.data());
+
+    // integrity hash to detect corruption on load
+    const auto keypair_hash = Hash(ser_xpub, privkey);
+
+    return WriteIC(std::make_pair(DBKeys::WALLETHDROOTKEY, ser_xpub), std::make_pair(privkey, keypair_hash), false);
+}
+
+bool WalletBatch::WriteCryptedHDRootKey(const CExtPubKey& xpub, const std::vector<unsigned char>& secret)
+{
+    std::vector<unsigned char> ser_xpub(BIP32_EXTKEY_SIZE);
+    xpub.Encode(ser_xpub.data());
+
+    if (!WriteIC(std::make_pair(DBKeys::WALLETHDROOTCKEY, ser_xpub), secret, false)) {
+        return false;
+    }
+    EraseIC(std::make_pair(DBKeys::WALLETHDROOTKEY, ser_xpub));
+    return true;
+}
+
+bool WalletBatch::EraseHDRootKey(const CExtPubKey& xpub)
+{
+    std::vector<unsigned char> ser_xpub(BIP32_EXTKEY_SIZE);
+    xpub.Encode(ser_xpub.data());
+
+    return EraseIC(std::make_pair(DBKeys::WALLETHDROOTKEY, ser_xpub)) &&
+           EraseIC(std::make_pair(DBKeys::WALLETHDROOTCKEY, ser_xpub));
 }
 
 bool WalletBatch::WriteDescriptorDerivedCache(const CExtPubKey& xpub, const uint256& desc_id, uint32_t key_exp_index, uint32_t der_index)
@@ -914,6 +948,87 @@ static DBErrors LoadDescriptorWalletRecords(CWallet* pwallet, DatabaseBatch& bat
     return desc_res.m_result;
 }
 
+static DBErrors LoadHDRootRecords(CWallet* pwallet, DatabaseBatch& batch) EXCLUSIVE_LOCKS_REQUIRED(pwallet->cs_wallet)
+{
+    AssertLockHeld(pwallet->cs_wallet);
+
+    int num_keys = 0;
+    int num_ckeys = 0;
+
+    LoadResult key_res = LoadRecords(pwallet, batch, DBKeys::WALLETHDROOTKEY,
+        [&num_keys] (CWallet* pwallet, DataStream& key, DataStream& value, std::string& strErr) {
+            std::vector<unsigned char> ser_xpub;
+            key >> ser_xpub;
+            if (ser_xpub.size() != BIP32_EXTKEY_SIZE) {
+                strErr = "Error reading wallet database: wallet HD root xpub corrupt";
+                return DBErrors::CORRUPT;
+            }
+
+            CExtPubKey xpub;
+            xpub.Decode(ser_xpub.data());
+            if (!xpub.pubkey.IsValid()) {
+                strErr = "Error reading wallet database: wallet HD root xpub invalid";
+                return DBErrors::CORRUPT;
+            }
+
+            CKey privkey;
+            CPrivKey pkey;
+            uint256 hash;
+            value >> pkey;
+            value >> hash;
+
+            // integrity hash to detect corruption on load
+            const auto keypair_hash = Hash(ser_xpub, pkey);
+            if (keypair_hash != hash) {
+                strErr = "Error reading wallet database: wallet HD root xpub/CPrivKey corrupt";
+                return DBErrors::CORRUPT;
+            }
+            if (!privkey.Load(pkey, xpub.pubkey, true)) {
+                strErr = "Error reading wallet database: wallet HD root CPrivKey corrupt";
+                return DBErrors::CORRUPT;
+            }
+            if (!pwallet->LoadHDKey(xpub, privkey)) {
+                strErr = "Error reading wallet database: duplicate wallet HD root";
+                return DBErrors::CORRUPT;
+            }
+            ++num_keys;
+            return DBErrors::LOAD_OK;
+        });
+
+    LoadResult ckey_res = LoadRecords(pwallet, batch, DBKeys::WALLETHDROOTCKEY,
+        [&num_ckeys] (CWallet* pwallet, DataStream& key, DataStream& value, std::string& strErr) {
+            std::vector<unsigned char> ser_xpub;
+            key >> ser_xpub;
+            if (ser_xpub.size() != BIP32_EXTKEY_SIZE) {
+                strErr = "Error reading wallet database: wallet encrypted HD root xpub corrupt";
+                return DBErrors::CORRUPT;
+            }
+
+            CExtPubKey xpub;
+            xpub.Decode(ser_xpub.data());
+            if (!xpub.pubkey.IsValid()) {
+                strErr = "Error reading wallet database: wallet encrypted HD root xpub invalid";
+                return DBErrors::CORRUPT;
+            }
+
+            std::vector<unsigned char> crypted_key;
+            value >> crypted_key;
+            if (!pwallet->LoadCryptedHDKey(xpub, crypted_key)) {
+                strErr = "Error reading wallet database: duplicate wallet encrypted HD root";
+                return DBErrors::CORRUPT;
+            }
+            ++num_ckeys;
+            return DBErrors::LOAD_OK;
+        });
+
+    if (std::max(key_res.m_result, ckey_res.m_result) <= DBErrors::NONCRITICAL_ERROR) {
+        pwallet->WalletLogPrintf("Wallet HD roots: %u plaintext, %u encrypted, %u total.\n",
+            num_keys, num_ckeys, num_keys + num_ckeys);
+    }
+
+    return std::max(key_res.m_result, ckey_res.m_result);
+}
+
 static DBErrors LoadAddressBookRecords(CWallet* pwallet, DatabaseBatch& batch) EXCLUSIVE_LOCKS_REQUIRED(pwallet->cs_wallet)
 {
     AssertLockHeld(pwallet->cs_wallet);
@@ -1127,6 +1242,9 @@ DBErrors WalletBatch::LoadWallet(CWallet* pwallet)
         // may reference the unknown descriptor's ID which can result in a misleading corruption error
         // when in reality the wallet is simply too new.
         if (result == DBErrors::UNKNOWN_DESCRIPTOR) return result;
+
+        // Load wallet-level HD roots.
+        result = std::max(LoadHDRootRecords(pwallet, *m_batch), result);
 
         // Load address book
         result = std::max(LoadAddressBookRecords(pwallet, *m_batch), result);
