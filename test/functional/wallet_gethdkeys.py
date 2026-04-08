@@ -27,6 +27,11 @@ class WalletGetHDKeyTest(BitcoinTestFramework):
     def skip_test_if_missing_module(self):
         self.skip_if_no_wallet()
 
+    def ensure_wallet_loaded(self, wallet_name):
+        if wallet_name not in self.nodes[0].listwallets():
+            self.nodes[0].loadwallet(wallet_name)
+        return self.nodes[0].get_wallet_rpc(wallet_name)
+
     def run_test(self):
         self.test_basic_gethdkeys()
         self.test_ranged_imports()
@@ -34,6 +39,7 @@ class WalletGetHDKeyTest(BitcoinTestFramework):
         self.test_ranged_multisig()
         self.test_mixed_multisig()
         self.test_addhdkey()
+        self.test_addhdkey_existing_descriptor()
 
     def test_basic_gethdkeys(self):
         self.log.info("Test gethdkeys basics")
@@ -42,14 +48,23 @@ class WalletGetHDKeyTest(BitcoinTestFramework):
         xpub_info = wallet.gethdkeys()
         assert_equal(len(xpub_info), 1)
         assert_equal(xpub_info[0]["has_private"], True)
+        assert_equal(xpub_info[0]["has_seed"], True)
 
         assert "xprv" not in xpub_info[0]
         xpub = xpub_info[0]["xpub"]
 
+        assert_raises_rpc_error(-8, '"codex32" requires "private" to be true', wallet.gethdkeys, codex32=True)
         xpub_info = wallet.gethdkeys(private=True)
         xprv = xpub_info[0]["xprv"]
         assert_equal(xpub_info[0]["xpub"], xpub)
         assert_equal(xpub_info[0]["has_private"], True)
+        assert_equal(xpub_info[0]["has_seed"], True)
+
+        xpub_info = wallet.gethdkeys(private=True, codex32=True)
+        codex32_secret = xpub_info[0]["codex32"]
+        self.nodes[0].createwallet("basic_restore", blank=True)
+        restore_wallet = self.nodes[0].get_wallet_rpc("basic_restore")
+        assert_equal(restore_wallet.addhdkey(codex32_secret)["xpub"], xpub)
 
         descs = wallet.listdescriptors(True)
         for desc in descs["descriptors"]:
@@ -66,16 +81,24 @@ class WalletGetHDKeyTest(BitcoinTestFramework):
         assert_not_equal(xpub_info[0]["xpub"], xpub)
         assert "xprv" not in xpub_info[0]
         assert_equal(xpub_info[0]["has_private"], True)
+        assert_equal(xpub_info[0]["has_seed"], True)
 
         self.log.info("HD privkey can be retrieved from encrypted wallets")
         assert_raises_rpc_error(-13, "Error: Please enter the wallet passphrase with walletpassphrase first", wallet.gethdkeys, private=True)
         with WalletUnlock(wallet, "pass"):
-            xpub_info = wallet.gethdkeys(active_only=True, private=True)[0]
-            assert_not_equal(xpub_info["xprv"], xprv)
+            xpub_info = wallet.gethdkeys(private=True, codex32=True)
+            assert_equal(len(xpub_info), 2)
+            for entry in xpub_info:
+                assert_equal(entry["has_seed"], True)
+                assert "codex32" in entry
+            active_info = wallet.gethdkeys(active_only=True, private=True, codex32=True)[0]
+            assert_not_equal(active_info["xprv"], xprv)
+            assert_equal(active_info["has_seed"], True)
+            assert "codex32" in active_info
             for desc in wallet.listdescriptors(True)["descriptors"]:
                 if desc["active"]:
                     # After encrypting, HD key was rotated and should appear in all active descriptors
-                    assert xpub_info["xprv"] in desc["desc"]
+                    assert active_info["xprv"] in desc["desc"]
                 else:
                     # Inactive descriptors should have the previous HD key
                     assert prev_xprv in desc["desc"]
@@ -89,6 +112,7 @@ class WalletGetHDKeyTest(BitcoinTestFramework):
         xpub_info = wallet.gethdkeys()
         assert_equal(len(xpub_info), 1)
         active_xpub = xpub_info[0]["xpub"]
+        assert_equal(xpub_info[0]["has_seed"], True)
 
         import_xpub = def_wallet.gethdkeys(active_only=True)[0]["xpub"]
         desc_import = def_wallet.listdescriptors(True)["descriptors"]
@@ -101,9 +125,11 @@ class WalletGetHDKeyTest(BitcoinTestFramework):
         assert_equal(len(xpub_info), 2)
         for x in xpub_info:
             if x["xpub"] == active_xpub:
+                assert_equal(x["has_seed"], True)
                 for desc in x["descriptors"]:
                     assert_equal(desc["active"], True)
             elif x["xpub"] == import_xpub:
+                assert_equal(x["has_seed"], False)
                 for desc in x["descriptors"]:
                     assert_equal(desc["active"], False)
             else:
@@ -130,6 +156,7 @@ class WalletGetHDKeyTest(BitcoinTestFramework):
         xpub_info = wallet.gethdkeys()
         assert_equal(len(xpub_info), 1)
         assert_equal(xpub_info[0]["xpub"], xpub)
+        assert_equal(xpub_info[0]["has_seed"], False)
         assert_equal(len(xpub_info[0]["descriptors"]), 1)
         assert_equal(xpub_info[0]["descriptors"][0]["desc"], pub_desc)
         assert_equal(xpub_info[0]["descriptors"][0]["active"], False)
@@ -160,6 +187,7 @@ class WalletGetHDKeyTest(BitcoinTestFramework):
             for hdkeys_info in hdkeys_response:
                 if hdkeys_info["xpub"] == within_wallet_xpub:
                     assert_equal(hdkeys_info["has_private"], True)
+                    assert_equal(hdkeys_info["has_seed"], True)
                     if requested_private:
                         assert_equal(hdkeys_info["xprv"], within_wallet_xprv)
                     else:
@@ -168,6 +196,7 @@ class WalletGetHDKeyTest(BitcoinTestFramework):
                     found_desc = next((d for d in hdkeys_info["descriptors"] if d["desc"] == pub_multi_desc), None)
                 elif hdkeys_info["xpub"] == outside_wallet_xpub:
                     assert_equal(hdkeys_info["has_private"], False)
+                    assert_equal(hdkeys_info["has_seed"], False)
                     assert_equal("xprv" not in hdkeys_info, True)
                     assert_equal(len(hdkeys_info["descriptors"]), 1) # outside wallet xpub is part of only the imported descriptor
                     found_desc = hdkeys_info["descriptors"][0]
@@ -195,6 +224,7 @@ class WalletGetHDKeyTest(BitcoinTestFramework):
         xpub_info = wallet.gethdkeys()
         assert_equal(len(xpub_info), 1)
         assert_equal(xpub_info[0]["xpub"], xpub)
+        assert_equal(xpub_info[0]["has_seed"], True)
         found_desc = next((d for d in xpub_info[0]["descriptors"] if d["desc"] == pub_multi_desc), None)
         assert found_desc is not None
         assert_equal(found_desc["active"], False)
@@ -213,22 +243,33 @@ class WalletGetHDKeyTest(BitcoinTestFramework):
         self.nodes[0].createwallet("addhdkey_blank", blank=True)
         wallet = self.nodes[0].get_wallet_rpc("addhdkey_blank")
 
-        xpub = wallet.addhdkey(self.CODEX32_SECRET)["xpub"]
+        blank_xpub = wallet.addhdkey(self.CODEX32_SECRET)["xpub"]
         hdkeys_info = wallet.gethdkeys()
         assert_equal(len(hdkeys_info), 1)
-        assert_equal(hdkeys_info[0]["xpub"], xpub)
+        assert_equal(hdkeys_info[0]["xpub"], blank_xpub)
         assert_equal(hdkeys_info[0]["has_private"], True)
+        assert_equal(hdkeys_info[0]["has_seed"], True)
         assert_equal(hdkeys_info[0]["descriptors"], [])
 
-        assert_raises_rpc_error(-5, f"HD key {xpub} is already known", wallet.addhdkey, self.CODEX32_SECRET)
+        hdkeys_info = wallet.gethdkeys(private=True, codex32=True)
+        assert_equal(len(hdkeys_info), 1)
+        assert_equal(hdkeys_info[0]["xpub"], blank_xpub)
+        exported_codex32 = hdkeys_info[0]["codex32"]
+        self.nodes[0].createwallet("addhdkey_roundtrip", blank=True)
+        roundtrip_wallet = self.nodes[0].get_wallet_rpc("addhdkey_roundtrip")
+        assert_equal(roundtrip_wallet.addhdkey(exported_codex32)["xpub"], blank_xpub)
+
+        assert_raises_rpc_error(-5, f"HD key {blank_xpub} is already known", wallet.addhdkey, self.CODEX32_SECRET)
         assert_raises_rpc_error(-8, "Unable to decode codex32 secret", wallet.addhdkey, "not-codex32")
 
-        descs = wallet.createwalletdescriptor(type="bech32m", hdkey=xpub)["descs"]
+        descs = wallet.createwalletdescriptor(type="bech32m", hdkey=blank_xpub)["descs"]
         assert_equal(len(descs), 2)
-        hdkeys_info = wallet.gethdkeys(active_only=True)
+        hdkeys_info = wallet.gethdkeys(active_only=True, private=True, codex32=True)
         assert_equal(len(hdkeys_info), 1)
-        assert_equal(hdkeys_info[0]["xpub"], xpub)
+        assert_equal(hdkeys_info[0]["xpub"], blank_xpub)
         assert_equal(hdkeys_info[0]["has_private"], True)
+        assert_equal(hdkeys_info[0]["has_seed"], True)
+        assert_equal(hdkeys_info[0]["codex32"], exported_codex32)
         assert_equal(len(hdkeys_info[0]["descriptors"]), 2)
 
         self.log.info("Imported HD roots can be stored in encrypted blank wallets")
@@ -237,22 +278,68 @@ class WalletGetHDKeyTest(BitcoinTestFramework):
 
         assert_raises_rpc_error(-13, "Error: Please enter the wallet passphrase with walletpassphrase first.", wallet.addhdkey, self.CODEX32_SECRET)
         with WalletUnlock(wallet, "pass"):
-            xpub = wallet.addhdkey(self.CODEX32_SECRET)["xpub"]
+            encrypted_xpub = wallet.addhdkey(self.CODEX32_SECRET)["xpub"]
 
         hdkeys_info = wallet.gethdkeys()
         assert_equal(len(hdkeys_info), 1)
-        assert_equal(hdkeys_info[0]["xpub"], xpub)
+        assert_equal(hdkeys_info[0]["xpub"], encrypted_xpub)
         assert_equal(hdkeys_info[0]["has_private"], True)
+        assert_equal(hdkeys_info[0]["has_seed"], True)
         assert_equal(hdkeys_info[0]["descriptors"], [])
 
         assert_raises_rpc_error(-13, "Error: Please enter the wallet passphrase with walletpassphrase first", wallet.gethdkeys, private=True)
         with WalletUnlock(wallet, "pass"):
-            hdkeys_info = wallet.gethdkeys(private=True)
+            hdkeys_info = wallet.gethdkeys(private=True, codex32=True)
             assert_equal(len(hdkeys_info), 1)
-            assert_equal(hdkeys_info[0]["xpub"], xpub)
+            assert_equal(hdkeys_info[0]["xpub"], encrypted_xpub)
             assert_equal(hdkeys_info[0]["has_private"], True)
+            assert_equal(hdkeys_info[0]["has_seed"], True)
             assert "xprv" in hdkeys_info[0]
-            wallet.createwalletdescriptor(type="bech32", hdkey=xpub)
+            assert "codex32" in hdkeys_info[0]
+            wallet.createwalletdescriptor(type="bech32", hdkey=encrypted_xpub)
+
+        self.restart_node(0)
+
+        self.ensure_wallet_loaded("basic")
+        wallet = self.ensure_wallet_loaded("addhdkey_blank")
+        hdkeys_info = wallet.gethdkeys(private=True, codex32=True)
+        assert_equal(len(hdkeys_info), 1)
+        assert_equal(hdkeys_info[0]["xpub"], blank_xpub)
+        assert_equal(hdkeys_info[0]["has_seed"], True)
+        assert "codex32" in hdkeys_info[0]
+
+        wallet = self.ensure_wallet_loaded("addhdkey_encrypted")
+        assert_raises_rpc_error(-13, "Error: Please enter the wallet passphrase with walletpassphrase first", wallet.gethdkeys, private=True, codex32=True)
+        with WalletUnlock(wallet, "pass"):
+            hdkeys_info = wallet.gethdkeys(private=True, codex32=True)
+            assert_equal(len(hdkeys_info), 1)
+            assert_equal(hdkeys_info[0]["has_seed"], True)
+            assert "codex32" in hdkeys_info[0]
+
+    def test_addhdkey_existing_descriptor(self):
+        self.log.info("addhdkey can associate a seed with an existing descriptor root")
+        source_wallet = self.ensure_wallet_loaded("basic")
+        with WalletUnlock(source_wallet, "pass"):
+            source_info = source_wallet.gethdkeys(active_only=True, private=True, codex32=True)[0]
+
+        self.nodes[0].createwallet("addhdkey_existing_descriptor", blank=True)
+        wallet = self.nodes[0].get_wallet_rpc("addhdkey_existing_descriptor")
+        desc = descsum_create(f"wpkh({source_info['xprv']})")
+        assert_equal(wallet.importdescriptors([{"desc": desc, "timestamp": "now"}])[0]["success"], True)
+
+        hdkeys_info = wallet.gethdkeys(private=True, codex32=True)
+        assert_equal(len(hdkeys_info), 1)
+        assert_equal(hdkeys_info[0]["xpub"], source_info["xpub"])
+        assert_equal(hdkeys_info[0]["has_seed"], False)
+        assert "codex32" not in hdkeys_info[0]
+
+        assert_equal(wallet.addhdkey(source_info["codex32"])["xpub"], source_info["xpub"])
+
+        hdkeys_info = wallet.gethdkeys(private=True, codex32=True)
+        assert_equal(len(hdkeys_info), 1)
+        assert_equal(hdkeys_info[0]["xpub"], source_info["xpub"])
+        assert_equal(hdkeys_info[0]["has_seed"], True)
+        assert "codex32" in hdkeys_info[0]
 
 
 if __name__ == '__main__':
