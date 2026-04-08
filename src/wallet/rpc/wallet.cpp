@@ -687,12 +687,13 @@ static RPCMethod addhdkey()
             }
             EnsureWalletIsUnlocked(*pwallet);
 
+            const CKeyingMaterial seed{codex32->payload.begin(), codex32->payload.end()};
             CExtKey master_key;
-            master_key.SetSeed(MakeByteSpan(codex32->payload));
+            master_key.SetSeed(MakeByteSpan(seed));
             const CExtPubKey xpub = master_key.Neuter();
 
-            if (!pwallet->AddHDKey(master_key)) {
-                if (pwallet->GetHDKey(xpub)) {
+            if (!pwallet->AddHDKey(master_key, seed)) {
+                if (pwallet->HasHDSeed(xpub)) {
                     throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, strprintf("HD key %s is already known", EncodeExtPubKey(xpub)));
                 }
                 throw JSONRPCError(RPC_WALLET_ERROR, strprintf("Unable to add HD key %s", EncodeExtPubKey(xpub)));
@@ -861,7 +862,6 @@ static RPCMethod createwalletdescriptor()
             EnsureWalletIsUnlocked(*pwallet);
 
             CExtPubKey xpub;
-            bool remove_wallet_hdkey = false;
             if (hdkey.isNull()) {
                 std::set<CExtPubKey> active_xpubs = pwallet->GetActiveHDPubKeys();
                 if (active_xpubs.size() != 1) {
@@ -873,7 +873,6 @@ static RPCMethod createwalletdescriptor()
                 if (!xpub.pubkey.IsValid()) {
                     throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "Unable to parse HD key. Please provide a valid xpub");
                 }
-                remove_wallet_hdkey = pwallet->GetWalletHDPubKeys().contains(xpub);
             }
 
             std::optional<CExtKey> hd_privkey = pwallet->GetHDKey(xpub);
@@ -892,9 +891,6 @@ static RPCMethod createwalletdescriptor()
             }
             if (spkms.empty()) {
                 throw JSONRPCError(RPC_WALLET_ERROR, "Descriptor already exists");
-            }
-            if (remove_wallet_hdkey) {
-                (void)pwallet->RemoveHDKey(xpub);
             }
 
             // Fetch each descspkm from the wallet in order to get the descriptor strings
