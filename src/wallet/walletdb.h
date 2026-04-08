@@ -9,6 +9,7 @@
 #include <key.h>
 #include <primitives/transaction_identifier.h>
 #include <script/sign.h>
+#include <wallet/crypter.h>
 #include <wallet/db.h>
 #include <wallet/walletutil.h>
 
@@ -82,8 +83,8 @@ extern const std::string VERSION;
 extern const std::string WALLETDESCRIPTOR;
 extern const std::string WALLETDESCRIPTORCKEY;
 extern const std::string WALLETDESCRIPTORKEY;
-extern const std::string WALLETHDROOTCSEED;
 extern const std::string WALLETHDROOTSEED;
+extern const std::string WALLETHDROOTCSEED;
 extern const std::string WATCHMETA;
 extern const std::string WATCHS;
 
@@ -248,8 +249,8 @@ public:
     bool WriteDescriptorKey(const uint256& desc_id, const CPubKey& pubkey, const CPrivKey& privkey);
     bool WriteCryptedDescriptorKey(const uint256& desc_id, const CPubKey& pubkey, const std::vector<unsigned char>& secret);
     bool WriteDescriptor(const uint256& desc_id, const WalletDescriptor& descriptor);
-    bool WriteHDRootSeed(const CExtPubKey& xpub, const CPrivKey& privkey);
-    bool WriteCryptedHDRootSeed(const CExtPubKey& xpub, const std::vector<unsigned char>& secret);
+    bool WriteHDRootSeed(const CExtPubKey& xpub, const CKeyingMaterial& seed);
+    bool WriteCryptedHDRootSeed(const CExtPubKey& xpub, const std::vector<unsigned char>& seed);
     bool ErasePlainHDRootSeed(const CExtPubKey& xpub);
     bool WriteDescriptorDerivedCache(const CExtPubKey& xpub, const uint256& desc_id, uint32_t key_exp_index, uint32_t der_index);
     bool WriteDescriptorParentCache(const CExtPubKey& xpub, const uint256& desc_id, uint32_t key_exp_index);

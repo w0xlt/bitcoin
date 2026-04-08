@@ -121,6 +121,16 @@ bool RemoveWalletSetting(interfaces::Chain& chain, const std::string& wallet_nam
     return chain.updateRwSetting("wallet", update_function);
 }
 
+static std::optional<CExtKey> DeriveHDKeyFromSeed(const CExtPubKey& xpub, const CKeyingMaterial& seed)
+{
+    CExtKey master_key;
+    master_key.SetSeed(MakeByteSpan(seed));
+    if (master_key.Neuter() != xpub) {
+        return std::nullopt;
+    }
+    return master_key;
+}
+
 static void UpdateWalletSetting(interfaces::Chain& chain,
                                 const std::string& wallet_name,
                                 std::optional<bool> load_on_startup,
@@ -3554,6 +3564,7 @@ bool CWallet::HasEncryptionKeys() const
 
 bool CWallet::HaveCryptedKeys() const
 {
+    AssertLockHeld(cs_wallet);
     if (!m_crypted_hd_root_seeds.empty()) {
         return true;
     }
@@ -3571,22 +3582,20 @@ bool CWallet::CheckHDSeedDecryptionKey(const CKeyingMaterial& master_key) const
         return false;
     }
 
-    bool key_pass = m_crypted_hd_root_seeds.empty();
-    bool key_fail = false;
-    for (const auto& [xpub, crypted_secret] : m_crypted_hd_root_seeds) {
-        CKey key;
-        if (!DecryptKey(master_key, crypted_secret, xpub.pubkey, key)) {
-            key_fail = true;
-            break;
+    bool any_ok = false;
+    for (const auto& [xpub, crypted_seed] : m_crypted_hd_root_seeds) {
+        CKeyingMaterial seed;
+        if (!DecryptSecret(master_key, crypted_seed, xpub.pubkey.GetHash(), seed) ||
+            !DeriveHDKeyFromSeed(xpub, seed)) {
+            if (any_ok) {
+                LogWarning("The wallet is probably corrupted: Some HD root seeds decrypt but not all.");
+                throw std::runtime_error("Error unlocking wallet: some HD root seeds decrypt but not all. Your wallet file may be corrupt.");
+            }
+            return false;
         }
-        key_pass = true;
+        any_ok = true;
     }
-
-    if (key_pass && key_fail) {
-        LogWarning("The wallet is probably corrupted: Some HD roots decrypt but not all.");
-        throw std::runtime_error("Error unlocking wallet: some HD roots decrypt but not all. Your wallet file may be corrupt.");
-    }
-    return key_pass && !key_fail;
+    return true;
 }
 
 bool CWallet::EncryptHDSeeds(const CKeyingMaterial& master_key, WalletBatch& batch)
@@ -3597,14 +3606,13 @@ bool CWallet::EncryptHDSeeds(const CKeyingMaterial& master_key, WalletBatch& bat
         return false;
     }
 
-    for (const auto& [xpub, key] : m_hd_root_seeds) {
-        std::vector<unsigned char> crypted_secret;
-        CKeyingMaterial secret{UCharCast(key.begin()), UCharCast(key.end())};
-        if (!EncryptSecret(master_key, secret, xpub.pubkey.GetHash(), crypted_secret)) {
+    for (const auto& [xpub, seed] : m_hd_root_seeds) {
+        std::vector<unsigned char> crypted_seed;
+        if (!EncryptSecret(master_key, seed, xpub.pubkey.GetHash(), crypted_seed)) {
             return false;
         }
-        m_crypted_hd_root_seeds.emplace(xpub, crypted_secret);
-        if (!batch.WriteCryptedHDRootSeed(xpub, crypted_secret)) {
+        m_crypted_hd_root_seeds.emplace(xpub, crypted_seed);
+        if (!batch.WriteCryptedHDRootSeed(xpub, crypted_seed) || !batch.ErasePlainHDRootSeed(xpub)) {
             return false;
         }
     }
@@ -3612,35 +3620,67 @@ bool CWallet::EncryptHDSeeds(const CKeyingMaterial& master_key, WalletBatch& bat
     return true;
 }
 
-bool CWallet::LoadHDSeed(const CExtPubKey& xpub, const CKey& key)
+bool CWallet::AddHDSeedWithDB(WalletBatch& batch, const CExtPubKey& xpub, const CKeyingMaterial& seed)
+{
+    AssertLockHeld(cs_wallet);
+
+    if (m_hd_root_seeds.contains(xpub) || m_crypted_hd_root_seeds.contains(xpub)) {
+        return true;
+    }
+
+    if (HasEncryptionKeys()) {
+        if (IsLocked()) {
+            return false;
+        }
+
+        std::vector<unsigned char> crypted_seed;
+        if (!WithEncryptionKey([&](const CKeyingMaterial& encryption_key) {
+                return EncryptSecret(encryption_key, seed, xpub.pubkey.GetHash(), crypted_seed);
+            })) {
+            return false;
+        }
+
+        m_crypted_hd_root_seeds.emplace(xpub, crypted_seed);
+        return batch.WriteCryptedHDRootSeed(xpub, crypted_seed);
+    }
+
+    m_hd_root_seeds.emplace(xpub, seed);
+    return batch.WriteHDRootSeed(xpub, seed);
+}
+
+bool CWallet::LoadHDSeed(const CExtPubKey& xpub, const CKeyingMaterial& seed)
 {
     AssertLockHeld(cs_wallet);
 
     if (m_hd_root_seeds.contains(xpub) || m_crypted_hd_root_seeds.contains(xpub)) {
         return false;
     }
-    m_hd_root_seeds.emplace(xpub, key);
+    if (!DeriveHDKeyFromSeed(xpub, seed)) {
+        return false;
+    }
+    m_hd_root_seeds.emplace(xpub, seed);
     return true;
 }
 
-bool CWallet::LoadCryptedHDSeed(const CExtPubKey& xpub, const std::vector<unsigned char>& crypted_key)
+bool CWallet::LoadCryptedHDSeed(const CExtPubKey& xpub, const std::vector<unsigned char>& crypted_seed)
 {
     AssertLockHeld(cs_wallet);
 
     if (m_hd_root_seeds.contains(xpub) || m_crypted_hd_root_seeds.contains(xpub)) {
         return false;
     }
-    m_crypted_hd_root_seeds.emplace(xpub, crypted_key);
+    m_crypted_hd_root_seeds.emplace(xpub, crypted_seed);
     return true;
 }
 
-bool CWallet::AddHDKeyWithDB(WalletBatch& batch, const CExtKey& master_key)
+bool CWallet::AddHDKeyWithDB(WalletBatch& batch, const CExtKey& master_key, const std::optional<CKeyingMaterial>& seed)
 {
     AssertLockHeld(cs_wallet);
     assert(!IsWalletFlagSet(WALLET_FLAG_DISABLE_PRIVATE_KEYS));
 
     const CExtPubKey xpub = master_key.Neuter();
-    const bool have_wallet_root = m_hd_root_seeds.contains(xpub) || m_crypted_hd_root_seeds.contains(xpub);
+    const bool have_known_root = HasHDKey(xpub);
+    const bool have_wallet_seed = m_hd_root_seeds.contains(xpub) || m_crypted_hd_root_seeds.contains(xpub);
 
     bool added_to_descriptors = false;
     for (const auto& spkm : GetAllScriptPubKeyMans()) {
@@ -3663,61 +3703,26 @@ bool CWallet::AddHDKeyWithDB(WalletBatch& batch, const CExtKey& master_key)
     }
 
     if (added_to_descriptors) {
-        if (have_wallet_root && !RemoveHDSeedWithDB(batch, xpub)) {
+        if (seed && !AddHDSeedWithDB(batch, xpub, *seed)) {
             return false;
         }
         return true;
     }
 
-    if (have_wallet_root) {
+    if (have_known_root) {
+        if (seed && !have_wallet_seed) {
+            return AddHDSeedWithDB(batch, xpub, *seed);
+        }
         return false;
     }
-
-    if (HasEncryptionKeys()) {
-        if (IsLocked()) {
-            return false;
-        }
-
-        std::vector<unsigned char> crypted_secret;
-        CKeyingMaterial secret{UCharCast(master_key.key.begin()), UCharCast(master_key.key.end())};
-        if (!WithEncryptionKey([&](const CKeyingMaterial& encryption_key) {
-                return EncryptSecret(encryption_key, secret, xpub.pubkey.GetHash(), crypted_secret);
-            })) {
-            return false;
-        }
-
-        m_crypted_hd_root_seeds.emplace(xpub, crypted_secret);
-        return batch.WriteCryptedHDRootSeed(xpub, crypted_secret);
-    }
-
-    m_hd_root_seeds.emplace(xpub, master_key.key);
-    return batch.WriteHDRootSeed(xpub, master_key.key.GetPrivKey());
+    return seed && AddHDSeedWithDB(batch, xpub, *seed);
 }
 
-bool CWallet::RemoveHDSeedWithDB(WalletBatch& batch, const CExtPubKey& xpub)
-{
-    AssertLockHeld(cs_wallet);
-
-    const auto removed_plain = m_hd_root_seeds.erase(xpub);
-    const auto removed_crypted = m_crypted_hd_root_seeds.erase(xpub);
-    if (removed_plain == 0 && removed_crypted == 0) {
-        return true;
-    }
-    return batch.ErasePlainHDRootSeed(xpub);
-}
-
-bool CWallet::AddHDKey(const CExtKey& master_key)
+bool CWallet::AddHDKey(const CExtKey& master_key, const std::optional<CKeyingMaterial>& seed)
 {
     LOCK(cs_wallet);
     WalletBatch batch(GetDatabase());
-    return AddHDKeyWithDB(batch, master_key);
-}
-
-bool CWallet::RemoveHDSeed(const CExtPubKey& xpub)
-{
-    LOCK(cs_wallet);
-    WalletBatch batch(GetDatabase());
-    return RemoveHDSeedWithDB(batch, xpub);
+    return AddHDKeyWithDB(batch, master_key, seed);
 }
 
 void CWallet::ConnectScriptPubKeyManNotifiers()
@@ -3780,12 +3785,16 @@ void CWallet::SetupOwnDescriptorScriptPubKeyMans(WalletBatch& batch)
     assert(!IsWalletFlagSet(WALLET_FLAG_EXTERNAL_SIGNER));
     // Make a seed
     CKey seed_key = GenerateRandomKey();
-    CPubKey seed = seed_key.GetPubKey();
-    assert(seed_key.VerifyPubKey(seed));
+    CPubKey seed_pubkey = seed_key.GetPubKey();
+    assert(seed_key.VerifyPubKey(seed_pubkey));
 
     // Get the extended key
     CExtKey master_key;
     master_key.SetSeed(seed_key);
+    const CKeyingMaterial seed_bytes{UCharCast(seed_key.begin()), UCharCast(seed_key.end())};
+    if (!AddHDSeedWithDB(batch, master_key.Neuter(), seed_bytes)) {
+        throw std::runtime_error(std::string(__func__) + ": writing HD root seed failed");
+    }
 
     SetupDescriptorScriptPubKeyMans(batch, master_key);
 }
@@ -4705,7 +4714,7 @@ std::set<CExtPubKey> CWallet::GetWalletHDPubKeys() const
     return wallet_xpubs;
 }
 
-bool CWallet::HasHDSeed(const CExtPubKey& xpub) const
+bool CWallet::HasHDKey(const CExtPubKey& xpub) const
 {
     AssertLockHeld(cs_wallet);
     Assert(IsWalletFlagSet(WALLET_FLAG_DESCRIPTORS));
@@ -4727,7 +4736,45 @@ bool CWallet::HasHDSeed(const CExtPubKey& xpub) const
     return m_hd_root_seeds.contains(xpub) || m_crypted_hd_root_seeds.contains(xpub);
 }
 
-std::optional<CExtKey> CWallet::GetHDSeed(const CExtPubKey& xpub) const
+bool CWallet::HasHDSeed(const CExtPubKey& xpub) const
+{
+    AssertLockHeld(cs_wallet);
+    return m_hd_root_seeds.contains(xpub) || m_crypted_hd_root_seeds.contains(xpub);
+}
+
+std::optional<CKeyingMaterial> CWallet::DecryptHDSeed(const CExtPubKey& xpub) const
+{
+    AssertLockHeld(cs_wallet);
+
+    if (HasEncryptionKeys()) {
+        if (IsLocked()) {
+            return std::nullopt;
+        }
+        const auto it = m_crypted_hd_root_seeds.find(xpub);
+        if (it == m_crypted_hd_root_seeds.end()) {
+            return std::nullopt;
+        }
+
+        CKeyingMaterial seed;
+        if (!Assume(WithEncryptionKey([&](const CKeyingMaterial& encryption_key) {
+                return DecryptSecret(encryption_key, it->second, xpub.pubkey.GetHash(), seed);
+            }))) {
+            return std::nullopt;
+        }
+        if (!DeriveHDKeyFromSeed(xpub, seed)) {
+            return std::nullopt;
+        }
+        return seed;
+    }
+
+    const auto it = m_hd_root_seeds.find(xpub);
+    if (it == m_hd_root_seeds.end()) {
+        return std::nullopt;
+    }
+    return it->second;
+}
+
+std::optional<CExtKey> CWallet::GetHDKey(const CExtPubKey& xpub) const
 {
     AssertLockHeld(cs_wallet);
     Assert(IsWalletFlagSet(WALLET_FLAG_DESCRIPTORS));
@@ -4749,68 +4796,16 @@ std::optional<CExtKey> CWallet::GetHDSeed(const CExtPubKey& xpub) const
         }
     }
 
-    if (HasEncryptionKeys()) {
-        if (IsLocked()) {
-            return std::nullopt;
-        }
-        const auto it = m_crypted_hd_root_seeds.find(xpub);
-        if (it == m_crypted_hd_root_seeds.end()) {
-            return std::nullopt;
-        }
-
-        CKey key;
-        if (!Assume(WithEncryptionKey([&](const CKeyingMaterial& encryption_key) {
-                return DecryptKey(encryption_key, it->second, xpub.pubkey, key);
-            }))) {
-            return std::nullopt;
-        }
-        return CExtKey(xpub, key);
-    }
-
-    const auto it = m_hd_root_seeds.find(xpub);
-    if (it == m_hd_root_seeds.end()) {
-        return std::nullopt;
-    }
-    return CExtKey(xpub, it->second);
-}
-
-std::optional<CKey> CWallet::GetKey(const CKeyID& keyid) const
-{
-    Assert(IsWalletFlagSet(WALLET_FLAG_DESCRIPTORS));
-
-    for (const auto& spkm : GetAllScriptPubKeyMans()) {
-        const DescriptorScriptPubKeyMan* desc_spkm = dynamic_cast<DescriptorScriptPubKeyMan*>(spkm);
-        assert(desc_spkm);
-        LOCK(desc_spkm->cs_desc_man);
-        if (std::optional<CKey> key = desc_spkm->GetKey(keyid)) {
-            return key;
-        }
-    }
-
-    if (HasEncryptionKeys()) {
-        if (IsLocked()) {
-            return std::nullopt;
-        }
-        for (const auto& [xpub, crypted_secret] : m_crypted_hd_root_seeds) {
-            if (xpub.pubkey.GetID() != keyid) {
-                continue;
-            }
-            CKey key;
-            if (!Assume(WithEncryptionKey([&](const CKeyingMaterial& encryption_key) {
-                    return DecryptKey(encryption_key, crypted_secret, xpub.pubkey, key);
-                }))) {
-                return std::nullopt;
-            }
-            return key;
-        }
-    }
-
-    for (const auto& [xpub, key] : m_hd_root_seeds) {
-        if (xpub.pubkey.GetID() == keyid) {
-            return key;
-        }
+    if (std::optional<CKeyingMaterial> seed = DecryptHDSeed(xpub)) {
+        return DeriveHDKeyFromSeed(xpub, *seed);
     }
     return std::nullopt;
+}
+
+std::optional<CKeyingMaterial> CWallet::GetHDSeed(const CExtPubKey& xpub) const
+{
+    AssertLockHeld(cs_wallet);
+    return DecryptHDSeed(xpub);
 }
 
 void CWallet::WriteBestBlock() const

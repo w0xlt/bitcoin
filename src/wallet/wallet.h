@@ -420,10 +420,10 @@ private:
     // ScriptPubKeyMan::GetID. In many cases it will be the hash of an internal structure
     std::map<uint256, std::unique_ptr<ScriptPubKeyMan>> m_spk_managers;
 
-    using HDRootSeedMap = std::map<CExtPubKey, CKey>;
+    using HDRootSeedMap = std::map<CExtPubKey, CKeyingMaterial>;
     using CryptedHDRootSeedMap = std::map<CExtPubKey, std::vector<unsigned char>>;
 
-    //! Wallet-level HD roots not currently associated with a descriptor.
+    //! Original seed bytes retained per HD root to support codex32 export and descriptor creation.
     HDRootSeedMap m_hd_root_seeds GUARDED_BY(cs_wallet);
     CryptedHDRootSeedMap m_crypted_hd_root_seeds GUARDED_BY(cs_wallet);
 
@@ -460,8 +460,9 @@ private:
 
     bool CheckHDSeedDecryptionKey(const CKeyingMaterial& master_key) const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
     bool EncryptHDSeeds(const CKeyingMaterial& master_key, WalletBatch& batch) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
-    bool AddHDKeyWithDB(WalletBatch& batch, const CExtKey& master_key) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
-    bool RemoveHDSeedWithDB(WalletBatch& batch, const CExtPubKey& xpub) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+    bool AddHDSeedWithDB(WalletBatch& batch, const CExtPubKey& xpub, const CKeyingMaterial& seed) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+    bool AddHDKeyWithDB(WalletBatch& batch, const CExtKey& master_key, const std::optional<CKeyingMaterial>& seed = std::nullopt) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+    std::optional<CKeyingMaterial> DecryptHDSeed(const CExtPubKey& xpub) const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
 
 public:
     /**
@@ -598,9 +599,9 @@ public:
     void LoadAddressPreviouslySpent(const CTxDestination& dest) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
     //! Appends payment request to destination.
     void LoadAddressReceiveRequest(const CTxDestination& dest, const std::string& id, const std::string& request) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
-    //! Load wallet-level HD roots (used by LoadWallet)
-    bool LoadHDSeed(const CExtPubKey& xpub, const CKey& key) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
-    bool LoadCryptedHDSeed(const CExtPubKey& xpub, const std::vector<unsigned char>& crypted_key) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+    //! Load wallet-level retained HD root seeds (used by LoadWallet)
+    bool LoadHDSeed(const CExtPubKey& xpub, const CKeyingMaterial& seed) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+    bool LoadCryptedHDSeed(const CExtPubKey& xpub, const std::vector<unsigned char>& crypted_seed) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
 
     //! Holds a timestamp at which point the wallet is scheduled (externally) to be relocked. Caller must arrange for actual relocking to occur via Lock().
     int64_t nRelockTime GUARDED_BY(cs_wallet){0};
@@ -994,7 +995,7 @@ public:
     bool WithEncryptionKey(std::function<bool (const CKeyingMaterial&)> cb) const override;
 
     bool HasEncryptionKeys() const override;
-    bool HaveCryptedKeys() const;
+    bool HaveCryptedKeys() const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
 
     /** Get last block processed height */
     int GetLastBlockHeight() const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet)
@@ -1083,24 +1084,23 @@ public:
     //! Retrieve the xpubs in use by the active descriptors
     std::set<CExtPubKey> GetActiveHDPubKeys() const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
 
-    //! Retrieve wallet-level HD roots not currently attached to descriptors.
+    //! Retrieve wallet-level HD roots with retained seed material.
     std::set<CExtPubKey> GetWalletHDPubKeys() const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
 
-    //! Return whether the wallet knows the private key for the given xpub.
+    //! Return whether the wallet knows the private material for the given xpub.
+    bool HasHDKey(const CExtPubKey& xpub) const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+
+    //! Return whether the wallet knows the original seed for the given xpub.
     bool HasHDSeed(const CExtPubKey& xpub) const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
 
     //! Find the exact HD root key for the given xpub, if available.
-    std::optional<CExtKey> GetHDSeed(const CExtPubKey& xpub) const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+    std::optional<CExtKey> GetHDKey(const CExtPubKey& xpub) const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
 
-    //! Find the private key for the given key id from the wallet's descriptors or wallet-level HD roots, if available
-    //! Returns nullopt when no descriptor has the key or if the wallet is locked.
-    std::optional<CKey> GetKey(const CKeyID& keyid) const;
+    //! Find the original seed for the given xpub, if available.
+    std::optional<CKeyingMaterial> GetHDSeed(const CExtPubKey& xpub) const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
 
-    //! Add an HD root key to the wallet or to matching descriptors.
-    bool AddHDKey(const CExtKey& master_key);
-
-    //! Remove a wallet-level HD root that is no longer needed.
-    bool RemoveHDSeed(const CExtPubKey& xpub);
+    //! Add an HD root seed to the wallet or attach the matching root key to descriptors.
+    bool AddHDKey(const CExtKey& master_key, const std::optional<CKeyingMaterial>& seed = std::nullopt);
 
     //! Disconnect chain notifications and wait for all notifications to be processed
     void DisconnectChainNotifications();
