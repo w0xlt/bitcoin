@@ -333,6 +333,7 @@ static const CRPCConvertParam vRPCConvertParams[] =
     { "addhdkey", 0, "codex32_secret", ParamFormat::STRING },
     { "gethdkeys", 0, "active_only" },
     { "gethdkeys", 0, "options" },
+    { "gethdkeys", 0, "codex32" },
     { "gethdkeys", 0, "private" },
     { "createwalletdescriptor", 1, "options" },
     { "createwalletdescriptor", 1, "hdkey", ParamFormat::STRING },
