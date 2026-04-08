@@ -5,7 +5,9 @@
 
 #include <bitcoin-build-config.h> // IWYU pragma: keep
 
+#include <bech32.h>
 #include <core_io.h>
+#include <hash.h>
 #include <key_io.h>
 #include <rpc/server.h>
 #include <rpc/util.h>
@@ -27,6 +29,22 @@
 namespace wallet {
 
 static constexpr std::string_view CODEX32_WALLET_HRP{"wr"};
+
+static std::string GetCodex32SeedId(const CExtPubKey& xpub)
+{
+    std::vector<unsigned char> ser_xpub(BIP32_EXTKEY_SIZE);
+    xpub.Encode(ser_xpub.data());
+    const uint256 hash = Hash(ser_xpub);
+    const unsigned char* bytes = hash.begin();
+
+    std::string id;
+    id.reserve(4);
+    id += bech32::CHARSET[(bytes[0] >> 3) & 31];
+    id += bech32::CHARSET[((bytes[0] << 2) | (bytes[1] >> 6)) & 31];
+    id += bech32::CHARSET[(bytes[1] >> 1) & 31];
+    id += bech32::CHARSET[((bytes[1] << 4) | (bytes[2] >> 4)) & 31];
+    return id;
+}
 
 static const std::map<uint64_t, std::string> WALLET_FLAG_CAVEATS{
     {WALLET_FLAG_AVOID_REUSE,
@@ -687,11 +705,12 @@ static RPCMethod addhdkey()
             }
             EnsureWalletIsUnlocked(*pwallet);
 
+            const CKeyingMaterial seed{codex32->payload.begin(), codex32->payload.end()};
             CExtKey master_key;
-            master_key.SetSeed(MakeByteSpan(codex32->payload));
+            master_key.SetSeed(MakeByteSpan(seed));
             const CExtPubKey xpub = master_key.Neuter();
 
-            if (!pwallet->AddHDKey(master_key)) {
+            if (!pwallet->AddHDKey(master_key, seed)) {
                 if (pwallet->GetHDKey(xpub)) {
                     throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, strprintf("HD key %s is already known", EncodeExtPubKey(xpub)));
                 }
@@ -713,7 +732,8 @@ RPCMethod gethdkeys()
         {
             {"options", RPCArg::Type::OBJ_NAMED_PARAMS, RPCArg::Optional::OMITTED, "", {
                 {"active_only", RPCArg::Type::BOOL, RPCArg::Default{false}, "Show the keys for only active descriptors"},
-                {"private", RPCArg::Type::BOOL, RPCArg::Default{false}, "Show private keys"}
+                {"private", RPCArg::Type::BOOL, RPCArg::Default{false}, "Show private keys"},
+                {"codex32", RPCArg::Type::BOOL, RPCArg::Default{false}, "Show codex32-encoded seeds for HD roots that retain original seed bytes. Requires \"private\" to be true"},
             }},
         },
         RPCResult{RPCResult::Type::ARR, "", "", {
@@ -722,6 +742,7 @@ RPCMethod gethdkeys()
                     {RPCResult::Type::STR, "xpub", "The extended public key"},
                     {RPCResult::Type::BOOL, "has_private", "Whether the wallet has the private key for this xpub"},
                     {RPCResult::Type::STR, "xprv", /*optional=*/true, "The extended private key if \"private\" is true"},
+                    {RPCResult::Type::STR, "codex32", /*optional=*/true, "The codex32-encoded original seed if \"private\" and \"codex32\" are true and the wallet retained the original seed"},
                     {RPCResult::Type::ARR, "descriptors", "Array of descriptor objects that use this HD key",
                     {
                         {RPCResult::Type::OBJ, "", "", {
@@ -735,6 +756,7 @@ RPCMethod gethdkeys()
         RPCExamples{
             HelpExampleCli("gethdkeys", "") + HelpExampleRpc("gethdkeys", "")
             + HelpExampleCliNamed("gethdkeys", {{"active_only", "true"}, {"private", "true"}}) + HelpExampleRpcNamed("gethdkeys", {{"active_only", "true"}, {"private", "true"}})
+            + HelpExampleCliNamed("gethdkeys", {{"private", "true"}, {"codex32", "true"}}) + HelpExampleRpcNamed("gethdkeys", {{"private", "true"}, {"codex32", "true"}})
         },
         [](const RPCMethod& self, const JSONRPCRequest& request) -> UniValue
         {
@@ -746,10 +768,13 @@ RPCMethod gethdkeys()
             UniValue options{request.params[0].isNull() ? UniValue::VOBJ : request.params[0]};
             const bool active_only{options.exists("active_only") ? options["active_only"].get_bool() : false};
             const bool priv{options.exists("private") ? options["private"].get_bool() : false};
+            const bool codex32{options.exists("codex32") ? options["codex32"].get_bool() : false};
+            if (codex32 && !priv) {
+                throw JSONRPCError(RPC_INVALID_PARAMETER, "\"codex32\" requires \"private\" to be true");
+            }
             if (priv) {
                 EnsureWalletIsUnlocked(*wallet);
             }
-
 
             std::set<ScriptPubKeyMan*> spkms;
             if (active_only) {
@@ -786,6 +811,7 @@ RPCMethod gethdkeys()
             for (const auto& [xpub, descs] : wallet_xpubs) {
                 const bool has_private = wallet->HasHDKey(xpub);
                 const std::optional<CExtKey> xprv = priv && has_private ? wallet->GetHDKey(xpub) : std::nullopt;
+                const std::optional<CKeyingMaterial> seed = codex32 ? wallet->GetHDSeed(xpub) : std::nullopt;
                 UniValue descriptors(UniValue::VARR);
                 for (const auto& [desc, active] : descs) {
                     UniValue d(UniValue::VOBJ);
@@ -799,6 +825,16 @@ RPCMethod gethdkeys()
                 xpub_info.pushKV("has_private", has_private);
                 if (priv && xprv) {
                     xpub_info.pushKV("xprv", EncodeExtKey(*xprv));
+                }
+                if (seed) {
+                    std::string error;
+                    const std::string codex32_secret = Codex32SecretEncode(
+                        std::string{CODEX32_WALLET_HRP}, GetCodex32SeedId(xpub), /*threshold=*/0,
+                        std::vector<uint8_t>{seed->begin(), seed->end()}, error);
+                    if (codex32_secret.empty()) {
+                        throw JSONRPCError(RPC_WALLET_ERROR, strprintf("Unable to encode codex32 seed for %s: %s", EncodeExtPubKey(xpub), error));
+                    }
+                    xpub_info.pushKV("codex32", codex32_secret);
                 }
                 xpub_info.pushKV("descriptors", std::move(descriptors));
 
