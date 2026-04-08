@@ -330,10 +330,12 @@ static const CRPCConvertParam vRPCConvertParams[] =
     { "logging", 0, "include" },
     { "logging", 1, "exclude" },
     { "disconnectnode", 1, "nodeid" },
+    { "addhdkey", 0, "codex32" },
     { "gethdkeys", 0, "active_only" },
     { "gethdkeys", 0, "options" },
     { "gethdkeys", 0, "private" },
     { "createwalletdescriptor", 1, "options" },
+    { "createwalletdescriptor", 1, "hdkey" },
     { "createwalletdescriptor", 1, "internal" },
     // Echo with conversion (For testing only)
     { "echojson", 0, "arg0" },
