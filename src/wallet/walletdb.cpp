@@ -60,6 +60,8 @@ const std::string WALLETDESCRIPTORCKEY{"walletdescriptorckey"};
 const std::string WALLETDESCRIPTORKEY{"walletdescriptorkey"};
 const std::string WALLETHDROOTCKEY{"wallethdrootckey"};
 const std::string WALLETHDROOTKEY{"wallethdrootkey"};
+const std::string WALLETHDROOTSEED{"wallethdrootseed"};
+const std::string WALLETHDROOTCSEED{"wallethdrootcseed"};
 const std::string WATCHMETA{"watchmeta"};
 const std::string WATCHS{"watchs"};
 const std::unordered_set<std::string> LEGACY_TYPES{CRYPTED_KEY, CSCRIPT, DEFAULTKEY, HDCHAIN, KEYMETA, KEY, OLD_KEY, POOL, WATCHMETA, WATCHS};
@@ -268,6 +270,41 @@ bool WalletBatch::EraseHDRootKey(const CExtPubKey& xpub)
 
     return EraseIC(std::make_pair(DBKeys::WALLETHDROOTKEY, ser_xpub)) &&
            EraseIC(std::make_pair(DBKeys::WALLETHDROOTCKEY, ser_xpub));
+}
+
+bool WalletBatch::ErasePlainHDRootKey(const CExtPubKey& xpub)
+{
+    std::vector<unsigned char> ser_xpub(BIP32_EXTKEY_SIZE);
+    xpub.Encode(ser_xpub.data());
+
+    return EraseIC(std::make_pair(DBKeys::WALLETHDROOTKEY, ser_xpub));
+}
+
+bool WalletBatch::WriteHDRootSeed(const CExtPubKey& xpub, const CKeyingMaterial& seed)
+{
+    std::vector<unsigned char> ser_xpub(BIP32_EXTKEY_SIZE);
+    xpub.Encode(ser_xpub.data());
+
+    // hash xpub/seed to accelerate wallet load
+    const auto seed_hash = Hash(ser_xpub, seed);
+
+    return WriteIC(std::make_pair(DBKeys::WALLETHDROOTSEED, ser_xpub), std::make_pair(seed, seed_hash), false);
+}
+
+bool WalletBatch::WriteCryptedHDRootSeed(const CExtPubKey& xpub, const std::vector<unsigned char>& seed)
+{
+    std::vector<unsigned char> ser_xpub(BIP32_EXTKEY_SIZE);
+    xpub.Encode(ser_xpub.data());
+
+    return WriteIC(std::make_pair(DBKeys::WALLETHDROOTCSEED, ser_xpub), seed, false);
+}
+
+bool WalletBatch::ErasePlainHDRootSeed(const CExtPubKey& xpub)
+{
+    std::vector<unsigned char> ser_xpub(BIP32_EXTKEY_SIZE);
+    xpub.Encode(ser_xpub.data());
+
+    return EraseIC(std::make_pair(DBKeys::WALLETHDROOTSEED, ser_xpub));
 }
 
 bool WalletBatch::WriteDescriptorDerivedCache(const CExtPubKey& xpub, const uint256& desc_id, uint32_t key_exp_index, uint32_t der_index)
@@ -954,6 +991,8 @@ static DBErrors LoadHDRootRecords(CWallet* pwallet, DatabaseBatch& batch) EXCLUS
 
     int num_keys = 0;
     int num_ckeys = 0;
+    int num_seeds = 0;
+    int num_cseeds = 0;
 
     LoadResult key_res = LoadRecords(pwallet, batch, DBKeys::WALLETHDROOTKEY,
         [&num_keys] (CWallet* pwallet, DataStream& key, DataStream& value, std::string& strErr) {
@@ -1021,12 +1060,73 @@ static DBErrors LoadHDRootRecords(CWallet* pwallet, DatabaseBatch& batch) EXCLUS
             return DBErrors::LOAD_OK;
         });
 
-    if (std::max(key_res.m_result, ckey_res.m_result) <= DBErrors::NONCRITICAL_ERROR) {
-        pwallet->WalletLogPrintf("Wallet HD roots: %u plaintext, %u encrypted, %u total.\n",
-            num_keys, num_ckeys, num_keys + num_ckeys);
+    LoadResult seed_res = LoadRecords(pwallet, batch, DBKeys::WALLETHDROOTSEED,
+        [&num_seeds] (CWallet* pwallet, DataStream& key, DataStream& value, std::string& strErr) {
+            std::vector<unsigned char> ser_xpub;
+            key >> ser_xpub;
+            if (ser_xpub.size() != BIP32_EXTKEY_SIZE) {
+                strErr = "Error reading wallet database: wallet HD root seed xpub corrupt";
+                return DBErrors::CORRUPT;
+            }
+
+            CExtPubKey xpub;
+            xpub.Decode(ser_xpub.data());
+            if (!xpub.pubkey.IsValid()) {
+                strErr = "Error reading wallet database: wallet HD root seed xpub invalid";
+                return DBErrors::CORRUPT;
+            }
+
+            CKeyingMaterial seed;
+            uint256 hash;
+            value >> seed;
+            value >> hash;
+
+            const auto seed_hash = Hash(ser_xpub, seed);
+            if (seed_hash != hash) {
+                strErr = "Error reading wallet database: wallet HD root xpub/seed corrupt";
+                return DBErrors::CORRUPT;
+            }
+            if (!pwallet->LoadHDSeed(xpub, seed)) {
+                strErr = "Error reading wallet database: duplicate wallet HD root seed";
+                return DBErrors::CORRUPT;
+            }
+            ++num_seeds;
+            return DBErrors::LOAD_OK;
+        });
+
+    LoadResult cseed_res = LoadRecords(pwallet, batch, DBKeys::WALLETHDROOTCSEED,
+        [&num_cseeds] (CWallet* pwallet, DataStream& key, DataStream& value, std::string& strErr) {
+            std::vector<unsigned char> ser_xpub;
+            key >> ser_xpub;
+            if (ser_xpub.size() != BIP32_EXTKEY_SIZE) {
+                strErr = "Error reading wallet database: wallet encrypted HD root seed xpub corrupt";
+                return DBErrors::CORRUPT;
+            }
+
+            CExtPubKey xpub;
+            xpub.Decode(ser_xpub.data());
+            if (!xpub.pubkey.IsValid()) {
+                strErr = "Error reading wallet database: wallet encrypted HD root seed xpub invalid";
+                return DBErrors::CORRUPT;
+            }
+
+            std::vector<unsigned char> crypted_seed;
+            value >> crypted_seed;
+            if (!pwallet->LoadCryptedHDSeed(xpub, crypted_seed)) {
+                strErr = "Error reading wallet database: duplicate wallet encrypted HD root seed";
+                return DBErrors::CORRUPT;
+            }
+            ++num_cseeds;
+            return DBErrors::LOAD_OK;
+        });
+
+    DBErrors result{std::max(std::max(key_res.m_result, ckey_res.m_result), std::max(seed_res.m_result, cseed_res.m_result))};
+    if (result <= DBErrors::NONCRITICAL_ERROR) {
+        pwallet->WalletLogPrintf("Wallet HD roots: %u plaintext, %u encrypted, %u total. Seeds: %u plaintext, %u encrypted, %u total.\n",
+            num_keys, num_ckeys, num_keys + num_ckeys, num_seeds, num_cseeds, num_seeds + num_cseeds);
     }
 
-    return std::max(key_res.m_result, ckey_res.m_result);
+    return result;
 }
 
 static DBErrors LoadAddressBookRecords(CWallet* pwallet, DatabaseBatch& batch) EXCLUSIVE_LOCKS_REQUIRED(pwallet->cs_wallet)
