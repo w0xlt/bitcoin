@@ -303,8 +303,6 @@ private:
      */
     mutable std::map<uint256, MuSig2SecNonce> m_musig2_secnonces;
 
-    bool AddDescriptorKeyWithDB(WalletBatch& batch, const CKey& key, const CPubKey &pubkey) EXCLUSIVE_LOCKS_REQUIRED(cs_desc_man);
-
     KeyMap GetKeys() const EXCLUSIVE_LOCKS_REQUIRED(cs_desc_man);
 
     // Cached FlatSigningProviders to avoid regenerating them each time they are needed.
@@ -357,6 +355,8 @@ public:
 
     bool HavePrivateKeys() const override;
     bool HasPrivKey(const CKeyID& keyid) const EXCLUSIVE_LOCKS_REQUIRED(cs_desc_man);
+    //! Add a descriptor private key to the keystore. Used to attach an imported HD root to an existing descriptor.
+    bool AddDescriptorKeyWithDB(WalletBatch& batch, const CKey& key, const CPubKey& pubkey) EXCLUSIVE_LOCKS_REQUIRED(cs_desc_man);
     //! Retrieve the particular key if it is available. Returns nullopt if the key is not in the wallet, or if the wallet is locked.
     std::optional<CKey> GetKey(const CKeyID& keyid) const EXCLUSIVE_LOCKS_REQUIRED(cs_desc_man);
     bool HaveCryptedKeys() const override;
