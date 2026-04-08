@@ -2,11 +2,15 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or https://www.opensource.org/licenses/mit-license.php.
 
+#include <key.h>
+#include <span.h>
 #include <wallet/test/util.h>
 #include <wallet/wallet.h>
+#include <wallet/walletdb.h>
 #include <test/util/common.h>
 #include <test/util/logging.h>
 #include <test/util/setup_common.h>
+#include <util/strencodings.h>
 
 #include <boost/test/unit_test.hpp>
 
@@ -41,6 +45,16 @@ public:
     uint32_t GetMaxKeyExpr() const override { return 0; }
     size_t GetKeyCount() const override { return 0; }
 };
+
+static SerializeData SerializeHDRootKey(const std::string& key_type, const CExtPubKey& xpub)
+{
+    std::vector<unsigned char> ser_xpub(BIP32_EXTKEY_SIZE);
+    xpub.Encode(ser_xpub.data());
+
+    DataStream key_ss{};
+    key_ss << std::make_pair(key_type, ser_xpub);
+    return {key_ss.begin(), key_ss.end()};
+}
 
 BOOST_FIXTURE_TEST_CASE(wallet_load_descriptors, TestingSetup)
 {
@@ -88,6 +102,71 @@ BOOST_FIXTURE_TEST_CASE(wallet_load_descriptors, TestingSetup)
         BOOST_CHECK_EQUAL(wallet->PopulateWalletFromDB(_error, _warnings), DBErrors::CORRUPT);
         BOOST_CHECK(found); // The error must be logged
     }
+}
+
+BOOST_FIXTURE_TEST_CASE(wallet_load_hd_root_seed_mismatched_xpub_and_seed, TestingSetup)
+{
+    bilingual_str error;
+    std::vector<bilingual_str> warnings;
+    std::unique_ptr<WalletDatabase> database = CreateMockableWalletDatabase();
+
+    const CExtPubKey xpub = MasterKeyFromSeedHex("e208d110a84650d6ae8b27776eb82ccd7963318d9af777306a496198c13a1d2b").Neuter();
+    const CKeyingMaterial mismatched_seed = SeedFromHex("659dec01c6c731124084add1fabc04833d3aa6718f7696ba1faebb4fe1a7a8b6");
+
+    {
+        WalletBatch batch(*database);
+        BOOST_CHECK(batch.WriteHDRootSeed(xpub, mismatched_seed));
+    }
+
+    const std::shared_ptr<CWallet> wallet(new CWallet(m_node.chain.get(), "", std::move(database)));
+    BOOST_CHECK_EQUAL(wallet->PopulateWalletFromDB(error, warnings), DBErrors::CORRUPT);
+}
+
+BOOST_FIXTURE_TEST_CASE(wallet_unlock_partially_corrupt_hd_root_seeds, TestingSetup)
+{
+    static constexpr auto seed_hex_a{"e208d110a84650d6ae8b27776eb82ccd7963318d9af777306a496198c13a1d2b"};
+    static constexpr auto seed_hex_b{"659dec01c6c731124084add1fabc04833d3aa6718f7696ba1faebb4fe1a7a8b6"};
+
+    CWallet wallet(m_node.chain.get(), "", CreateMockableWalletDatabase());
+    {
+        LOCK(wallet.cs_wallet);
+        wallet.SetWalletFlag(WALLET_FLAG_DESCRIPTORS);
+        wallet.SetWalletFlag(WALLET_FLAG_BLANK_WALLET);
+    }
+
+    const CKeyingMaterial seed_a = SeedFromHex(seed_hex_a);
+    const CKeyingMaterial seed_b = SeedFromHex(seed_hex_b);
+    const CExtKey master_key_a = MasterKeyFromSeedHex(seed_hex_a);
+    const CExtKey master_key_b = MasterKeyFromSeedHex(seed_hex_b);
+    const CExtPubKey xpub_a = master_key_a.Neuter();
+    const CExtPubKey xpub_b = master_key_b.Neuter();
+
+    BOOST_CHECK(wallet.AddHDKey(master_key_a, seed_a));
+    BOOST_CHECK(wallet.AddHDKey(master_key_b, seed_b));
+
+    SecureString passphrase;
+    passphrase = "pass";
+    BOOST_CHECK(wallet.EncryptWallet(passphrase));
+
+    std::unique_ptr<WalletDatabase> database = DuplicateMockDatabase(wallet.GetDatabase());
+    auto& mock_db = dynamic_cast<MockableDatabase&>(*database);
+    const CExtPubKey corrupt_xpub = xpub_a < xpub_b ? xpub_b : xpub_a;
+    const SerializeData corrupt_key = SerializeHDRootKey(DBKeys::WALLETHDROOTCSEED, corrupt_xpub);
+    const auto it = mock_db.m_records.find(corrupt_key);
+    BOOST_REQUIRE(it != mock_db.m_records.end());
+    BOOST_REQUIRE(!it->second.empty());
+    it->second.back() ^= std::byte{1};
+
+    bilingual_str error;
+    std::vector<bilingual_str> warnings;
+    const std::shared_ptr<CWallet> loaded_wallet(new CWallet(m_node.chain.get(), "", std::move(database)));
+    BOOST_CHECK_EQUAL(loaded_wallet->PopulateWalletFromDB(error, warnings), DBErrors::LOAD_OK);
+    BOOST_CHECK_EXCEPTION(
+        loaded_wallet->Unlock(passphrase),
+        std::runtime_error,
+        [](const std::runtime_error& e) {
+            return std::string_view{e.what()}.find("some HD root seeds decrypt but not all") != std::string_view::npos;
+        });
 }
 
 BOOST_AUTO_TEST_SUITE_END()

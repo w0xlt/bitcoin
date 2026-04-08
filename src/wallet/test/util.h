@@ -6,6 +6,10 @@
 #define BITCOIN_WALLET_TEST_UTIL_H
 
 #include <addresstype.h>
+#include <key.h>
+#include <span.h>
+#include <util/strencodings.h>
+#include <wallet/crypter.h>
 #include <wallet/db.h>
 #include <wallet/scriptpubkeyman.h>
 
@@ -120,6 +124,20 @@ std::unique_ptr<WalletDatabase> CreateMockableWalletDatabase(MockableData record
 MockableDatabase& GetMockableDatabase(CWallet& wallet);
 
 DescriptorScriptPubKeyMan* CreateDescriptor(CWallet& keystore, const std::string& desc_str, bool success);
+
+inline CKeyingMaterial SeedFromHex(const std::string& seed_hex)
+{
+    const auto seed = ParseHex(seed_hex);
+    return {seed.begin(), seed.end()};
+}
+
+inline CExtKey MasterKeyFromSeedHex(const std::string& seed_hex)
+{
+    CExtKey master_key;
+    const CKeyingMaterial seed = SeedFromHex(seed_hex);
+    master_key.SetSeed(MakeByteSpan(seed));
+    return master_key;
+}
 } // namespace wallet
 
 #endif // BITCOIN_WALLET_TEST_UTIL_H
