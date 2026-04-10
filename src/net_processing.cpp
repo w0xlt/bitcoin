@@ -182,6 +182,8 @@ static constexpr auto AVG_FEEFILTER_BROADCAST_INTERVAL{10min};
 static constexpr auto MAX_FEEFILTER_CHANGE_DELAY{5min};
 /** Maximum number of compact filters that may be requested with one getcfilters. See BIP 157. */
 static constexpr uint32_t MAX_GETCFILTERS_SIZE = 1000;
+/** Maximum number of compact filters to serve from one pending response in a single pass. */
+static constexpr size_t MAX_CFILTERS_BATCH_SIZE = 25;
 /** Maximum number of cf hashes that may be requested with one getcfheaders. See BIP 157. */
 static constexpr uint32_t MAX_GETCFHEADERS_SIZE = 2000;
 /** the maximum percentage of addresses from our addrman to return in response to a getaddr message. */
@@ -392,6 +394,16 @@ struct Peer {
     Mutex m_getdata_requests_mutex;
     /** Work queue of items requested by this peer **/
     std::deque<CInv> m_getdata_requests GUARDED_BY(m_getdata_requests_mutex);
+
+    struct GetCFiltersResponse
+    {
+        BlockFilterType m_filter_type;
+        BlockFilterIndex* m_filter_index;
+        std::vector<const CBlockIndex*> m_block_indexes;
+        size_t m_next_filter{0};
+    };
+    /** Pending getcfilters response to serve incrementally with send-buffer backpressure. */
+    std::optional<GetCFiltersResponse> m_getcfilters_response GUARDED_BY(NetEventsInterface::g_msgproc_mutex);
 
     /** Time of the last getheaders message to this peer */
     NodeClock::time_point m_last_getheaders_timestamp GUARDED_BY(NetEventsInterface::g_msgproc_mutex){};
@@ -960,6 +972,10 @@ private:
         EXCLUSIVE_LOCKS_REQUIRED(!m_most_recent_block_mutex, peer.m_getdata_requests_mutex, NetEventsInterface::g_msgproc_mutex)
         LOCKS_EXCLUDED(::cs_main);
 
+    /** Continue serving a pending getcfilters response, respecting send-buffer backpressure. */
+    bool ProcessGetCFiltersResponse(CNode& node, Peer& peer)
+        EXCLUSIVE_LOCKS_REQUIRED(!m_most_recent_block_mutex, NetEventsInterface::g_msgproc_mutex);
+
     /** Process a new block. Perform any post-processing housekeeping */
     void ProcessBlock(CNode& node, const std::shared_ptr<const CBlock>& block, bool force_processing, bool min_pow_checked);
 
@@ -1051,7 +1067,8 @@ private:
      * @param[in]   peer            The peer that we received the request from
      * @param[in]   vRecv           The raw message received
      */
-    void ProcessGetCFilters(CNode& node, Peer& peer, DataStream& vRecv);
+    void ProcessGetCFilters(CNode& node, Peer& peer, DataStream& vRecv)
+        EXCLUSIVE_LOCKS_REQUIRED(!m_most_recent_block_mutex, NetEventsInterface::g_msgproc_mutex);
 
     /**
      * Handle a cfheaders request.
@@ -2587,6 +2604,36 @@ void PeerManagerImpl::ProcessGetData(CNode& pfrom, Peer& peer, const std::atomic
     }
 }
 
+bool PeerManagerImpl::ProcessGetCFiltersResponse(CNode& node, Peer& peer)
+{
+    if (!peer.m_getcfilters_response.has_value()) return false;
+
+    auto& response = *peer.m_getcfilters_response;
+    size_t served{0};
+    while (!node.fPauseSend && response.m_next_filter < response.m_block_indexes.size() &&
+           served < MAX_CFILTERS_BATCH_SIZE) {
+        BlockFilter filter;
+        const CBlockIndex* block_index = response.m_block_indexes[response.m_next_filter];
+        if (!response.m_filter_index->LookupFilter(block_index, filter)) {
+            LogDebug(BCLog::NET, "Failed to find block filter in index: filter_type=%s, block_hash=%s\n",
+                     BlockFilterTypeName(response.m_filter_type), block_index->GetBlockHash().ToString());
+            peer.m_getcfilters_response.reset();
+            return false;
+        }
+
+        MakeAndPushMessage(node, NetMsgType::CFILTER, filter);
+        ++response.m_next_filter;
+        ++served;
+    }
+
+    if (response.m_next_filter == response.m_block_indexes.size()) {
+        peer.m_getcfilters_response.reset();
+        return false;
+    }
+
+    return true;
+}
+
 uint32_t PeerManagerImpl::GetFetchFlags(const Peer& peer) const
 {
     uint32_t nFetchFlags = 0;
@@ -3330,16 +3377,21 @@ void PeerManagerImpl::ProcessGetCFilters(CNode& node, Peer& peer, DataStream& vR
         return;
     }
 
-    std::vector<BlockFilter> filters;
-    if (!filter_index->LookupFilterRange(start_height, stop_index, filters)) {
-        LogDebug(BCLog::NET, "Failed to find block filter in index: filter_type=%s, start_height=%d, stop_hash=%s\n",
-                     BlockFilterTypeName(filter_type), start_height, stop_hash.ToString());
-        return;
+    if (!Assume(!peer.m_getcfilters_response.has_value())) return;
+
+    std::vector<const CBlockIndex*> block_indexes(stop_index->nHeight - start_height + 1);
+    for (const CBlockIndex* block_index = stop_index;
+         block_index && block_index->nHeight >= static_cast<int>(start_height);
+         block_index = block_index->pprev) {
+        block_indexes[block_index->nHeight - start_height] = block_index;
     }
 
-    for (const auto& filter : filters) {
-        MakeAndPushMessage(node, NetMsgType::CFILTER, filter);
-    }
+    peer.m_getcfilters_response.emplace(Peer::GetCFiltersResponse{
+        .m_filter_type = filter_type,
+        .m_filter_index = filter_index,
+        .m_block_indexes = std::move(block_indexes),
+    });
+    (void)ProcessGetCFiltersResponse(node, peer);
 }
 
 void PeerManagerImpl::ProcessGetCFHeaders(CNode& node, Peer& peer, DataStream& vRecv)
@@ -5140,6 +5192,8 @@ bool PeerManagerImpl::ProcessMessages(CNode& node, std::atomic<bool>& interruptM
         }
     }
 
+    if (ProcessGetCFiltersResponse(node, peer)) return true;
+
     const bool processed_orphan = ProcessOrphanTx(peer);
 
     if (node.fDisconnect)
@@ -5153,6 +5207,7 @@ bool PeerManagerImpl::ProcessMessages(CNode& node, std::atomic<bool>& interruptM
         LOCK(peer.m_getdata_requests_mutex);
         if (!peer.m_getdata_requests.empty()) return true;
     }
+    if (peer.m_getcfilters_response.has_value()) return true;
 
     // Don't bother if send buffer is too full to respond anyway
     if (node.fPauseSend) return false;
@@ -5186,6 +5241,7 @@ bool PeerManagerImpl::ProcessMessages(CNode& node, std::atomic<bool>& interruptM
             LOCK(peer.m_getdata_requests_mutex);
             if (!peer.m_getdata_requests.empty()) fMoreWork = true;
         }
+        if (peer.m_getcfilters_response.has_value()) fMoreWork = true;
         // Does this peer have an orphan ready to reconsider?
         // (Note: we may have provided a parent for an orphan provided
         //  by another peer that was already processed; in that case,

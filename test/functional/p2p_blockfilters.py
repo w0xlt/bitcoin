@@ -177,6 +177,24 @@ class CompactFiltersTest(BitcoinTestFramework):
             computed_cfhash = uint256_from_str(hash256(cfilter.filter_data))
             assert_equal(computed_cfhash, cfhash)
 
+        self.log.info("Check that peers can fetch a max-sized cfilters response.")
+        request = msg_getcfilters(
+            filter_type=FILTER_TYPE_BASIC,
+            start_height=1,
+            stop_hash=int(main_block_hash, 16),
+        )
+        peer_0.send_without_ping(request)
+        peer_0.wait_until(lambda: len(peer_0.cfilters) == 1000, timeout=120)
+        response = peer_0.pop_cfilters()
+        assert_equal(len(response), 1000)
+        for height in (1, 500, 1000):
+            cfilter = response[height - 1]
+            block_hash = self.nodes[0].getblockhash(height)
+            assert_equal(cfilter.filter_type, FILTER_TYPE_BASIC)
+            assert_equal(cfilter.block_hash, int(block_hash, 16))
+            computed_cfhash = uint256_from_str(hash256(cfilter.filter_data))
+            assert_equal(computed_cfhash, main_cfhashes[height - 1])
+
         self.log.info("Check that peers can fetch cfilters for stale blocks.")
         request = msg_getcfilters(
             filter_type=FILTER_TYPE_BASIC,
