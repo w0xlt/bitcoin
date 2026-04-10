@@ -644,27 +644,41 @@ void TxOrphanageImpl::EraseForBlock(const CBlock& block)
 
 std::vector<CTransactionRef> TxOrphanageImpl::GetChildrenFromSamePeer(const CTransactionRef& parent, NodeId peer) const
 {
-    std::vector<CTransactionRef> children_found;
     const auto& parent_txid{parent->GetHash()};
+    std::vector<const Announcement*> matching_announcements;
+    std::set<Wtxid> matched_wtxids;
+    const auto& index_by_wtxid = m_orphans.get<ByWtxid>();
 
-    // Iterate through all orphans from this peer, in reverse order, so that more recent
-    // transactions are added first. Doing so helps avoid work when one of the orphans replaced
-    // an earlier one. Since we require the NodeId to match, one peer's announcement order does
-    // not bias how we process other peer's orphans.
-    auto& index_by_peer = m_orphans.get<ByPeer>();
-    auto it_upper = index_by_peer.upper_bound(ByPeerView{peer, true, std::numeric_limits<uint64_t>::max()});
-    auto it_lower = index_by_peer.lower_bound(ByPeerView{peer, false, 0});
+    // Use the parent outpoint index to only examine orphans that actually spend from this parent.
+    // A transaction can spend multiple outputs from the same parent, so deduplicate by wtxid before
+    // sorting the matching announcements into the same order as the old peer-wide scan:
+    // reconsiderable first, then most recent to least recent.
+    for (unsigned int i = 0; i < parent->vout.size(); ++i) {
+        const auto it_prev = m_outpoint_to_orphan_wtxids.find(COutPoint(parent_txid, i));
+        if (it_prev == m_outpoint_to_orphan_wtxids.end()) continue;
 
-    while (it_upper != it_lower) {
-        --it_upper;
-        if (!Assume(it_upper->m_announcer == peer)) break;
-        // Check if this tx spends from parent.
-        for (const auto& input : it_upper->m_tx->vin) {
-            if (input.prevout.hash == parent_txid) {
-                children_found.emplace_back(it_upper->m_tx);
-                break;
-            }
+        for (const auto& wtxid : it_prev->second) {
+            if (!matched_wtxids.insert(wtxid).second) continue;
+
+            const auto it_wtxid = index_by_wtxid.lower_bound(ByWtxidView{wtxid, peer});
+            if (it_wtxid == index_by_wtxid.end()) continue;
+            if (it_wtxid->m_tx->GetWitnessHash() != wtxid) continue;
+            if (it_wtxid->m_announcer != peer) continue;
+
+            matching_announcements.push_back(&*it_wtxid);
         }
+    }
+
+    std::sort(matching_announcements.begin(), matching_announcements.end(),
+              [](const Announcement* lhs, const Announcement* rhs) {
+                  if (lhs->m_reconsider != rhs->m_reconsider) return lhs->m_reconsider > rhs->m_reconsider;
+                  return lhs->m_entry_sequence > rhs->m_entry_sequence;
+              });
+
+    std::vector<CTransactionRef> children_found;
+    children_found.reserve(matching_announcements.size());
+    for (const Announcement* ann : matching_announcements) {
+        children_found.emplace_back(ann->m_tx);
     }
     return children_found;
 }

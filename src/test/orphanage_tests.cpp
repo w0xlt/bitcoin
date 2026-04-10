@@ -664,6 +664,32 @@ BOOST_AUTO_TEST_CASE(get_children)
     }
 }
 
+BOOST_AUTO_TEST_CASE(get_children_ordering)
+{
+    FastRandomContext det_rand{true};
+    std::unique_ptr<node::TxOrphanage> orphanage{node::MakeTxOrphanage()};
+    const NodeId peer{1};
+
+    auto parent = MakeTransactionSpending({}, det_rand);
+
+    // Add two children and mark them reconsiderable, then add two more later. The lookup should
+    // still return reconsiderable children first, then non-reconsiderable ones, each newest first.
+    auto child_old = MakeTransactionSpending({{parent->GetHash(), 0}}, det_rand);
+    auto child_mid = MakeTransactionSpending({{parent->GetHash(), 1}}, det_rand);
+    BOOST_CHECK(orphanage->AddTx(child_old, peer));
+    BOOST_CHECK(orphanage->AddTx(child_mid, peer));
+    orphanage->AddChildrenToWorkSet(*parent, det_rand);
+
+    auto child_newer = MakeTransactionSpending({{parent->GetHash(), 0}}, det_rand);
+    auto child_newest = MakeTransactionSpending({{parent->GetHash(), 1}}, det_rand);
+    BOOST_CHECK(orphanage->AddTx(child_newer, peer));
+    BOOST_CHECK(orphanage->AddTx(child_newest, peer));
+
+    std::vector<CTransactionRef> expected_children{child_mid, child_old, child_newest, child_newer};
+    BOOST_CHECK(expected_children == orphanage->GetChildrenFromSamePeer(parent, peer));
+    orphanage->SanityCheck();
+}
+
 BOOST_AUTO_TEST_CASE(too_large_orphan_tx)
 {
     std::unique_ptr<node::TxOrphanage> orphanage{node::MakeTxOrphanage()};
