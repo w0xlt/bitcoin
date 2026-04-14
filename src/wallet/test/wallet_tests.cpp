@@ -12,6 +12,7 @@
 #include <addresstype.h>
 #include <interfaces/chain.h>
 #include <key_io.h>
+#include <script/descriptor.h>
 #include <node/blockstorage.h>
 #include <node/types.h>
 #include <policy/policy.h>
@@ -721,6 +722,127 @@ BOOST_FIXTURE_TEST_CASE(RemoveTxs, TestChain100Setup)
     }
 
     TestUnloadWallet(std::move(wallet));
+}
+
+BOOST_FIXTURE_TEST_CASE(wallet_hd_seed_in_spkm, TestingSetup)
+{
+    static constexpr auto seed_hex{"e208d110a84650d6ae8b27776eb82ccd7963318d9af777306a496198c13a1d2b"};
+
+    CWallet wallet(m_node.chain.get(), "", CreateMockableWalletDatabase());
+    {
+        LOCK(wallet.cs_wallet);
+        wallet.SetWalletFlag(WALLET_FLAG_DESCRIPTORS);
+        wallet.SetWalletFlag(WALLET_FLAG_BLANK_WALLET);
+    }
+
+    const CKeyingMaterial seed = SeedFromHex(seed_hex);
+    const CExtKey master_key = MasterKeyFromSeedHex(seed_hex);
+    const CExtPubKey xpub = master_key.Neuter();
+
+    // Create descriptors with seed
+    {
+        LOCK(wallet.cs_wallet);
+        WalletBatch batch(wallet.GetDatabase());
+        wallet.SetupDescriptorScriptPubKeyMans(batch, master_key, seed);
+    }
+
+    {
+        LOCK(wallet.cs_wallet);
+        BOOST_CHECK(wallet.HasHDSeed(xpub));
+        const auto hd_seed = wallet.GetHDSeed(xpub);
+        BOOST_REQUIRE(hd_seed.has_value());
+        BOOST_CHECK(*hd_seed == seed);
+        // Verify all SPKMs have the seed
+        for (const auto& spkm : wallet.GetAllScriptPubKeyMans()) {
+            auto* desc_spkm = dynamic_cast<DescriptorScriptPubKeyMan*>(spkm);
+            LOCK(desc_spkm->cs_desc_man);
+            BOOST_CHECK(desc_spkm->HasHDSeed());
+        }
+    }
+}
+
+BOOST_FIXTURE_TEST_CASE(wallet_hd_seed_encrypted, TestingSetup)
+{
+    static constexpr auto seed_hex{"659dec01c6c731124084add1fabc04833d3aa6718f7696ba1faebb4fe1a7a8b6"};
+
+    CWallet wallet(m_node.chain.get(), "", CreateMockableWalletDatabase());
+    {
+        LOCK(wallet.cs_wallet);
+        wallet.SetWalletFlag(WALLET_FLAG_DESCRIPTORS);
+        wallet.SetWalletFlag(WALLET_FLAG_BLANK_WALLET);
+    }
+
+    const CKeyingMaterial seed = SeedFromHex(seed_hex);
+    const CExtKey master_key = MasterKeyFromSeedHex(seed_hex);
+    const CExtPubKey xpub = master_key.Neuter();
+
+    // Create descriptors with seed, then encrypt
+    {
+        LOCK(wallet.cs_wallet);
+        WalletBatch batch(wallet.GetDatabase());
+        wallet.SetupDescriptorScriptPubKeyMans(batch, master_key, seed);
+    }
+
+    SecureString passphrase;
+    passphrase = "pass";
+    BOOST_CHECK(wallet.EncryptWallet(passphrase));
+
+    {
+        LOCK(wallet.cs_wallet);
+        BOOST_CHECK(wallet.HasHDSeed(xpub));
+        // Seed not accessible while locked
+        BOOST_CHECK(!wallet.GetHDSeed(xpub).has_value());
+    }
+
+    BOOST_CHECK(wallet.Unlock(passphrase));
+
+    {
+        LOCK(wallet.cs_wallet);
+        const auto hd_seed = wallet.GetHDSeed(xpub);
+        BOOST_REQUIRE(hd_seed.has_value());
+        BOOST_CHECK(*hd_seed == seed);
+    }
+}
+
+BOOST_FIXTURE_TEST_CASE(wallet_hd_seed_attach_to_existing_descriptor, TestingSetup)
+{
+    static constexpr auto seed_hex{"e208d110a84650d6ae8b27776eb82ccd7963318d9af777306a496198c13a1d2b"};
+
+    const CKeyingMaterial seed = SeedFromHex(seed_hex);
+    const CExtKey master_key = MasterKeyFromSeedHex(seed_hex);
+    const CExtPubKey xpub = master_key.Neuter();
+
+    CWallet wallet(m_node.chain.get(), "", CreateMockableWalletDatabase());
+    {
+        LOCK(wallet.cs_wallet);
+        wallet.SetWalletFlag(WALLET_FLAG_DESCRIPTORS);
+
+        // Import a watch-only descriptor
+        FlatSigningProvider provider;
+        std::string error;
+        auto descs = Parse("wpkh(" + EncodeExtPubKey(xpub) + "/*)", provider, error, /*require_checksum=*/false);
+        BOOST_REQUIRE(error.empty());
+        BOOST_REQUIRE_EQUAL(descs.size(), 1);
+        WalletDescriptor w_desc(std::move(descs.at(0)), /*creation_time=*/0, /*range_start=*/0, /*range_end=*/1, /*next_index=*/0);
+        BOOST_REQUIRE(wallet.AddWalletDescriptor(w_desc, provider, "", /*internal=*/false));
+
+        // No seed initially
+        BOOST_CHECK(!wallet.HasHDSeed(xpub));
+
+        // Attach key with seed
+        WalletBatch batch(wallet.GetDatabase());
+        for (auto* spkm : wallet.GetAllScriptPubKeyMans()) {
+            auto* desc_spkm = dynamic_cast<DescriptorScriptPubKeyMan*>(spkm);
+            LOCK(desc_spkm->cs_desc_man);
+            desc_spkm->AddDescriptorKeyWithDB(batch, master_key.key, master_key.key.GetPubKey());
+            desc_spkm->SetHDSeed(batch, seed);
+        }
+
+        BOOST_CHECK(wallet.HasHDSeed(xpub));
+        const auto hd_seed = wallet.GetHDSeed(xpub);
+        BOOST_REQUIRE(hd_seed.has_value());
+        BOOST_CHECK(*hd_seed == seed);
+    }
 }
 
 BOOST_AUTO_TEST_SUITE_END()
