@@ -287,6 +287,11 @@ private:
     //! keeps track of whether Unlock has run a thorough check before
     bool m_decryption_thoroughly_checked = false;
 
+    //! Original BIP32 seed bytes, retained for codex32 export.
+    //! At most one of these is populated: plaintext before encryption, crypted after.
+    std::optional<CKeyingMaterial> m_hd_root_seed GUARDED_BY(cs_desc_man);
+    std::optional<std::vector<unsigned char>> m_crypted_hd_root_seed GUARDED_BY(cs_desc_man);
+
     //! Number of pre-generated keys/scripts (part of the look-ahead process, used to detect payments)
     int64_t m_keypool_size GUARDED_BY(cs_desc_man){DEFAULT_KEYPOOL_SIZE};
 
@@ -302,8 +307,6 @@ private:
      * to find ongoing signing sessions. It is the SHA256 of aggregate xonly key, + participant pubkey + sighash.
      */
     mutable std::map<uint256, MuSig2SecNonce> m_musig2_secnonces;
-
-    bool AddDescriptorKeyWithDB(WalletBatch& batch, const CKey& key, const CPubKey &pubkey) EXCLUSIVE_LOCKS_REQUIRED(cs_desc_man);
 
     KeyMap GetKeys() const EXCLUSIVE_LOCKS_REQUIRED(cs_desc_man);
 
@@ -357,9 +360,22 @@ public:
 
     bool HavePrivateKeys() const override;
     bool HasPrivKey(const CKeyID& keyid) const EXCLUSIVE_LOCKS_REQUIRED(cs_desc_man);
+    //! Add a descriptor private key to the keystore. Used to attach an imported HD root to an existing descriptor.
+    bool AddDescriptorKeyWithDB(WalletBatch& batch, const CKey& key, const CPubKey& pubkey) EXCLUSIVE_LOCKS_REQUIRED(cs_desc_man);
     //! Retrieve the particular key if it is available. Returns nullopt if the key is not in the wallet, or if the wallet is locked.
     std::optional<CKey> GetKey(const CKeyID& keyid) const EXCLUSIVE_LOCKS_REQUIRED(cs_desc_man);
     bool HaveCryptedKeys() const override;
+
+    //! Store the original BIP32 seed for codex32 round-trip. Encrypts the seed if the wallet is encrypted.
+    bool SetHDSeed(WalletBatch& batch, const CKeyingMaterial& seed) EXCLUSIVE_LOCKS_REQUIRED(cs_desc_man);
+    //! Whether this descriptor retains original seed bytes.
+    bool HasHDSeed() const EXCLUSIVE_LOCKS_REQUIRED(cs_desc_man);
+    //! Retrieve the decrypted original seed, if available.
+    std::optional<CKeyingMaterial> GetHDSeed() const EXCLUSIVE_LOCKS_REQUIRED(cs_desc_man);
+    //! Populate seed from DB during wallet load (plaintext).
+    bool LoadHDSeed(const CKeyingMaterial& seed) EXCLUSIVE_LOCKS_REQUIRED(cs_desc_man);
+    //! Populate encrypted seed from DB during wallet load.
+    bool LoadCryptedHDSeed(const std::vector<unsigned char>& crypted_seed) EXCLUSIVE_LOCKS_REQUIRED(cs_desc_man);
 
     unsigned int GetKeyPoolSize() const override;
 

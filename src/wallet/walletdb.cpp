@@ -58,6 +58,8 @@ const std::string WALLETDESCRIPTORCACHE{"walletdescriptorcache"};
 const std::string WALLETDESCRIPTORLHCACHE{"walletdescriptorlhcache"};
 const std::string WALLETDESCRIPTORCKEY{"walletdescriptorckey"};
 const std::string WALLETDESCRIPTORKEY{"walletdescriptorkey"};
+const std::string WALLETDESCRIPTORSEED{"walletdescriptorseed"};
+const std::string WALLETDESCRIPTORCSEED{"walletdescriptorcseed"};
 const std::string WATCHMETA{"watchmeta"};
 const std::string WATCHS{"watchs"};
 const std::unordered_set<std::string> LEGACY_TYPES{CRYPTED_KEY, CSCRIPT, DEFAULTKEY, HDCHAIN, KEYMETA, KEY, OLD_KEY, POOL, WATCHMETA, WATCHS};
@@ -229,6 +231,30 @@ bool WalletBatch::WriteCryptedDescriptorKey(const uint256& desc_id, const CPubKe
     }
     EraseIC(std::make_pair(DBKeys::WALLETDESCRIPTORKEY, std::make_pair(desc_id, pubkey)));
     return true;
+}
+
+bool WalletBatch::WriteDescriptorSeed(const uint256& desc_id, const CKeyingMaterial& seed)
+{
+    // integrity hash to detect corruption on load
+    const auto seed_hash = Hash(seed);
+
+    return WriteIC(std::make_pair(DBKeys::WALLETDESCRIPTORSEED, desc_id),
+                   std::make_pair(seed, seed_hash), false);
+}
+
+bool WalletBatch::WriteCryptedDescriptorSeed(const uint256& desc_id, const std::vector<unsigned char>& crypted_seed)
+{
+    if (!WriteIC(std::make_pair(DBKeys::WALLETDESCRIPTORCSEED, desc_id),
+                 crypted_seed, false)) {
+        return false;
+    }
+    EraseIC(std::make_pair(DBKeys::WALLETDESCRIPTORSEED, desc_id));
+    return true;
+}
+
+bool WalletBatch::EraseDescriptorSeed(const uint256& desc_id)
+{
+    return EraseIC(std::make_pair(DBKeys::WALLETDESCRIPTORSEED, desc_id));
 }
 
 bool WalletBatch::WriteDescriptor(const uint256& desc_id, const WalletDescriptor& descriptor)
@@ -753,8 +779,10 @@ static DBErrors LoadDescriptorWalletRecords(CWallet* pwallet, DatabaseBatch& bat
     // Load descriptor record
     int num_keys = 0;
     int num_ckeys= 0;
+    int num_seeds = 0;
+    int num_cseeds = 0;
     LoadResult desc_res = LoadRecords(pwallet, batch, DBKeys::WALLETDESCRIPTOR,
-        [&batch, &num_keys, &num_ckeys, &last_client] (CWallet* pwallet, DataStream& key, DataStream& value, std::string& strErr) {
+        [&batch, &num_keys, &num_ckeys, &num_seeds, &num_cseeds, &last_client] (CWallet* pwallet, DataStream& key, DataStream& value, std::string& strErr) {
         DBErrors result = DBErrors::LOAD_OK;
 
         uint256 id;
@@ -902,13 +930,58 @@ static DBErrors LoadDescriptorWalletRecords(CWallet* pwallet, DatabaseBatch& bat
         result = std::max(result, ckey_res.m_result);
         num_ckeys = ckey_res.m_records;
 
+        // Get unencrypted HD root seeds
+        prefix = PrefixStream(DBKeys::WALLETDESCRIPTORSEED, id);
+        LoadResult seed_res = LoadRecords(pwallet, batch, DBKeys::WALLETDESCRIPTORSEED, prefix,
+            [&id, &spk_man] (CWallet* pwallet, DataStream& key, DataStream& value, std::string& strErr) {
+            uint256 desc_id;
+            key >> desc_id;
+            assert(desc_id == id);
+            CKeyingMaterial seed;
+            uint256 hash;
+            value >> seed;
+            value >> hash;
+            const auto seed_hash = Hash(seed);
+            if (seed_hash != hash) {
+                strErr = "Error reading wallet database: descriptor seed corrupt";
+                return DBErrors::CORRUPT;
+            }
+            LOCK(spk_man->cs_desc_man);
+            if (!spk_man->LoadHDSeed(seed)) {
+                strErr = "Error reading wallet database: duplicate descriptor seed";
+                return DBErrors::CORRUPT;
+            }
+            return DBErrors::LOAD_OK;
+        });
+        result = std::max(result, seed_res.m_result);
+        num_seeds += seed_res.m_records;
+
+        // Get encrypted HD root seeds
+        prefix = PrefixStream(DBKeys::WALLETDESCRIPTORCSEED, id);
+        LoadResult cseed_res = LoadRecords(pwallet, batch, DBKeys::WALLETDESCRIPTORCSEED, prefix,
+            [&id, &spk_man] (CWallet* pwallet, DataStream& key, DataStream& value, std::string& strErr) {
+            uint256 desc_id;
+            key >> desc_id;
+            assert(desc_id == id);
+            std::vector<unsigned char> crypted_seed;
+            value >> crypted_seed;
+            LOCK(spk_man->cs_desc_man);
+            if (!spk_man->LoadCryptedHDSeed(crypted_seed)) {
+                strErr = "Error reading wallet database: duplicate encrypted descriptor seed";
+                return DBErrors::CORRUPT;
+            }
+            return DBErrors::LOAD_OK;
+        });
+        result = std::max(result, cseed_res.m_result);
+        num_cseeds += cseed_res.m_records;
+
         return result;
     });
 
     if (desc_res.m_result <= DBErrors::NONCRITICAL_ERROR) {
         // Only log if there are no critical errors
-        pwallet->WalletLogPrintf("Descriptors: %u, Descriptor Keys: %u plaintext, %u encrypted, %u total.\n",
-               desc_res.m_records, num_keys, num_ckeys, num_keys + num_ckeys);
+        pwallet->WalletLogPrintf("Descriptors: %u, Descriptor Keys: %u plaintext, %u encrypted, %u total. Seeds: %u plaintext, %u encrypted.\n",
+               desc_res.m_records, num_keys, num_ckeys, num_keys + num_ckeys, num_seeds, num_cseeds);
     }
 
     return desc_res.m_result;

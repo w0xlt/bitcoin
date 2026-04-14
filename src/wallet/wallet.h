@@ -1024,9 +1024,9 @@ public:
     void DeactivateScriptPubKeyMan(uint256 id, OutputType type, bool internal);
 
     //! Create new DescriptorScriptPubKeyMan and add it to the wallet
-    DescriptorScriptPubKeyMan& SetupDescriptorScriptPubKeyMan(WalletBatch& batch, const CExtKey& master_key, const OutputType& output_type, bool internal) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+    DescriptorScriptPubKeyMan& SetupDescriptorScriptPubKeyMan(WalletBatch& batch, const CExtKey& master_key, const OutputType& output_type, bool internal, const std::optional<CKeyingMaterial>& seed = std::nullopt) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
     //! Create new DescriptorScriptPubKeyMans and add them to the wallet
-    void SetupDescriptorScriptPubKeyMans(WalletBatch& batch, const CExtKey& master_key) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+    void SetupDescriptorScriptPubKeyMans(WalletBatch& batch, const CExtKey& master_key, const std::optional<CKeyingMaterial>& seed = std::nullopt) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
     void SetupDescriptorScriptPubKeyMans() EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
 
     //! Create new seed and default DescriptorScriptPubKeyMans for this wallet
@@ -1067,6 +1067,12 @@ public:
 
     //! Retrieve the xpubs in use by the active descriptors
     std::set<CExtPubKey> GetActiveHDPubKeys() const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+
+    //! Return whether any descriptor retains the original seed for the given xpub.
+    bool HasHDSeed(const CExtPubKey& xpub) const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+
+    //! Retrieve the original seed for the given xpub from any descriptor that has it.
+    std::optional<CKeyingMaterial> GetHDSeed(const CExtPubKey& xpub) const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
 
     //! Find the private key for the given key id from the wallet's descriptors, if available
     //! Returns nullopt when no descriptor has the key or if the wallet is locked.

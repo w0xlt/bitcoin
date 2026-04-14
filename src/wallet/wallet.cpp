@@ -3575,7 +3575,7 @@ DescriptorScriptPubKeyMan& CWallet::LoadDescriptorScriptPubKeyMan(uint256 id, Wa
     return *spk_manager;
 }
 
-DescriptorScriptPubKeyMan& CWallet::SetupDescriptorScriptPubKeyMan(WalletBatch& batch, const CExtKey& master_key, const OutputType& output_type, bool internal)
+DescriptorScriptPubKeyMan& CWallet::SetupDescriptorScriptPubKeyMan(WalletBatch& batch, const CExtKey& master_key, const OutputType& output_type, bool internal, const std::optional<CKeyingMaterial>& seed)
 {
     AssertLockHeld(cs_wallet);
     auto spk_manager = std::unique_ptr<DescriptorScriptPubKeyMan>(new DescriptorScriptPubKeyMan(*this, m_keypool_size));
@@ -3588,6 +3588,12 @@ DescriptorScriptPubKeyMan& CWallet::SetupDescriptorScriptPubKeyMan(WalletBatch& 
         }
     }
     spk_manager->SetupDescriptorGeneration(batch, master_key, output_type, internal);
+    if (seed) {
+        LOCK(spk_manager->cs_desc_man);
+        if (!spk_manager->SetHDSeed(batch, *seed)) {
+            throw std::runtime_error(std::string(__func__) + ": writing HD root seed failed");
+        }
+    }
     DescriptorScriptPubKeyMan* out = spk_manager.get();
     uint256 id = spk_manager->GetID();
     AddScriptPubKeyMan(id, std::move(spk_manager));
@@ -3595,12 +3601,12 @@ DescriptorScriptPubKeyMan& CWallet::SetupDescriptorScriptPubKeyMan(WalletBatch& 
     return *out;
 }
 
-void CWallet::SetupDescriptorScriptPubKeyMans(WalletBatch& batch, const CExtKey& master_key)
+void CWallet::SetupDescriptorScriptPubKeyMans(WalletBatch& batch, const CExtKey& master_key, const std::optional<CKeyingMaterial>& seed)
 {
     AssertLockHeld(cs_wallet);
     for (bool internal : {false, true}) {
         for (OutputType t : OUTPUT_TYPES) {
-            SetupDescriptorScriptPubKeyMan(batch, master_key, t, internal);
+            SetupDescriptorScriptPubKeyMan(batch, master_key, t, internal, seed);
         }
     }
 }
@@ -3617,8 +3623,9 @@ void CWallet::SetupOwnDescriptorScriptPubKeyMans(WalletBatch& batch)
     // Get the extended key
     CExtKey master_key;
     master_key.SetSeed(seed_key);
+    const CKeyingMaterial seed_bytes{UCharCast(seed_key.begin()), UCharCast(seed_key.end())};
 
-    SetupDescriptorScriptPubKeyMans(batch, master_key);
+    SetupDescriptorScriptPubKeyMans(batch, master_key, seed_bytes);
 }
 
 void CWallet::SetupDescriptorScriptPubKeyMans()
@@ -4520,6 +4527,42 @@ std::set<CExtPubKey> CWallet::GetActiveHDPubKeys() const
         active_xpubs.merge(std::move(desc_xpubs));
     }
     return active_xpubs;
+}
+
+bool CWallet::HasHDSeed(const CExtPubKey& xpub) const
+{
+    AssertLockHeld(cs_wallet);
+    for (const auto& spkm : GetAllScriptPubKeyMans()) {
+        const auto* desc_spkm = dynamic_cast<const DescriptorScriptPubKeyMan*>(spkm);
+        assert(desc_spkm);
+        LOCK(desc_spkm->cs_desc_man);
+        WalletDescriptor w_desc = desc_spkm->GetWalletDescriptor();
+        std::set<CPubKey> desc_pubkeys;
+        std::set<CExtPubKey> desc_xpubs;
+        w_desc.descriptor->GetPubKeys(desc_pubkeys, desc_xpubs);
+        if (desc_xpubs.count(xpub) && desc_spkm->HasHDSeed()) {
+            return true;
+        }
+    }
+    return false;
+}
+
+std::optional<CKeyingMaterial> CWallet::GetHDSeed(const CExtPubKey& xpub) const
+{
+    AssertLockHeld(cs_wallet);
+    for (const auto& spkm : GetAllScriptPubKeyMans()) {
+        const auto* desc_spkm = dynamic_cast<const DescriptorScriptPubKeyMan*>(spkm);
+        assert(desc_spkm);
+        LOCK(desc_spkm->cs_desc_man);
+        WalletDescriptor w_desc = desc_spkm->GetWalletDescriptor();
+        std::set<CPubKey> desc_pubkeys;
+        std::set<CExtPubKey> desc_xpubs;
+        w_desc.descriptor->GetPubKeys(desc_pubkeys, desc_xpubs);
+        if (desc_xpubs.count(xpub) && desc_spkm->HasHDSeed()) {
+            return desc_spkm->GetHDSeed();
+        }
+    }
+    return std::nullopt;
 }
 
 std::optional<CKey> CWallet::GetKey(const CKeyID& keyid) const

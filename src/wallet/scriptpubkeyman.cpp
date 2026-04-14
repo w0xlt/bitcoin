@@ -894,6 +894,25 @@ bool DescriptorScriptPubKeyMan::CheckDecryptionKey(const CKeyingMaterial& master
     if (keyFail || !keyPass) {
         return false;
     }
+
+    // Verify encrypted seed decrypts to the expected xpub
+    if (m_crypted_hd_root_seed) {
+        CKeyingMaterial seed;
+        if (!DecryptSecret(master_key, *m_crypted_hd_root_seed, GetID(), seed)) {
+            return false;
+        }
+        std::set<CPubKey> desc_pubkeys;
+        std::set<CExtPubKey> desc_xpubs;
+        m_wallet_descriptor.descriptor->GetPubKeys(desc_pubkeys, desc_xpubs);
+        if (desc_xpubs.size() == 1) {
+            CExtKey derived;
+            derived.SetSeed(MakeByteSpan(seed));
+            if (derived.Neuter() != *desc_xpubs.begin()) {
+                return false;
+            }
+        }
+    }
+
     m_decryption_thoroughly_checked = true;
     return true;
 }
@@ -918,6 +937,18 @@ bool DescriptorScriptPubKeyMan::Encrypt(const CKeyingMaterial& master_key, Walle
         batch->WriteCryptedDescriptorKey(GetID(), pubkey, crypted_secret);
     }
     m_map_keys.clear();
+
+    if (m_hd_root_seed) {
+        std::vector<unsigned char> crypted_seed;
+        if (!EncryptSecret(master_key, *m_hd_root_seed, GetID(), crypted_seed)) {
+            return false;
+        }
+        m_crypted_hd_root_seed = crypted_seed;
+        batch->WriteCryptedDescriptorSeed(GetID(), crypted_seed);
+        batch->EraseDescriptorSeed(GetID());
+        m_hd_root_seed.reset();
+    }
+
     return true;
 }
 
@@ -1605,6 +1636,83 @@ bool DescriptorScriptPubKeyMan::CanUpdateToWalletDescriptor(const WalletDescript
         return false;
     }
 
+    return true;
+}
+
+bool DescriptorScriptPubKeyMan::SetHDSeed(WalletBatch& batch, const CKeyingMaterial& seed)
+{
+    AssertLockHeld(cs_desc_man);
+
+    if (m_hd_root_seed || m_crypted_hd_root_seed) {
+        return true; // already set
+    }
+
+    if (m_storage.HasEncryptionKeys()) {
+        if (m_storage.IsLocked()) {
+            return false;
+        }
+        const uint256 desc_id = GetID();
+        std::vector<unsigned char> crypted_seed;
+        if (!m_storage.WithEncryptionKey([&](const CKeyingMaterial& enc_key) {
+                return EncryptSecret(enc_key, seed, desc_id, crypted_seed);
+            })) {
+            return false;
+        }
+        m_crypted_hd_root_seed = crypted_seed;
+        return batch.WriteCryptedDescriptorSeed(desc_id, crypted_seed);
+    }
+
+    m_hd_root_seed = seed;
+    return batch.WriteDescriptorSeed(GetID(), seed);
+}
+
+bool DescriptorScriptPubKeyMan::HasHDSeed() const
+{
+    AssertLockHeld(cs_desc_man);
+    return m_hd_root_seed.has_value() || m_crypted_hd_root_seed.has_value();
+}
+
+std::optional<CKeyingMaterial> DescriptorScriptPubKeyMan::GetHDSeed() const
+{
+    AssertLockHeld(cs_desc_man);
+
+    if (m_crypted_hd_root_seed) {
+        if (m_storage.IsLocked()) {
+            return std::nullopt;
+        }
+
+        const uint256 desc_id = GetID();
+        const std::vector<unsigned char>& crypted = *m_crypted_hd_root_seed;
+
+        CKeyingMaterial seed;
+        if (!m_storage.WithEncryptionKey([&](const CKeyingMaterial& enc_key) {
+                return DecryptSecret(enc_key, crypted, desc_id, seed);
+            })) {
+            return std::nullopt;
+        }
+        return seed;
+    }
+
+    return m_hd_root_seed;
+}
+
+bool DescriptorScriptPubKeyMan::LoadHDSeed(const CKeyingMaterial& seed)
+{
+    AssertLockHeld(cs_desc_man);
+    if (m_hd_root_seed || m_crypted_hd_root_seed) {
+        return false;
+    }
+    m_hd_root_seed = seed;
+    return true;
+}
+
+bool DescriptorScriptPubKeyMan::LoadCryptedHDSeed(const std::vector<unsigned char>& crypted_seed)
+{
+    AssertLockHeld(cs_desc_man);
+    if (m_hd_root_seed || m_crypted_hd_root_seed) {
+        return false;
+    }
+    m_crypted_hd_root_seed = crypted_seed;
     return true;
 }
 } // namespace wallet
