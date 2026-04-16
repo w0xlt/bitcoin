@@ -287,6 +287,11 @@ private:
     //! keeps track of whether Unlock has run a thorough check before
     bool m_decryption_thoroughly_checked = false;
 
+    //! Codex32 secret imported via addhdkey, retained for round-trip export.
+    //! At most one of these is populated: plaintext before encryption, crypted after.
+    std::optional<CKeyingMaterial> m_codex32_secret GUARDED_BY(cs_desc_man);
+    std::optional<std::vector<unsigned char>> m_crypted_codex32_secret GUARDED_BY(cs_desc_man);
+
     //! Number of pre-generated keys/scripts (part of the look-ahead process, used to detect payments)
     int64_t m_keypool_size GUARDED_BY(cs_desc_man){DEFAULT_KEYPOOL_SIZE};
 
@@ -302,8 +307,6 @@ private:
      * to find ongoing signing sessions. It is the SHA256 of aggregate xonly key, + participant pubkey + sighash.
      */
     mutable std::map<uint256, MuSig2SecNonce> m_musig2_secnonces;
-
-    bool AddDescriptorKeyWithDB(WalletBatch& batch, const CKey& key, const CPubKey &pubkey) EXCLUSIVE_LOCKS_REQUIRED(cs_desc_man);
 
     KeyMap GetKeys() const EXCLUSIVE_LOCKS_REQUIRED(cs_desc_man);
 
@@ -357,9 +360,22 @@ public:
 
     bool HavePrivateKeys() const override;
     bool HasPrivKey(const CKeyID& keyid) const EXCLUSIVE_LOCKS_REQUIRED(cs_desc_man);
+    //! Add a descriptor private key to the keystore. Used to attach an imported HD root to an existing descriptor.
+    bool AddDescriptorKeyWithDB(WalletBatch& batch, const CKey& key, const CPubKey& pubkey) EXCLUSIVE_LOCKS_REQUIRED(cs_desc_man);
     //! Retrieve the particular key if it is available. Returns nullopt if the key is not in the wallet, or if the wallet is locked.
     std::optional<CKey> GetKey(const CKeyID& keyid) const EXCLUSIVE_LOCKS_REQUIRED(cs_desc_man);
     bool HaveCryptedKeys() const override;
+
+    //! Store a codex32 secret for round-trip export. Encrypts if the wallet is encrypted.
+    bool SetCodex32Secret(WalletBatch& batch, const std::string& codex32) EXCLUSIVE_LOCKS_REQUIRED(cs_desc_man);
+    //! Whether this descriptor retains a codex32 secret.
+    bool HasCodex32Secret() const EXCLUSIVE_LOCKS_REQUIRED(cs_desc_man);
+    //! Retrieve the decrypted codex32 secret, if available.
+    std::optional<std::string> GetCodex32Secret() const EXCLUSIVE_LOCKS_REQUIRED(cs_desc_man);
+    //! Populate codex32 secret from DB during wallet load (plaintext).
+    bool LoadCodex32Secret(const CKeyingMaterial& secret) EXCLUSIVE_LOCKS_REQUIRED(cs_desc_man);
+    //! Populate encrypted codex32 secret from DB during wallet load.
+    bool LoadCryptedCodex32Secret(const std::vector<unsigned char>& crypted_secret) EXCLUSIVE_LOCKS_REQUIRED(cs_desc_man);
 
     unsigned int GetKeyPoolSize() const override;
 
