@@ -11,15 +11,18 @@
 #include <script/script.h>
 #include <script/sign.h>
 #include <script/solver.h>
+#include <span.h>
 #include <util/bip32.h>
 #include <util/check.h>
 #include <util/strencodings.h>
 #include <util/string.h>
 #include <util/time.h>
 #include <util/translation.h>
+#include <wallet/codex32.h>
 #include <wallet/scriptpubkeyman.h>
 
 #include <optional>
+#include <string_view>
 
 using common::PSBTError;
 using util::ToString;
@@ -27,6 +30,36 @@ using util::ToString;
 namespace wallet {
 
 typedef std::vector<unsigned char> valtype;
+
+namespace {
+static constexpr std::string_view CODEX32_WALLET_HRP{"wr"};
+
+std::vector<unsigned char> SerializeExtPubKey(const CExtPubKey& xpub)
+{
+    std::vector<unsigned char> ser_xpub(BIP32_EXTKEY_SIZE);
+    xpub.Encode(ser_xpub.data());
+    return ser_xpub;
+}
+
+uint256 DescriptorCodex32IV(const uint256& desc_id, const CExtPubKey& xpub)
+{
+    return Hash(desc_id, SerializeExtPubKey(xpub));
+}
+
+bool Codex32SecretMatchesXpub(const CKeyingMaterial& secret, const CExtPubKey& xpub)
+{
+    std::string error;
+    const auto codex32 = Codex32Decode(std::string{CODEX32_WALLET_HRP}, std::string{secret.begin(), secret.end()}, error);
+    if (!codex32 || codex32->type != Codex32Encoding::SECRET || codex32->payload.size() < 16 || codex32->payload.size() > 64) {
+        return false;
+    }
+
+    const CKeyingMaterial seed{codex32->payload.begin(), codex32->payload.end()};
+    CExtKey master_key;
+    master_key.SetSeed(MakeByteSpan(seed));
+    return master_key.Neuter() == xpub;
+}
+} // namespace
 
 // Legacy wallet IsMine(). Used only in migration
 // DO NOT USE ANYTHING IN THIS NAMESPACE OUTSIDE OF MIGRATION
@@ -894,6 +927,17 @@ bool DescriptorScriptPubKeyMan::CheckDecryptionKey(const CKeyingMaterial& master
     if (keyFail || !keyPass) {
         return false;
     }
+
+    // Verify encrypted codex32 secrets can be decrypted.
+    const uint256 desc_id = GetID();
+    for (const auto& [xpub, crypted] : m_crypted_codex32_secrets) {
+        CKeyingMaterial secret;
+        if (!DecryptSecret(master_key, crypted, DescriptorCodex32IV(desc_id, xpub), secret) ||
+            !Codex32SecretMatchesXpub(secret, xpub)) {
+            return false;
+        }
+    }
+
     m_decryption_thoroughly_checked = true;
     return true;
 }
@@ -918,6 +962,21 @@ bool DescriptorScriptPubKeyMan::Encrypt(const CKeyingMaterial& master_key, Walle
         batch->WriteCryptedDescriptorKey(GetID(), pubkey, crypted_secret);
     }
     m_map_keys.clear();
+
+    const uint256 desc_id = GetID();
+    if (!m_codex32_secrets.empty() && !m_storage.IsWalletFlagSet(WALLET_FLAG_CODEX32_SECRETS)) {
+        m_storage.SetWalletFlagWithDB(*batch, WALLET_FLAG_CODEX32_SECRETS);
+    }
+    for (const auto& [xpub, secret] : m_codex32_secrets) {
+        std::vector<unsigned char> crypted;
+        if (!EncryptSecret(master_key, secret, DescriptorCodex32IV(desc_id, xpub), crypted)) {
+            return false;
+        }
+        m_crypted_codex32_secrets[xpub] = crypted;
+        batch->WriteCryptedDescriptorCodex32(desc_id, xpub, crypted);
+    }
+    m_codex32_secrets.clear();
+
     return true;
 }
 
@@ -1605,6 +1664,94 @@ bool DescriptorScriptPubKeyMan::CanUpdateToWalletDescriptor(const WalletDescript
         return false;
     }
 
+    return true;
+}
+
+bool DescriptorScriptPubKeyMan::SetCodex32Secret(WalletBatch& batch, const CExtPubKey& xpub, const std::string& codex32)
+{
+    AssertLockHeld(cs_desc_man);
+
+    if (m_codex32_secrets.contains(xpub) || m_crypted_codex32_secrets.contains(xpub)) {
+        return true; // already set
+    }
+
+    if (m_storage.HasEncryptionKeys()) {
+        if (m_storage.IsLocked()) {
+            return false;
+        }
+        const CKeyingMaterial secret{codex32.begin(), codex32.end()};
+        const uint256 desc_id = GetID();
+        std::vector<unsigned char> crypted;
+        if (!m_storage.WithEncryptionKey([&](const CKeyingMaterial& enc_key) {
+                return EncryptSecret(enc_key, secret, DescriptorCodex32IV(desc_id, xpub), crypted);
+            })) {
+            return false;
+        }
+        if (!m_storage.IsWalletFlagSet(WALLET_FLAG_CODEX32_SECRETS)) {
+            m_storage.SetWalletFlagWithDB(batch, WALLET_FLAG_CODEX32_SECRETS);
+        }
+        m_crypted_codex32_secrets[xpub] = crypted;
+        return batch.WriteCryptedDescriptorCodex32(desc_id, xpub, crypted);
+    }
+
+    const CKeyingMaterial secret{codex32.begin(), codex32.end()};
+    if (!m_storage.IsWalletFlagSet(WALLET_FLAG_CODEX32_SECRETS)) {
+        m_storage.SetWalletFlagWithDB(batch, WALLET_FLAG_CODEX32_SECRETS);
+    }
+    m_codex32_secrets[xpub] = secret;
+    return batch.WriteDescriptorCodex32(GetID(), xpub, secret);
+}
+
+bool DescriptorScriptPubKeyMan::HasCodex32Secret(const CExtPubKey& xpub) const
+{
+    AssertLockHeld(cs_desc_man);
+    return m_codex32_secrets.contains(xpub) || m_crypted_codex32_secrets.contains(xpub);
+}
+
+std::optional<std::string> DescriptorScriptPubKeyMan::GetCodex32Secret(const CExtPubKey& xpub) const
+{
+    AssertLockHeld(cs_desc_man);
+
+    if (const auto it = m_crypted_codex32_secrets.find(xpub); it != m_crypted_codex32_secrets.end()) {
+        if (m_storage.IsLocked()) {
+            return std::nullopt;
+        }
+
+        const uint256 desc_id = GetID();
+        const std::vector<unsigned char>& crypted = it->second;
+
+        CKeyingMaterial secret;
+        if (!m_storage.WithEncryptionKey([&](const CKeyingMaterial& enc_key) {
+                return DecryptSecret(enc_key, crypted, DescriptorCodex32IV(desc_id, xpub), secret);
+            }) || !Codex32SecretMatchesXpub(secret, xpub)) {
+            return std::nullopt;
+        }
+        return std::string{secret.begin(), secret.end()};
+    }
+
+    if (const auto it = m_codex32_secrets.find(xpub); it != m_codex32_secrets.end()) {
+        return std::string{it->second.begin(), it->second.end()};
+    }
+    return std::nullopt;
+}
+
+bool DescriptorScriptPubKeyMan::LoadCodex32Secret(const CExtPubKey& xpub, const CKeyingMaterial& secret)
+{
+    AssertLockHeld(cs_desc_man);
+    if (m_codex32_secrets.contains(xpub) || m_crypted_codex32_secrets.contains(xpub)) {
+        return false;
+    }
+    m_codex32_secrets[xpub] = secret;
+    return true;
+}
+
+bool DescriptorScriptPubKeyMan::LoadCryptedCodex32Secret(const CExtPubKey& xpub, const std::vector<unsigned char>& crypted)
+{
+    AssertLockHeld(cs_desc_man);
+    if (m_codex32_secrets.contains(xpub) || m_crypted_codex32_secrets.contains(xpub)) {
+        return false;
+    }
+    m_crypted_codex32_secrets[xpub] = crypted;
     return true;
 }
 } // namespace wallet
