@@ -54,6 +54,13 @@ enum WalletFlags : uint64_t {
 
     //! Indicates that the wallet needs an external signer
     WALLET_FLAG_EXTERNAL_SIGNER = (1ULL << 35),
+
+    //! Indicates that the wallet contains codex32 seed backup records.
+    //!
+    //! This is mandatory so older clients refuse to load the wallet instead
+    //! of ignoring codex32 records and leaving plaintext seed backups behind
+    //! when encrypting the wallet.
+    WALLET_FLAG_CODEX32_SECRETS = (1ULL << 36),
 };
 
 //! Get the path of the wallet directory.
