@@ -894,6 +894,15 @@ bool DescriptorScriptPubKeyMan::CheckDecryptionKey(const CKeyingMaterial& master
     if (keyFail || !keyPass) {
         return false;
     }
+
+    // Verify encrypted codex32 secret can be decrypted
+    if (m_crypted_codex32_secret) {
+        CKeyingMaterial secret;
+        if (!DecryptSecret(master_key, *m_crypted_codex32_secret, GetID(), secret)) {
+            return false;
+        }
+    }
+
     m_decryption_thoroughly_checked = true;
     return true;
 }
@@ -918,6 +927,18 @@ bool DescriptorScriptPubKeyMan::Encrypt(const CKeyingMaterial& master_key, Walle
         batch->WriteCryptedDescriptorKey(GetID(), pubkey, crypted_secret);
     }
     m_map_keys.clear();
+
+    if (m_codex32_secret) {
+        std::vector<unsigned char> crypted;
+        if (!EncryptSecret(master_key, *m_codex32_secret, GetID(), crypted)) {
+            return false;
+        }
+        m_crypted_codex32_secret = crypted;
+        batch->WriteCryptedDescriptorCodex32(GetID(), crypted);
+        batch->EraseDescriptorCodex32(GetID());
+        m_codex32_secret.reset();
+    }
+
     return true;
 }
 
@@ -1605,6 +1626,88 @@ bool DescriptorScriptPubKeyMan::CanUpdateToWalletDescriptor(const WalletDescript
         return false;
     }
 
+    return true;
+}
+
+bool DescriptorScriptPubKeyMan::SetCodex32Secret(WalletBatch& batch, const std::string& codex32)
+{
+    AssertLockHeld(cs_desc_man);
+
+    if (m_codex32_secret || m_crypted_codex32_secret) {
+        return true; // already set
+    }
+
+    const CKeyingMaterial secret{codex32.begin(), codex32.end()};
+
+    if (m_storage.HasEncryptionKeys()) {
+        if (m_storage.IsLocked()) {
+            return false;
+        }
+        const uint256 desc_id = GetID();
+        std::vector<unsigned char> crypted;
+        if (!m_storage.WithEncryptionKey([&](const CKeyingMaterial& enc_key) {
+                return EncryptSecret(enc_key, secret, desc_id, crypted);
+            })) {
+            return false;
+        }
+        m_crypted_codex32_secret = crypted;
+        return batch.WriteCryptedDescriptorCodex32(desc_id, crypted);
+    }
+
+    m_codex32_secret = secret;
+    return batch.WriteDescriptorCodex32(GetID(), secret);
+}
+
+bool DescriptorScriptPubKeyMan::HasCodex32Secret() const
+{
+    AssertLockHeld(cs_desc_man);
+    return m_codex32_secret.has_value() || m_crypted_codex32_secret.has_value();
+}
+
+std::optional<std::string> DescriptorScriptPubKeyMan::GetCodex32Secret() const
+{
+    AssertLockHeld(cs_desc_man);
+
+    if (m_crypted_codex32_secret) {
+        if (m_storage.IsLocked()) {
+            return std::nullopt;
+        }
+
+        const uint256 desc_id = GetID();
+        const std::vector<unsigned char>& crypted = *m_crypted_codex32_secret;
+
+        CKeyingMaterial secret;
+        if (!m_storage.WithEncryptionKey([&](const CKeyingMaterial& enc_key) {
+                return DecryptSecret(enc_key, crypted, desc_id, secret);
+            })) {
+            return std::nullopt;
+        }
+        return std::string{secret.begin(), secret.end()};
+    }
+
+    if (m_codex32_secret) {
+        return std::string{m_codex32_secret->begin(), m_codex32_secret->end()};
+    }
+    return std::nullopt;
+}
+
+bool DescriptorScriptPubKeyMan::LoadCodex32Secret(const CKeyingMaterial& secret)
+{
+    AssertLockHeld(cs_desc_man);
+    if (m_codex32_secret || m_crypted_codex32_secret) {
+        return false;
+    }
+    m_codex32_secret = secret;
+    return true;
+}
+
+bool DescriptorScriptPubKeyMan::LoadCryptedCodex32Secret(const std::vector<unsigned char>& crypted)
+{
+    AssertLockHeld(cs_desc_man);
+    if (m_codex32_secret || m_crypted_codex32_secret) {
+        return false;
+    }
+    m_crypted_codex32_secret = crypted;
     return true;
 }
 } // namespace wallet

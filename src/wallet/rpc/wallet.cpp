@@ -654,6 +654,7 @@ RPCMethod gethdkeys()
                 {RPCResult::Type::OBJ, "", "", {
                     {RPCResult::Type::STR, "xpub", "The extended public key"},
                     {RPCResult::Type::BOOL, "has_private", "Whether the wallet has the private key for this xpub"},
+                    {RPCResult::Type::BOOL, "has_codex32", "Whether the wallet retains a codex32 secret for this xpub"},
                     {RPCResult::Type::STR, "xprv", /*optional=*/true, "The extended private key if \"private\" is true"},
                     {RPCResult::Type::ARR, "descriptors", "Array of descriptor objects that use this HD key",
                     {
@@ -726,9 +727,11 @@ RPCMethod gethdkeys()
 
                     descriptors.push_back(std::move(d));
                 }
+                const bool has_codex32 = wallet->HasCodex32Secret(xpub);
                 UniValue xpub_info(UniValue::VOBJ);
                 xpub_info.pushKV("xpub", EncodeExtPubKey(xpub));
                 xpub_info.pushKV("has_private", has_xprv);
+                xpub_info.pushKV("has_codex32", has_codex32);
                 if (priv && has_xprv) {
                     xpub_info.pushKV("xprv", EncodeExtKey(wallet_xprvs.at(xpub)));
                 }
