@@ -60,6 +60,7 @@
 #include <util/string.h>
 #include <util/time.h>
 #include <util/translation.h>
+#include <wallet/codex32.h>
 #include <wallet/coincontrol.h>
 #include <wallet/context.h>
 #include <wallet/crypter.h>
@@ -3642,6 +3643,33 @@ void CWallet::SetupOwnDescriptorScriptPubKeyMans(WalletBatch& batch)
     master_key.SetSeed(seed_key);
 
     SetupDescriptorScriptPubKeyMans(batch, master_key);
+
+    // If the wallet already carries codex32 secrets (e.g. from a prior addhdkey),
+    // attach a codex32 backup of this freshly-generated seed to the new descriptors
+    // so the active root has a recoverable string. Existing codex32 secrets stay put.
+    if (IsWalletFlagSet(WALLET_FLAG_CODEX32_SECRETS)) {
+        const std::vector<uint8_t> seed_bytes(UCharCast(seed_key.begin()), UCharCast(seed_key.end()));
+        std::string error;
+        const std::string codex32_str = Codex32SecretEncode("wr", "seed", /*threshold=*/0, seed_bytes, error);
+        if (codex32_str.empty()) {
+            throw std::runtime_error(std::string(__func__) + ": codex32 encoding failed: " + error);
+        }
+        const CExtPubKey master_xpub = master_key.Neuter();
+        for (auto* spkm : GetAllScriptPubKeyMans()) {
+            auto* desc_spkm = dynamic_cast<DescriptorScriptPubKeyMan*>(spkm);
+            if (!desc_spkm) continue;
+            LOCK(desc_spkm->cs_desc_man);
+            WalletDescriptor w_desc = desc_spkm->GetWalletDescriptor();
+            std::set<CPubKey> desc_pubkeys;
+            std::set<CExtPubKey> desc_xpubs;
+            w_desc.descriptor->GetPubKeys(desc_pubkeys, desc_xpubs);
+            if (desc_xpubs.contains(master_xpub) && !desc_spkm->HasCodex32Secret(master_xpub)) {
+                if (!desc_spkm->SetCodex32Secret(batch, master_xpub, codex32_str)) {
+                    throw std::runtime_error(std::string(__func__) + ": failed to store codex32 backup for new HD root");
+                }
+            }
+        }
+    }
 }
 
 void CWallet::SetupDescriptorScriptPubKeyMans()
@@ -4543,6 +4571,42 @@ std::set<CExtPubKey> CWallet::GetActiveHDPubKeys() const
         active_xpubs.merge(std::move(desc_xpubs));
     }
     return active_xpubs;
+}
+
+bool CWallet::HasCodex32Secret(const CExtPubKey& xpub) const
+{
+    AssertLockHeld(cs_wallet);
+    for (const auto& spkm : GetAllScriptPubKeyMans()) {
+        const auto* desc_spkm = dynamic_cast<const DescriptorScriptPubKeyMan*>(spkm);
+        assert(desc_spkm);
+        LOCK(desc_spkm->cs_desc_man);
+        WalletDescriptor w_desc = desc_spkm->GetWalletDescriptor();
+        std::set<CPubKey> desc_pubkeys;
+        std::set<CExtPubKey> desc_xpubs;
+        w_desc.descriptor->GetPubKeys(desc_pubkeys, desc_xpubs);
+        if (desc_xpubs.contains(xpub) && desc_spkm->HasCodex32Secret(xpub)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+std::optional<std::string> CWallet::GetCodex32Secret(const CExtPubKey& xpub) const
+{
+    AssertLockHeld(cs_wallet);
+    for (const auto& spkm : GetAllScriptPubKeyMans()) {
+        const auto* desc_spkm = dynamic_cast<const DescriptorScriptPubKeyMan*>(spkm);
+        assert(desc_spkm);
+        LOCK(desc_spkm->cs_desc_man);
+        WalletDescriptor w_desc = desc_spkm->GetWalletDescriptor();
+        std::set<CPubKey> desc_pubkeys;
+        std::set<CExtPubKey> desc_xpubs;
+        w_desc.descriptor->GetPubKeys(desc_pubkeys, desc_xpubs);
+        if (desc_xpubs.contains(xpub) && desc_spkm->HasCodex32Secret(xpub)) {
+            return desc_spkm->GetCodex32Secret(xpub);
+        }
+    }
+    return std::nullopt;
 }
 
 std::optional<CKey> CWallet::GetKey(const CKeyID& keyid) const
