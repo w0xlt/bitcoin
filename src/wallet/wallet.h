@@ -153,7 +153,8 @@ static constexpr uint64_t KNOWN_WALLET_FLAGS =
     |   WALLET_FLAG_LAST_HARDENED_XPUB_CACHED
     |   WALLET_FLAG_DISABLE_PRIVATE_KEYS
     |   WALLET_FLAG_DESCRIPTORS
-    |   WALLET_FLAG_EXTERNAL_SIGNER;
+    |   WALLET_FLAG_EXTERNAL_SIGNER
+    |   WALLET_FLAG_CODEX32_SECRETS;
 
 static constexpr uint64_t MUTABLE_WALLET_FLAGS =
         WALLET_FLAG_AVOID_REUSE;
@@ -165,7 +166,8 @@ static const std::map<WalletFlags, std::string> WALLET_FLAG_TO_STRING{
     {WALLET_FLAG_LAST_HARDENED_XPUB_CACHED, "last_hardened_xpub_cached"},
     {WALLET_FLAG_DISABLE_PRIVATE_KEYS, "disable_private_keys"},
     {WALLET_FLAG_DESCRIPTORS, "descriptor_wallet"},
-    {WALLET_FLAG_EXTERNAL_SIGNER, "external_signer"}
+    {WALLET_FLAG_EXTERNAL_SIGNER, "external_signer"},
+    {WALLET_FLAG_CODEX32_SECRETS, "codex32_secrets"}
 };
 
 static const std::map<std::string, WalletFlags> STRING_TO_WALLET_FLAG{
@@ -175,7 +177,8 @@ static const std::map<std::string, WalletFlags> STRING_TO_WALLET_FLAG{
     {WALLET_FLAG_TO_STRING.at(WALLET_FLAG_LAST_HARDENED_XPUB_CACHED), WALLET_FLAG_LAST_HARDENED_XPUB_CACHED},
     {WALLET_FLAG_TO_STRING.at(WALLET_FLAG_DISABLE_PRIVATE_KEYS), WALLET_FLAG_DISABLE_PRIVATE_KEYS},
     {WALLET_FLAG_TO_STRING.at(WALLET_FLAG_DESCRIPTORS), WALLET_FLAG_DESCRIPTORS},
-    {WALLET_FLAG_TO_STRING.at(WALLET_FLAG_EXTERNAL_SIGNER), WALLET_FLAG_EXTERNAL_SIGNER}
+    {WALLET_FLAG_TO_STRING.at(WALLET_FLAG_EXTERNAL_SIGNER), WALLET_FLAG_EXTERNAL_SIGNER},
+    {WALLET_FLAG_TO_STRING.at(WALLET_FLAG_CODEX32_SECRETS), WALLET_FLAG_CODEX32_SECRETS}
 };
 
 /** A wrapper to reserve an address from a wallet
@@ -428,7 +431,7 @@ private:
     void AddActiveScriptPubKeyManWithDb(WalletBatch& batch, uint256 id, OutputType type, bool internal);
 
     /** Store wallet flags */
-    void SetWalletFlagWithDB(WalletBatch& batch, uint64_t flags);
+    void SetWalletFlagWithDB(WalletBatch& batch, uint64_t flags) override;
 
     //! Cache of descriptor ScriptPubKeys used for IsMine. Maps ScriptPubKey to set of spkms
     std::unordered_map<CScript, std::vector<ScriptPubKeyMan*>, SaltedSipHasher> m_cached_spks;
@@ -1068,6 +1071,12 @@ public:
 
     //! Retrieve the xpubs in use by the active descriptors
     std::set<CExtPubKey> GetActiveHDPubKeys() const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+
+    //! Return whether any descriptor retains a codex32 secret for the given xpub.
+    bool HasCodex32Secret(const CExtPubKey& xpub) const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+
+    //! Retrieve the codex32 secret for the given xpub from any descriptor that has it.
+    std::optional<std::string> GetCodex32Secret(const CExtPubKey& xpub) const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
 
     //! Find the private key for the given key id from the wallet's descriptors, if available
     //! Returns nullopt when no descriptor has the key or if the wallet is locked.

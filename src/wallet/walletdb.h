@@ -9,6 +9,7 @@
 #include <key.h>
 #include <primitives/transaction_identifier.h>
 #include <script/sign.h>
+#include <wallet/crypter.h>
 #include <wallet/db.h>
 #include <wallet/walletutil.h>
 
@@ -29,6 +30,9 @@ struct WalletContext;
 
 // Logs information about the database, including available engines, features, and other capabilities
 void LogDBInfo();
+
+//! Serialize a CExtPubKey to BIP32_EXTKEY_SIZE bytes.
+std::vector<unsigned char> SerializeExtPubKey(const CExtPubKey& xpub);
 
 /**
  * Overview of wallet database classes:
@@ -82,6 +86,8 @@ extern const std::string VERSION;
 extern const std::string WALLETDESCRIPTOR;
 extern const std::string WALLETDESCRIPTORCKEY;
 extern const std::string WALLETDESCRIPTORKEY;
+extern const std::string WALLETDESCRIPTORCODEX32;
+extern const std::string WALLETDESCRIPTORCCODEX32;
 extern const std::string WATCHMETA;
 extern const std::string WATCHS;
 
@@ -250,6 +256,9 @@ public:
     bool WriteDescriptorParentCache(const CExtPubKey& xpub, const uint256& desc_id, uint32_t key_exp_index);
     bool WriteDescriptorLastHardenedCache(const CExtPubKey& xpub, const uint256& desc_id, uint32_t key_exp_index);
     bool WriteDescriptorCacheItems(const uint256& desc_id, const DescriptorCache& cache);
+
+    bool WriteDescriptorCodex32(const uint256& desc_id, const CExtPubKey& xpub, const CKeyingMaterial& secret);
+    bool WriteCryptedDescriptorCodex32(const uint256& desc_id, const CExtPubKey& xpub, const std::vector<unsigned char>& crypted);
 
     bool WriteLockedUTXO(const COutPoint& output);
     bool EraseLockedUTXO(const COutPoint& output);

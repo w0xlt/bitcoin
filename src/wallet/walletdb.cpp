@@ -28,6 +28,13 @@
 #include <string>
 
 namespace wallet {
+std::vector<unsigned char> SerializeExtPubKey(const CExtPubKey& xpub)
+{
+    std::vector<unsigned char> ser_xpub(BIP32_EXTKEY_SIZE);
+    xpub.Encode(ser_xpub.data());
+    return ser_xpub;
+}
+
 namespace DBKeys {
 const std::string ACENTRY{"acentry"};
 const std::string ACTIVEEXTERNALSPK{"activeexternalspk"};
@@ -58,6 +65,8 @@ const std::string WALLETDESCRIPTORCACHE{"walletdescriptorcache"};
 const std::string WALLETDESCRIPTORLHCACHE{"walletdescriptorlhcache"};
 const std::string WALLETDESCRIPTORCKEY{"walletdescriptorckey"};
 const std::string WALLETDESCRIPTORKEY{"walletdescriptorkey"};
+const std::string WALLETDESCRIPTORCODEX32{"walletdescriptorcodex32"};
+const std::string WALLETDESCRIPTORCCODEX32{"walletdescriptorccodex32"};
 const std::string WATCHMETA{"watchmeta"};
 const std::string WATCHS{"watchs"};
 const std::unordered_set<std::string> LEGACY_TYPES{CRYPTED_KEY, CSCRIPT, DEFAULTKEY, HDCHAIN, KEYMETA, KEY, OLD_KEY, POOL, WATCHMETA, WATCHS};
@@ -228,6 +237,25 @@ bool WalletBatch::WriteCryptedDescriptorKey(const uint256& desc_id, const CPubKe
         return false;
     }
     EraseIC(std::make_pair(DBKeys::WALLETDESCRIPTORKEY, std::make_pair(desc_id, pubkey)));
+    return true;
+}
+
+bool WalletBatch::WriteDescriptorCodex32(const uint256& desc_id, const CExtPubKey& xpub, const CKeyingMaterial& secret)
+{
+    const auto secret_hash = Hash(secret);
+    const auto ser_xpub = SerializeExtPubKey(xpub);
+    return WriteIC(std::make_pair(DBKeys::WALLETDESCRIPTORCODEX32, std::make_pair(desc_id, ser_xpub)),
+                   std::make_pair(secret, secret_hash), false);
+}
+
+bool WalletBatch::WriteCryptedDescriptorCodex32(const uint256& desc_id, const CExtPubKey& xpub, const std::vector<unsigned char>& crypted)
+{
+    const auto ser_xpub = SerializeExtPubKey(xpub);
+    if (!WriteIC(std::make_pair(DBKeys::WALLETDESCRIPTORCCODEX32, std::make_pair(desc_id, ser_xpub)),
+                 crypted, false)) {
+        return false;
+    }
+    EraseIC(std::make_pair(DBKeys::WALLETDESCRIPTORCODEX32, std::make_pair(desc_id, ser_xpub)));
     return true;
 }
 
@@ -753,8 +781,10 @@ static DBErrors LoadDescriptorWalletRecords(CWallet* pwallet, DatabaseBatch& bat
     // Load descriptor record
     int num_keys = 0;
     int num_ckeys= 0;
+    int num_seeds = 0;
+    int num_cseeds = 0;
     LoadResult desc_res = LoadRecords(pwallet, batch, DBKeys::WALLETDESCRIPTOR,
-        [&batch, &num_keys, &num_ckeys, &last_client] (CWallet* pwallet, DataStream& key, DataStream& value, std::string& strErr) {
+        [&batch, &num_keys, &num_ckeys, &num_seeds, &num_cseeds, &last_client] (CWallet* pwallet, DataStream& key, DataStream& value, std::string& strErr) {
         DBErrors result = DBErrors::LOAD_OK;
 
         uint256 id;
@@ -902,13 +932,81 @@ static DBErrors LoadDescriptorWalletRecords(CWallet* pwallet, DatabaseBatch& bat
         result = std::max(result, ckey_res.m_result);
         num_ckeys = ckey_res.m_records;
 
+        // Get unencrypted codex32 secrets
+        prefix = PrefixStream(DBKeys::WALLETDESCRIPTORCODEX32, id);
+        LoadResult seed_res = LoadRecords(pwallet, batch, DBKeys::WALLETDESCRIPTORCODEX32, prefix,
+            [&id, &spk_man] (CWallet* pwallet, DataStream& key, DataStream& value, std::string& strErr) {
+            uint256 desc_id;
+            std::vector<unsigned char> ser_xpub;
+            key >> desc_id;
+            assert(desc_id == id);
+            key >> ser_xpub;
+            if (ser_xpub.size() != BIP32_EXTKEY_SIZE) {
+                strErr = "Error reading wallet database: descriptor codex32 xpub corrupt";
+                return DBErrors::CORRUPT;
+            }
+            CExtPubKey xpub;
+            xpub.Decode(ser_xpub.data());
+            if (!xpub.pubkey.IsValid()) {
+                strErr = "Error reading wallet database: descriptor codex32 xpub invalid";
+                return DBErrors::CORRUPT;
+            }
+            CKeyingMaterial secret;
+            uint256 hash;
+            value >> secret;
+            value >> hash;
+            if (Hash(secret) != hash) {
+                strErr = "Error reading wallet database: descriptor codex32 secret corrupt";
+                return DBErrors::CORRUPT;
+            }
+            LOCK(spk_man->cs_desc_man);
+            if (!spk_man->LoadCodex32Secret(xpub, secret)) {
+                strErr = "Error reading wallet database: duplicate descriptor codex32 secret";
+                return DBErrors::CORRUPT;
+            }
+            return DBErrors::LOAD_OK;
+        });
+        result = std::max(result, seed_res.m_result);
+        num_seeds += seed_res.m_records;
+
+        // Get encrypted codex32 secrets
+        prefix = PrefixStream(DBKeys::WALLETDESCRIPTORCCODEX32, id);
+        LoadResult cseed_res = LoadRecords(pwallet, batch, DBKeys::WALLETDESCRIPTORCCODEX32, prefix,
+            [&id, &spk_man] (CWallet* pwallet, DataStream& key, DataStream& value, std::string& strErr) {
+            uint256 desc_id;
+            std::vector<unsigned char> ser_xpub;
+            key >> desc_id;
+            assert(desc_id == id);
+            key >> ser_xpub;
+            if (ser_xpub.size() != BIP32_EXTKEY_SIZE) {
+                strErr = "Error reading wallet database: encrypted descriptor codex32 xpub corrupt";
+                return DBErrors::CORRUPT;
+            }
+            CExtPubKey xpub;
+            xpub.Decode(ser_xpub.data());
+            if (!xpub.pubkey.IsValid()) {
+                strErr = "Error reading wallet database: encrypted descriptor codex32 xpub invalid";
+                return DBErrors::CORRUPT;
+            }
+            std::vector<unsigned char> crypted;
+            value >> crypted;
+            LOCK(spk_man->cs_desc_man);
+            if (!spk_man->LoadCryptedCodex32Secret(xpub, crypted)) {
+                strErr = "Error reading wallet database: duplicate encrypted codex32 secret";
+                return DBErrors::CORRUPT;
+            }
+            return DBErrors::LOAD_OK;
+        });
+        result = std::max(result, cseed_res.m_result);
+        num_cseeds += cseed_res.m_records;
+
         return result;
     });
 
     if (desc_res.m_result <= DBErrors::NONCRITICAL_ERROR) {
         // Only log if there are no critical errors
-        pwallet->WalletLogPrintf("Descriptors: %u, Descriptor Keys: %u plaintext, %u encrypted, %u total.\n",
-               desc_res.m_records, num_keys, num_ckeys, num_keys + num_ckeys);
+        pwallet->WalletLogPrintf("Descriptors: %u, Descriptor Keys: %u plaintext, %u encrypted, %u total. Seeds: %u plaintext, %u encrypted.\n",
+               desc_res.m_records, num_keys, num_ckeys, num_keys + num_ckeys, num_seeds, num_cseeds);
     }
 
     return desc_res.m_result;
