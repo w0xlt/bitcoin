@@ -10,12 +10,15 @@
 #include <rpc/server.h>
 #include <rpc/util.h>
 #include <univalue.h>
+#include <util/strencodings.h>
 #include <util/translation.h>
+#include <wallet/codex32.h>
 #include <wallet/context.h>
 #include <wallet/receive.h>
 #include <wallet/rpc/util.h>
 #include <wallet/rpc/wallet.h>
 #include <wallet/wallet.h>
+#include <wallet/walletdb.h>
 #include <wallet/walletutil.h>
 
 #include <optional>
@@ -638,6 +641,145 @@ static RPCMethod migratewallet()
     };
 }
 
+static constexpr std::string_view CODEX32_WALLET_HRP{"wr"};
+
+static RPCMethod addhdkey()
+{
+    return RPCMethod{
+        "addhdkey",
+        "Add a BIP 32 HD root to a descriptor wallet from a codex32 secret.\n"
+        "Creates default descriptors for all address types using the imported seed when the wallet has no active descriptors."
+        + HELP_REQUIRING_PASSPHRASE,
+        {
+            {"codex32_secret", RPCArg::Type::STR, RPCArg::Optional::NO, "The codex32 secret to import"},
+        },
+        RPCResult{
+            RPCResult::Type::OBJ, "", "", {
+                {RPCResult::Type::STR, "xpub", "The extended public key derived from the imported seed"},
+            }
+        },
+        RPCExamples{
+            HelpExampleCli("addhdkey", "\"wr10f2tvsugydzy9ggegddt5tyamkawpve4ukxvvdntmhwvr2f9se3sf6r54slxj9n4fxe7vmp\"")
+        },
+        [](const RPCMethod& self, const JSONRPCRequest& request) -> UniValue
+        {
+            std::shared_ptr<CWallet> const pwallet = GetWalletForJSONRPCRequest(request);
+            if (!pwallet) return UniValue::VNULL;
+
+            std::string error;
+            const auto codex32 = Codex32Decode(std::string{CODEX32_WALLET_HRP}, request.params[0].get_str(), error);
+            if (!codex32) {
+                throw JSONRPCError(RPC_INVALID_PARAMETER, strprintf("Unable to decode codex32 secret: %s", error));
+            }
+            if (codex32->type != Codex32Encoding::SECRET) {
+                throw JSONRPCError(RPC_INVALID_PARAMETER, "Expected a codex32 secret, not a share");
+            }
+            if (codex32->payload.size() < 16 || codex32->payload.size() > 64) {
+                throw JSONRPCError(RPC_INVALID_PARAMETER, strprintf("Expected a 16 to 64 byte seed, got %u bytes", codex32->payload.size()));
+            }
+
+            LOCK(pwallet->cs_wallet);
+            if (!pwallet->IsWalletFlagSet(WALLET_FLAG_DESCRIPTORS)) {
+                throw JSONRPCError(RPC_WALLET_ERROR, "Only descriptor wallets are supported");
+            }
+            if (pwallet->IsWalletFlagSet(WALLET_FLAG_DISABLE_PRIVATE_KEYS)) {
+                throw JSONRPCError(RPC_WALLET_ERROR, "Wallet private keys are disabled");
+            }
+            EnsureWalletIsUnlocked(*pwallet);
+
+            const std::string codex32_str = request.params[0].get_str();
+            const CKeyingMaterial seed{codex32->payload.begin(), codex32->payload.end()};
+            CExtKey master_key;
+            master_key.SetSeed(MakeByteSpan(seed));
+            const CExtPubKey xpub = master_key.Neuter();
+
+            // Walk existing descriptors: attach key and/or codex32 secret where needed
+            bool any_matched = false;
+            bool any_changed = false;
+            {
+                std::vector<DescriptorScriptPubKeyMan*> matching_spkms;
+                for (const auto& spkm : pwallet->GetAllScriptPubKeyMans()) {
+                    auto* desc_spkm = dynamic_cast<DescriptorScriptPubKeyMan*>(spkm);
+                    CHECK_NONFATAL(desc_spkm);
+                    LOCK(desc_spkm->cs_desc_man);
+                    WalletDescriptor w_desc = desc_spkm->GetWalletDescriptor();
+                    std::set<CPubKey> desc_pubkeys;
+                    std::set<CExtPubKey> desc_xpubs;
+                    w_desc.descriptor->GetPubKeys(desc_pubkeys, desc_xpubs);
+                    if (!desc_xpubs.contains(xpub)) continue;
+                    any_matched = true;
+                    matching_spkms.push_back(desc_spkm);
+
+                    if (desc_spkm->HasCodex32Secret(xpub)) {
+                        const auto existing_codex32 = desc_spkm->GetCodex32Secret(xpub);
+                        if (!existing_codex32) {
+                            throw JSONRPCError(RPC_WALLET_ERROR, strprintf("Unable to retrieve codex32 secret for %s", EncodeExtPubKey(xpub)));
+                        }
+                        if (!CaseInsensitiveEqual(*existing_codex32, codex32_str)) {
+                            throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, strprintf("HD key %s already has a different codex32 secret", EncodeExtPubKey(xpub)));
+                        }
+                    }
+                }
+
+                WalletBatch batch(pwallet->GetDatabase());
+                for (auto* desc_spkm : matching_spkms) {
+                    LOCK(desc_spkm->cs_desc_man);
+
+                    if (!desc_spkm->HasPrivKey(xpub.pubkey.GetID())) {
+                        if (!desc_spkm->AddDescriptorKeyWithDB(batch, master_key.key, master_key.key.GetPubKey())) {
+                            throw JSONRPCError(RPC_WALLET_ERROR, strprintf("Unable to add key for %s", EncodeExtPubKey(xpub)));
+                        }
+                        any_changed = true;
+                    }
+                    if (!desc_spkm->HasCodex32Secret(xpub)) {
+                        if (!desc_spkm->SetCodex32Secret(batch, xpub, codex32_str)) {
+                            throw JSONRPCError(RPC_WALLET_ERROR, strprintf("Unable to store codex32 secret for %s", EncodeExtPubKey(xpub)));
+                        }
+                        any_changed = true;
+                    }
+                }
+            }
+
+            const bool has_active_spkms = !pwallet->GetActiveScriptPubKeyMans().empty();
+
+            if (has_active_spkms && any_matched && !any_changed) {
+                throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, strprintf("HD key %s is already known", EncodeExtPubKey(xpub)));
+            }
+
+            if (!has_active_spkms) {
+                // No active descriptors: create the full default set and store the codex32 secret.
+                // This also covers blank/import-only wallets where the xpub only matched inactive descriptors.
+                if (!RunWithinTxn(pwallet->GetDatabase(), "addhdkey", [&](WalletBatch& batch) EXCLUSIVE_LOCKS_REQUIRED(pwallet->cs_wallet) {
+                        pwallet->SetupDescriptorScriptPubKeyMans(batch, master_key);
+                        for (const auto& spkm : pwallet->GetAllScriptPubKeyMans()) {
+                            auto* desc_spkm = dynamic_cast<DescriptorScriptPubKeyMan*>(spkm);
+                            CHECK_NONFATAL(desc_spkm);
+                            LOCK(desc_spkm->cs_desc_man);
+                            WalletDescriptor w_desc = desc_spkm->GetWalletDescriptor();
+                            std::set<CPubKey> desc_pubkeys;
+                            std::set<CExtPubKey> desc_xpubs;
+                            w_desc.descriptor->GetPubKeys(desc_pubkeys, desc_xpubs);
+                            if (desc_xpubs.contains(xpub)) {
+                                if (!desc_spkm->SetCodex32Secret(batch, xpub, codex32_str)) {
+                                    return false;
+                                }
+                            }
+                        }
+                        return true;
+                    })) {
+                    throw JSONRPCError(RPC_WALLET_ERROR, strprintf("Unable to create descriptors for %s", EncodeExtPubKey(xpub)));
+                }
+            } else if (!any_matched) {
+                throw JSONRPCError(RPC_WALLET_ERROR, "Cannot create default descriptors for a new HD key while the wallet already has active descriptors");
+            }
+
+            UniValue result(UniValue::VOBJ);
+            result.pushKV("xpub", EncodeExtPubKey(xpub));
+            return result;
+        },
+    };
+}
+
 RPCMethod gethdkeys()
 {
     return RPCMethod{
@@ -828,13 +970,23 @@ static RPCMethod createwalletdescriptor()
             }
             CExtKey active_hdkey(xpub, *key);
 
+            // Propagate codex32 secret from an existing descriptor that has it
+            std::optional<std::string> codex32_secret = pwallet->GetCodex32Secret(xpub);
+
             std::vector<std::reference_wrapper<DescriptorScriptPubKeyMan>> spkms;
             WalletBatch batch{pwallet->GetDatabase()};
             for (bool internal : internals) {
                 WalletDescriptor w_desc = GenerateWalletDescriptor(xpub, *output_type, internal);
                 uint256 w_id = DescriptorID(*w_desc.descriptor);
                 if (!pwallet->GetScriptPubKeyMan(w_id)) {
-                    spkms.emplace_back(pwallet->SetupDescriptorScriptPubKeyMan(batch, active_hdkey, *output_type, internal));
+                    auto& new_spkm = pwallet->SetupDescriptorScriptPubKeyMan(batch, active_hdkey, *output_type, internal);
+                    if (codex32_secret) {
+                        LOCK(new_spkm.cs_desc_man);
+                        if (!new_spkm.SetCodex32Secret(batch, xpub, *codex32_secret)) {
+                            throw JSONRPCError(RPC_WALLET_ERROR, strprintf("Unable to store codex32 secret for %s", EncodeExtPubKey(xpub)));
+                        }
+                    }
+                    spkms.emplace_back(new_spkm);
                 }
             }
             if (spkms.empty()) {
@@ -923,6 +1075,7 @@ std::span<const CRPCCommand> GetWalletRPCCommands()
         {"rawtransactions", &fundrawtransaction},
         {"wallet", &abandontransaction},
         {"wallet", &abortrescan},
+        {"wallet", &addhdkey},
         {"wallet", &backupwallet},
         {"wallet", &bumpfee},
         {"wallet", &psbtbumpfee},
