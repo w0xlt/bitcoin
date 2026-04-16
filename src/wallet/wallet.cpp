@@ -3621,9 +3621,15 @@ DescriptorScriptPubKeyMan& CWallet::SetupDescriptorScriptPubKeyMan(WalletBatch& 
 void CWallet::SetupDescriptorScriptPubKeyMans(WalletBatch& batch, const CExtKey& master_key)
 {
     AssertLockHeld(cs_wallet);
+    const CExtPubKey master_xpub = master_key.Neuter();
     for (bool internal : {false, true}) {
         for (OutputType t : OUTPUT_TYPES) {
-            SetupDescriptorScriptPubKeyMan(batch, master_key, t, internal);
+            const WalletDescriptor w_desc{GenerateWalletDescriptor(master_xpub, t, internal)};
+            if (GetScriptPubKeyMan(w_desc.id)) {
+                AddActiveScriptPubKeyManWithDb(batch, w_desc.id, t, internal);
+            } else {
+                SetupDescriptorScriptPubKeyMan(batch, master_key, t, internal);
+            }
         }
     }
 }
