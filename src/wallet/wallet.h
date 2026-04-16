@@ -1068,6 +1068,12 @@ public:
     //! Retrieve the xpubs in use by the active descriptors
     std::set<CExtPubKey> GetActiveHDPubKeys() const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
 
+    //! Return whether any descriptor retains a codex32 secret for the given xpub.
+    bool HasCodex32Secret(const CExtPubKey& xpub) const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+
+    //! Retrieve the codex32 secret for the given xpub from any descriptor that has it.
+    std::optional<std::string> GetCodex32Secret(const CExtPubKey& xpub) const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+
     //! Find the private key for the given key id from the wallet's descriptors, if available
     //! Returns nullopt when no descriptor has the key or if the wallet is locked.
     std::optional<CKey> GetKey(const CKeyID& keyid) const;
