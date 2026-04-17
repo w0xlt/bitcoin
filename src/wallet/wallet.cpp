@@ -4509,15 +4509,10 @@ std::set<CExtPubKey> CWallet::GetActiveHDPubKeys() const
 
     std::set<CExtPubKey> active_xpubs;
     for (const auto& spkm : GetActiveScriptPubKeyMans()) {
-        const DescriptorScriptPubKeyMan* desc_spkm = dynamic_cast<DescriptorScriptPubKeyMan*>(spkm);
+        const auto* desc_spkm = dynamic_cast<const DescriptorScriptPubKeyMan*>(spkm);
         assert(desc_spkm);
         LOCK(desc_spkm->cs_desc_man);
-        WalletDescriptor w_desc = desc_spkm->GetWalletDescriptor();
-
-        std::set<CPubKey> desc_pubkeys;
-        std::set<CExtPubKey> desc_xpubs;
-        w_desc.descriptor->GetPubKeys(desc_pubkeys, desc_xpubs);
-        active_xpubs.merge(std::move(desc_xpubs));
+        active_xpubs.merge(desc_spkm->GetXPubs());
     }
     return active_xpubs;
 }

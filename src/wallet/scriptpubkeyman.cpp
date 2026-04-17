@@ -1498,6 +1498,15 @@ WalletDescriptor DescriptorScriptPubKeyMan::GetWalletDescriptor() const
     return m_wallet_descriptor;
 }
 
+std::set<CExtPubKey> DescriptorScriptPubKeyMan::GetXPubs() const
+{
+    AssertLockHeld(cs_desc_man);
+    std::set<CPubKey> pubkeys;
+    std::set<CExtPubKey> xpubs;
+    m_wallet_descriptor.descriptor->GetPubKeys(pubkeys, xpubs);
+    return xpubs;
+}
+
 std::unordered_set<CScript, SaltedSipHasher> DescriptorScriptPubKeyMan::GetScriptPubKeys() const
 {
     return GetScriptPubKeys(0);
