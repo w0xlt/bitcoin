@@ -6,6 +6,10 @@
 #define BITCOIN_WALLET_TEST_UTIL_H
 
 #include <addresstype.h>
+#include <key.h>
+#include <span.h>
+#include <util/strencodings.h>
+#include <wallet/crypter.h>
 #include <wallet/db.h>
 #include <wallet/scriptpubkeyman.h>
 #include <wallet/sqlite.h>
@@ -46,6 +50,22 @@ std::unique_ptr<WalletDatabase> DuplicateMockDatabase(WalletDatabase& database);
 std::string getnewaddress(CWallet& w);
 /** Returns a new destination, of an specific type, from the wallet */
 CTxDestination getNewDestination(CWallet& w, OutputType output_type);
+
+/** Decode a hex seed string into a CKeyingMaterial. */
+inline CKeyingMaterial SeedFromHex(const char* hex)
+{
+    auto bytes = ParseHex(hex);
+    return CKeyingMaterial{bytes.begin(), bytes.end()};
+}
+
+/** Derive a BIP32 master key from a hex seed string. */
+inline CExtKey MasterKeyFromSeedHex(const char* hex)
+{
+    auto seed = SeedFromHex(hex);
+    CExtKey master_key;
+    master_key.SetSeed(MakeByteSpan(seed));
+    return master_key;
+}
 
 using MockableData = std::map<SerializeData, SerializeData, std::less<>>;
 
