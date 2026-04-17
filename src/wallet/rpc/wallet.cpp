@@ -665,8 +665,9 @@ static RPCMethod addhdkey()
             std::shared_ptr<CWallet> const pwallet = GetWalletForJSONRPCRequest(request);
             if (!pwallet) return UniValue::VNULL;
 
+            const std::string codex32_str = request.params[0].get_str();
             std::string error;
-            const auto codex32 = Codex32Decode(std::string{CODEX32_WALLET_HRP}, request.params[0].get_str(), error);
+            const auto codex32 = Codex32Decode(std::string{CODEX32_WALLET_HRP}, codex32_str, error);
             if (!codex32) {
                 throw JSONRPCError(RPC_INVALID_PARAMETER, strprintf("Unable to decode codex32 secret: %s", error));
             }
@@ -685,8 +686,6 @@ static RPCMethod addhdkey()
                 throw JSONRPCError(RPC_WALLET_ERROR, "Wallet private keys are disabled");
             }
             EnsureWalletIsUnlocked(*pwallet);
-
-            const std::string codex32_str = request.params[0].get_str();
             const CKeyingMaterial seed{codex32->payload.begin(), codex32->payload.end()};
             CExtKey master_key;
             master_key.SetSeed(MakeByteSpan(seed));
@@ -880,9 +879,8 @@ RPCMethod gethdkeys()
                     xpub_info.pushKV("xprv", EncodeExtKey(wallet_xprvs.at(xpub)));
                 }
                 if (codex32 && has_codex32) {
-                    std::optional<std::string> codex32_secret = wallet->GetCodex32Secret(xpub);
-                    if (codex32_secret) {
-                        xpub_info.pushKV("codex32", *codex32_secret);
+                    if (std::optional<std::string> secret = wallet->GetCodex32Secret(xpub)) {
+                        xpub_info.pushKV("codex32", *secret);
                     }
                 }
                 xpub_info.pushKV("descriptors", std::move(descriptors));
