@@ -935,7 +935,6 @@ bool DescriptorScriptPubKeyMan::Encrypt(const CKeyingMaterial& master_key, Walle
         }
         m_crypted_codex32_secret = crypted;
         batch->WriteCryptedDescriptorCodex32(GetID(), crypted);
-        batch->EraseDescriptorCodex32(GetID());
         m_codex32_secret.reset();
     }
 
