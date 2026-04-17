@@ -10,8 +10,13 @@
 #include <vector>
 
 #include <addresstype.h>
+#include <hash.h>
 #include <interfaces/chain.h>
 #include <key_io.h>
+#include <script/descriptor.h>
+#include <util/bip32.h>
+#include <wallet/codex32.h>
+#include <wallet/crypter.h>
 #include <node/blockstorage.h>
 #include <node/types.h>
 #include <policy/policy.h>
@@ -721,6 +726,163 @@ BOOST_FIXTURE_TEST_CASE(RemoveTxs, TestChain100Setup)
     }
 
     TestUnloadWallet(std::move(wallet));
+}
+
+BOOST_FIXTURE_TEST_CASE(wallet_codex32_secret_in_spkm, TestingSetup)
+{
+    static const std::string codex32_str{"wr10f2tvsugydzy9ggegddt5tyamkawpve4ukxvvdntmhwvr2f9se3sf6r54slxj9n4fxe7vmp"};
+
+    CWallet wallet(m_node.chain.get(), "", CreateMockableWalletDatabase());
+    {
+        LOCK(wallet.cs_wallet);
+        wallet.SetWalletFlag(WALLET_FLAG_DESCRIPTORS);
+        wallet.SetWalletFlag(WALLET_FLAG_BLANK_WALLET);
+    }
+
+    // Decode the codex32 secret to get the master key
+    std::string error;
+    const auto codex32 = Codex32Decode(std::string{"wr"}, codex32_str, error);
+    BOOST_REQUIRE(codex32.has_value());
+    const CKeyingMaterial seed{codex32->payload.begin(), codex32->payload.end()};
+    CExtKey master_key;
+    master_key.SetSeed(MakeByteSpan(seed));
+    const CExtPubKey xpub = master_key.Neuter();
+
+    // Create descriptors, then attach codex32 secret
+    {
+        LOCK(wallet.cs_wallet);
+        WalletBatch batch(wallet.GetDatabase());
+        wallet.SetupDescriptorScriptPubKeyMans(batch, master_key);
+        for (auto* spkm : wallet.GetAllScriptPubKeyMans()) {
+            auto* desc_spkm = dynamic_cast<DescriptorScriptPubKeyMan*>(spkm);
+            LOCK(desc_spkm->cs_desc_man);
+            desc_spkm->SetCodex32Secret(batch, xpub, codex32_str);
+        }
+    }
+
+    {
+        LOCK(wallet.cs_wallet);
+        BOOST_CHECK(wallet.IsWalletFlagSet(WALLET_FLAG_CODEX32_SECRETS));
+        BOOST_CHECK(wallet.HasCodex32Secret(xpub));
+        const auto secret = wallet.GetCodex32Secret(xpub);
+        BOOST_REQUIRE(secret.has_value());
+        BOOST_CHECK_EQUAL(*secret, codex32_str);
+    }
+}
+
+BOOST_FIXTURE_TEST_CASE(wallet_codex32_secret_encrypted, TestingSetup)
+{
+    static const std::string codex32_str{"wr10f2tvsugydzy9ggegddt5tyamkawpve4ukxvvdntmhwvr2f9se3sf6r54slxj9n4fxe7vmp"};
+
+    CWallet wallet(m_node.chain.get(), "", CreateMockableWalletDatabase());
+    {
+        LOCK(wallet.cs_wallet);
+        wallet.SetWalletFlag(WALLET_FLAG_DESCRIPTORS);
+        wallet.SetWalletFlag(WALLET_FLAG_BLANK_WALLET);
+    }
+
+    std::string error;
+    const auto codex32 = Codex32Decode(std::string{"wr"}, codex32_str, error);
+    BOOST_REQUIRE(codex32.has_value());
+    const CKeyingMaterial seed{codex32->payload.begin(), codex32->payload.end()};
+    CExtKey master_key;
+    master_key.SetSeed(MakeByteSpan(seed));
+    const CExtPubKey xpub = master_key.Neuter();
+
+    // Create descriptors with codex32 secret, then encrypt
+    {
+        LOCK(wallet.cs_wallet);
+        WalletBatch batch(wallet.GetDatabase());
+        wallet.SetupDescriptorScriptPubKeyMans(batch, master_key);
+        for (auto* spkm : wallet.GetAllScriptPubKeyMans()) {
+            auto* desc_spkm = dynamic_cast<DescriptorScriptPubKeyMan*>(spkm);
+            LOCK(desc_spkm->cs_desc_man);
+            desc_spkm->SetCodex32Secret(batch, xpub, codex32_str);
+        }
+    }
+
+    SecureString passphrase;
+    passphrase = "pass";
+    BOOST_CHECK(wallet.EncryptWallet(passphrase));
+
+    {
+        LOCK(wallet.cs_wallet);
+        BOOST_CHECK(wallet.IsWalletFlagSet(WALLET_FLAG_CODEX32_SECRETS));
+        BOOST_CHECK(wallet.HasCodex32Secret(xpub));
+        // Not accessible while locked
+        BOOST_CHECK(!wallet.GetCodex32Secret(xpub).has_value());
+    }
+
+    BOOST_CHECK(wallet.Unlock(passphrase));
+
+    {
+        LOCK(wallet.cs_wallet);
+        const auto secret = wallet.GetCodex32Secret(xpub);
+        BOOST_REQUIRE(secret.has_value());
+        BOOST_CHECK_EQUAL(*secret, codex32_str);
+    }
+
+    CExtKey wrong_master_key;
+    wrong_master_key.SetSeed(GenerateRandomKey());
+    const CExtPubKey wrong_xpub = wrong_master_key.Neuter();
+    BOOST_REQUIRE(!(wrong_xpub == xpub));
+
+    CKeyingMaterial encryption_key;
+    BOOST_REQUIRE(wallet.WithEncryptionKey([&](const CKeyingMaterial& key) {
+        encryption_key = key;
+        return true;
+    }));
+
+    DescriptorScriptPubKeyMan* desc_spkm{nullptr};
+    {
+        LOCK(wallet.cs_wallet);
+        const auto spkms = wallet.GetAllScriptPubKeyMans();
+        BOOST_REQUIRE(!spkms.empty());
+        desc_spkm = dynamic_cast<DescriptorScriptPubKeyMan*>(*spkms.begin());
+    }
+    BOOST_REQUIRE(desc_spkm);
+
+    std::vector<unsigned char> ser_wrong_xpub(BIP32_EXTKEY_SIZE);
+    wrong_xpub.Encode(ser_wrong_xpub.data());
+    const CKeyingMaterial secret{codex32_str.begin(), codex32_str.end()};
+    std::vector<unsigned char> crypted;
+    BOOST_REQUIRE(EncryptSecret(encryption_key, secret, Hash(desc_spkm->GetID(), ser_wrong_xpub), crypted));
+    {
+        LOCK(desc_spkm->cs_desc_man);
+        BOOST_REQUIRE(desc_spkm->LoadCryptedCodex32Secret(wrong_xpub, crypted));
+    }
+    BOOST_CHECK(wallet.Lock());
+    BOOST_CHECK(!wallet.Unlock(passphrase));
+}
+
+BOOST_FIXTURE_TEST_CASE(wallet_auto_generated_has_no_codex32, TestingSetup)
+{
+    // Auto-generated wallets should NOT have codex32 secrets
+    CWallet wallet(m_node.chain.get(), "", CreateMockableWalletDatabase());
+    {
+        LOCK(wallet.cs_wallet);
+        wallet.SetWalletFlag(WALLET_FLAG_DESCRIPTORS);
+        wallet.SetWalletFlag(WALLET_FLAG_BLANK_WALLET);
+    }
+
+    // Create descriptors with an auto-generated seed (no codex32)
+    CKey seed_key = GenerateRandomKey();
+    CExtKey master_key;
+    master_key.SetSeed(seed_key);
+    const CExtPubKey xpub = master_key.Neuter();
+
+    {
+        LOCK(wallet.cs_wallet);
+        WalletBatch batch(wallet.GetDatabase());
+        wallet.SetupDescriptorScriptPubKeyMans(batch, master_key);
+    }
+
+    {
+        LOCK(wallet.cs_wallet);
+        BOOST_CHECK(!wallet.IsWalletFlagSet(WALLET_FLAG_CODEX32_SECRETS));
+        BOOST_CHECK(!wallet.HasCodex32Secret(xpub));
+        BOOST_CHECK(!wallet.GetCodex32Secret(xpub).has_value());
+    }
 }
 
 BOOST_AUTO_TEST_SUITE_END()
