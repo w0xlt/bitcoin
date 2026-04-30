@@ -7,6 +7,7 @@
 
 #include <bitcoin-build-config.h> // IWYU pragma: keep
 #include <addresstype.h>
+#include <bech32.h>
 #include <blockfilter.h>
 #include <chain.h>
 #include <coins.h>
@@ -60,6 +61,7 @@
 #include <util/string.h>
 #include <util/time.h>
 #include <util/translation.h>
+#include <wallet/codex32.h>
 #include <wallet/coincontrol.h>
 #include <wallet/context.h>
 #include <wallet/crypter.h>
@@ -3642,6 +3644,38 @@ void CWallet::SetupOwnDescriptorScriptPubKeyMans(WalletBatch& batch)
     master_key.SetSeed(seed_key);
 
     SetupDescriptorScriptPubKeyMans(batch, master_key);
+
+    // Attach a codex32 backup of the freshly-generated seed to the new descriptors
+    // so the active HD root is recoverable from a single string. The id is 4 random
+    // bech32 chars to avoid a uniform "Core wallet" prefix on every backup.
+    const std::vector<uint8_t> seed_bytes(UCharCast(seed_key.begin()), UCharCast(seed_key.end()));
+    unsigned char rnd_id[4];
+    GetStrongRandBytes(rnd_id);
+    std::string codex32_id;
+    codex32_id.reserve(4);
+    for (unsigned char b : rnd_id) {
+        codex32_id += bech32::CHARSET[b & 0x1f];
+    }
+    std::string error;
+    const std::string codex32_str = Codex32SecretEncode("ms", codex32_id, /*threshold=*/0, seed_bytes, error);
+    if (codex32_str.empty()) {
+        throw std::runtime_error(std::string(__func__) + ": codex32 encoding failed: " + error);
+    }
+    const CExtPubKey master_xpub = master_key.Neuter();
+    for (auto* spkm : GetAllScriptPubKeyMans()) {
+        auto* desc_spkm = dynamic_cast<DescriptorScriptPubKeyMan*>(spkm);
+        if (!desc_spkm) continue;
+        LOCK(desc_spkm->cs_desc_man);
+        WalletDescriptor w_desc = desc_spkm->GetWalletDescriptor();
+        std::set<CPubKey> desc_pubkeys;
+        std::set<CExtPubKey> desc_xpubs;
+        w_desc.descriptor->GetPubKeys(desc_pubkeys, desc_xpubs);
+        if (desc_xpubs.contains(master_xpub) && !desc_spkm->HasCodex32Secret(master_xpub)) {
+            if (!desc_spkm->SetCodex32Secret(batch, master_xpub, codex32_str)) {
+                throw std::runtime_error(std::string(__func__) + ": failed to store codex32 backup for new HD root");
+            }
+        }
+    }
 }
 
 void CWallet::SetupDescriptorScriptPubKeyMans()
