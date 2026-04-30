@@ -270,8 +270,11 @@ class BackwardsCompatibilityTest(BitcoinTestFramework):
         for node in descriptors_nodes:
             self.log.info(f"- {node.version}")
             for wallet_name in ["w1", "w2", "w3"]:
-                if self.major_version_less_than(node, 22) and wallet_name == "w1":
-                    # Descriptor wallets created after 0.21 have taproot descriptors which 0.21 does not support, tested below
+                if wallet_name == "w1":
+                    # Default descriptor wallets now carry the codex32 backup
+                    # flag (bit 36), which older releases reject as an unknown
+                    # mandatory flag. (v0.21 also rejects on taproot.)
+                    # Per-version rejection is asserted below.
                     continue
                 # Also try to reopen on master after opening on old
                 for n in [node, node_master]:
@@ -317,9 +320,16 @@ class BackwardsCompatibilityTest(BitcoinTestFramework):
         for wallet_name in ["w1", "w2", "w3"]:
             assert_raises_rpc_error(-4, "Wallet file verification failed: wallet.dat corrupt, salvage failed", node_v20.loadwallet, wallet_name)
 
-        # w1 cannot be opened by 0.21 since it contains a taproot descriptor
-        self.log.info("Test that 0.21 cannot open wallet containing tr() descriptors")
-        assert_raises_rpc_error(-1, "map::at", node_v21.loadwallet, "w1")
+        # w1 cannot be opened by older descriptor-supporting versions:
+        # v0.21 still rejects due to the taproot descriptor (map::at);
+        # v22 onward reject because the codex32_secrets flag (bit 36) is
+        # unknown to them (Wallet corrupted).
+        self.log.info("Test that older descriptor-supporting versions cannot open w1")
+        for node in descriptors_nodes:
+            if self.major_version_equals(node, 21):
+                assert_raises_rpc_error(-1, "map::at", node.loadwallet, "w1")
+            else:
+                assert_raises_rpc_error(-4, "Wallet corrupted", node.loadwallet, "w1")
 
         self.log.info("Test that a wallet can upgrade to and downgrade from master, from:")
         for node in descriptors_nodes:
