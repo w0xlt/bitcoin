@@ -10,8 +10,13 @@
 #include <vector>
 
 #include <addresstype.h>
+#include <hash.h>
 #include <interfaces/chain.h>
 #include <key_io.h>
+#include <script/descriptor.h>
+#include <util/bip32.h>
+#include <wallet/codex32.h>
+#include <wallet/crypter.h>
 #include <node/blockstorage.h>
 #include <node/types.h>
 #include <policy/policy.h>
@@ -721,6 +726,238 @@ BOOST_FIXTURE_TEST_CASE(RemoveTxs, TestChain100Setup)
     }
 
     TestUnloadWallet(std::move(wallet));
+}
+
+BOOST_FIXTURE_TEST_CASE(wallet_codex32_secret_in_spkm, TestingSetup)
+{
+    const auto seed_bytes = ParseHex("e208d110a84650d6ae8b27776eb82ccd7963318d9af777306a496198c13a1d2b");
+    std::string encode_error;
+    const std::string codex32_str = Codex32SecretEncode("ms", "f2tv", 0, seed_bytes, encode_error);
+    BOOST_REQUIRE(encode_error.empty());
+
+    CWallet wallet(m_node.chain.get(), "", CreateMockableWalletDatabase());
+    {
+        LOCK(wallet.cs_wallet);
+        wallet.SetWalletFlag(WALLET_FLAG_DESCRIPTORS);
+        wallet.SetWalletFlag(WALLET_FLAG_BLANK_WALLET);
+    }
+
+    const CKeyingMaterial seed{seed_bytes.begin(), seed_bytes.end()};
+    CExtKey master_key;
+    master_key.SetSeed(MakeByteSpan(seed));
+    const CExtPubKey xpub = master_key.Neuter();
+
+    // Create descriptors, then attach codex32 secret
+    {
+        LOCK(wallet.cs_wallet);
+        WalletBatch batch(wallet.GetDatabase());
+        wallet.SetupDescriptorScriptPubKeyMans(batch, master_key);
+        for (auto* spkm : wallet.GetAllScriptPubKeyMans()) {
+            auto* desc_spkm = dynamic_cast<DescriptorScriptPubKeyMan*>(spkm);
+            LOCK(desc_spkm->cs_desc_man);
+            desc_spkm->SetCodex32Secret(batch, xpub, codex32_str);
+        }
+    }
+
+    {
+        LOCK(wallet.cs_wallet);
+        BOOST_CHECK(wallet.IsWalletFlagSet(WALLET_FLAG_CODEX32_SECRETS));
+        BOOST_CHECK(wallet.HasCodex32Secret(xpub));
+        const auto secret = wallet.GetCodex32Secret(xpub);
+        BOOST_REQUIRE(secret.has_value());
+        BOOST_CHECK_EQUAL(*secret, codex32_str);
+    }
+}
+
+BOOST_FIXTURE_TEST_CASE(wallet_codex32_secret_encrypted, TestingSetup)
+{
+    const auto seed_bytes = ParseHex("e208d110a84650d6ae8b27776eb82ccd7963318d9af777306a496198c13a1d2b");
+    std::string encode_error;
+    const std::string codex32_str = Codex32SecretEncode("ms", "f2tv", 0, seed_bytes, encode_error);
+    BOOST_REQUIRE(encode_error.empty());
+
+    CWallet wallet(m_node.chain.get(), "", CreateMockableWalletDatabase());
+    {
+        LOCK(wallet.cs_wallet);
+        wallet.SetWalletFlag(WALLET_FLAG_DESCRIPTORS);
+        wallet.SetWalletFlag(WALLET_FLAG_BLANK_WALLET);
+    }
+
+    const CKeyingMaterial seed{seed_bytes.begin(), seed_bytes.end()};
+    CExtKey master_key;
+    master_key.SetSeed(MakeByteSpan(seed));
+    const CExtPubKey xpub = master_key.Neuter();
+
+    // Create descriptors with codex32 secret, then encrypt
+    {
+        LOCK(wallet.cs_wallet);
+        WalletBatch batch(wallet.GetDatabase());
+        wallet.SetupDescriptorScriptPubKeyMans(batch, master_key);
+        for (auto* spkm : wallet.GetAllScriptPubKeyMans()) {
+            auto* desc_spkm = dynamic_cast<DescriptorScriptPubKeyMan*>(spkm);
+            LOCK(desc_spkm->cs_desc_man);
+            desc_spkm->SetCodex32Secret(batch, xpub, codex32_str);
+        }
+    }
+
+    SecureString passphrase;
+    passphrase = "pass";
+    BOOST_CHECK(wallet.EncryptWallet(passphrase));
+
+    {
+        LOCK(wallet.cs_wallet);
+        BOOST_CHECK(wallet.IsWalletFlagSet(WALLET_FLAG_CODEX32_SECRETS));
+        BOOST_CHECK(wallet.HasCodex32Secret(xpub));
+        // Not accessible while locked
+        BOOST_CHECK(!wallet.GetCodex32Secret(xpub).has_value());
+    }
+
+    BOOST_CHECK(wallet.Unlock(passphrase));
+
+    {
+        LOCK(wallet.cs_wallet);
+        const auto secret = wallet.GetCodex32Secret(xpub);
+        BOOST_REQUIRE(secret.has_value());
+        BOOST_CHECK_EQUAL(*secret, codex32_str);
+    }
+
+    CExtKey wrong_master_key;
+    wrong_master_key.SetSeed(GenerateRandomKey());
+    const CExtPubKey wrong_xpub = wrong_master_key.Neuter();
+    BOOST_REQUIRE(!(wrong_xpub == xpub));
+
+    CKeyingMaterial encryption_key;
+    BOOST_REQUIRE(wallet.WithEncryptionKey([&](const CKeyingMaterial& key) {
+        encryption_key = key;
+        return true;
+    }));
+
+    DescriptorScriptPubKeyMan* desc_spkm{nullptr};
+    {
+        LOCK(wallet.cs_wallet);
+        const auto spkms = wallet.GetAllScriptPubKeyMans();
+        BOOST_REQUIRE(!spkms.empty());
+        desc_spkm = dynamic_cast<DescriptorScriptPubKeyMan*>(*spkms.begin());
+    }
+    BOOST_REQUIRE(desc_spkm);
+
+    std::vector<unsigned char> ser_wrong_xpub(BIP32_EXTKEY_SIZE);
+    wrong_xpub.Encode(ser_wrong_xpub.data());
+    const CKeyingMaterial secret{codex32_str.begin(), codex32_str.end()};
+    std::vector<unsigned char> crypted;
+    BOOST_REQUIRE(EncryptSecret(encryption_key, secret, Hash(desc_spkm->GetID(), ser_wrong_xpub), crypted));
+    {
+        LOCK(desc_spkm->cs_desc_man);
+        BOOST_REQUIRE(desc_spkm->LoadCryptedCodex32Secret(wrong_xpub, crypted));
+    }
+    BOOST_CHECK(wallet.Lock());
+    BOOST_CHECK(!wallet.Unlock(passphrase));
+}
+
+BOOST_FIXTURE_TEST_CASE(wallet_auto_generated_has_codex32, TestingSetup)
+{
+    // Vanilla descriptor wallets receive a codex32 backup of their auto-generated
+    // HD root at creation. The backup string must round-trip to the same xpub.
+    CWallet wallet(m_node.chain.get(), "", CreateMockableWalletDatabase());
+    {
+        LOCK(wallet.cs_wallet);
+        wallet.SetWalletFlag(WALLET_FLAG_DESCRIPTORS);
+        // Intentionally NOT BLANK_WALLET so SetupOwnDescriptorScriptPubKeyMans runs.
+    }
+
+    {
+        LOCK(wallet.cs_wallet);
+        wallet.SetupDescriptorScriptPubKeyMans();
+    }
+
+    LOCK(wallet.cs_wallet);
+    BOOST_CHECK(wallet.IsWalletFlagSet(WALLET_FLAG_CODEX32_SECRETS));
+
+    const auto active_xpubs = wallet.GetActiveHDPubKeys();
+    BOOST_REQUIRE_EQUAL(active_xpubs.size(), 1);
+    const CExtPubKey xpub = *active_xpubs.begin();
+    BOOST_CHECK(wallet.HasCodex32Secret(xpub));
+
+    const auto codex32_str = wallet.GetCodex32Secret(xpub);
+    BOOST_REQUIRE(codex32_str.has_value());
+
+    std::string error;
+    const auto codex32 = Codex32Decode(std::string{"ms"}, *codex32_str, error);
+    BOOST_REQUIRE(codex32.has_value());
+    BOOST_CHECK(codex32->type == Codex32Encoding::SECRET);
+    const CKeyingMaterial seed{codex32->payload.begin(), codex32->payload.end()};
+    CExtKey recovered_master_key;
+    recovered_master_key.SetSeed(MakeByteSpan(seed));
+    BOOST_CHECK(recovered_master_key.Neuter() == xpub);
+}
+
+// When a codex32-using wallet is encrypted, EncryptWallet generates a fresh
+// HD seed for the new active descriptors. That auto-generated seed must carry
+// a codex32 backup string that round-trips back to the same xpub.
+BOOST_FIXTURE_TEST_CASE(wallet_codex32_auto_seed_after_encrypt, TestingSetup)
+{
+    const auto seed_bytes = ParseHex("e208d110a84650d6ae8b27776eb82ccd7963318d9af777306a496198c13a1d2b");
+    std::string encode_error;
+    const std::string codex32_str = Codex32SecretEncode("ms", "f2tv", 0, seed_bytes, encode_error);
+    BOOST_REQUIRE(encode_error.empty());
+
+    CWallet wallet(m_node.chain.get(), "", CreateMockableWalletDatabase());
+    {
+        LOCK(wallet.cs_wallet);
+        wallet.SetWalletFlag(WALLET_FLAG_DESCRIPTORS);
+        // Intentionally do NOT set BLANK_WALLET so EncryptWallet's post-encrypt
+        // SetupDescriptorScriptPubKeyMans path runs.
+    }
+
+    const CKeyingMaterial seed{seed_bytes.begin(), seed_bytes.end()};
+    CExtKey imported_master_key;
+    imported_master_key.SetSeed(MakeByteSpan(seed));
+    const CExtPubKey imported_xpub = imported_master_key.Neuter();
+
+    // Create the imported descriptors and attach the codex32 secret. This sets
+    // WALLET_FLAG_CODEX32_SECRETS, which is the gate the new behavior keys off.
+    {
+        LOCK(wallet.cs_wallet);
+        WalletBatch batch(wallet.GetDatabase());
+        wallet.SetupDescriptorScriptPubKeyMans(batch, imported_master_key);
+        for (auto* spkm : wallet.GetAllScriptPubKeyMans()) {
+            auto* desc_spkm = dynamic_cast<DescriptorScriptPubKeyMan*>(spkm);
+            LOCK(desc_spkm->cs_desc_man);
+            BOOST_REQUIRE(desc_spkm->SetCodex32Secret(batch, imported_xpub, codex32_str));
+        }
+        BOOST_REQUIRE(wallet.IsWalletFlagSet(WALLET_FLAG_CODEX32_SECRETS));
+    }
+
+    SecureString passphrase{"pass"};
+    BOOST_REQUIRE(wallet.EncryptWallet(passphrase));
+    BOOST_REQUIRE(wallet.Unlock(passphrase));
+
+    LOCK(wallet.cs_wallet);
+
+    // The imported root is now inactive but its codex32 secret is preserved.
+    BOOST_CHECK(wallet.HasCodex32Secret(imported_xpub));
+    const auto preserved = wallet.GetCodex32Secret(imported_xpub);
+    BOOST_REQUIRE(preserved.has_value());
+    BOOST_CHECK_EQUAL(*preserved, codex32_str);
+
+    // A new active root was generated and must have a codex32 backup.
+    const auto active_xpubs = wallet.GetActiveHDPubKeys();
+    BOOST_REQUIRE_EQUAL(active_xpubs.size(), 1);
+    const CExtPubKey new_xpub = *active_xpubs.begin();
+    BOOST_CHECK(!(new_xpub == imported_xpub));
+    BOOST_CHECK(wallet.HasCodex32Secret(new_xpub));
+    const auto new_codex32 = wallet.GetCodex32Secret(new_xpub);
+    BOOST_REQUIRE(new_codex32.has_value());
+
+    // Round-trip: decoding the backup string and re-deriving must yield the same xpub.
+    std::string decode_error;
+    const auto recovered = Codex32Decode(std::string{"ms"}, *new_codex32, decode_error);
+    BOOST_REQUIRE(recovered.has_value());
+    BOOST_CHECK(recovered->type == Codex32Encoding::SECRET);
+    const CKeyingMaterial recovered_seed{recovered->payload.begin(), recovered->payload.end()};
+    CExtKey recovered_master_key;
+    recovered_master_key.SetSeed(MakeByteSpan(recovered_seed));
+    BOOST_CHECK(recovered_master_key.Neuter() == new_xpub);
 }
 
 BOOST_AUTO_TEST_SUITE_END()
