@@ -1088,6 +1088,31 @@ BOOST_AUTO_TEST_CASE(btck_chainman_in_memory_tests)
     BOOST_CHECK(context.interrupt());
 }
 
+BOOST_AUTO_TEST_CASE(btck_chainman_process_block_header_resets_state)
+{
+    auto test_directory{TestDirectory{"regtest_header_state_bitcoin_kernel"}};
+
+    auto notifications{std::make_shared<TestKernelNotifications>()};
+    auto context{create_context(notifications, ChainType::REGTEST)};
+    auto chainman{create_chainman(
+        test_directory, /*reindex=*/false, /*wipe_chainstate=*/false,
+        /*block_tree_db_in_memory=*/false, /*chainstate_db_in_memory=*/false, context)};
+
+    Block first_block{hex_string_to_byte_vec(REGTEST_BLOCK_DATA[0])};
+    BlockHeader first_header{first_block.GetHeader()};
+    Block orphan_block{hex_string_to_byte_vec(REGTEST_BLOCK_DATA[1])};
+    BlockHeader orphan_header{orphan_block.GetHeader()};
+    BlockValidationState state{};
+
+    BOOST_CHECK(!chainman->ProcessBlockHeader(orphan_header, state));
+    BOOST_CHECK(state.GetValidationMode() == ValidationMode::INVALID);
+    BOOST_CHECK(state.GetBlockValidationResult() == BlockValidationResult::MISSING_PREV);
+
+    BOOST_CHECK(chainman->ProcessBlockHeader(first_header, state));
+    BOOST_CHECK(state.GetValidationMode() == ValidationMode::VALID);
+    BOOST_CHECK(state.GetBlockValidationResult() == BlockValidationResult::UNSET);
+}
+
 BOOST_AUTO_TEST_CASE(btck_chainman_regtest_tests)
 {
     auto test_directory{TestDirectory{"regtest_test_bitcoin_kernel"}};

@@ -1345,7 +1345,9 @@ int btck_chainstate_manager_process_block_header(
 {
     try {
         auto& chainman = btck_ChainstateManager::get(chainstate_manager).m_chainman;
-        auto result = chainman->ProcessNewBlockHeaders({&btck_BlockHeader::get(header), 1}, /*min_pow_checked=*/true, btck_BlockValidationState::get(state), /*ppindex=*/nullptr);
+        auto& validation_state = btck_BlockValidationState::get(state);
+        validation_state = BlockValidationState{};
+        auto result = chainman->ProcessNewBlockHeaders({&btck_BlockHeader::get(header), 1}, /*min_pow_checked=*/true, validation_state, /*ppindex=*/nullptr);
 
         return result ? 0 : -1;
     } catch (const std::exception& e) {

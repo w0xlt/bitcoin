@@ -1161,7 +1161,8 @@ BITCOINKERNEL_API const btck_BlockTreeEntry* BITCOINKERNEL_WARN_UNUSED_RESULT bt
  *
  * @param[in] chainstate_manager        Non-null.
  * @param[in] header                    Non-null btck_BlockHeader to be validated.
- * @param[out] block_validation_state   The result of the btck_BlockHeader validation.
+ * @param[out] block_validation_state   Reset on entry and updated with the result
+ *                                      of the btck_BlockHeader validation.
  * @return                              0 if btck_BlockHeader processing completed successfully, non-zero on error.
  */
 BITCOINKERNEL_API int BITCOINKERNEL_WARN_UNUSED_RESULT btck_chainstate_manager_process_block_header(
