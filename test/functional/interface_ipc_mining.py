@@ -120,8 +120,29 @@ class IPCMiningTest(BitcoinTestFramework):
         block.hashMerkleRoot = block.calc_merkle_root()
         return block, coinbase
 
-    async def assert_submit_block(self, mining, ctx, block, *, result, reason="", debug=""):
-        submit = await mining.submitBlock(ctx, block.serialize())
+    def make_block_variant(self, block, coinbase, extra_nonce):
+        """Make a solved same-template block with a distinct coinbase scriptSig."""
+        block = deepcopy(block)
+        coinbase = deepcopy(coinbase)
+        coinbase.vin[0].scriptSig = CScript(bytes(coinbase.vin[0].scriptSig) + bytes(CScript([CScriptNum(extra_nonce)])))
+        block.vtx[0] = coinbase
+        block.hashMerkleRoot = block.calc_merkle_root()
+        block.solve()
+        return block, coinbase
+
+    def assert_chain_tip(self, node, block_hash, *, active):
+        matching_tips = [tip for tip in node.getchaintips() if tip["hash"] == block_hash]
+        assert_equal(len(matching_tips), 1)
+        if active:
+            assert_equal(matching_tips[0]["status"], "active")
+        else:
+            assert_not_equal(matching_tips[0]["status"], "active")
+
+    async def assert_submit_block(self, mining, ctx, block, *, result, reason="", debug="", precious=None):
+        if precious is None:
+            submit = await mining.submitBlock(ctx, block.serialize())
+        else:
+            submit = await mining.submitBlock(ctx, block.serialize(), precious)
         assert_equal(submit.result, result)
         assert_equal(submit.reason, reason)
         assert_equal(submit.debug, debug)
@@ -518,6 +539,80 @@ class IPCMiningTest(BitcoinTestFramework):
 
         asyncio.run(capnp.run(async_routine()))
 
+    def run_precious_submission_test(self):
+        """Test precious submitBlock and submitSolution IPC arguments."""
+        self.log.info("Running precious block submission test")
+
+        async def async_routine():
+            node = self.nodes[0]
+            ctx, mining = await make_mining_ctx(self)
+
+            async with AsyncExitStack() as stack:
+                self.log.debug("Build same-height blocks from one template")
+                template = await mining_create_block_template(mining, stack, ctx, self.default_block_create_options)
+                block, coinbase = await self.build_candidate_block(template, ctx)
+                active_block, _ = self.make_block_variant(block, coinbase, extra_nonce=1)
+                side_block, _ = self.make_block_variant(block, coinbase, extra_nonce=2)
+
+                assert_not_equal(active_block.hash_hex, side_block.hash_hex)
+                assert_equal(active_block.hashPrevBlock, side_block.hashPrevBlock)
+
+                self.log.debug("submitBlock with precious=false stores but does not connect a same-work side block")
+                await self.assert_submit_block(mining, ctx, active_block, result=True)
+                assert_equal(node.getbestblockhash(), active_block.hash_hex)
+                await self.assert_submit_block(mining, ctx, side_block, result=False, reason="inconclusive", precious=False)
+                assert_equal(node.getbestblockhash(), active_block.hash_hex)
+                self.assert_chain_tip(node, side_block.hash_hex, active=False)
+
+                self.log.debug("submitBlock with precious=true prefers the stored side block")
+                await self.assert_submit_block(mining, ctx, side_block, result=True, precious=True)
+                assert_equal(node.getbestblockhash(), side_block.hash_hex)
+                self.assert_chain_tip(node, side_block.hash_hex, active=True)
+
+                self.log.debug("Build another same-height pair for submitSolution")
+                stale_template = await mining_create_block_template(mining, stack, ctx, self.default_block_create_options)
+                stale_block, stale_coinbase = await self.build_candidate_block(stale_template, ctx)
+                active_solution_block, _ = self.make_block_variant(stale_block, stale_coinbase, extra_nonce=3)
+                side_solution_block, side_solution_coinbase = self.make_block_variant(stale_block, stale_coinbase, extra_nonce=4)
+
+                assert_not_equal(active_solution_block.hash_hex, side_solution_block.hash_hex)
+                assert_equal(active_solution_block.hashPrevBlock, side_solution_block.hashPrevBlock)
+
+                self.log.debug("Make the template stale by connecting a sibling block")
+                await self.assert_submit_block(mining, ctx, active_solution_block, result=True)
+                assert_equal(node.getbestblockhash(), active_solution_block.hash_hex)
+
+                self.log.debug("submitSolution with precious=false does not connect the stale same-work solution")
+                submitted = (await stale_template.submitSolution(
+                    ctx,
+                    side_solution_block.nVersion,
+                    side_solution_block.nTime,
+                    side_solution_block.nNonce,
+                    side_solution_coinbase.serialize(),
+                    False,
+                )).result
+                assert_equal(submitted, True)
+                assert_equal(node.getbestblockhash(), active_solution_block.hash_hex)
+                self.assert_chain_tip(node, side_solution_block.hash_hex, active=False)
+
+                self.log.debug("submitSolution with precious=true prefers the stale same-work solution")
+                submitted = (await stale_template.submitSolution(
+                    ctx,
+                    side_solution_block.nVersion,
+                    side_solution_block.nTime,
+                    side_solution_block.nNonce,
+                    side_solution_coinbase.serialize(),
+                    True,
+                )).result
+                assert_equal(submitted, True)
+                assert_equal(node.getbestblockhash(), side_solution_block.hash_hex)
+                self.assert_chain_tip(node, side_solution_block.hash_hex, active=True)
+
+            # Move to a strictly better chain so peers converge before later tests.
+            self.generate(node, 1)
+
+        asyncio.run(capnp.run(async_routine()))
+
     def run_test(self):
         self.miniwallet = MiniWallet(self.nodes[0])
         self.default_block_create_options = self.capnp_modules['mining'].BlockCreateOptions()
@@ -525,6 +620,7 @@ class IPCMiningTest(BitcoinTestFramework):
         self.run_early_startup_test()
         self.run_block_template_test()
         self.run_coinbase_and_submission_test()
+        self.run_precious_submission_test()
         self.run_ipc_option_override_test()
 
 
