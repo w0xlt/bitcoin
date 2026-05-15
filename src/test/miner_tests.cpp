@@ -834,13 +834,13 @@ BOOST_AUTO_TEST_CASE(CreateNewBlock_validity)
         if (current_height % 2 == 0) {
             std::string reason{"stale reason"};
             std::string debug{"stale debug"};
-            BOOST_REQUIRE(mining->submitBlock(block, reason, debug));
+            BOOST_REQUIRE(mining->submitBlock(block, /*precious=*/false, reason, debug));
             BOOST_REQUIRE_EQUAL(reason, "");
             BOOST_REQUIRE_EQUAL(debug, "");
 
             reason = "stale reason";
             debug = "stale debug";
-            BOOST_REQUIRE(!mining->submitBlock(block, reason, debug));
+            BOOST_REQUIRE(!mining->submitBlock(block, /*precious=*/false, reason, debug));
             BOOST_REQUIRE_EQUAL(reason, "duplicate");
             BOOST_REQUIRE_EQUAL(debug, "");
         } else {

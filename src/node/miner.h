@@ -142,8 +142,9 @@ void ApplyArgsManOptions(const ArgsManager& gArgs, BlockAssembler::Options& opti
 void AddMerkleRootAndCoinbase(CBlock& block, CTransactionRef coinbase, uint32_t version, uint32_t timestamp, uint32_t nonce);
 
 //! Submit a block and capture the validation state via the BlockChecked callback.
-//! Returns whether ProcessNewBlock accepted the block.
-bool SubmitBlock(ChainstateManager& chainman, const std::shared_ptr<const CBlock>& block, bool* new_block, std::string& reason, std::string& debug);
+//! Returns whether ProcessNewBlock accepted the block and, if precious is true,
+//! whether PreciousBlock did not report an error.
+bool SubmitBlock(ChainstateManager& chainman, const std::shared_ptr<const CBlock>& block, bool* new_block, bool precious, std::string& reason, std::string& debug);
 
 /* Interrupt a blocking call. */
 void InterruptWait(KernelNotifications& kernel_notifications, bool& interrupt_wait);

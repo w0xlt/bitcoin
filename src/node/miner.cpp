@@ -367,16 +367,16 @@ protected:
     void BlockChecked(const std::shared_ptr<const CBlock>& block, const BlockValidationState& state) override
     {
         if (block->GetHash() != m_hash) return;
-        // ProcessNewBlock emits BlockChecked synchronously while holding cs_main,
-        // so SubmitBlock can read these fields after ProcessNewBlock returns
-        // without extra synchronization.
+        // ProcessNewBlock and PreciousBlock emit BlockChecked synchronously
+        // while holding cs_main, so SubmitBlock can read these fields after
+        // they return without extra synchronization.
         m_found = true;
         m_state = state;
     }
 };
 } // namespace
 
-bool SubmitBlock(ChainstateManager& chainman, const std::shared_ptr<const CBlock>& block, bool* new_block, std::string& reason, std::string& debug)
+bool SubmitBlock(ChainstateManager& chainman, const std::shared_ptr<const CBlock>& block, bool* new_block, bool precious, std::string& reason, std::string& debug)
 {
     reason.clear();
     debug.clear();
@@ -385,24 +385,38 @@ bool SubmitBlock(ChainstateManager& chainman, const std::shared_ptr<const CBlock
     // is intentionally kept separate from the RPC implementation. The RPC entry
     // point decodes hex, formats BIP22/JSONRPC results, and calls
     // UpdateUncommittedBlockStructures() for legacy witness handling. IPC
-    // callers submit already-formed blocks and need bool + reason/debug
-    // results, while submitSolution() preserves its duplicate-as-success
-    // behavior.
+    // callers submit already-formed blocks, need bool + reason/debug results,
+    // and may optionally request preciousblock-like handling, while
+    // submitSolution() preserves its duplicate-as-success behavior.
     auto sc = std::make_shared<SubmitBlockStateCatcher>(block->GetHash());
     CHECK_NONFATAL(chainman.m_options.signals)->RegisterSharedValidationInterface(sc);
     bool accepted = chainman.ProcessNewBlock(block, /*force_processing=*/true, /*min_pow_checked=*/true, /*new_block=*/new_block);
+
+    if (accepted && precious && !sc->m_found) {
+        BlockValidationState state;
+        // LookupBlockIndex() requires cs_main, while PreciousBlock() takes it
+        // internally.
+        CBlockIndex* pindex{WITH_LOCK(::cs_main, return chainman.m_blockman.LookupBlockIndex(block->GetHash()))};
+        if (pindex && (!chainman.ActiveChainstate().PreciousBlock(state, pindex) || !state.IsValid())) {
+            accepted = false;
+            reason = state.GetRejectReason();
+            debug = state.GetDebugMessage();
+            if (reason.empty()) reason = state.ToString();
+        }
+    }
+
     CHECK_NONFATAL(chainman.m_options.signals)->UnregisterSharedValidationInterface(sc);
 
-    if (new_block && !*new_block && accepted) {
+    if (reason.empty() && new_block && !*new_block && accepted && !(precious && sc->m_found && sc->m_state.IsValid())) {
         reason = "duplicate";
-    } else if (!sc->m_found) {
+    } else if (reason.empty() && !sc->m_found) {
         // A block can be accepted and stored without being connected, for
         // example if it does not have more work than the current tip. In that
         // case no BlockChecked callback is emitted, so the validation result is
         // inconclusive. Mining::submitBlock treats this as an error for mining
         // clients, but it does not mean the block is invalid.
         reason = "inconclusive";
-    } else if (!sc->m_state.IsValid()) {
+    } else if (reason.empty() && !sc->m_state.IsValid()) {
         reason = sc->m_state.GetRejectReason();
         debug = sc->m_state.GetDebugMessage();
     }

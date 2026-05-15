@@ -60,6 +60,8 @@ public:
      * @param[in] timestamp time block header field (unix timestamp)
      * @param[in] nonce nonce block header field
      * @param[in] coinbase complete coinbase transaction (including witness)
+     * @param[in] precious prefer this block over same-work tips, similar to the
+     *                     preciousblock RPC.
      *
      * @note Unlike the submitblock RPC, this method does not call
      *       UpdateUncommittedBlockStructures to add a missing coinbase witness
@@ -72,7 +74,7 @@ public:
      *       the solved block is constructed and broadcast by multiple nodes
      *       (e.g. both the miner who constructed the template and the pool).
      */
-    virtual bool submitSolution(uint32_t version, uint32_t timestamp, uint32_t nonce, CTransactionRef coinbase) = 0;
+    virtual bool submitSolution(uint32_t version, uint32_t timestamp, uint32_t nonce, CTransactionRef coinbase, bool precious = false) = 0;
 
     /**
      * Waits for fees in the next block to rise, a new tip or the timeout.
@@ -159,23 +161,27 @@ public:
     /**
      * Process a fully assembled block.
      *
-     * Similar to the submitblock RPC. Accepts a complete block, validates
-     * it, and if accepted as new, processes it into chainstate. Accepted
-     * blocks may then be announced to peers through normal validation signals.
+     * Similar to the submitblock RPC. Accepts a complete block, validates it,
+     * and processes accepted blocks into chainstate. Accepted blocks may then
+     * be announced to peers through normal validation signals.
      *
      * @param[in]  block  the complete block to submit
+     * @param[in]  precious prefer this block over same-work tips, similar to the
+     *                      preciousblock RPC.
      * @param[out] reason failure reason (BIP22)
      * @param[out] debug  more detailed rejection reason
-     * @returns           true if the block was accepted as a new block. Returns
+     * @returns           true if the block was accepted. By default, returns
      *                    false and sets reason if the block is a duplicate or
-     *                    the validation result is inconclusive.
+     *                    the validation result is inconclusive. With precious,
+     *                    an already-known block may return true if it is
+     *                    validated/connected.
      *
      * @note Unlike the submitblock RPC, this method does not call
      *       UpdateUncommittedBlockStructures to add a missing coinbase witness
      *       reserved value. Callers must submit a fully formed block, including
      *       the coinbase witness when a witness commitment is present.
      */
-    virtual bool submitBlock(const CBlock& block, std::string& reason, std::string& debug) = 0;
+    virtual bool submitBlock(const CBlock& block, bool precious, std::string& reason, std::string& debug) = 0;
 
     //! Get internal node context. Useful for RPC and testing,
     //! but not accessible across processes.
