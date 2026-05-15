@@ -108,6 +108,36 @@ static std::unique_ptr<CBlockIndex> CreateBlockIndex(int nHeight, CBlockIndex* a
     return index;
 }
 
+static uint256 ActiveTipHash(const node::NodeContext& node)
+{
+    return WITH_LOCK(::cs_main, return Assert(node.chainman)->ActiveChain().Tip()->GetBlockHash());
+}
+
+static void MutateCoinbase(CBlock& block, int extra_nonce)
+{
+    CMutableTransaction coinbase{*block.vtx.at(0)};
+    coinbase.vin.at(0).scriptSig << extra_nonce;
+    block.vtx.at(0) = MakeTransactionRef(std::move(coinbase));
+    block.hashMerkleRoot = BlockMerkleRoot(block);
+    block.nNonce = 0;
+}
+
+static void GrindBlock(CBlock& block, const Consensus::Params& consensus)
+{
+    while (!CheckProofOfWork(block.GetHash(), block.nBits, consensus)) {
+        ++block.nNonce;
+        BOOST_REQUIRE(block.nNonce != 0);
+    }
+}
+
+static BlockAssembler::Options BlockOptions()
+{
+    BlockAssembler::Options options;
+    options.coinbase_output_script = CScript() << OP_TRUE;
+    options.include_dummy_extranonce = true;
+    return options;
+}
+
 // Test suite for ancestor feerate transaction selection.
 // Implemented as an additional function, rather than a separate test case,
 // to allow reusing the blockchain created in CreateNewBlock_validity.
@@ -875,6 +905,107 @@ BOOST_AUTO_TEST_CASE(CreateNewBlock_validity)
     SetMockTime(0);
 
     TestPrioritisedMining(scriptPubKey, txFirst);
+}
+
+BOOST_AUTO_TEST_SUITE_END()
+
+namespace miner_precious_tests {
+using miner_tests::ActiveTipHash;
+using miner_tests::BlockOptions;
+using miner_tests::GrindBlock;
+using miner_tests::MutateCoinbase;
+
+struct RegtestMinerTestingSetup : public RegTestingSetup {
+    std::unique_ptr<Mining> MakeMining()
+    {
+        return interfaces::MakeMining(m_node, /*wait_loaded=*/false);
+    }
+};
+} // namespace miner_precious_tests
+
+BOOST_FIXTURE_TEST_SUITE(miner_precious_tests, RegtestMinerTestingSetup)
+
+BOOST_AUTO_TEST_CASE(SubmitBlock_precious)
+{
+    auto mining{MakeMining()};
+    BOOST_REQUIRE(mining);
+
+    auto block_template{mining->createNewBlock(BlockOptions(), /*cooldown=*/false)};
+    BOOST_REQUIRE(block_template);
+
+    const auto& consensus{Assert(m_node.chainman)->GetParams().GetConsensus()};
+    CBlock active_block{block_template->getBlock()};
+    MutateCoinbase(active_block, /*extra_nonce=*/1);
+    GrindBlock(active_block, consensus);
+
+    CBlock side_block{block_template->getBlock()};
+    MutateCoinbase(side_block, /*extra_nonce=*/2);
+    GrindBlock(side_block, consensus);
+
+    BOOST_REQUIRE(active_block.GetHash() != side_block.GetHash());
+    BOOST_REQUIRE_EQUAL(active_block.hashPrevBlock, side_block.hashPrevBlock);
+
+    std::string reason{"stale reason"};
+    std::string debug{"stale debug"};
+    BOOST_REQUIRE(mining->submitBlock(active_block, /*precious=*/false, reason, debug));
+    BOOST_REQUIRE_EQUAL(reason, "");
+    BOOST_REQUIRE_EQUAL(debug, "");
+    BOOST_REQUIRE_EQUAL(ActiveTipHash(m_node), active_block.GetHash());
+
+    reason = "stale reason";
+    debug = "stale debug";
+    BOOST_REQUIRE(!mining->submitBlock(active_block, /*precious=*/false, reason, debug));
+    BOOST_REQUIRE_EQUAL(reason, "duplicate");
+    BOOST_REQUIRE_EQUAL(debug, "");
+    BOOST_REQUIRE_EQUAL(ActiveTipHash(m_node), active_block.GetHash());
+
+    reason = "stale reason";
+    debug = "stale debug";
+    BOOST_REQUIRE(!mining->submitBlock(side_block, /*precious=*/false, reason, debug));
+    BOOST_REQUIRE_EQUAL(reason, "inconclusive");
+    BOOST_REQUIRE_EQUAL(debug, "");
+    BOOST_REQUIRE_EQUAL(ActiveTipHash(m_node), active_block.GetHash());
+
+    reason = "stale reason";
+    debug = "stale debug";
+    BOOST_REQUIRE(mining->submitBlock(side_block, /*precious=*/true, reason, debug));
+    BOOST_REQUIRE_EQUAL(reason, "");
+    BOOST_REQUIRE_EQUAL(debug, "");
+    BOOST_REQUIRE_EQUAL(ActiveTipHash(m_node), side_block.GetHash());
+}
+
+BOOST_AUTO_TEST_CASE(SubmitSolution_precious)
+{
+    auto mining{MakeMining()};
+    BOOST_REQUIRE(mining);
+
+    auto side_template{mining->createNewBlock(BlockOptions(), /*cooldown=*/false)};
+    BOOST_REQUIRE(side_template);
+
+    const auto& consensus{Assert(m_node.chainman)->GetParams().GetConsensus()};
+    CBlock active_block{side_template->getBlock()};
+    MutateCoinbase(active_block, /*extra_nonce=*/1);
+    GrindBlock(active_block, consensus);
+
+    CBlock side_block{side_template->getBlock()};
+    MutateCoinbase(side_block, /*extra_nonce=*/2);
+    GrindBlock(side_block, consensus);
+
+    BOOST_REQUIRE(active_block.GetHash() != side_block.GetHash());
+    BOOST_REQUIRE_EQUAL(active_block.hashPrevBlock, side_block.hashPrevBlock);
+
+    std::string reason{"stale reason"};
+    std::string debug{"stale debug"};
+    BOOST_REQUIRE(mining->submitBlock(active_block, /*precious=*/false, reason, debug));
+    BOOST_REQUIRE_EQUAL(reason, "");
+    BOOST_REQUIRE_EQUAL(debug, "");
+    BOOST_REQUIRE_EQUAL(ActiveTipHash(m_node), active_block.GetHash());
+
+    BOOST_REQUIRE(side_template->submitSolution(side_block.nVersion, side_block.nTime, side_block.nNonce, side_block.vtx.at(0), /*precious=*/false));
+    BOOST_REQUIRE_EQUAL(ActiveTipHash(m_node), active_block.GetHash());
+
+    BOOST_REQUIRE(side_template->submitSolution(side_block.nVersion, side_block.nTime, side_block.nNonce, side_block.vtx.at(0), /*precious=*/true));
+    BOOST_REQUIRE_EQUAL(ActiveTipHash(m_node), side_block.GetHash());
 }
 
 BOOST_AUTO_TEST_SUITE_END()
