@@ -29,6 +29,32 @@ bool AllInputsMine(const CWallet& wallet, const CTransaction& tx)
     return true;
 }
 
+static WalletTxInputOwnership GetInputOwnership(const CWallet& wallet, const CTransaction& tx)
+{
+    if (tx.vin.empty()) return WalletTxInputOwnership::NONE;
+
+    LOCK(wallet.cs_wallet);
+    bool any_mine{false};
+    bool any_not_mine{false};
+    for (const CTxIn& txin : tx.vin) {
+        if (InputIsMine(wallet, txin)) {
+            any_mine = true;
+        } else {
+            any_not_mine = true;
+        }
+        if (any_mine && any_not_mine) return WalletTxInputOwnership::PARTIAL;
+    }
+    return any_mine ? WalletTxInputOwnership::ALL : WalletTxInputOwnership::NONE;
+}
+
+WalletTxInputOwnership CachedTxGetInputOwnership(const CWallet& wallet, const CWalletTx& wtx)
+{
+    if (!wtx.m_cached_input_ownership.has_value()) {
+        wtx.m_cached_input_ownership = GetInputOwnership(wallet, *wtx.tx);
+    }
+    return wtx.m_cached_input_ownership.value();
+}
+
 CAmount OutputGetCredit(const CWallet& wallet, const CTxOut& txout)
 {
     if (!MoneyRange(txout.nValue))
@@ -134,6 +160,18 @@ CAmount CachedTxGetChange(const CWallet& wallet, const CWalletTx& wtx)
     wtx.nChangeCached = TxGetChange(wallet, *wtx.tx);
     wtx.fChangeCached = true;
     return wtx.nChangeCached;
+}
+
+WalletTxHistoryAccounting CachedTxGetHistoryAccounting(const CWallet& wallet, const CWalletTx& wtx)
+{
+    const CAmount debit{CachedTxGetDebit(wallet, wtx, /*avoid_reuse=*/false)};
+    const CAmount credit{CachedTxGetCredit(wallet, wtx, /*avoid_reuse=*/false)};
+    const WalletTxInputOwnership input_ownership{CachedTxGetInputOwnership(wallet, wtx)};
+    std::optional<CAmount> fee;
+    if (input_ownership == WalletTxInputOwnership::ALL) {
+        fee = debit - wtx.tx->GetValueOut();
+    }
+    return {input_ownership, debit, credit, credit - debit, fee};
 }
 
 void CachedTxGetAmounts(const CWallet& wallet, const CWalletTx& wtx,
