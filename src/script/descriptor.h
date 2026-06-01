@@ -7,6 +7,7 @@
 
 #include <outputtype.h>
 #include <pubkey.h>
+#include <script/keyorigin.h>
 #include <uint256.h>
 
 #include <cstddef>
@@ -31,6 +32,7 @@ struct DescriptorAnalysisKey {
     bool is_range{false};
     bool is_bip32{false};
     size_t key_count{0};
+    std::optional<KeyOriginInfo> origin;
     std::optional<CPubKey> root_pubkey;
     std::optional<CExtPubKey> root_ext_pubkey;
 };

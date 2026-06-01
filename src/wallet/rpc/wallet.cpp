@@ -14,6 +14,7 @@
 #include <rpc/util.h>
 #include <script/descriptor.h>
 #include <script/signingprovider.h>
+#include <util/bip32.h>
 #include <univalue.h>
 #include <util/strencodings.h>
 #include <util/translation.h>
@@ -23,9 +24,11 @@
 #include <wallet/wallet.h>
 #include <wallet/walletutil.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <map>
 #include <optional>
+#include <set>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -757,6 +760,52 @@ struct DescriptorOwnershipSummary {
     bool all{false};
 };
 
+struct WalletExtKeyInfo {
+    CExtPubKey xpub;
+    bool has_private{false};
+    std::optional<CExtKey> xprv;
+};
+
+struct WalletKeyMatch {
+    bool has_private{false};
+    std::string type{"none"};
+};
+
+static std::string KeyOriginString(const KeyOriginInfo& origin)
+{
+    return HexStr(origin.fingerprint) + FormatHDKeypath(origin.path);
+}
+
+static bool ExtPubKeyMatchesOriginFingerprint(const CExtPubKey& xpub, const KeyOriginInfo& origin)
+{
+    const CKeyID id{xpub.pubkey.GetID()};
+    return std::equal(id.begin(), id.begin() + sizeof(origin.fingerprint), origin.fingerprint);
+}
+
+static std::vector<WalletExtKeyInfo> GetWalletExtKeyInfo(const CWallet& wallet) EXCLUSIVE_LOCKS_REQUIRED(wallet.cs_wallet)
+{
+    std::vector<WalletExtKeyInfo> keys;
+    for (auto* spkm : wallet.GetAllScriptPubKeyMans()) {
+        auto* desc_spkm{dynamic_cast<DescriptorScriptPubKeyMan*>(spkm)};
+        CHECK_NONFATAL(desc_spkm);
+        LOCK(desc_spkm->cs_desc_man);
+
+        std::set<CPubKey> desc_pubkeys;
+        std::set<CExtPubKey> desc_xpubs;
+        desc_spkm->GetWalletDescriptor().descriptor->GetPubKeys(desc_pubkeys, desc_xpubs);
+        for (const CExtPubKey& xpub : desc_xpubs) {
+            WalletExtKeyInfo info;
+            info.xpub = xpub;
+            info.has_private = desc_spkm->HasPrivKey(xpub.pubkey.GetID());
+            if (std::optional<CKey> key = desc_spkm->GetKey(xpub.pubkey.GetID())) {
+                info.xprv = CExtKey{xpub, *key};
+            }
+            keys.push_back(std::move(info));
+        }
+    }
+    return keys;
+}
+
 static bool ProviderHasPrivateKeyForAnalysisKey(const FlatSigningProvider& provider, const DescriptorAnalysisKey& key)
 {
     if (key.root_ext_pubkey && provider.HaveKey(key.root_ext_pubkey->pubkey.GetID())) return true;
@@ -764,21 +813,49 @@ static bool ProviderHasPrivateKeyForAnalysisKey(const FlatSigningProvider& provi
     return false;
 }
 
-static bool WalletHasPrivateKeyForAnalysisKey(const CWallet& wallet, const DescriptorAnalysisKey& key)
+static bool DeriveExtKey(const CExtKey& root, const KeyOriginInfo& origin, CExtKey& out)
 {
-    if (key.root_ext_pubkey && wallet.HasPrivKey(key.root_ext_pubkey->pubkey.GetID())) return true;
-    if (key.root_pubkey && wallet.HasPrivKey(key.root_pubkey->GetID())) return true;
-    return false;
+    out = root;
+    for (const auto& path_index : origin.path) {
+        if (!out.Derive(out, path_index)) return false;
+    }
+    return true;
 }
 
-static UniValue DescriptorAnalysisKeysToUniValue(const DescriptorAnalysis& analysis, const FlatSigningProvider& input_provider, const CWallet& wallet, DescriptorOwnershipSummary& summary)
+static WalletKeyMatch MatchWalletKey(const CWallet& wallet, const DescriptorAnalysisKey& key, const std::vector<WalletExtKeyInfo>& wallet_ext_keys)
+{
+    if (key.root_ext_pubkey && wallet.HasPrivKey(key.root_ext_pubkey->pubkey.GetID())) return {true, "exact_xprv"};
+    if (key.root_pubkey && wallet.HasPrivKey(key.root_pubkey->GetID())) return {true, "exact_private_key"};
+
+    if (!key.origin) return {};
+
+    bool locked_candidate{false};
+    for (const auto& wallet_key : wallet_ext_keys) {
+        if (!wallet_key.has_private || !ExtPubKeyMatchesOriginFingerprint(wallet_key.xpub, *key.origin)) continue;
+        if (!wallet_key.xprv) {
+            locked_candidate = true;
+            continue;
+        }
+
+        CExtKey derived;
+        if (!DeriveExtKey(*wallet_key.xprv, *key.origin, derived)) continue;
+        if (key.root_ext_pubkey && derived.Neuter() == *key.root_ext_pubkey) return {true, "derived_xprv"};
+        if (key.root_pubkey && derived.key.GetPubKey() == *key.root_pubkey) return {true, "derived_private_key"};
+    }
+
+    if (locked_candidate && wallet.HasEncryptionKeys() && wallet.IsLocked()) return {false, "unknown_locked"};
+    return {};
+}
+
+static UniValue DescriptorAnalysisKeysToUniValue(const DescriptorAnalysis& analysis, const FlatSigningProvider& input_provider, const CWallet& wallet, const std::vector<WalletExtKeyInfo>& wallet_ext_keys, DescriptorOwnershipSummary& summary)
 {
     UniValue keys{UniValue::VARR};
     summary.all = !analysis.keys.empty();
 
     for (const auto& key : analysis.keys) {
         const bool input_has_private{ProviderHasPrivateKeyForAnalysisKey(input_provider, key)};
-        const bool wallet_has_private{WalletHasPrivateKeyForAnalysisKey(wallet, key)};
+        const WalletKeyMatch wallet_match{MatchWalletKey(wallet, key, wallet_ext_keys)};
+        const bool wallet_has_private{wallet_match.has_private};
         summary.any |= wallet_has_private;
         summary.all &= wallet_has_private;
 
@@ -790,7 +867,10 @@ static UniValue DescriptorAnalysisKeysToUniValue(const DescriptorAnalysis& analy
         key_obj.pushKV("key_count", static_cast<int64_t>(key.key_count));
         key_obj.pushKV("input_has_private_key", input_has_private);
         key_obj.pushKV("wallet_has_private_key", wallet_has_private);
-        key_obj.pushKV("wallet_match_type", wallet_has_private ? (key.root_ext_pubkey ? "exact_xprv" : "exact_private_key") : "none");
+        key_obj.pushKV("wallet_match_type", wallet_match.type);
+        if (key.origin) {
+            key_obj.pushKV("origin", KeyOriginString(*key.origin));
+        }
         if (key.root_pubkey) {
             key_obj.pushKV("root_pubkey", HexStr(*key.root_pubkey));
         }
@@ -859,14 +939,14 @@ static UniValue DescriptorScriptsToUniValue(const Descriptor& desc, int range, c
     return script;
 }
 
-static UniValue DescriptorAnalysisToUniValue(const Descriptor& desc, int range, const FlatSigningProvider& input_provider, const CWallet& wallet, DescriptorOwnershipSummary& summary)
+static UniValue DescriptorAnalysisToUniValue(const Descriptor& desc, int range, const FlatSigningProvider& input_provider, const CWallet& wallet, const std::vector<WalletExtKeyInfo>& wallet_ext_keys, DescriptorOwnershipSummary& summary)
 {
     const DescriptorAnalysis analysis{desc.GetAnalysis()};
     UniValue obj{UniValue::VOBJ};
     obj.pushKV("descriptor", desc.ToString());
     obj.pushKV("isrange", desc.IsRange());
     obj.pushKV("issolvable", desc.IsSolvable());
-    UniValue keys{DescriptorAnalysisKeysToUniValue(analysis, input_provider, wallet, summary)};
+    UniValue keys{DescriptorAnalysisKeysToUniValue(analysis, input_provider, wallet, wallet_ext_keys, summary)};
     obj.pushKV("wallet_has_any_private_key", summary.any);
     obj.pushKV("wallet_has_all_private_keys", summary.all);
     obj.pushKV("keys", std::move(keys));
@@ -918,6 +998,7 @@ RPCMethod analyzedescriptor()
                             {RPCResult::Type::BOOL, "input_has_private_key", "Whether the input descriptor provided this private key."},
                             {RPCResult::Type::BOOL, "wallet_has_private_key", "Whether the wallet stores matching private key material."},
                             {RPCResult::Type::STR, "wallet_match_type", "How wallet key material matched this expression."},
+                            {RPCResult::Type::STR, "origin", /*optional=*/true, "Key origin information, if present."},
                             {RPCResult::Type::STR_HEX, "root_pubkey", /*optional=*/true, "Root public key for non-extended key expressions."},
                             {RPCResult::Type::STR, "root_xpub", /*optional=*/true, "Root extended public key for BIP32 key expressions."},
                         }}}},
@@ -975,9 +1056,10 @@ RPCMethod analyzedescriptor()
             UniValue descriptor_results{UniValue::VARR};
             {
                 LOCK(wallet->cs_wallet);
+                const std::vector<WalletExtKeyInfo> wallet_ext_keys{GetWalletExtKeyInfo(*wallet)};
                 for (const auto& desc : descs) {
                     DescriptorOwnershipSummary summary;
-                    descriptor_results.push_back(DescriptorAnalysisToUniValue(*desc, range, input_provider, *wallet, summary));
+                    descriptor_results.push_back(DescriptorAnalysisToUniValue(*desc, range, input_provider, *wallet, wallet_ext_keys, summary));
                     wallet_has_any_private_key |= summary.any;
                     wallet_has_all_private_keys &= summary.all;
                 }
