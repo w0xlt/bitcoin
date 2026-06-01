@@ -4551,6 +4551,19 @@ std::optional<CKey> CWallet::GetKey(const CKeyID& keyid) const
     return std::nullopt;
 }
 
+bool CWallet::HasPrivKey(const CKeyID& keyid) const
+{
+    Assert(IsWalletFlagSet(WALLET_FLAG_DESCRIPTORS));
+
+    for (const auto& spkm : GetAllScriptPubKeyMans()) {
+        const DescriptorScriptPubKeyMan* desc_spkm = dynamic_cast<DescriptorScriptPubKeyMan*>(spkm);
+        assert(desc_spkm);
+        LOCK(desc_spkm->cs_desc_man);
+        if (desc_spkm->HasPrivKey(keyid)) return true;
+    }
+    return false;
+}
+
 void CWallet::WriteBestBlock() const
 {
     AssertLockHeld(cs_wallet);

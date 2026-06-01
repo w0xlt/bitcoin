@@ -1379,6 +1379,39 @@ void CheckUnused(const std::string& prv, const std::string& pub)
     BOOST_CHECK_EQUAL(pub_pubkeys.size() + pub_extpubs.size(), 1);
 }
 
+BOOST_AUTO_TEST_CASE(descriptor_analysis_tree)
+{
+    FlatSigningProvider keys;
+    std::string error;
+    auto descs = Parse("wsh(sortedmulti(2,03a34b99f22c790c4e36b2b3c2c35a36db06226e41c692fc82b8b56ac1c540c5bd,0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798,0379e45b3cf75f9c5f9befd8e9506fb962f6a9d185ac87001ec44a8d3df8d4a9e3))", keys, error);
+    BOOST_REQUIRE_MESSAGE(!descs.empty(), error);
+
+    const DescriptorAnalysis analysis{descs[0]->GetAnalysis()};
+    BOOST_REQUIRE_EQUAL(analysis.nodes.size(), 2U);
+    BOOST_CHECK_EQUAL(analysis.root_index, 0U);
+    BOOST_CHECK_EQUAL(analysis.nodes[0].type, "wsh");
+    BOOST_REQUIRE_EQUAL(analysis.nodes[0].children.size(), 1U);
+
+    const DescriptorAnalysisNode& multisig_node{analysis.nodes[analysis.nodes[0].children[0]]};
+    BOOST_CHECK_EQUAL(multisig_node.type, "sortedmulti");
+    BOOST_REQUIRE(multisig_node.threshold.has_value());
+    BOOST_CHECK_EQUAL(*multisig_node.threshold, 2);
+    BOOST_REQUIRE_EQUAL(multisig_node.key_indices.size(), 3U);
+    BOOST_CHECK_EQUAL(multisig_node.key_indices[0], 0U);
+    BOOST_CHECK_EQUAL(multisig_node.key_indices[1], 1U);
+    BOOST_CHECK_EQUAL(multisig_node.key_indices[2], 2U);
+
+    BOOST_REQUIRE_EQUAL(analysis.keys.size(), 3U);
+    for (size_t i = 0; i < analysis.keys.size(); ++i) {
+        BOOST_CHECK_EQUAL(analysis.keys[i].index, i);
+        BOOST_CHECK(!analysis.keys[i].is_range);
+        BOOST_CHECK(!analysis.keys[i].is_bip32);
+        BOOST_CHECK_EQUAL(analysis.keys[i].key_count, 1U);
+        BOOST_CHECK(analysis.keys[i].root_pubkey.has_value());
+        BOOST_CHECK(!analysis.keys[i].root_ext_pubkey.has_value());
+    }
+}
+
 // unused() descriptors don't produce scripts, so these need to be tested separately
 BOOST_AUTO_TEST_CASE(unused_descriptor_test)
 {

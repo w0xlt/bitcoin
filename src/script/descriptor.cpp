@@ -832,6 +832,12 @@ protected:
     //! Return a serialization of anything except pubkey and script arguments, to be prepended to those.
     virtual std::string ToStringExtra() const { return ""; }
 
+    virtual std::string AnalysisType() const { return m_name == "?" ? "miniscript" : m_name; }
+
+    virtual std::optional<int> AnalysisThreshold() const { return std::nullopt; }
+
+    virtual std::optional<int> AnalysisTaprootDepth(size_t child_pos) const { return std::nullopt; }
+
     /** A helper function to construct the scripts for this descriptor.
      *
      *  This function is invoked once by ExpandHelper.
@@ -1099,6 +1105,62 @@ public:
         }
         return count;
     }
+
+    DescriptorAnalysis GetAnalysis() const override
+    {
+        DescriptorAnalysis analysis;
+        std::map<uint32_t, size_t> key_positions;
+
+        struct PendingNode {
+            const DescriptorImpl* desc;
+            std::optional<size_t> parent;
+            std::optional<int> taproot_depth;
+        };
+
+        std::vector<PendingNode> todo{{this, std::nullopt, std::nullopt}};
+        while (!todo.empty()) {
+            PendingNode pending{todo.back()};
+            todo.pop_back();
+
+            DescriptorAnalysisNode node;
+            node.id = analysis.nodes.size();
+            node.type = pending.desc->AnalysisType();
+            pending.desc->ToStringHelper(nullptr, node.expression, StringType::PUBLIC);
+            node.threshold = pending.desc->AnalysisThreshold();
+            node.taproot_depth = pending.taproot_depth;
+
+            for (const auto& p : pending.desc->m_pubkey_args) {
+                node.key_indices.push_back(p->m_expr_index);
+                if (key_positions.contains(p->m_expr_index)) continue;
+
+                DescriptorAnalysisKey key;
+                key.index = p->m_expr_index;
+                key.expression = p->ToString();
+                key.is_range = p->IsRange();
+                key.is_bip32 = p->IsBIP32();
+                key.key_count = p->GetKeyCount();
+                key.root_pubkey = p->GetRootPubKey();
+                key.root_ext_pubkey = p->GetRootExtPubKey();
+                key_positions.emplace(key.index, analysis.keys.size());
+                analysis.keys.push_back(std::move(key));
+            }
+
+            analysis.nodes.push_back(std::move(node));
+            if (pending.parent) {
+                analysis.nodes[*pending.parent].children.push_back(analysis.nodes.back().id);
+            }
+
+            for (size_t i = pending.desc->m_subdescriptor_args.size(); i > 0; --i) {
+                const size_t child_pos{i - 1};
+                todo.push_back({pending.desc->m_subdescriptor_args[child_pos].get(), analysis.nodes.back().id, pending.desc->AnalysisTaprootDepth(child_pos)});
+            }
+        }
+
+        std::sort(analysis.keys.begin(), analysis.keys.end(), [](const auto& a, const auto& b) {
+            return a.index < b.index;
+        });
+        return analysis;
+    }
 };
 
 /** A parsed addr(A) descriptor. */
@@ -1294,6 +1356,7 @@ class MultisigDescriptor final : public DescriptorImpl
     const bool m_sorted;
 protected:
     std::string ToStringExtra() const override { return strprintf("%i", m_threshold); }
+    std::optional<int> AnalysisThreshold() const override { return m_threshold; }
     std::vector<CScript> MakeScripts(const std::vector<CPubKey>& keys, std::span<const CScript>, FlatSigningProvider&) const override {
         if (m_sorted) {
             std::vector<CPubKey> sorted_keys(keys);
@@ -1340,6 +1403,7 @@ class MultiADescriptor final : public DescriptorImpl
     const bool m_sorted;
 protected:
     std::string ToStringExtra() const override { return strprintf("%i", m_threshold); }
+    std::optional<int> AnalysisThreshold() const override { return m_threshold; }
     std::vector<CScript> MakeScripts(const std::vector<CPubKey>& keys, std::span<const CScript>, FlatSigningProvider&) const override {
         CScript ret;
         std::vector<XOnlyPubKey> xkeys;
@@ -1475,6 +1539,12 @@ class TRDescriptor final : public DescriptorImpl
 {
     std::vector<int> m_depths;
 protected:
+    std::optional<int> AnalysisTaprootDepth(size_t child_pos) const override
+    {
+        if (child_pos >= m_depths.size()) return std::nullopt;
+        return m_depths[child_pos];
+    }
+
     std::vector<CScript> MakeScripts(const std::vector<CPubKey>& keys, std::span<const CScript> scripts, FlatSigningProvider& out) const override
     {
         TaprootBuilder builder;

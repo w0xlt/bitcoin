@@ -12,7 +12,10 @@
 #include <key_io.h>
 #include <rpc/server.h>
 #include <rpc/util.h>
+#include <script/descriptor.h>
+#include <script/signingprovider.h>
 #include <univalue.h>
+#include <util/strencodings.h>
 #include <util/translation.h>
 #include <wallet/context.h>
 #include <wallet/receive.h>
@@ -20,8 +23,13 @@
 #include <wallet/wallet.h>
 #include <wallet/walletutil.h>
 
+#include <cstdint>
+#include <map>
 #include <optional>
+#include <string>
 #include <string_view>
+#include <utility>
+#include <vector>
 
 
 namespace wallet {
@@ -744,6 +752,245 @@ RPCMethod gethdkeys()
     };
 }
 
+struct DescriptorOwnershipSummary {
+    bool any{false};
+    bool all{false};
+};
+
+static bool ProviderHasPrivateKeyForAnalysisKey(const FlatSigningProvider& provider, const DescriptorAnalysisKey& key)
+{
+    if (key.root_ext_pubkey && provider.HaveKey(key.root_ext_pubkey->pubkey.GetID())) return true;
+    if (key.root_pubkey && provider.HaveKey(key.root_pubkey->GetID())) return true;
+    return false;
+}
+
+static bool WalletHasPrivateKeyForAnalysisKey(const CWallet& wallet, const DescriptorAnalysisKey& key)
+{
+    if (key.root_ext_pubkey && wallet.HasPrivKey(key.root_ext_pubkey->pubkey.GetID())) return true;
+    if (key.root_pubkey && wallet.HasPrivKey(key.root_pubkey->GetID())) return true;
+    return false;
+}
+
+static UniValue DescriptorAnalysisKeysToUniValue(const DescriptorAnalysis& analysis, const FlatSigningProvider& input_provider, const CWallet& wallet, DescriptorOwnershipSummary& summary)
+{
+    UniValue keys{UniValue::VARR};
+    summary.all = !analysis.keys.empty();
+
+    for (const auto& key : analysis.keys) {
+        const bool input_has_private{ProviderHasPrivateKeyForAnalysisKey(input_provider, key)};
+        const bool wallet_has_private{WalletHasPrivateKeyForAnalysisKey(wallet, key)};
+        summary.any |= wallet_has_private;
+        summary.all &= wallet_has_private;
+
+        UniValue key_obj{UniValue::VOBJ};
+        key_obj.pushKV("index", static_cast<int64_t>(key.index));
+        key_obj.pushKV("expression", key.expression);
+        key_obj.pushKV("isrange", key.is_range);
+        key_obj.pushKV("isbip32", key.is_bip32);
+        key_obj.pushKV("key_count", static_cast<int64_t>(key.key_count));
+        key_obj.pushKV("input_has_private_key", input_has_private);
+        key_obj.pushKV("wallet_has_private_key", wallet_has_private);
+        key_obj.pushKV("wallet_match_type", wallet_has_private ? (key.root_ext_pubkey ? "exact_xprv" : "exact_private_key") : "none");
+        if (key.root_pubkey) {
+            key_obj.pushKV("root_pubkey", HexStr(*key.root_pubkey));
+        }
+        if (key.root_ext_pubkey) {
+            key_obj.pushKV("root_xpub", EncodeExtPubKey(*key.root_ext_pubkey));
+        }
+        keys.push_back(std::move(key_obj));
+    }
+
+    return keys;
+}
+
+static UniValue DescriptorAnalysisTreeToUniValue(const DescriptorAnalysis& analysis)
+{
+    UniValue tree{UniValue::VOBJ};
+    tree.pushKV("root", static_cast<int64_t>(analysis.root_index));
+
+    UniValue nodes{UniValue::VARR};
+    for (const auto& node : analysis.nodes) {
+        UniValue node_obj{UniValue::VOBJ};
+        node_obj.pushKV("id", static_cast<int64_t>(node.id));
+        node_obj.pushKV("type", node.type);
+        node_obj.pushKV("expression", node.expression);
+        if (node.threshold) node_obj.pushKV("threshold", *node.threshold);
+        if (node.taproot_depth) node_obj.pushKV("taproot_depth", *node.taproot_depth);
+
+        UniValue key_indices{UniValue::VARR};
+        for (uint32_t key_index : node.key_indices) {
+            key_indices.push_back(static_cast<int64_t>(key_index));
+        }
+        node_obj.pushKV("key_indices", std::move(key_indices));
+
+        UniValue children{UniValue::VARR};
+        for (size_t child : node.children) {
+            children.push_back(static_cast<int64_t>(child));
+        }
+        node_obj.pushKV("children", std::move(children));
+        nodes.push_back(std::move(node_obj));
+    }
+    tree.pushKV("nodes", std::move(nodes));
+    return tree;
+}
+
+static UniValue DescriptorScriptsToUniValue(const Descriptor& desc, int range, const FlatSigningProvider& input_provider)
+{
+    UniValue script{UniValue::VOBJ};
+    FlatSigningProvider expanded_provider;
+    std::vector<CScript> script_pubkeys;
+
+    if (!desc.Expand(range, input_provider, script_pubkeys, expanded_provider)) {
+        script.pushKV("error", "Cannot expand descriptor at the requested index. This may require private keys for hardened derivation.");
+        return script;
+    }
+
+    UniValue spks{UniValue::VARR};
+    for (const auto& spk : script_pubkeys) {
+        spks.push_back(HexStr(spk));
+    }
+    script.pushKV("scriptPubKeys", std::move(spks));
+
+    UniValue solving_scripts{UniValue::VARR};
+    for (const auto& [_, solving_script] : expanded_provider.scripts) {
+        solving_scripts.push_back(HexStr(solving_script));
+    }
+    script.pushKV("solving_scripts", std::move(solving_scripts));
+    return script;
+}
+
+static UniValue DescriptorAnalysisToUniValue(const Descriptor& desc, int range, const FlatSigningProvider& input_provider, const CWallet& wallet, DescriptorOwnershipSummary& summary)
+{
+    const DescriptorAnalysis analysis{desc.GetAnalysis()};
+    UniValue obj{UniValue::VOBJ};
+    obj.pushKV("descriptor", desc.ToString());
+    obj.pushKV("isrange", desc.IsRange());
+    obj.pushKV("issolvable", desc.IsSolvable());
+    UniValue keys{DescriptorAnalysisKeysToUniValue(analysis, input_provider, wallet, summary)};
+    obj.pushKV("wallet_has_any_private_key", summary.any);
+    obj.pushKV("wallet_has_all_private_keys", summary.all);
+    obj.pushKV("keys", std::move(keys));
+
+    UniValue warnings{UniValue::VARR};
+    for (const auto& warning : desc.Warnings()) {
+        warnings.push_back(warning);
+    }
+    obj.pushKV("warnings", std::move(warnings));
+
+    obj.pushKV("tree", DescriptorAnalysisTreeToUniValue(analysis));
+    obj.pushKV("script", DescriptorScriptsToUniValue(desc, range, input_provider));
+    return obj;
+}
+
+RPCMethod analyzedescriptor()
+{
+    return RPCMethod{
+        "analyzedescriptor",
+        "Analyze a descriptor in the context of this wallet without importing it.\n"
+        "The result contains public descriptor structure, representative scripts, and whether this wallet stores private key material for descriptor key slots.\n"
+        "Private key material is never returned.\n",
+        {
+            {"descriptor", RPCArg::Type::STR, RPCArg::Optional::NO, "The descriptor to analyze."},
+            {"range", RPCArg::Type::NUM, RPCArg::Default{0}, "Derivation index used for ranged descriptor script preview."},
+        },
+        RPCResult{
+            RPCResult::Type::OBJ, "", "",
+            {
+                {RPCResult::Type::STR, "checksum", "The checksum for the input descriptor."},
+                {RPCResult::Type::BOOL, "input_has_private_keys", "Whether the input descriptor contained any private keys."},
+                {RPCResult::Type::BOOL, "wallet_has_any_private_key", "Whether the wallet stores private key material for at least one descriptor key slot."},
+                {RPCResult::Type::BOOL, "wallet_has_all_private_keys", "Whether the wallet stores private key material for every descriptor key slot."},
+                {RPCResult::Type::ARR, "descriptors", "Analysis for each multipath descriptor expansion.",
+                {
+                    {RPCResult::Type::OBJ, "", "", {
+                        {RPCResult::Type::STR, "descriptor", "Canonical public descriptor."},
+                        {RPCResult::Type::BOOL, "isrange", "Whether the descriptor is ranged."},
+                        {RPCResult::Type::BOOL, "issolvable", "Whether the descriptor is solvable."},
+                        {RPCResult::Type::BOOL, "wallet_has_any_private_key", "Whether the wallet has private key material for at least one key in this expansion."},
+                        {RPCResult::Type::BOOL, "wallet_has_all_private_keys", "Whether the wallet has private key material for every key in this expansion."},
+                        {RPCResult::Type::ARR, "warnings", "Descriptor warnings.", {{RPCResult::Type::STR, "", ""}}},
+                        {RPCResult::Type::ARR, "keys", "Key expression analysis.", {{RPCResult::Type::OBJ, "", "", {
+                            {RPCResult::Type::NUM, "index", "Descriptor key expression index."},
+                            {RPCResult::Type::STR, "expression", "Public key expression."},
+                            {RPCResult::Type::BOOL, "isrange", "Whether this key expression is ranged."},
+                            {RPCResult::Type::BOOL, "isbip32", "Whether this key expression is BIP32."},
+                            {RPCResult::Type::NUM, "key_count", "Number of keys represented by this expression."},
+                            {RPCResult::Type::BOOL, "input_has_private_key", "Whether the input descriptor provided this private key."},
+                            {RPCResult::Type::BOOL, "wallet_has_private_key", "Whether the wallet stores matching private key material."},
+                            {RPCResult::Type::STR, "wallet_match_type", "How wallet key material matched this expression."},
+                            {RPCResult::Type::STR_HEX, "root_pubkey", /*optional=*/true, "Root public key for non-extended key expressions."},
+                            {RPCResult::Type::STR, "root_xpub", /*optional=*/true, "Root extended public key for BIP32 key expressions."},
+                        }}}},
+                        {RPCResult::Type::OBJ, "tree", "Descriptor node table.", {
+                            {RPCResult::Type::NUM, "root", "Root node id."},
+                            {RPCResult::Type::ARR, "nodes", "Descriptor nodes.", {{RPCResult::Type::OBJ, "", "", {
+                                {RPCResult::Type::NUM, "id", "Node id."},
+                                {RPCResult::Type::STR, "type", "Descriptor node type."},
+                                {RPCResult::Type::STR, "expression", "Public descriptor expression for this node."},
+                                {RPCResult::Type::NUM, "threshold", /*optional=*/true, "Multisig threshold."},
+                                {RPCResult::Type::NUM, "taproot_depth", /*optional=*/true, "Taproot leaf depth for this node."},
+                                {RPCResult::Type::ARR, "key_indices", "Key expression indexes used directly by this node.", {{RPCResult::Type::NUM, "", ""}}},
+                                {RPCResult::Type::ARR, "children", "Child node ids.", {{RPCResult::Type::NUM, "", ""}}},
+                            }}}},
+                        }},
+                        {RPCResult::Type::OBJ, "script", "Representative script expansion.", {
+                            {RPCResult::Type::ARR, "scriptPubKeys", /*optional=*/true, "Expanded scriptPubKeys.", {{RPCResult::Type::STR_HEX, "", ""}}},
+                            {RPCResult::Type::ARR, "solving_scripts", /*optional=*/true, "Redeem/witness scripts produced during expansion.", {{RPCResult::Type::STR_HEX, "", ""}}},
+                            {RPCResult::Type::STR, "error", /*optional=*/true, "Expansion error."},
+                        }},
+                    }},
+                }},
+            }
+        },
+        RPCExamples{
+            HelpExampleCli("analyzedescriptor", "\"wpkh([d34db33f/84h/0h/0h]xpub.../0/*)#checksum\" 0")
+        },
+        [](const RPCMethod& self, const JSONRPCRequest& request) -> UniValue
+        {
+            std::shared_ptr<const CWallet> const wallet = GetWalletForJSONRPCRequest(request);
+            if (!wallet) return UniValue::VNULL;
+            if (!wallet->IsWalletFlagSet(WALLET_FLAG_DESCRIPTORS)) {
+                throw JSONRPCError(RPC_WALLET_ERROR, "analyzedescriptor is only available for descriptor wallets");
+            }
+
+            const std::string descriptor{request.params[0].get_str()};
+            const int range{request.params.size() > 1 && !request.params[1].isNull() ? request.params[1].getInt<int>() : 0};
+            if (range < 0) {
+                throw JSONRPCError(RPC_INVALID_PARAMETER, "Range index must be non-negative");
+            }
+
+            FlatSigningProvider input_provider;
+            std::string error;
+            auto descs = Parse(descriptor, input_provider, error);
+            if (descs.empty()) {
+                throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, error);
+            }
+
+            UniValue response{UniValue::VOBJ};
+            response.pushKV("checksum", GetDescriptorChecksum(descriptor));
+            response.pushKV("input_has_private_keys", !input_provider.keys.empty());
+
+            bool wallet_has_any_private_key{false};
+            bool wallet_has_all_private_keys{true};
+            UniValue descriptor_results{UniValue::VARR};
+            {
+                LOCK(wallet->cs_wallet);
+                for (const auto& desc : descs) {
+                    DescriptorOwnershipSummary summary;
+                    descriptor_results.push_back(DescriptorAnalysisToUniValue(*desc, range, input_provider, *wallet, summary));
+                    wallet_has_any_private_key |= summary.any;
+                    wallet_has_all_private_keys &= summary.all;
+                }
+            }
+
+            response.pushKV("wallet_has_any_private_key", wallet_has_any_private_key);
+            response.pushKV("wallet_has_all_private_keys", wallet_has_all_private_keys);
+            response.pushKV("descriptors", std::move(descriptor_results));
+            return response;
+        },
+    };
+}
+
 static RPCMethod createwalletdescriptor()
 {
     return RPCMethod{"createwalletdescriptor",
@@ -986,6 +1233,7 @@ std::span<const CRPCCommand> GetWalletRPCCommands()
         {"wallet", &abandontransaction},
         {"wallet", &abortrescan},
         {"wallet", &addhdkey},
+        {"wallet", &analyzedescriptor},
         {"wallet", &backupwallet},
         {"wallet", &bumpfee},
         {"wallet", &psbtbumpfee},

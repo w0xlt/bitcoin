@@ -25,6 +25,32 @@ struct FlatSigningProvider;
 
 using ExtPubKeyMap = std::unordered_map<uint32_t, CExtPubKey>;
 
+struct DescriptorAnalysisKey {
+    uint32_t index{0};
+    std::string expression;
+    bool is_range{false};
+    bool is_bip32{false};
+    size_t key_count{0};
+    std::optional<CPubKey> root_pubkey;
+    std::optional<CExtPubKey> root_ext_pubkey;
+};
+
+struct DescriptorAnalysisNode {
+    size_t id{0};
+    std::string type;
+    std::string expression;
+    std::optional<int> threshold;
+    std::optional<int> taproot_depth;
+    std::vector<uint32_t> key_indices;
+    std::vector<size_t> children;
+};
+
+struct DescriptorAnalysis {
+    size_t root_index{0};
+    std::vector<DescriptorAnalysisKey> keys;
+    std::vector<DescriptorAnalysisNode> nodes;
+};
+
 /** Cache for single descriptor's derived extended pubkeys */
 class DescriptorCache {
 private:
@@ -200,6 +226,9 @@ struct Descriptor {
 
     /** Get the number of key expressions in this descriptor. Used only for tests */
     virtual size_t GetKeyCount() const = 0;
+
+    /** Return a public, structured representation of this descriptor. */
+    virtual DescriptorAnalysis GetAnalysis() const { return {}; }
 };
 
 /** Parse a `descriptor` string. Included private keys are put in `out`.
