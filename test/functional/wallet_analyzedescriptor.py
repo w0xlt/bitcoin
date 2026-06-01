@@ -131,6 +131,11 @@ class AnalyzeDescriptorTest(BitcoinTestFramework):
         # ECDSA keys and MuSig participants still distinguish the two parities.
         assert_equal(wallet.analyzedescriptor(f"wpkh({opposite})")["wallet_has_any_private_key"], False)
         self.assert_owned(wallet.analyzedescriptor(f"wpkh({pubkey})"), "exact_private_key")
+        other_pubkey = xpub_pubkey(other.gethdkeys()[0]["xpub"]).hex()
+        for participant, owned in ((pubkey, True), (opposite, False)):
+            result = wallet.analyzedescriptor(f"rawtr(musig({participant},{other_pubkey}))")
+            assert_equal(result["wallet_has_any_private_key"], owned)
+
         fingerprint = hash160(xpub_pubkey(owner_xpub))[:4].hex()
         for index in range(256):
             child_pubkey = xpub_pubkey(derive_xpub_nonhardened(owner_xpub, index)).hex()
@@ -143,6 +148,52 @@ class AnalyzeDescriptorTest(BitcoinTestFramework):
         for wrapper in ("tr", "rawtr"):
             self.assert_owned(owner.analyzedescriptor(f"{wrapper}([{origin}]02{child_pubkey[2:]})"), "derived_private_key")
         assert_equal(owner.analyzedescriptor(f"wpkh([{origin}]02{child_pubkey[2:]})")["wallet_has_any_private_key"], False)
+        result = owner.analyzedescriptor(f"rawtr(musig([{origin}]02{child_pubkey[2:]},{other_pubkey}))")
+        assert_equal(result["wallet_has_any_private_key"], False)
+
+    def test_repeated_keys(self, owner, other, owner_xpub, other_xpub):
+        self.log.info("Warn about repeated effective signing keys within each multisig leaf")
+        repeated_descriptors = [
+            f"wsh({kind}(2,{owner_xpub}/0/*,{owner_xpub}/0/*))" for kind in ("multi", "sortedmulti")
+        ] + [
+            f"tr({other_xpub}/0/*,{kind}(2,{owner_xpub}/0/*,{owner_xpub}/0/*))" for kind in ("multi_a", "sortedmulti_a")
+        ]
+        child_xpub = derive_xpub_nonhardened(owner_xpub, 0)
+        repeated_descriptors += [
+            f"wsh(sortedmulti(2,[12345678]{owner_xpub}/0/*,[87654321]{owner_xpub}/0/*))",
+            f"wsh(sortedmulti(2,{owner_xpub}/0/*,{child_xpub}/*))",
+        ]
+        pubkey = xpub_pubkey(owner_xpub).hex()
+        repeated_descriptors.append(f"tr({other_xpub}/0/*,multi_a(2,02{pubkey[2:]},03{pubkey[2:]}))")
+        for descriptor in repeated_descriptors:
+            analysis = owner.analyzedescriptor(descsum_create(descriptor), 3)["descriptors"][0]
+            assert any("Repeated signing keys" in warning for warning in analysis["warnings"]), descriptor
+            assert "error" not in analysis["script"]
+
+        # Compare effective keys at the requested index, rather than just roots.
+        pubkey7 = xpub_pubkey(derive_xpub_nonhardened(child_xpub, 7)).hex()
+        descriptor = descsum_create(f"wsh(multi(2,{owner_xpub}/0/*,{pubkey7}))")
+        assert_equal(owner.analyzedescriptor(descriptor, 0)["descriptors"][0]["warnings"], [])
+        assert any("Repeated signing keys" in warning for warning in owner.analyzedescriptor(descriptor, 7)["descriptors"][0]["warnings"])
+
+        for descriptor in (
+            f"wsh(sortedmulti(2,{owner_xpub}/0/*,{owner_xpub}/1/*))",
+            f"tr({other_xpub}/1/*,{{multi_a(1,{owner_xpub}/0/*,{other_xpub}/0/*),multi_a(1,{owner_xpub}/0/*,{owner_xpub}/1/*)}})",
+        ):
+            assert_equal(owner.analyzedescriptor(descsum_create(descriptor))["descriptors"][0]["warnings"], [])
+
+        # Repeated hardened expressions can be recognized even without secrets.
+        descriptor = descsum_create(f"wsh(multi(2,{owner_xpub}/0h/*,{owner_xpub}/0h/*))")
+        analysis = other.analyzedescriptor(descriptor)["descriptors"][0]
+        assert "error" in analysis["script"]
+        assert any("Repeated signing keys" in warning for warning in analysis["warnings"])
+        for first, second in (("/0h/*", "/0'/*"), ("/0/*h", "/0/*'"), ("/0h/1'/*", "/0'/1h/*")):
+            descriptor = descsum_create(f"wsh(multi(2,{owner_xpub}{first},{owner_xpub}{second}))")
+            analysis = other.analyzedescriptor(descriptor)["descriptors"][0]
+            assert "error" in analysis["script"]
+            assert any("Repeated signing keys" in warning for warning in analysis["warnings"]), descriptor
+        descriptor = descsum_create(f"wsh(multi(2,{owner_xpub}/0h/*,{owner_xpub}/1'/*))")
+        assert_equal(other.analyzedescriptor(descriptor)["descriptors"][0]["warnings"], [])
 
     def test_cached_keys(self, owner, other):
         self.log.info("Resolve known derived public keys without input origins")
@@ -175,6 +226,7 @@ class AnalyzeDescriptorTest(BitcoinTestFramework):
         descendant = f"[{fingerprint}/7/8]{child_xpub}"
         for name, private_desc in (
             ("account", f"wpkh([{fingerprint}/7]{account_xprv}/0/*)"),
+            ("musig_account", f"tr(musig([{fingerprint}/7]{account_xprv}/0/*,{other_xpub}/0/*))"),
         ):
             self.log.info(f"Match descendants of an origin-qualified account key in {name}")
             wallet = node.get_wallet_rpc(node.createwallet(wallet_name=name, blank=True)["name"])
@@ -212,8 +264,14 @@ class AnalyzeDescriptorTest(BitcoinTestFramework):
         assert_equal(len(analysis["script"]["solving_scripts"]), 1)
 
         keys_by_xpub = {key["root_xpub"]: key for key in analysis["keys"]}
+        assert_equal(keys_by_xpub[owner_xpub]["type"], "bip32")
+        assert_equal(keys_by_xpub[owner_xpub]["private_key_slot"], True)
+        assert_equal(keys_by_xpub[owner_xpub]["children"], [])
         assert_equal(keys_by_xpub[owner_xpub]["wallet_has_private_key"], True)
         assert_equal(keys_by_xpub[owner_xpub]["wallet_match_type"], "exact_xprv")
+        assert_equal(keys_by_xpub[other_xpub]["type"], "bip32")
+        assert_equal(keys_by_xpub[other_xpub]["private_key_slot"], True)
+        assert_equal(keys_by_xpub[other_xpub]["children"], [])
         assert_equal(keys_by_xpub[other_xpub]["wallet_has_private_key"], False)
         assert_equal(keys_by_xpub[other_xpub]["wallet_match_type"], "none")
 
@@ -231,11 +289,32 @@ class AnalyzeDescriptorTest(BitcoinTestFramework):
         derived_desc = descsum_create(f"wpkh([{origin_fingerprint}/{child_index}]{child_xpub}/0/*)")
         derived_result = owner.analyzedescriptor(derived_desc, 0)
         derived_key = derived_result["descriptors"][0]["keys"][0]
+        assert_equal(derived_key["type"], "bip32")
+        assert_equal(derived_key["private_key_slot"], True)
         assert_equal(derived_key["origin"], f"{origin_fingerprint}/{child_index}")
         assert_equal(derived_key["wallet_has_private_key"], True)
         assert_equal(derived_key["wallet_match_type"], "derived_xprv")
 
+        musig_desc = descsum_create(f"rawtr(musig({owner_xpub}/0/*,{other_xpub}/0/*))")
+        musig_analysis = owner.analyzedescriptor(musig_desc, 0)["descriptors"][0]
+        musig_key = [key for key in musig_analysis["keys"] if key["type"] == "musig"][0]
+        assert_equal(musig_key["private_key_slot"], False)
+        assert_equal(musig_key["children"], [0, 1])
+        assert_equal(musig_key["wallet_has_private_key"], False)
+        assert_equal(musig_analysis["wallet_has_any_private_key"], True)
+        assert_equal(musig_analysis["wallet_has_all_private_keys"], False)
+        assert_equal(musig_analysis["tree"]["nodes"][0]["key_indices"], [2])
+
+        hash256_hex = "ae253ca2a54debcac7ecf414f6734f48c56421a08bb59182ff9f39a6fffdb588"
+        miniscript_desc = descsum_create(f"wsh(and_v(and_v(v:hash256({hash256_hex}),v:pk({owner_xpub}/0/*)),older(42)))")
+        miniscript_analysis = owner.analyzedescriptor(miniscript_desc, 0)["descriptors"][0]
+        miniscript_nodes = miniscript_analysis["tree"]["nodes"]
+        assert any(node["type"] == "hash256" and node["data"] == hash256_hex for node in miniscript_nodes)
+        assert any(node["type"] == "older" and node["value"] == 42 for node in miniscript_nodes)
+        assert any(node["type"] == "pk_k" and node["key_indices"] == [0] for node in miniscript_nodes)
+
         self.test_xonly_keys(owner, other, owner_xpub)
+        self.test_repeated_keys(owner, other, owner_xpub, other_xpub)
         self.test_cached_keys(owner, other)
         self.test_parent_origins_and_musig_inventory(owner, owner_xpub, other_xpub)
 

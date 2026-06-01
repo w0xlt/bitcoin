@@ -792,7 +792,8 @@ static std::vector<WalletExtKeyInfo> GetWalletExtKeyInfo(const CWallet& wallet) 
         CHECK_NONFATAL(desc_spkm);
         LOCK(desc_spkm->cs_desc_man);
 
-        // Keep the stored origin so descendants can be derived from account keys.
+        // Structured analysis also enumerates keys nested inside musig(). Keep
+        // each key's origin so descendants can be derived from an account key.
         for (const auto& key : desc_spkm->GetWalletDescriptor().descriptor->GetAnalysis().keys) {
             if (!key.root_ext_pubkey) continue;
             const CExtPubKey& xpub{*key.root_ext_pubkey};
@@ -819,6 +820,7 @@ static std::vector<CKeyID> AnalysisKeyIDs(const DescriptorAnalysisKey& key)
 
 static bool ProviderHasPrivateKeyForAnalysisKey(const FlatSigningProvider& provider, const DescriptorAnalysisKey& key)
 {
+    if (!key.private_key_slot) return false;
     for (const auto& id : AnalysisKeyIDs(key)) {
         if (provider.HaveKey(id)) return true;
     }
@@ -876,6 +878,7 @@ static WalletKeyMatch MatchWalletKeyOrigin(const CWallet& wallet, const Descript
 
 static WalletKeyMatch MatchWalletKey(const CWallet& wallet, const DescriptorAnalysisKey& key, const std::vector<WalletExtKeyInfo>& wallet_ext_keys)
 {
+    if (!key.private_key_slot) return {};
     for (const auto& id : AnalysisKeyIDs(key)) {
         if (wallet.HasPrivKey(id)) {
             return {true, key.root_ext_pubkey ? "exact_xprv" : "exact_private_key"};
@@ -914,24 +917,33 @@ static WalletKeyMatch MatchWalletKey(const CWallet& wallet, const DescriptorAnal
 static UniValue DescriptorAnalysisKeysToUniValue(const DescriptorAnalysis& analysis, const FlatSigningProvider& input_provider, const CWallet& wallet, const std::vector<WalletExtKeyInfo>& wallet_ext_keys, DescriptorOwnershipSummary& summary)
 {
     UniValue keys{UniValue::VARR};
-    summary.all = !analysis.keys.empty();
+    summary.all = std::any_of(analysis.keys.begin(), analysis.keys.end(), [](const auto& key) { return key.private_key_slot; });
 
     for (const auto& key : analysis.keys) {
         const bool input_has_private{ProviderHasPrivateKeyForAnalysisKey(input_provider, key)};
         const WalletKeyMatch wallet_match{MatchWalletKey(wallet, key, wallet_ext_keys)};
         const bool wallet_has_private{wallet_match.has_private};
-        summary.any |= wallet_has_private;
-        summary.all &= wallet_has_private;
+        if (key.private_key_slot) {
+            summary.any |= wallet_has_private;
+            summary.all &= wallet_has_private;
+        }
 
         UniValue key_obj{UniValue::VOBJ};
         key_obj.pushKV("index", static_cast<int64_t>(key.index));
+        key_obj.pushKV("type", key.type);
         key_obj.pushKV("expression", key.expression);
         key_obj.pushKV("isrange", key.is_range);
         key_obj.pushKV("isbip32", key.is_bip32);
+        key_obj.pushKV("private_key_slot", key.private_key_slot);
         key_obj.pushKV("key_count", static_cast<int64_t>(key.key_count));
         key_obj.pushKV("input_has_private_key", input_has_private);
         key_obj.pushKV("wallet_has_private_key", wallet_has_private);
         key_obj.pushKV("wallet_match_type", wallet_match.type);
+        UniValue children{UniValue::VARR};
+        for (uint32_t child : key.children) {
+            children.push_back(static_cast<int64_t>(child));
+        }
+        key_obj.pushKV("children", std::move(children));
         if (key.origin) {
             key_obj.pushKV("origin", KeyOriginString(*key.origin));
         }
@@ -959,6 +971,8 @@ static UniValue DescriptorAnalysisTreeToUniValue(const DescriptorAnalysis& analy
         node_obj.pushKV("type", node.type);
         node_obj.pushKV("expression", node.expression);
         if (node.threshold) node_obj.pushKV("threshold", *node.threshold);
+        if (node.value) node_obj.pushKV("value", *node.value);
+        if (node.data) node_obj.pushKV("data", *node.data);
         if (node.taproot_depth) node_obj.pushKV("taproot_depth", *node.taproot_depth);
 
         UniValue key_indices{UniValue::VARR};
@@ -978,12 +992,57 @@ static UniValue DescriptorAnalysisTreeToUniValue(const DescriptorAnalysis& analy
     return tree;
 }
 
-static UniValue DescriptorScriptsToUniValue(const Descriptor& desc, int range, const FlatSigningProvider& input_provider)
+static std::vector<std::string> DescriptorMultisigWarnings(const DescriptorAnalysis& analysis)
+{
+    std::map<uint32_t, const DescriptorAnalysisKey*> keys;
+    for (const auto& key : analysis.keys) {
+        keys.emplace(key.index, &key);
+    }
+
+    std::vector<std::string> warnings;
+    for (const auto& node : analysis.nodes) {
+        const bool xonly{node.type == "multi_a" || node.type == "sortedmulti_a"};
+        if (!xonly && node.type != "multi" && node.type != "sortedmulti") continue;
+
+        std::set<std::string> expressions;
+        std::set<CPubKey> pubkeys;
+        bool repeated{false};
+        for (const auto index : node.key_indices) {
+            const auto& key{*keys.at(index)};
+            // Origins do not change the signing key. Comparing expressions
+            // also detects identical hardened paths while the wallet is locked.
+            std::string expression{key.expression};
+            if (expression.starts_with('[')) expression.erase(0, expression.find(']') + 1);
+            // Both hardened markers denote the same path even when private
+            // keys are unavailable to derive the effective public keys.
+            std::replace(expression.begin(), expression.end(), '\'', 'h');
+            repeated |= !expressions.insert(std::move(expression)).second;
+            if (key.derived_pubkey) {
+                CPubKey pubkey{*key.derived_pubkey};
+                if (xonly) {
+                    pubkey = XOnlyPubKey{pubkey}.GetEvenCorrespondingCPubKey();
+                } else {
+                    pubkey.Decompress();
+                }
+                repeated |= !pubkeys.insert(pubkey).second;
+            }
+        }
+        if (repeated) {
+            warnings.push_back(strprintf("Repeated signing keys in %s at node %u may allow fewer distinct signers than the threshold.", node.type, node.id));
+        }
+    }
+    return warnings;
+}
+
+static UniValue DescriptorScriptsToUniValue(const Descriptor& desc, int range, const FlatSigningProvider& input_provider, UniValue& warnings)
 {
     UniValue script{UniValue::VOBJ};
     FlatSigningProvider expanded_provider;
     std::vector<CScript> script_pubkeys;
 
+    for (const auto& warning : DescriptorMultisigWarnings(desc.GetAnalysis(range, &input_provider))) {
+        warnings.push_back(warning);
+    }
     if (!desc.Expand(range, input_provider, script_pubkeys, expanded_provider)) {
         script.pushKV("error", "Cannot expand descriptor at the requested index. This may require private keys for hardened derivation.");
         return script;
@@ -1019,10 +1078,10 @@ static UniValue DescriptorAnalysisToUniValue(const Descriptor& desc, int range, 
     for (const auto& warning : desc.Warnings()) {
         warnings.push_back(warning);
     }
-    obj.pushKV("warnings", std::move(warnings));
 
     obj.pushKV("tree", DescriptorAnalysisTreeToUniValue(analysis));
-    obj.pushKV("script", DescriptorScriptsToUniValue(desc, range, input_provider));
+    obj.pushKV("script", DescriptorScriptsToUniValue(desc, range, input_provider, warnings));
+    obj.pushKV("warnings", std::move(warnings));
     return obj;
 }
 
@@ -1055,13 +1114,16 @@ RPCMethod analyzedescriptor()
                         {RPCResult::Type::ARR, "warnings", "Descriptor warnings.", {{RPCResult::Type::STR, "", ""}}},
                         {RPCResult::Type::ARR, "keys", "Key expression analysis.", {{RPCResult::Type::OBJ, "", "", {
                             {RPCResult::Type::NUM, "index", "Descriptor key expression index."},
+                            {RPCResult::Type::STR, "type", "Key expression type."},
                             {RPCResult::Type::STR, "expression", "Public key expression."},
                             {RPCResult::Type::BOOL, "isrange", "Whether this key expression is ranged."},
                             {RPCResult::Type::BOOL, "isbip32", "Whether this key expression is BIP32."},
+                            {RPCResult::Type::BOOL, "private_key_slot", "Whether this key entry represents private key material that can be held by the wallet."},
                             {RPCResult::Type::NUM, "key_count", "Number of keys represented by this expression."},
                             {RPCResult::Type::BOOL, "input_has_private_key", "Whether the input descriptor provided this private key."},
                             {RPCResult::Type::BOOL, "wallet_has_private_key", "Whether the wallet stores matching private key material."},
                             {RPCResult::Type::STR, "wallet_match_type", "How wallet key material matched this expression."},
+                            {RPCResult::Type::ARR, "children", "Nested key expression indexes, such as MuSig participants.", {{RPCResult::Type::NUM, "", ""}}},
                             {RPCResult::Type::STR, "origin", /*optional=*/true, "Key origin information, if present."},
                             {RPCResult::Type::STR_HEX, "root_pubkey", /*optional=*/true, "Root public key for non-extended key expressions."},
                             {RPCResult::Type::STR, "root_xpub", /*optional=*/true, "Root extended public key for BIP32 key expressions."},
@@ -1073,6 +1135,8 @@ RPCMethod analyzedescriptor()
                                 {RPCResult::Type::STR, "type", "Descriptor node type."},
                                 {RPCResult::Type::STR, "expression", "Public descriptor expression for this node."},
                                 {RPCResult::Type::NUM, "threshold", /*optional=*/true, "Multisig threshold."},
+                                {RPCResult::Type::NUM, "value", /*optional=*/true, "Numeric node value, such as a miniscript threshold or timelock."},
+                                {RPCResult::Type::STR_HEX, "data", /*optional=*/true, "Hex-encoded data carried by this node."},
                                 {RPCResult::Type::NUM, "taproot_depth", /*optional=*/true, "Taproot leaf depth for this node."},
                                 {RPCResult::Type::ARR, "key_indices", "Key expression indexes used directly by this node.", {{RPCResult::Type::NUM, "", ""}}},
                                 {RPCResult::Type::ARR, "children", "Child node ids.", {{RPCResult::Type::NUM, "", ""}}},
