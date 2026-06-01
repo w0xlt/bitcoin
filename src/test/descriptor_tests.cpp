@@ -1404,12 +1404,67 @@ BOOST_AUTO_TEST_CASE(descriptor_analysis_tree)
     BOOST_REQUIRE_EQUAL(analysis.keys.size(), 3U);
     for (size_t i = 0; i < analysis.keys.size(); ++i) {
         BOOST_CHECK_EQUAL(analysis.keys[i].index, i);
+        BOOST_CHECK_EQUAL(analysis.keys[i].type, "public_key");
         BOOST_CHECK(!analysis.keys[i].is_range);
         BOOST_CHECK(!analysis.keys[i].is_bip32);
+        BOOST_CHECK(analysis.keys[i].private_key_slot);
         BOOST_CHECK_EQUAL(analysis.keys[i].key_count, 1U);
+        BOOST_CHECK(analysis.keys[i].children.empty());
         BOOST_CHECK(analysis.keys[i].root_pubkey.has_value());
         BOOST_CHECK(!analysis.keys[i].root_ext_pubkey.has_value());
     }
+
+    auto musig_descs = Parse("tr(musig(02f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9,03dff1d77f2a671c5f36183726db2341be58feae1da2deced843240f7b502ba659))", keys, error);
+    BOOST_REQUIRE_MESSAGE(!musig_descs.empty(), error);
+
+    const DescriptorAnalysis musig_analysis{musig_descs[0]->GetAnalysis()};
+    BOOST_REQUIRE_EQUAL(musig_analysis.keys.size(), 3U);
+    BOOST_CHECK_EQUAL(musig_analysis.keys[0].type, "public_key");
+    BOOST_CHECK(musig_analysis.keys[0].private_key_slot);
+    BOOST_CHECK_EQUAL(musig_analysis.keys[1].type, "public_key");
+    BOOST_CHECK(musig_analysis.keys[1].private_key_slot);
+    BOOST_CHECK_EQUAL(musig_analysis.keys[2].type, "musig");
+    BOOST_CHECK(!musig_analysis.keys[2].private_key_slot);
+    BOOST_CHECK_EQUAL(musig_analysis.keys[2].key_count, 3U);
+    BOOST_REQUIRE_EQUAL(musig_analysis.keys[2].children.size(), 2U);
+    BOOST_CHECK_EQUAL(musig_analysis.keys[2].children[0], 0U);
+    BOOST_CHECK_EQUAL(musig_analysis.keys[2].children[1], 1U);
+    BOOST_REQUIRE_EQUAL(musig_analysis.nodes[0].key_indices.size(), 1U);
+    BOOST_CHECK_EQUAL(musig_analysis.nodes[0].key_indices[0], 2U);
+
+    const std::string hash256{"ae253ca2a54debcac7ecf414f6734f48c56421a08bb59182ff9f39a6fffdb588"};
+    auto miniscript_descs = Parse("wsh(and_v(and_v(v:hash256(" + hash256 + "),v:pk(03a34b99f22c790c4e36b2b3c2c35a36db06226e41c692fc82b8b56ac1c540c5bd)),older(42)))", keys, error);
+    BOOST_REQUIRE_MESSAGE(!miniscript_descs.empty(), error);
+
+    const DescriptorAnalysis miniscript_analysis{miniscript_descs[0]->GetAnalysis()};
+    BOOST_REQUIRE_EQUAL(miniscript_analysis.nodes[0].type, "wsh");
+    BOOST_REQUIRE_EQUAL(miniscript_analysis.nodes[0].children.size(), 1U);
+    const DescriptorAnalysisNode& miniscript_node{miniscript_analysis.nodes[miniscript_analysis.nodes[0].children[0]]};
+    BOOST_CHECK_EQUAL(miniscript_node.type, "miniscript");
+    BOOST_REQUIRE_EQUAL(miniscript_node.children.size(), 1U);
+    BOOST_CHECK_EQUAL(miniscript_analysis.nodes[miniscript_node.children[0]].type, "and_v");
+
+    bool found_hash256{false};
+    bool found_older{false};
+    bool found_pk{false};
+    for (const auto& node : miniscript_analysis.nodes) {
+        if (node.type == "hash256") {
+            BOOST_REQUIRE(node.data.has_value());
+            BOOST_CHECK_EQUAL(*node.data, hash256);
+            found_hash256 = true;
+        } else if (node.type == "older") {
+            BOOST_REQUIRE(node.value.has_value());
+            BOOST_CHECK_EQUAL(*node.value, 42);
+            found_older = true;
+        } else if (node.type == "pk_k") {
+            BOOST_REQUIRE_EQUAL(node.key_indices.size(), 1U);
+            BOOST_CHECK_EQUAL(node.key_indices[0], 0U);
+            found_pk = true;
+        }
+    }
+    BOOST_CHECK(found_hash256);
+    BOOST_CHECK(found_older);
+    BOOST_CHECK(found_pk);
 }
 
 // unused() descriptors don't produce scripts, so these need to be tested separately

@@ -28,13 +28,16 @@ using ExtPubKeyMap = std::unordered_map<uint32_t, CExtPubKey>;
 
 struct DescriptorAnalysisKey {
     uint32_t index{0};
+    std::string type;
     std::string expression;
     bool is_range{false};
     bool is_bip32{false};
+    bool private_key_slot{true};
     size_t key_count{0};
     std::optional<KeyOriginInfo> origin;
     std::optional<CPubKey> root_pubkey;
     std::optional<CExtPubKey> root_ext_pubkey;
+    std::vector<uint32_t> children;
 };
 
 struct DescriptorAnalysisNode {
@@ -42,6 +45,8 @@ struct DescriptorAnalysisNode {
     std::string type;
     std::string expression;
     std::optional<int> threshold;
+    std::optional<int64_t> value;
+    std::optional<std::string> data;
     std::optional<int> taproot_depth;
     std::vector<uint32_t> key_indices;
     std::vector<size_t> children;

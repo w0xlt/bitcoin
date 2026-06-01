@@ -99,8 +99,14 @@ class AnalyzeDescriptorTest(BitcoinTestFramework):
         assert_equal(len(analysis["script"]["solving_scripts"]), 1)
 
         keys_by_xpub = {key["root_xpub"]: key for key in analysis["keys"]}
+        assert_equal(keys_by_xpub[owner_xpub]["type"], "bip32")
+        assert_equal(keys_by_xpub[owner_xpub]["private_key_slot"], True)
+        assert_equal(keys_by_xpub[owner_xpub]["children"], [])
         assert_equal(keys_by_xpub[owner_xpub]["wallet_has_private_key"], True)
         assert_equal(keys_by_xpub[owner_xpub]["wallet_match_type"], "exact_xprv")
+        assert_equal(keys_by_xpub[other_xpub]["type"], "bip32")
+        assert_equal(keys_by_xpub[other_xpub]["private_key_slot"], True)
+        assert_equal(keys_by_xpub[other_xpub]["children"], [])
         assert_equal(keys_by_xpub[other_xpub]["wallet_has_private_key"], False)
         assert_equal(keys_by_xpub[other_xpub]["wallet_match_type"], "none")
 
@@ -118,9 +124,29 @@ class AnalyzeDescriptorTest(BitcoinTestFramework):
         derived_desc = descsum_create(f"wpkh([{origin_fingerprint}/{child_index}]{child_xpub}/0/*)")
         derived_result = owner.analyzedescriptor(derived_desc, 0)
         derived_key = derived_result["descriptors"][0]["keys"][0]
+        assert_equal(derived_key["type"], "bip32")
+        assert_equal(derived_key["private_key_slot"], True)
         assert_equal(derived_key["origin"], f"{origin_fingerprint}/{child_index}")
         assert_equal(derived_key["wallet_has_private_key"], True)
         assert_equal(derived_key["wallet_match_type"], "derived_xprv")
+
+        musig_desc = descsum_create(f"rawtr(musig({owner_xpub}/0/*,{other_xpub}/0/*))")
+        musig_analysis = owner.analyzedescriptor(musig_desc, 0)["descriptors"][0]
+        musig_key = [key for key in musig_analysis["keys"] if key["type"] == "musig"][0]
+        assert_equal(musig_key["private_key_slot"], False)
+        assert_equal(musig_key["children"], [0, 1])
+        assert_equal(musig_key["wallet_has_private_key"], False)
+        assert_equal(musig_analysis["wallet_has_any_private_key"], True)
+        assert_equal(musig_analysis["wallet_has_all_private_keys"], False)
+        assert_equal(musig_analysis["tree"]["nodes"][0]["key_indices"], [2])
+
+        hash256_hex = "ae253ca2a54debcac7ecf414f6734f48c56421a08bb59182ff9f39a6fffdb588"
+        miniscript_desc = descsum_create(f"wsh(and_v(and_v(v:hash256({hash256_hex}),v:pk({owner_xpub}/0/*)),older(42)))")
+        miniscript_analysis = owner.analyzedescriptor(miniscript_desc, 0)["descriptors"][0]
+        miniscript_nodes = miniscript_analysis["tree"]["nodes"]
+        assert any(node["type"] == "hash256" and node["data"] == hash256_hex for node in miniscript_nodes)
+        assert any(node["type"] == "older" and node["value"] == 42 for node in miniscript_nodes)
+        assert any(node["type"] == "pk_k" and node["key_indices"] == [0] for node in miniscript_nodes)
 
 
 if __name__ == "__main__":

@@ -241,6 +241,32 @@ public:
     /** Return key origin information, if this PubkeyProvider has it. */
     virtual std::optional<KeyOriginInfo> GetOrigin() const { return std::nullopt; }
 
+    /** Return a stable public analysis type for this provider. */
+    virtual std::string AnalysisType() const = 0;
+
+    /** Whether this provider represents private key material the wallet can hold. */
+    virtual bool IsPrivateKeySlot() const { return true; }
+
+    /** Add this provider and any nested providers to the descriptor analysis. */
+    virtual void AddAnalysisKeys(DescriptorAnalysis& analysis, std::map<uint32_t, size_t>& key_positions) const
+    {
+        if (key_positions.contains(m_expr_index)) return;
+
+        DescriptorAnalysisKey key;
+        key.index = m_expr_index;
+        key.type = AnalysisType();
+        key.expression = ToString();
+        key.is_range = IsRange();
+        key.is_bip32 = IsBIP32();
+        key.private_key_slot = IsPrivateKeySlot();
+        key.key_count = GetKeyCount();
+        key.origin = GetOrigin();
+        key.root_pubkey = GetRootPubKey();
+        key.root_ext_pubkey = GetRootExtPubKey();
+        key_positions.emplace(key.index, analysis.keys.size());
+        analysis.keys.push_back(std::move(key));
+    }
+
     /** Make a deep copy of this PubkeyProvider */
     virtual std::unique_ptr<PubkeyProvider> Clone() const = 0;
 
@@ -316,6 +342,8 @@ public:
         return m_provider->GetRootExtPubKey();
     }
     std::optional<KeyOriginInfo> GetOrigin() const override { return m_origin; }
+    std::string AnalysisType() const override { return m_provider->AnalysisType(); }
+    bool IsPrivateKeySlot() const override { return m_provider->IsPrivateKeySlot(); }
     std::unique_ptr<PubkeyProvider> Clone() const override
     {
         return std::make_unique<OriginPubkeyProvider>(m_expr_index, m_origin, m_provider->Clone(), m_apostrophe);
@@ -380,6 +408,7 @@ public:
     {
         return std::nullopt;
     }
+    std::string AnalysisType() const override { return "public_key"; }
     std::unique_ptr<PubkeyProvider> Clone() const override
     {
         return std::make_unique<ConstPubkeyProvider>(m_expr_index, m_pubkey, m_xonly);
@@ -606,6 +635,7 @@ public:
     {
         return m_root_extkey;
     }
+    std::string AnalysisType() const override { return "bip32"; }
     std::unique_ptr<PubkeyProvider> Clone() const override
     {
         return std::make_unique<BIP32PubkeyProvider>(m_expr_index, m_root_extkey, m_path, m_derive, m_apostrophe);
@@ -795,6 +825,32 @@ public:
         return std::nullopt;
     }
 
+    std::string AnalysisType() const override { return "musig"; }
+    bool IsPrivateKeySlot() const override { return false; }
+    void AddAnalysisKeys(DescriptorAnalysis& analysis, std::map<uint32_t, size_t>& key_positions) const override
+    {
+        if (!key_positions.contains(m_expr_index)) {
+            DescriptorAnalysisKey key;
+            key.index = m_expr_index;
+            key.type = AnalysisType();
+            key.expression = ToString();
+            key.is_range = IsRange();
+            key.is_bip32 = IsBIP32();
+            key.private_key_slot = IsPrivateKeySlot();
+            key.key_count = GetKeyCount();
+            key.children.reserve(m_participants.size());
+            for (const auto& participant : m_participants) {
+                key.children.push_back(participant->m_expr_index);
+            }
+            key_positions.emplace(key.index, analysis.keys.size());
+            analysis.keys.push_back(std::move(key));
+        }
+
+        for (const auto& participant : m_participants) {
+            participant->AddAnalysisKeys(analysis, key_positions);
+        }
+    }
+
     std::unique_ptr<PubkeyProvider> Clone() const override
     {
         std::vector<std::unique_ptr<PubkeyProvider>> providers;
@@ -840,6 +896,8 @@ protected:
     virtual std::optional<int> AnalysisThreshold() const { return std::nullopt; }
 
     virtual std::optional<int> AnalysisTaprootDepth(size_t child_pos) const { return std::nullopt; }
+
+    virtual void AppendAnalysisChildNodes(DescriptorAnalysis& analysis, size_t parent_id) const {}
 
     /** A helper function to construct the scripts for this descriptor.
      *
@@ -1134,29 +1192,19 @@ public:
 
             for (const auto& p : pending.desc->m_pubkey_args) {
                 node.key_indices.push_back(p->m_expr_index);
-                if (key_positions.contains(p->m_expr_index)) continue;
-
-                DescriptorAnalysisKey key;
-                key.index = p->m_expr_index;
-                key.expression = p->ToString();
-                key.is_range = p->IsRange();
-                key.is_bip32 = p->IsBIP32();
-                key.key_count = p->GetKeyCount();
-                key.origin = p->GetOrigin();
-                key.root_pubkey = p->GetRootPubKey();
-                key.root_ext_pubkey = p->GetRootExtPubKey();
-                key_positions.emplace(key.index, analysis.keys.size());
-                analysis.keys.push_back(std::move(key));
+                p->AddAnalysisKeys(analysis, key_positions);
             }
 
+            const size_t node_id{node.id};
             analysis.nodes.push_back(std::move(node));
             if (pending.parent) {
-                analysis.nodes[*pending.parent].children.push_back(analysis.nodes.back().id);
+                analysis.nodes[*pending.parent].children.push_back(node_id);
             }
+            pending.desc->AppendAnalysisChildNodes(analysis, node_id);
 
             for (size_t i = pending.desc->m_subdescriptor_args.size(); i > 0; --i) {
                 const size_t child_pos{i - 1};
-                todo.push_back({pending.desc->m_subdescriptor_args[child_pos].get(), analysis.nodes.back().id, pending.desc->AnalysisTaprootDepth(child_pos)});
+                todo.push_back({pending.desc->m_subdescriptor_args[child_pos].get(), node_id, pending.desc->AnalysisTaprootDepth(child_pos)});
             }
         }
 
@@ -1713,6 +1761,55 @@ public:
     }
 };
 
+std::string MiniscriptFragmentName(miniscript::Fragment fragment)
+{
+    switch (fragment) {
+    case miniscript::Fragment::JUST_0: return "just_0";
+    case miniscript::Fragment::JUST_1: return "just_1";
+    case miniscript::Fragment::PK_K: return "pk_k";
+    case miniscript::Fragment::PK_H: return "pk_h";
+    case miniscript::Fragment::OLDER: return "older";
+    case miniscript::Fragment::AFTER: return "after";
+    case miniscript::Fragment::SHA256: return "sha256";
+    case miniscript::Fragment::HASH256: return "hash256";
+    case miniscript::Fragment::RIPEMD160: return "ripemd160";
+    case miniscript::Fragment::HASH160: return "hash160";
+    case miniscript::Fragment::WRAP_A: return "wrap_a";
+    case miniscript::Fragment::WRAP_S: return "wrap_s";
+    case miniscript::Fragment::WRAP_C: return "wrap_c";
+    case miniscript::Fragment::WRAP_D: return "wrap_d";
+    case miniscript::Fragment::WRAP_V: return "wrap_v";
+    case miniscript::Fragment::WRAP_J: return "wrap_j";
+    case miniscript::Fragment::WRAP_N: return "wrap_n";
+    case miniscript::Fragment::AND_V: return "and_v";
+    case miniscript::Fragment::AND_B: return "and_b";
+    case miniscript::Fragment::OR_B: return "or_b";
+    case miniscript::Fragment::OR_C: return "or_c";
+    case miniscript::Fragment::OR_D: return "or_d";
+    case miniscript::Fragment::OR_I: return "or_i";
+    case miniscript::Fragment::ANDOR: return "andor";
+    case miniscript::Fragment::THRESH: return "thresh";
+    case miniscript::Fragment::MULTI: return "multi";
+    case miniscript::Fragment::MULTI_A: return "multi_a";
+    }
+    assert(false);
+    return "unknown";
+}
+
+bool MiniscriptFragmentHasValue(miniscript::Fragment fragment)
+{
+    switch (fragment) {
+    case miniscript::Fragment::OLDER:
+    case miniscript::Fragment::AFTER:
+    case miniscript::Fragment::THRESH:
+    case miniscript::Fragment::MULTI:
+    case miniscript::Fragment::MULTI_A:
+        return true;
+    default:
+        return false;
+    }
+}
+
 class MiniscriptDescriptor final : public DescriptorImpl
 {
 private:
@@ -1731,6 +1828,47 @@ protected:
             }
         }
         return Vector(m_node.ToScript(ScriptMaker(keys, script_ctx)));
+    }
+
+    void AppendAnalysisChildNodes(DescriptorAnalysis& analysis, size_t parent_id) const override
+    {
+        struct PendingNode {
+            const miniscript::Node<uint32_t>* node;
+            size_t parent;
+        };
+
+        std::vector<PendingNode> todo{{&m_node, parent_id}};
+        while (!todo.empty()) {
+            const PendingNode pending{todo.back()};
+            todo.pop_back();
+
+            DescriptorAnalysisNode analysis_node;
+            analysis_node.id = analysis.nodes.size();
+            analysis_node.type = MiniscriptFragmentName(pending.node->Fragment());
+            if (const auto expression{pending.node->ToString(StringMaker(nullptr, m_pubkey_args, StringType::PUBLIC, nullptr))}) {
+                analysis_node.expression = *expression;
+            } else {
+                analysis_node.expression = analysis_node.type;
+            }
+            if (MiniscriptFragmentHasValue(pending.node->Fragment())) {
+                analysis_node.value = static_cast<int64_t>(pending.node->K());
+            }
+            if (!pending.node->Data().empty()) {
+                analysis_node.data = HexStr(pending.node->Data());
+            }
+            for (uint32_t key_pos : pending.node->Keys()) {
+                analysis_node.key_indices.push_back(m_pubkey_args.at(key_pos)->m_expr_index);
+            }
+
+            const size_t id{analysis_node.id};
+            analysis.nodes.push_back(std::move(analysis_node));
+            analysis.nodes[pending.parent].children.push_back(id);
+
+            const auto& subs{pending.node->Subs()};
+            for (size_t i = subs.size(); i > 0; --i) {
+                todo.push_back({&subs[i - 1], id});
+            }
+        }
     }
 
 public:
