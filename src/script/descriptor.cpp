@@ -238,6 +238,8 @@ public:
     virtual std::optional<CPubKey> GetRootPubKey() const = 0;
     /** Return the extended public key for this PubkeyProvider, if it has one. */
     virtual std::optional<CExtPubKey> GetRootExtPubKey() const = 0;
+    /** Return key origin information, if this PubkeyProvider has it. */
+    virtual std::optional<KeyOriginInfo> GetOrigin() const { return std::nullopt; }
 
     /** Whether a constant key is used in a context with x-only signatures. */
     virtual bool IsXOnly() const { return false; }
@@ -317,6 +319,7 @@ public:
     {
         return m_provider->GetRootExtPubKey();
     }
+    std::optional<KeyOriginInfo> GetOrigin() const override { return m_origin; }
     std::unique_ptr<PubkeyProvider> Clone() const override
     {
         return std::make_unique<OriginPubkeyProvider>(m_expr_index, m_origin, m_provider->Clone(), m_apostrophe);
@@ -1146,6 +1149,7 @@ public:
                 key.is_bip32 = p->IsBIP32();
                 key.is_xonly = p->IsXOnly();
                 key.key_count = p->GetKeyCount();
+                key.origin = p->GetOrigin();
                 key.root_pubkey = p->GetRootPubKey();
                 key.root_ext_pubkey = p->GetRootExtPubKey();
                 key_positions.emplace(key.index, analysis.keys.size());

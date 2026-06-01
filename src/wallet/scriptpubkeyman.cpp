@@ -1254,7 +1254,7 @@ std::unique_ptr<FlatSigningProvider> DescriptorScriptPubKeyMan::GetSigningProvid
     return GetSigningProvider(index, include_private);
 }
 
-std::unique_ptr<FlatSigningProvider> DescriptorScriptPubKeyMan::GetSigningProvider(const CPubKey& pubkey) const
+std::unique_ptr<FlatSigningProvider> DescriptorScriptPubKeyMan::GetSigningProvider(const CPubKey& pubkey, bool include_private) const
 {
     LOCK(cs_desc_man);
 
@@ -1265,9 +1265,8 @@ std::unique_ptr<FlatSigningProvider> DescriptorScriptPubKeyMan::GetSigningProvid
     }
     int32_t index = it->second;
 
-    // Always try to get the signing provider with private keys. This function should only be called during signing anyways
-    std::unique_ptr<FlatSigningProvider> out = GetSigningProvider(index, true);
-    if (!out->HaveKey(pubkey.GetID())) {
+    std::unique_ptr<FlatSigningProvider> out = GetSigningProvider(index, include_private);
+    if (!out || (include_private && !out->HaveKey(pubkey.GetID()))) {
         return nullptr;
     }
     return out;

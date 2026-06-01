@@ -390,8 +390,8 @@ public:
 
     bool CanProvide(const CScript& script, SignatureData& sigdata) override;
 
-    // Fetch the SigningProvider for the given pubkey and always include private keys. This should only be called by signing code.
-    std::unique_ptr<FlatSigningProvider> GetSigningProvider(const CPubKey& pubkey) const;
+    // Fetch the SigningProvider for a cached pubkey, optionally including its private key.
+    std::unique_ptr<FlatSigningProvider> GetSigningProvider(const CPubKey& pubkey, bool include_private = true) const;
 
     bool SignTransaction(CMutableTransaction& tx, const std::map<COutPoint, Coin>& coins, int sighash, std::map<int, bilingual_str>& input_errors) const override;
     SigningResult SignMessage(const std::string& message, const PKHash& pkhash, std::string& str_sig) const override;

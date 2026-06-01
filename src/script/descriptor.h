@@ -7,6 +7,7 @@
 
 #include <outputtype.h>
 #include <pubkey.h>
+#include <script/keyorigin.h>
 #include <uint256.h>
 
 #include <cstddef>
@@ -33,6 +34,7 @@ struct DescriptorAnalysisKey {
     /** Whether a constant key is used in a context with x-only signatures. */
     bool is_xonly{false};
     size_t key_count{0};
+    std::optional<KeyOriginInfo> origin;
     std::optional<CPubKey> root_pubkey;
     std::optional<CExtPubKey> root_ext_pubkey;
 };
