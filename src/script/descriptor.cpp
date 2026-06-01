@@ -239,6 +239,9 @@ public:
     /** Return the extended public key for this PubkeyProvider, if it has one. */
     virtual std::optional<CExtPubKey> GetRootExtPubKey() const = 0;
 
+    /** Whether a constant key is used in a context with x-only signatures. */
+    virtual bool IsXOnly() const { return false; }
+
     /** Make a deep copy of this PubkeyProvider */
     virtual std::unique_ptr<PubkeyProvider> Clone() const = 0;
 
@@ -278,6 +281,7 @@ public:
     bool IsRange() const override { return m_provider->IsRange(); }
     size_t GetSize() const override { return m_provider->GetSize(); }
     bool IsBIP32() const override { return m_provider->IsBIP32(); }
+    bool IsXOnly() const override { return m_provider->IsXOnly(); }
     std::string ToString(StringType type) const override { return "[" + OriginString(type) + "]" + m_provider->ToString(type); }
     bool ToPrivateString(const SigningProvider& arg, std::string& ret) const override
     {
@@ -324,6 +328,7 @@ class ConstPubkeyProvider final : public PubkeyProvider
 {
     CPubKey m_pubkey;
     bool m_xonly;
+    bool m_xonly_signing;
 
     std::optional<CKey> GetPrivKey(const SigningProvider& arg) const
     {
@@ -334,7 +339,7 @@ class ConstPubkeyProvider final : public PubkeyProvider
     }
 
 public:
-    ConstPubkeyProvider(uint32_t exp_index, const CPubKey& pubkey, bool xonly) : PubkeyProvider(exp_index), m_pubkey(pubkey), m_xonly(xonly) {}
+    ConstPubkeyProvider(uint32_t exp_index, const CPubKey& pubkey, bool xonly, bool xonly_signing) : PubkeyProvider(exp_index), m_pubkey(pubkey), m_xonly(xonly), m_xonly_signing(xonly_signing) {}
     std::optional<CPubKey> GetPubKey(int pos, const SigningProvider&, FlatSigningProvider& out, const DescriptorCache* read_cache = nullptr, DescriptorCache* write_cache = nullptr) const override
     {
         KeyOriginInfo info;
@@ -347,6 +352,7 @@ public:
     bool IsRange() const override { return false; }
     size_t GetSize() const override { return m_pubkey.size(); }
     bool IsBIP32() const override { return false; }
+    bool IsXOnly() const override { return m_xonly_signing; }
     std::string ToString(StringType type) const override { return m_xonly ? HexStr(m_pubkey).substr(2) : HexStr(m_pubkey); }
     bool ToPrivateString(const SigningProvider& arg, std::string& ret) const override
     {
@@ -379,7 +385,7 @@ public:
     }
     std::unique_ptr<PubkeyProvider> Clone() const override
     {
-        return std::make_unique<ConstPubkeyProvider>(m_expr_index, m_pubkey, m_xonly);
+        return std::make_unique<ConstPubkeyProvider>(m_expr_index, m_pubkey, m_xonly, m_xonly_signing);
     }
 };
 
@@ -672,7 +678,7 @@ public:
                 CExtPubKey extpub = CreateMuSig2SyntheticXpub(m_aggregate_pubkey.value());
                 m_aggregate_provider = std::make_unique<BIP32PubkeyProvider>(m_expr_index, extpub, m_path, m_derive, /*apostrophe=*/false);
             } else {
-                m_aggregate_provider = std::make_unique<ConstPubkeyProvider>(m_expr_index, m_aggregate_pubkey.value(), /*xonly=*/false);
+                m_aggregate_provider = std::make_unique<ConstPubkeyProvider>(m_expr_index, m_aggregate_pubkey.value(), /*xonly=*/false, /*xonly_signing=*/false);
             }
         }
 
@@ -701,7 +707,7 @@ public:
             if (!aggregate_pubkey) return std::nullopt;
             pubout = *aggregate_pubkey;
 
-            std::unique_ptr<ConstPubkeyProvider> this_agg_provider = std::make_unique<ConstPubkeyProvider>(m_expr_index, aggregate_pubkey.value(), /*xonly=*/false);
+            std::unique_ptr<ConstPubkeyProvider> this_agg_provider = std::make_unique<ConstPubkeyProvider>(m_expr_index, aggregate_pubkey.value(), /*xonly=*/false, /*xonly_signing=*/false);
             this_agg_provider->GetPubKey(0, dummy, out, read_cache, write_cache);
             out.aggregate_pubkeys.emplace(pubout, pubkeys);
         }
@@ -831,6 +837,12 @@ protected:
 
     //! Return a serialization of anything except pubkey and script arguments, to be prepended to those.
     virtual std::string ToStringExtra() const { return ""; }
+
+    virtual std::string AnalysisType() const { return m_name == "?" ? "miniscript" : m_name; }
+
+    virtual std::optional<int> AnalysisThreshold() const { return std::nullopt; }
+
+    virtual std::optional<int> AnalysisTaprootDepth(size_t child_pos) const { return std::nullopt; }
 
     /** A helper function to construct the scripts for this descriptor.
      *
@@ -1099,6 +1111,63 @@ public:
         }
         return count;
     }
+
+    DescriptorAnalysis GetAnalysis() const override
+    {
+        DescriptorAnalysis analysis;
+        std::map<uint32_t, size_t> key_positions;
+
+        struct PendingNode {
+            const DescriptorImpl* desc;
+            std::optional<size_t> parent;
+            std::optional<int> taproot_depth;
+        };
+
+        std::vector<PendingNode> todo{{this, std::nullopt, std::nullopt}};
+        while (!todo.empty()) {
+            PendingNode pending{todo.back()};
+            todo.pop_back();
+
+            DescriptorAnalysisNode node;
+            node.id = analysis.nodes.size();
+            node.type = pending.desc->AnalysisType();
+            pending.desc->ToStringHelper(nullptr, node.expression, StringType::PUBLIC);
+            node.threshold = pending.desc->AnalysisThreshold();
+            node.taproot_depth = pending.taproot_depth;
+
+            for (const auto& p : pending.desc->m_pubkey_args) {
+                node.key_indices.push_back(p->m_expr_index);
+                if (key_positions.contains(p->m_expr_index)) continue;
+
+                DescriptorAnalysisKey key;
+                key.index = p->m_expr_index;
+                key.expression = p->ToString();
+                key.is_range = p->IsRange();
+                key.is_bip32 = p->IsBIP32();
+                key.is_xonly = p->IsXOnly();
+                key.key_count = p->GetKeyCount();
+                key.root_pubkey = p->GetRootPubKey();
+                key.root_ext_pubkey = p->GetRootExtPubKey();
+                key_positions.emplace(key.index, analysis.keys.size());
+                analysis.keys.push_back(std::move(key));
+            }
+
+            analysis.nodes.push_back(std::move(node));
+            if (pending.parent) {
+                analysis.nodes[*pending.parent].children.push_back(analysis.nodes.back().id);
+            }
+
+            for (size_t i = pending.desc->m_subdescriptor_args.size(); i > 0; --i) {
+                const size_t child_pos{i - 1};
+                todo.push_back({pending.desc->m_subdescriptor_args[child_pos].get(), analysis.nodes.back().id, pending.desc->AnalysisTaprootDepth(child_pos)});
+            }
+        }
+
+        std::sort(analysis.keys.begin(), analysis.keys.end(), [](const auto& a, const auto& b) {
+            return a.index < b.index;
+        });
+        return analysis;
+    }
 };
 
 /** A parsed addr(A) descriptor. */
@@ -1294,6 +1363,7 @@ class MultisigDescriptor final : public DescriptorImpl
     const bool m_sorted;
 protected:
     std::string ToStringExtra() const override { return strprintf("%i", m_threshold); }
+    std::optional<int> AnalysisThreshold() const override { return m_threshold; }
     std::vector<CScript> MakeScripts(const std::vector<CPubKey>& keys, std::span<const CScript>, FlatSigningProvider&) const override {
         if (m_sorted) {
             std::vector<CPubKey> sorted_keys(keys);
@@ -1340,6 +1410,7 @@ class MultiADescriptor final : public DescriptorImpl
     const bool m_sorted;
 protected:
     std::string ToStringExtra() const override { return strprintf("%i", m_threshold); }
+    std::optional<int> AnalysisThreshold() const override { return m_threshold; }
     std::vector<CScript> MakeScripts(const std::vector<CPubKey>& keys, std::span<const CScript>, FlatSigningProvider&) const override {
         CScript ret;
         std::vector<XOnlyPubKey> xkeys;
@@ -1475,6 +1546,12 @@ class TRDescriptor final : public DescriptorImpl
 {
     std::vector<int> m_depths;
 protected:
+    std::optional<int> AnalysisTaprootDepth(size_t child_pos) const override
+    {
+        if (child_pos >= m_depths.size()) return std::nullopt;
+        return m_depths[child_pos];
+    }
+
     std::vector<CScript> MakeScripts(const std::vector<CPubKey>& keys, std::span<const CScript> scripts, FlatSigningProvider& out) const override
     {
         TaprootBuilder builder;
@@ -1932,7 +2009,7 @@ std::vector<std::unique_ptr<PubkeyProvider>> ParsePubkeyInner(uint32_t& key_exp_
             }
             if (pubkey.IsFullyValid()) {
                 if (permit_uncompressed || pubkey.IsCompressed()) {
-                    ret.emplace_back(std::make_unique<ConstPubkeyProvider>(key_exp_index, pubkey, false));
+                    ret.emplace_back(std::make_unique<ConstPubkeyProvider>(key_exp_index, pubkey, /*xonly=*/false, /*xonly_signing=*/ctx == ParseScriptContext::P2TR));
                     ++key_exp_index;
                     return ret;
                 } else {
@@ -1944,7 +2021,7 @@ std::vector<std::unique_ptr<PubkeyProvider>> ParsePubkeyInner(uint32_t& key_exp_
                 std::copy(data.begin(), data.end(), fullkey + 1);
                 pubkey.Set(std::begin(fullkey), std::end(fullkey));
                 if (pubkey.IsFullyValid()) {
-                    ret.emplace_back(std::make_unique<ConstPubkeyProvider>(key_exp_index, pubkey, true));
+                    ret.emplace_back(std::make_unique<ConstPubkeyProvider>(key_exp_index, pubkey, /*xonly=*/true, /*xonly_signing=*/true));
                     ++key_exp_index;
                     return ret;
                 }
@@ -1957,7 +2034,7 @@ std::vector<std::unique_ptr<PubkeyProvider>> ParsePubkeyInner(uint32_t& key_exp_
             if (permit_uncompressed || key.IsCompressed()) {
                 CPubKey pubkey = key.GetPubKey();
                 out.keys.emplace(pubkey.GetID(), key);
-                ret.emplace_back(std::make_unique<ConstPubkeyProvider>(key_exp_index, pubkey, ctx == ParseScriptContext::P2TR));
+                ret.emplace_back(std::make_unique<ConstPubkeyProvider>(key_exp_index, pubkey, /*xonly=*/ctx == ParseScriptContext::P2TR, /*xonly_signing=*/ctx == ParseScriptContext::P2TR));
                 ++key_exp_index;
                 return ret;
             } else {
@@ -2187,7 +2264,7 @@ std::unique_ptr<PubkeyProvider> InferPubkey(const CPubKey& pubkey, ParseScriptCo
     if (ctx != ParseScriptContext::TOP && ctx != ParseScriptContext::P2SH && !pubkey.IsCompressed()) {
         return nullptr;
     }
-    std::unique_ptr<PubkeyProvider> key_provider = std::make_unique<ConstPubkeyProvider>(0, pubkey, false);
+    std::unique_ptr<PubkeyProvider> key_provider = std::make_unique<ConstPubkeyProvider>(0, pubkey, /*xonly=*/false, /*xonly_signing=*/ctx == ParseScriptContext::P2TR);
     KeyOriginInfo info;
     if (provider.GetKeyOrigin(pubkey.GetID(), info)) {
         return std::make_unique<OriginPubkeyProvider>(0, std::move(info), std::move(key_provider), /*apostrophe=*/false);
@@ -2198,7 +2275,7 @@ std::unique_ptr<PubkeyProvider> InferPubkey(const CPubKey& pubkey, ParseScriptCo
 std::unique_ptr<PubkeyProvider> InferXOnlyPubkey(const XOnlyPubKey& xkey, ParseScriptContext ctx, const SigningProvider& provider)
 {
     CPubKey pubkey{xkey.GetEvenCorrespondingCPubKey()};
-    std::unique_ptr<PubkeyProvider> key_provider = std::make_unique<ConstPubkeyProvider>(0, pubkey, true);
+    std::unique_ptr<PubkeyProvider> key_provider = std::make_unique<ConstPubkeyProvider>(0, pubkey, /*xonly=*/true, /*xonly_signing=*/true);
     KeyOriginInfo info;
     if (provider.GetKeyOriginByXOnly(xkey, info)) {
         return std::make_unique<OriginPubkeyProvider>(0, std::move(info), std::move(key_provider), /*apostrophe=*/false);

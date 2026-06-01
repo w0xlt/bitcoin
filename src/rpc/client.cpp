@@ -124,6 +124,7 @@ static const CRPCConvertParam vRPCConvertParams[] =
     { "sendmany", 7, "estimate_mode", ParamFormat::STRING },
     { "sendmany", 8, "fee_rate"},
     { "sendmany", 9, "verbose" },
+    { "analyzedescriptor", 1, "range" },
     { "deriveaddresses", 1, "range" },
     { "scanblocks", 1, "scanobjects" },
     { "scanblocks", 2, "start_height" },

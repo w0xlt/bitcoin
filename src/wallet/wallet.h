@@ -1075,6 +1075,9 @@ public:
     //! Returns nullopt when no descriptor has the key or if the wallet is locked.
     std::optional<CKey> GetKey(const CKeyID& keyid) const;
 
+    //! Return whether private key material for the given key id is stored in the wallet.
+    bool HasPrivKey(const CKeyID& keyid) const;
+
     //! Disconnect chain notifications and wait for all notifications to be processed
     void DisconnectChainNotifications();
 };
