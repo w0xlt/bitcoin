@@ -758,6 +758,7 @@ RPCMethod gethdkeys()
 struct DescriptorOwnershipSummary {
     bool any{false};
     bool all{false};
+    bool unknown_due_to_locked_wallet{false};
 };
 
 struct WalletExtKeyInfo {
@@ -768,6 +769,7 @@ struct WalletExtKeyInfo {
 
 struct WalletKeyMatch {
     bool has_private{false};
+    bool unknown_due_to_locked_wallet{false};
     std::string type{"none"};
 };
 
@@ -826,8 +828,8 @@ static bool DeriveExtKey(const CExtKey& root, const KeyOriginInfo& origin, CExtK
 static WalletKeyMatch MatchWalletKey(const CWallet& wallet, const DescriptorAnalysisKey& key, const std::vector<WalletExtKeyInfo>& wallet_ext_keys)
 {
     if (!key.private_key_slot) return {};
-    if (key.root_ext_pubkey && wallet.HasPrivKey(key.root_ext_pubkey->pubkey.GetID())) return {true, "exact_xprv"};
-    if (key.root_pubkey && wallet.HasPrivKey(key.root_pubkey->GetID())) return {true, "exact_private_key"};
+    if (key.root_ext_pubkey && wallet.HasPrivKey(key.root_ext_pubkey->pubkey.GetID())) return {true, false, "exact_xprv"};
+    if (key.root_pubkey && wallet.HasPrivKey(key.root_pubkey->GetID())) return {true, false, "exact_private_key"};
 
     if (!key.origin) return {};
 
@@ -841,12 +843,65 @@ static WalletKeyMatch MatchWalletKey(const CWallet& wallet, const DescriptorAnal
 
         CExtKey derived;
         if (!DeriveExtKey(*wallet_key.xprv, *key.origin, derived)) continue;
-        if (key.root_ext_pubkey && derived.Neuter() == *key.root_ext_pubkey) return {true, "derived_xprv"};
-        if (key.root_pubkey && derived.key.GetPubKey() == *key.root_pubkey) return {true, "derived_private_key"};
+        if (key.root_ext_pubkey && derived.Neuter() == *key.root_ext_pubkey) return {true, false, "derived_xprv"};
+        if (key.root_pubkey && derived.key.GetPubKey() == *key.root_pubkey) return {true, false, "derived_private_key"};
     }
 
-    if (locked_candidate && wallet.HasEncryptionKeys() && wallet.IsLocked()) return {false, "unknown_locked"};
+    if (locked_candidate && wallet.HasEncryptionKeys() && wallet.IsLocked()) return {false, true, "unknown_locked"};
     return {};
+}
+
+static bool AddWalletPrivateKeyForAnalysisKey(const CWallet& wallet, const DescriptorAnalysisKey& key, const std::vector<WalletExtKeyInfo>& wallet_ext_keys, FlatSigningProvider& provider) EXCLUSIVE_LOCKS_REQUIRED(wallet.cs_wallet)
+{
+    if (!key.private_key_slot) return false;
+
+    bool locked_candidate{false};
+    if (key.root_ext_pubkey) {
+        const CKeyID id{key.root_ext_pubkey->pubkey.GetID()};
+        if (std::optional<CKey> wallet_key = wallet.GetKey(id)) {
+            provider.keys.emplace(id, *wallet_key);
+        } else if (wallet.HasPrivKey(id)) {
+            locked_candidate = true;
+        }
+    }
+    if (key.root_pubkey) {
+        const CKeyID id{key.root_pubkey->GetID()};
+        if (std::optional<CKey> wallet_key = wallet.GetKey(id)) {
+            provider.keys.emplace(id, *wallet_key);
+        } else if (wallet.HasPrivKey(id)) {
+            locked_candidate = true;
+        }
+    }
+
+    if (key.origin) {
+        for (const auto& wallet_key : wallet_ext_keys) {
+            if (!wallet_key.has_private || !ExtPubKeyMatchesOriginFingerprint(wallet_key.xpub, *key.origin)) continue;
+            if (!wallet_key.xprv) {
+                locked_candidate = true;
+                continue;
+            }
+
+            CExtKey derived;
+            if (!DeriveExtKey(*wallet_key.xprv, *key.origin, derived)) continue;
+            if (key.root_ext_pubkey && derived.Neuter() == *key.root_ext_pubkey) {
+                provider.keys.emplace(derived.key.GetPubKey().GetID(), derived.key);
+            }
+            if (key.root_pubkey && derived.key.GetPubKey() == *key.root_pubkey) {
+                provider.keys.emplace(derived.key.GetPubKey().GetID(), derived.key);
+            }
+        }
+    }
+
+    return locked_candidate && wallet.HasEncryptionKeys() && wallet.IsLocked();
+}
+
+static bool AddWalletPrivateKeysForAnalysis(const CWallet& wallet, const DescriptorAnalysis& analysis, const std::vector<WalletExtKeyInfo>& wallet_ext_keys, FlatSigningProvider& provider) EXCLUSIVE_LOCKS_REQUIRED(wallet.cs_wallet)
+{
+    bool unknown_due_to_locked_wallet{false};
+    for (const auto& key : analysis.keys) {
+        unknown_due_to_locked_wallet |= AddWalletPrivateKeyForAnalysisKey(wallet, key, wallet_ext_keys, provider);
+    }
+    return unknown_due_to_locked_wallet;
 }
 
 static UniValue DescriptorAnalysisKeysToUniValue(const DescriptorAnalysis& analysis, const FlatSigningProvider& input_provider, const CWallet& wallet, const std::vector<WalletExtKeyInfo>& wallet_ext_keys, DescriptorOwnershipSummary& summary)
@@ -861,6 +916,7 @@ static UniValue DescriptorAnalysisKeysToUniValue(const DescriptorAnalysis& analy
         if (key.private_key_slot) {
             summary.any |= wallet_has_private;
             summary.all &= wallet_has_private;
+            summary.unknown_due_to_locked_wallet |= wallet_match.unknown_due_to_locked_wallet;
         }
 
         UniValue key_obj{UniValue::VOBJ};
@@ -873,6 +929,7 @@ static UniValue DescriptorAnalysisKeysToUniValue(const DescriptorAnalysis& analy
         key_obj.pushKV("key_count", static_cast<int64_t>(key.key_count));
         key_obj.pushKV("input_has_private_key", input_has_private);
         key_obj.pushKV("wallet_has_private_key", wallet_has_private);
+        key_obj.pushKV("unknown_due_to_locked_wallet", wallet_match.unknown_due_to_locked_wallet);
         key_obj.pushKV("wallet_match_type", wallet_match.type);
         UniValue children{UniValue::VARR};
         for (uint32_t child : key.children) {
@@ -927,16 +984,31 @@ static UniValue DescriptorAnalysisTreeToUniValue(const DescriptorAnalysis& analy
     return tree;
 }
 
-static UniValue DescriptorScriptsToUniValue(const Descriptor& desc, int range, const FlatSigningProvider& input_provider)
+static UniValue DescriptorScriptsToUniValue(const Descriptor& desc, int range, const FlatSigningProvider& input_provider, const CWallet& wallet, const DescriptorAnalysis& analysis, const std::vector<WalletExtKeyInfo>& wallet_ext_keys, bool& unknown_due_to_locked_wallet) EXCLUSIVE_LOCKS_REQUIRED(wallet.cs_wallet)
 {
     UniValue script{UniValue::VOBJ};
     FlatSigningProvider expanded_provider;
     std::vector<CScript> script_pubkeys;
+    bool used_wallet_private_keys{false};
 
     if (!desc.Expand(range, input_provider, script_pubkeys, expanded_provider)) {
-        script.pushKV("error", "Cannot expand descriptor at the requested index. This may require private keys for hardened derivation.");
-        return script;
+        FlatSigningProvider wallet_provider{input_provider};
+        unknown_due_to_locked_wallet = AddWalletPrivateKeysForAnalysis(wallet, analysis, wallet_ext_keys, wallet_provider);
+        expanded_provider = {};
+        script_pubkeys.clear();
+        used_wallet_private_keys = desc.Expand(range, wallet_provider, script_pubkeys, expanded_provider);
+        if (!used_wallet_private_keys) {
+            script.pushKV("used_wallet_private_keys", false);
+            script.pushKV("unknown_due_to_locked_wallet", unknown_due_to_locked_wallet);
+            script.pushKV("error", unknown_due_to_locked_wallet ?
+                "Cannot expand descriptor at the requested index. Unlock the wallet to use wallet private keys for hardened derivation." :
+                "Cannot expand descriptor at the requested index. This may require private keys for hardened derivation.");
+            return script;
+        }
     }
+
+    script.pushKV("used_wallet_private_keys", used_wallet_private_keys);
+    script.pushKV("unknown_due_to_locked_wallet", unknown_due_to_locked_wallet);
 
     UniValue spks{UniValue::VARR};
     for (const auto& spk : script_pubkeys) {
@@ -952,7 +1024,7 @@ static UniValue DescriptorScriptsToUniValue(const Descriptor& desc, int range, c
     return script;
 }
 
-static UniValue DescriptorAnalysisToUniValue(const Descriptor& desc, int range, const FlatSigningProvider& input_provider, const CWallet& wallet, const std::vector<WalletExtKeyInfo>& wallet_ext_keys, DescriptorOwnershipSummary& summary)
+static UniValue DescriptorAnalysisToUniValue(const Descriptor& desc, int range, const FlatSigningProvider& input_provider, const CWallet& wallet, const std::vector<WalletExtKeyInfo>& wallet_ext_keys, DescriptorOwnershipSummary& summary) EXCLUSIVE_LOCKS_REQUIRED(wallet.cs_wallet)
 {
     const DescriptorAnalysis analysis{desc.GetAnalysis()};
     UniValue obj{UniValue::VOBJ};
@@ -962,7 +1034,6 @@ static UniValue DescriptorAnalysisToUniValue(const Descriptor& desc, int range, 
     UniValue keys{DescriptorAnalysisKeysToUniValue(analysis, input_provider, wallet, wallet_ext_keys, summary)};
     obj.pushKV("wallet_has_any_private_key", summary.any);
     obj.pushKV("wallet_has_all_private_keys", summary.all);
-    obj.pushKV("keys", std::move(keys));
 
     UniValue warnings{UniValue::VARR};
     for (const auto& warning : desc.Warnings()) {
@@ -970,8 +1041,13 @@ static UniValue DescriptorAnalysisToUniValue(const Descriptor& desc, int range, 
     }
     obj.pushKV("warnings", std::move(warnings));
 
+    bool script_unknown_due_to_locked_wallet{false};
+    UniValue script{DescriptorScriptsToUniValue(desc, range, input_provider, wallet, analysis, wallet_ext_keys, script_unknown_due_to_locked_wallet)};
+    summary.unknown_due_to_locked_wallet |= script_unknown_due_to_locked_wallet;
+    obj.pushKV("unknown_due_to_locked_wallet", summary.unknown_due_to_locked_wallet);
+    obj.pushKV("keys", std::move(keys));
     obj.pushKV("tree", DescriptorAnalysisTreeToUniValue(analysis));
-    obj.pushKV("script", DescriptorScriptsToUniValue(desc, range, input_provider));
+    obj.pushKV("script", std::move(script));
     return obj;
 }
 
@@ -993,6 +1069,7 @@ RPCMethod analyzedescriptor()
                 {RPCResult::Type::BOOL, "input_has_private_keys", "Whether the input descriptor contained any private keys."},
                 {RPCResult::Type::BOOL, "wallet_has_any_private_key", "Whether the wallet stores private key material for at least one descriptor key slot."},
                 {RPCResult::Type::BOOL, "wallet_has_all_private_keys", "Whether the wallet stores private key material for every descriptor key slot."},
+                {RPCResult::Type::BOOL, "unknown_due_to_locked_wallet", "Whether the wallet is locked and some private-key status or script expansion could not be determined."},
                 {RPCResult::Type::ARR, "descriptors", "Analysis for each multipath descriptor expansion.",
                 {
                     {RPCResult::Type::OBJ, "", "", {
@@ -1001,6 +1078,7 @@ RPCMethod analyzedescriptor()
                         {RPCResult::Type::BOOL, "issolvable", "Whether the descriptor is solvable."},
                         {RPCResult::Type::BOOL, "wallet_has_any_private_key", "Whether the wallet has private key material for at least one key in this expansion."},
                         {RPCResult::Type::BOOL, "wallet_has_all_private_keys", "Whether the wallet has private key material for every key in this expansion."},
+                        {RPCResult::Type::BOOL, "unknown_due_to_locked_wallet", "Whether the wallet is locked and some private-key status or script expansion could not be determined for this expansion."},
                         {RPCResult::Type::ARR, "warnings", "Descriptor warnings.", {{RPCResult::Type::STR, "", ""}}},
                         {RPCResult::Type::ARR, "keys", "Key expression analysis.", {{RPCResult::Type::OBJ, "", "", {
                             {RPCResult::Type::NUM, "index", "Descriptor key expression index."},
@@ -1012,6 +1090,7 @@ RPCMethod analyzedescriptor()
                             {RPCResult::Type::NUM, "key_count", "Number of keys represented by this expression."},
                             {RPCResult::Type::BOOL, "input_has_private_key", "Whether the input descriptor provided this private key."},
                             {RPCResult::Type::BOOL, "wallet_has_private_key", "Whether the wallet stores matching private key material."},
+                            {RPCResult::Type::BOOL, "unknown_due_to_locked_wallet", "Whether a locked wallet prevented determining this key's private-key status."},
                             {RPCResult::Type::STR, "wallet_match_type", "How wallet key material matched this expression."},
                             {RPCResult::Type::ARR, "children", "Nested key expression indexes, such as MuSig participants.", {{RPCResult::Type::NUM, "", ""}}},
                             {RPCResult::Type::STR, "origin", /*optional=*/true, "Key origin information, if present."},
@@ -1033,6 +1112,8 @@ RPCMethod analyzedescriptor()
                             }}}},
                         }},
                         {RPCResult::Type::OBJ, "script", "Representative script expansion.", {
+                            {RPCResult::Type::BOOL, "used_wallet_private_keys", "Whether wallet private keys were used internally to expand the descriptor preview."},
+                            {RPCResult::Type::BOOL, "unknown_due_to_locked_wallet", "Whether a locked wallet prevented script preview expansion."},
                             {RPCResult::Type::ARR, "scriptPubKeys", /*optional=*/true, "Expanded scriptPubKeys.", {{RPCResult::Type::STR_HEX, "", ""}}},
                             {RPCResult::Type::ARR, "solving_scripts", /*optional=*/true, "Redeem/witness scripts produced during expansion.", {{RPCResult::Type::STR_HEX, "", ""}}},
                             {RPCResult::Type::STR, "error", /*optional=*/true, "Expansion error."},
@@ -1071,6 +1152,7 @@ RPCMethod analyzedescriptor()
 
             bool wallet_has_any_private_key{false};
             bool wallet_has_all_private_keys{true};
+            bool unknown_due_to_locked_wallet{false};
             UniValue descriptor_results{UniValue::VARR};
             {
                 LOCK(wallet->cs_wallet);
@@ -1080,11 +1162,13 @@ RPCMethod analyzedescriptor()
                     descriptor_results.push_back(DescriptorAnalysisToUniValue(*desc, range, input_provider, *wallet, wallet_ext_keys, summary));
                     wallet_has_any_private_key |= summary.any;
                     wallet_has_all_private_keys &= summary.all;
+                    unknown_due_to_locked_wallet |= summary.unknown_due_to_locked_wallet;
                 }
             }
 
             response.pushKV("wallet_has_any_private_key", wallet_has_any_private_key);
             response.pushKV("wallet_has_all_private_keys", wallet_has_all_private_keys);
+            response.pushKV("unknown_due_to_locked_wallet", unknown_due_to_locked_wallet);
             response.pushKV("descriptors", std::move(descriptor_results));
             return response;
         },

@@ -596,7 +596,8 @@ Discovered couplings and seams:
 - Wallet ownership can be reported for exact root pubkey/xpub matches without unlocking encrypted wallets by using a new wallet-level `HasPrivKey()` helper.
 - Full HD origin/path matching is separate from exact root matching and should follow the PR #35377-style xpub/xprv substitution approach in a focused follow-up.
 - Follow-up implemented for unlocked wallets: descriptor key origins are now exposed in analysis results, and `[fingerprint/path]xpub` keys can match wallet-held parent xprvs via derived-key matching.
-- Representative script expansion currently uses private keys supplied in the input descriptor, not wallet-derived private keys. Hardened derivation from wallet-held keys needs a follow-up if script preview must work for those descriptors.
-- Miniscript is represented as a descriptor node with its expression string in the first slice. A full miniscript AST should be added only if the GUI needs that granularity.
-- `musig()` participant ownership is not fully represented by the initial key-expression model and needs dedicated follow-up handling.
+- Structured key analysis now distinguishes ordinary public keys, BIP32 keys, and `musig()` aggregate keys. MuSig aggregates are non-private parent entries with participant key indexes as children.
+- Miniscript fragments are exposed as structured child nodes under the miniscript descriptor node, including key indexes, numeric values such as `older()` and `thresh()`, and hash data.
+- Representative script expansion first tries the input descriptor provider, then retries internally with wallet private keys where they are retrievable. This enables hardened-derivation previews for matching wallet xprvs without returning private key material.
+- Locked encrypted wallets now report `unknown_due_to_locked_wallet` at top level, per descriptor, per key, and script-preview level when private-key matching or wallet-backed expansion cannot be completed without unlocking.
 - Functional testing needs generated test config when run directly: `--configfile=build/test/config.ini`.
