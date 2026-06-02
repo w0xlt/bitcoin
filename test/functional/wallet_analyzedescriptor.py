@@ -93,13 +93,14 @@ class AnalyzeDescriptorTest(BitcoinTestFramework):
     def assert_owned(self, result, match_type):
         assert_equal(result["wallet_has_any_private_key"], True)
         assert_equal(result["wallet_has_all_private_keys"], True)
+        assert_equal(result["unknown_due_to_locked_wallet"], False)
         analysis = result["descriptors"][0]
         assert_equal(analysis["wallet_has_any_private_key"], True)
         assert_equal(analysis["wallet_has_all_private_keys"], True)
         key = analysis["keys"][0]
         assert_equal(key["wallet_has_private_key"], True)
+        assert_equal(key["unknown_due_to_locked_wallet"], False)
         assert_equal(key["wallet_match_type"], match_type)
-
 
     def test_xonly_keys(self, owner, other, owner_xpub):
         self.log.info("Check both public-key parities for x-only ownership")
@@ -215,6 +216,7 @@ class AnalyzeDescriptorTest(BitcoinTestFramework):
         assert_equal(watch.getaddressinfo(address)["ismine"], True)
         result = watch.analyzedescriptor(descriptor)
         assert_equal(result["wallet_has_any_private_key"], False)
+        assert_equal(result["unknown_due_to_locked_wallet"], False)
 
     def test_parent_origins_and_musig_inventory(self, owner, owner_xpub, other_xpub):
         node = self.nodes[0]
@@ -232,13 +234,79 @@ class AnalyzeDescriptorTest(BitcoinTestFramework):
             wallet = node.get_wallet_rpc(node.createwallet(wallet_name=name, blank=True)["name"])
             assert_equal(wallet.importdescriptors([{"desc": descsum_create(private_desc), "timestamp": "now", "range": [0, 10]}])[0]["success"], True)
             self.assert_owned(wallet.analyzedescriptor(f"wpkh({descendant}/0/*)"), "derived_xprv")
+            self.assert_owned(wallet.analyzedescriptor(f"wpkh({descendant}/0h/*)"), "derived_xprv")
+            script = wallet.analyzedescriptor(f"wpkh({descendant}/0h/*)")["descriptors"][0]["script"]
+            assert_equal(script["used_wallet_private_keys"], True)
+            assert "error" not in script
+            expected_address = node.deriveaddresses(descsum_create(f"wpkh({account_xprv}/8/0h/*)"), [0, 0])[0]
+            assert_equal(script["scriptPubKeys"], [node.validateaddress(expected_address)["scriptPubKey"]])
+
             for origin in (f"{fingerprint}/9/8", f"{fingerprint}/7", f"{fingerprint}", "12345678/7/8"):
-                result = wallet.analyzedescriptor(f"wpkh([{origin}]{child_xpub}/0/*)")
+                result = wallet.analyzedescriptor(f"wpkh([{origin}]{child_xpub}/0h/*)")
                 assert_equal(result["wallet_has_any_private_key"], False)
+                assert_equal(result["unknown_due_to_locked_wallet"], False)
                 assert "error" in result["descriptors"][0]["script"]
             # A matching origin alone is insufficient; verify the derived key.
             assert_equal(wallet.analyzedescriptor(f"wpkh([{fingerprint}/7/8]{other_xpub}/0/*)")["wallet_has_any_private_key"], False)
 
+            wallet.encryptwallet("passphrase")
+            result = wallet.analyzedescriptor(f"wpkh({descendant}/0h/*)")
+            assert_equal(result["unknown_due_to_locked_wallet"], True)
+            assert_equal(result["descriptors"][0]["keys"][0]["wallet_match_type"], "unknown_locked")
+            assert_equal(result["descriptors"][0]["script"]["unknown_due_to_locked_wallet"], True)
+            wallet.walletpassphrase("passphrase", 60)
+            self.assert_owned(wallet.analyzedescriptor(f"wpkh({descendant}/0h/*)"), "derived_xprv")
+            assert_equal(wallet.analyzedescriptor(f"wpkh({descendant}/0h/*)")["descriptors"][0]["script"]["scriptPubKeys"], script["scriptPubKeys"])
+            wallet.walletlock()
+
+    def test_locked_preview_requirements(self, encrypted, other_xpub):
+        self.log.info("Only attribute preview failures to locked keys that require private derivation")
+        xpub = encrypted.gethdkeys()[0]["xpub"]
+        pubkey = xpub_pubkey(xpub).hex()
+        descriptors = [
+            f"wsh(multi(1,{xpub}/0/*,{other_xpub}/0h/*))",
+            f"wsh(multi(1,{pubkey},{other_xpub}/0h/*))",
+            f"tr({xpub}/0/*,pk({other_xpub}/0h/*))",
+            f"tr({other_xpub}/0h/*,pk({xpub}/0/*))",
+            f"rawtr(musig({xpub}/0/*,{other_xpub}/0h/*))",
+        ]
+        locked_results = []
+        for descriptor in descriptors:
+            result = encrypted.analyzedescriptor(descriptor, 2)
+            assert_equal(result["unknown_due_to_locked_wallet"], False)
+            analysis = result["descriptors"][0]
+            assert_equal(analysis["unknown_due_to_locked_wallet"], False)
+            assert_equal(analysis["script"]["unknown_due_to_locked_wallet"], False)
+            assert "error" in analysis["script"]
+            assert "Unlock" not in analysis["script"]["error"]
+            locked_results.append(result)
+
+        # Ownership uncertainty and preview uncertainty are independent.
+        child_xpub = derive_xpub_nonhardened(xpub, 7)
+        fingerprint = hash160(xpub_pubkey(xpub))[:4].hex()
+        origin_desc = f"wsh(multi(1,[{fingerprint}/7]{child_xpub}/0/*,{other_xpub}/0h/*))"
+        result = encrypted.analyzedescriptor(origin_desc)
+        assert_equal(result["unknown_due_to_locked_wallet"], True)
+        assert_equal(result["descriptors"][0]["script"]["unknown_due_to_locked_wallet"], False)
+
+        owned_hardened = f"wsh(multi(1,{xpub}/0h/*,{other_xpub}/0/*))"
+        result = encrypted.analyzedescriptor(owned_hardened)
+        assert_equal(result["unknown_due_to_locked_wallet"], True)
+        assert_equal(result["descriptors"][0]["script"]["unknown_due_to_locked_wallet"], True)
+        encrypted.walletpassphrase("passphrase", 60)
+        for descriptor, expected in zip(descriptors, locked_results):
+            assert_equal(encrypted.analyzedescriptor(descriptor, 2), expected)
+        result = encrypted.analyzedescriptor(owned_hardened)
+        assert_equal(result["unknown_due_to_locked_wallet"], False)
+        assert_equal(result["descriptors"][0]["script"]["used_wallet_private_keys"], True)
+        assert "error" not in result["descriptors"][0]["script"]
+        xprv = next(key["xprv"] for key in encrypted.gethdkeys({"private": True}) if key["xpub"] == xpub)
+        encrypted.walletlock()
+
+        result = encrypted.analyzedescriptor(f"wsh(multi(1,{xprv}/0h/*,{other_xpub}/0h/*))")
+        assert_equal(result["unknown_due_to_locked_wallet"], False)
+        assert_equal(result["descriptors"][0]["script"]["unknown_due_to_locked_wallet"], False)
+        assert "Unlock" not in result["descriptors"][0]["script"]["error"]
 
     def run_test(self):
         node = self.nodes[0]
@@ -253,6 +321,7 @@ class AnalyzeDescriptorTest(BitcoinTestFramework):
         assert_equal(result["input_has_private_keys"], False)
         assert_equal(result["wallet_has_any_private_key"], True)
         assert_equal(result["wallet_has_all_private_keys"], False)
+        assert_equal(result["unknown_due_to_locked_wallet"], False)
         assert_equal(len(result["descriptors"]), 1)
 
         analysis = result["descriptors"][0]
@@ -260,6 +329,9 @@ class AnalyzeDescriptorTest(BitcoinTestFramework):
         assert_equal(analysis["issolvable"], True)
         assert_equal(analysis["wallet_has_any_private_key"], True)
         assert_equal(analysis["wallet_has_all_private_keys"], False)
+        assert_equal(analysis["unknown_due_to_locked_wallet"], False)
+        assert_equal(analysis["script"]["used_wallet_private_keys"], False)
+        assert_equal(analysis["script"]["unknown_due_to_locked_wallet"], False)
         assert_equal(len(analysis["script"]["scriptPubKeys"]), 1)
         assert_equal(len(analysis["script"]["solving_scripts"]), 1)
 
@@ -268,11 +340,13 @@ class AnalyzeDescriptorTest(BitcoinTestFramework):
         assert_equal(keys_by_xpub[owner_xpub]["private_key_slot"], True)
         assert_equal(keys_by_xpub[owner_xpub]["children"], [])
         assert_equal(keys_by_xpub[owner_xpub]["wallet_has_private_key"], True)
+        assert_equal(keys_by_xpub[owner_xpub]["unknown_due_to_locked_wallet"], False)
         assert_equal(keys_by_xpub[owner_xpub]["wallet_match_type"], "exact_xprv")
         assert_equal(keys_by_xpub[other_xpub]["type"], "bip32")
         assert_equal(keys_by_xpub[other_xpub]["private_key_slot"], True)
         assert_equal(keys_by_xpub[other_xpub]["children"], [])
         assert_equal(keys_by_xpub[other_xpub]["wallet_has_private_key"], False)
+        assert_equal(keys_by_xpub[other_xpub]["unknown_due_to_locked_wallet"], False)
         assert_equal(keys_by_xpub[other_xpub]["wallet_match_type"], "none")
 
         tree = analysis["tree"]
@@ -293,6 +367,7 @@ class AnalyzeDescriptorTest(BitcoinTestFramework):
         assert_equal(derived_key["private_key_slot"], True)
         assert_equal(derived_key["origin"], f"{origin_fingerprint}/{child_index}")
         assert_equal(derived_key["wallet_has_private_key"], True)
+        assert_equal(derived_key["unknown_due_to_locked_wallet"], False)
         assert_equal(derived_key["wallet_match_type"], "derived_xprv")
 
         musig_desc = descsum_create(f"rawtr(musig({owner_xpub}/0/*,{other_xpub}/0/*))")
@@ -301,6 +376,7 @@ class AnalyzeDescriptorTest(BitcoinTestFramework):
         assert_equal(musig_key["private_key_slot"], False)
         assert_equal(musig_key["children"], [0, 1])
         assert_equal(musig_key["wallet_has_private_key"], False)
+        assert_equal(musig_key["unknown_due_to_locked_wallet"], False)
         assert_equal(musig_analysis["wallet_has_any_private_key"], True)
         assert_equal(musig_analysis["wallet_has_all_private_keys"], False)
         assert_equal(musig_analysis["tree"]["nodes"][0]["key_indices"], [2])
@@ -313,10 +389,44 @@ class AnalyzeDescriptorTest(BitcoinTestFramework):
         assert any(node["type"] == "older" and node["value"] == 42 for node in miniscript_nodes)
         assert any(node["type"] == "pk_k" and node["key_indices"] == [0] for node in miniscript_nodes)
 
+        encrypted = node.get_wallet_rpc(node.createwallet(wallet_name="encrypted", passphrase="passphrase")["name"])
+        encrypted_xpub = encrypted.gethdkeys()[0]["xpub"]
+        encrypted_child_index = 11
+        encrypted_child_xpub = derive_xpub_nonhardened(encrypted_xpub, encrypted_child_index)
+        encrypted_origin_fingerprint = hash160(xpub_pubkey(encrypted_xpub))[:4].hex()
+        hardened_desc = descsum_create(f"wpkh([{encrypted_origin_fingerprint}/{encrypted_child_index}]{encrypted_child_xpub}/0h/*)")
+
+        locked_result = encrypted.analyzedescriptor(hardened_desc, 0)
+        assert_equal(locked_result["unknown_due_to_locked_wallet"], True)
+        locked_analysis = locked_result["descriptors"][0]
+        assert_equal(locked_analysis["unknown_due_to_locked_wallet"], True)
+        locked_key = locked_analysis["keys"][0]
+        assert_equal(locked_key["wallet_has_private_key"], False)
+        assert_equal(locked_key["unknown_due_to_locked_wallet"], True)
+        assert_equal(locked_key["wallet_match_type"], "unknown_locked")
+        assert_equal(locked_analysis["script"]["used_wallet_private_keys"], False)
+        assert_equal(locked_analysis["script"]["unknown_due_to_locked_wallet"], True)
+        assert "error" in locked_analysis["script"]
+
+        encrypted.walletpassphrase("passphrase", 60)
+        unlocked_result = encrypted.analyzedescriptor(hardened_desc, 0)
+        assert_equal(unlocked_result["unknown_due_to_locked_wallet"], False)
+        unlocked_analysis = unlocked_result["descriptors"][0]
+        assert_equal(unlocked_analysis["unknown_due_to_locked_wallet"], False)
+        unlocked_key = unlocked_analysis["keys"][0]
+        assert_equal(unlocked_key["wallet_has_private_key"], True)
+        assert_equal(unlocked_key["unknown_due_to_locked_wallet"], False)
+        assert_equal(unlocked_key["wallet_match_type"], "derived_xprv")
+        assert_equal(unlocked_analysis["script"]["used_wallet_private_keys"], True)
+        assert_equal(unlocked_analysis["script"]["unknown_due_to_locked_wallet"], False)
+        assert_equal(len(unlocked_analysis["script"]["scriptPubKeys"]), 1)
+        encrypted.walletlock()
+
         self.test_xonly_keys(owner, other, owner_xpub)
         self.test_repeated_keys(owner, other, owner_xpub, other_xpub)
         self.test_cached_keys(owner, other)
         self.test_parent_origins_and_musig_inventory(owner, owner_xpub, other_xpub)
+        self.test_locked_preview_requirements(encrypted, other_xpub)
 
 
 if __name__ == "__main__":
