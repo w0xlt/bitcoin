@@ -9,6 +9,8 @@
 #include <wallet/transaction.h>
 #include <wallet/wallet.h>
 
+#include <utility>
+
 namespace wallet {
 bool InputIsMine(const CWallet& wallet, const CTxIn& txin)
 {
@@ -53,6 +55,42 @@ WalletTxInputOwnership CachedTxGetInputOwnership(const CWallet& wallet, const CW
         wtx.m_cached_input_ownership = GetInputOwnership(wallet, *wtx.tx);
     }
     return wtx.m_cached_input_ownership.value();
+}
+
+static std::optional<CAmount> GetKnownInputValue(const CWallet& wallet, const CTxIn& txin)
+{
+    AssertLockHeld(wallet.cs_wallet);
+    const CWalletTx* prev{wallet.GetWalletTx(txin.prevout.hash)};
+    if (prev && txin.prevout.n < prev->tx->vout.size()) {
+        const CAmount value{prev->tx->vout[txin.prevout.n].nValue};
+        if (!MoneyRange(value)) {
+            throw std::runtime_error(std::string(__func__) + ": value out of range");
+        }
+        return value;
+    }
+    return std::nullopt;
+}
+
+static std::pair<CAmount, bool> GetKnownForeignDebit(const CWallet& wallet, const CTransaction& tx)
+{
+    LOCK(wallet.cs_wallet);
+    CAmount known_foreign_debit{0};
+    bool has_unknown_foreign_debit{false};
+
+    for (const CTxIn& txin : tx.vin) {
+        if (InputIsMine(wallet, txin)) continue;
+
+        if (const auto value{GetKnownInputValue(wallet, txin)}) {
+            known_foreign_debit += *value;
+            if (!MoneyRange(known_foreign_debit)) {
+                throw std::runtime_error(std::string(__func__) + ": value out of range");
+            }
+        } else {
+            has_unknown_foreign_debit = true;
+        }
+    }
+
+    return {known_foreign_debit, has_unknown_foreign_debit};
 }
 
 CAmount OutputGetCredit(const CWallet& wallet, const CTxOut& txout)
@@ -168,9 +206,17 @@ WalletTxHistoryAccounting CachedTxGetHistoryAccounting(const CWallet& wallet, co
     const CAmount debit{CachedTxGetDebit(wallet, wtx, /*avoid_reuse=*/false)};
     const CAmount credit{CachedTxGetCredit(wallet, wtx, /*avoid_reuse=*/false)};
     const WalletTxInputOwnership input_ownership{CachedTxGetInputOwnership(wallet, wtx)};
+
+    // Foreign input values only need to be inspected for mixed-input transactions;
+    // for fully-owned or fully-foreign transactions the fee is decided by ownership alone.
     std::optional<CAmount> fee;
     if (input_ownership == WalletTxInputOwnership::ALL) {
         fee = debit - wtx.tx->GetValueOut();
+    } else if (input_ownership == WalletTxInputOwnership::PARTIAL) {
+        const auto [known_foreign_debit, has_unknown_foreign_debit]{GetKnownForeignDebit(wallet, *wtx.tx)};
+        if (known_foreign_debit == 0 && !has_unknown_foreign_debit) {
+            fee = debit - wtx.tx->GetValueOut();
+        }
     }
     return {input_ownership, debit, credit, credit - debit, fee};
 }
@@ -185,7 +231,7 @@ void CachedTxGetAmounts(const CWallet& wallet, const CWalletTx& wtx,
     listReceived.clear();
     listSent.clear();
     const WalletTxHistoryAccounting accounting{CachedTxGetHistoryAccounting(wallet, wtx)};
-    const bool all_inputs_mine{accounting.input_ownership == WalletTxInputOwnership::ALL};
+    const bool can_attribute_sent_outputs{accounting.fee.has_value()};
 
     // Compute fee:
     if (accounting.fee.has_value()) {
@@ -198,9 +244,9 @@ void CachedTxGetAmounts(const CWallet& wallet, const CWalletTx& wtx,
         const CTxOut& txout = wtx.tx->vout[i];
         bool ismine = wallet.IsMine(txout);
         // Only need to handle txouts if either:
-        //   1) every input is ours, so the output can be reported as sent
+        //   1) every spent input value is ours, so the output can be reported as sent
         //   2) the output is ours, so it can be reported as received
-        if (all_inputs_mine)
+        if (can_attribute_sent_outputs)
         {
             if (!include_change && OutputIsChange(wallet, txout))
                 continue;
@@ -220,8 +266,8 @@ void CachedTxGetAmounts(const CWallet& wallet, const CWalletTx& wtx,
 
         COutputEntry output = {address, txout.nValue, (int)i};
 
-        // Only transactions fully funded by the wallet have attributable sent outputs.
-        if (all_inputs_mine)
+        // Only transactions whose spent value is fully funded by the wallet have attributable sent outputs.
+        if (can_attribute_sent_outputs)
             listSent.push_back(output);
 
         // If we are receiving the output, add it as a "received" entry
