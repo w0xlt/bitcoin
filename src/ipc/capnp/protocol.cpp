@@ -26,6 +26,7 @@
 #include <sys/socket.h>
 #include <system_error>
 #include <thread>
+#include <vector>
 
 namespace ipc {
 namespace capnp {
@@ -108,11 +109,24 @@ public:
     void disconnectIncoming() override
     {
         if (!m_loop) return;
-        // Delete incoming connections, except the connection to a parent
+        std::vector<std::shared_ptr<mp::ConnectionCleanup>> cleanup;
+        // Disconnect incoming connections, except the connection to a parent
         // process (if there is one), since a parent process should be able to
-        // monitor and control this process, even during shutdown.
+        // monitor and control this process, even during shutdown. The
+        // Connection objects are kept alive until in-flight requests release
+        // server objects and finish queuing their asynchronous cleanup.
         m_loop->sync([&] {
-            m_loop->m_incoming_connections.remove_if([this](mp::Connection& c) { return &c != m_parent_connection; });
+            for (auto& c : m_loop->m_incoming_connections) {
+                if (&c == m_parent_connection || c.m_disconnected) continue;
+                cleanup.push_back(c.m_cleanup);
+                c.disconnect();
+            }
+        });
+        m_loop->waitForAsyncCleanup(cleanup);
+        m_loop->sync([&] {
+            m_loop->m_incoming_connections.remove_if([&](mp::Connection& c) {
+                return &c != m_parent_connection && c.m_disconnected;
+            });
         });
     }
     void addCleanup(std::type_index type, void* iface, std::function<void()> cleanup) override

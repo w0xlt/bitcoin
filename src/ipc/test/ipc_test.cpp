@@ -2,6 +2,8 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
+#include <interfaces/echo.h>
+#include <ipc/capnp/echo.capnp.proxy.h>
 #include <interfaces/init.h>
 #include <ipc/capnp/mining.capnp.h>
 #include <ipc/capnp/protocol.h>
@@ -15,8 +17,11 @@
 #include <util/log.h>
 #include <validation.h>
 
+#include <chrono>
 #include <future>
+#include <memory>
 #include <thread>
+#include <utility>
 #include <kj/common.h>
 #include <kj/memory.h>
 #include <kj/test.h>
@@ -29,11 +34,41 @@ static_assert(ipc::capnp::messages::MAX_DOUBLE == std::numeric_limits<double>::m
 static_assert(ipc::capnp::messages::DEFAULT_BLOCK_RESERVED_WEIGHT == DEFAULT_BLOCK_RESERVED_WEIGHT);
 static_assert(ipc::capnp::messages::DEFAULT_COINBASE_OUTPUT_MAX_ADDITIONAL_SIGOPS == DEFAULT_COINBASE_OUTPUT_MAX_ADDITIONAL_SIGOPS);
 
+//! State used to test that incoming connection cleanup finishes before shutdown continues.
+struct CleanupState {
+    std::promise<void> started;
+    std::promise<void> allow;
+    std::shared_future<void> allow_future{allow.get_future().share()};
+};
+
+class CleanupEcho final : public interfaces::Echo
+{
+public:
+    explicit CleanupEcho(std::shared_ptr<CleanupState> cleanup) : m_cleanup{std::move(cleanup)} {}
+    ~CleanupEcho() override
+    {
+        m_cleanup->started.set_value();
+        m_cleanup->allow_future.wait();
+    }
+    std::string echo(const std::string& echo) override { return echo; }
+
+private:
+    std::shared_ptr<CleanupState> m_cleanup;
+};
+
 //! Remote init class.
 class TestInit : public interfaces::Init
 {
 public:
-    std::unique_ptr<interfaces::Echo> makeEcho() override { return interfaces::MakeEcho(); }
+    explicit TestInit(std::shared_ptr<CleanupState> cleanup = {}) : m_cleanup{std::move(cleanup)} {}
+    std::unique_ptr<interfaces::Echo> makeEcho() override
+    {
+        if (m_cleanup) return std::make_unique<CleanupEcho>(m_cleanup);
+        return interfaces::MakeEcho();
+    }
+
+private:
+    std::shared_ptr<CleanupState> m_cleanup;
 };
 
 //! Generate a temporary path with temp_directory_path and mkstemp
@@ -134,6 +169,86 @@ void IpcSocketPairTest()
     remote_echo.reset();
     remote_init.reset();
     thread.join();
+}
+
+//! Test EventLoop::waitForAsyncCleanup() waits for server objects still kept alive.
+void IpcAsyncCleanupWaitTest()
+{
+    auto cleanup{std::make_shared<CleanupState>()};
+    auto cleanup_started{cleanup->started.get_future()};
+    std::promise<mp::EventLoop*> loop_promise;
+    std::optional<mp::EventLoopRef> loop_ref;
+    std::unique_ptr<mp::Connection> connection;
+    std::shared_ptr<mp::ConnectionCleanup> connection_cleanup;
+    std::optional<kj::Own<mp::ProxyServer<ipc::capnp::messages::Echo>>> server;
+
+    std::thread loop_thread{[&] {
+        mp::EventLoop loop("IpcAsyncCleanupWaitTest", [](bool raise, const std::string& log) { LogInfo("LOG%i: %s", raise, log); });
+        loop_ref.emplace(loop);
+        loop_promise.set_value(&loop);
+        loop.loop();
+    }};
+    mp::EventLoop* loop{loop_promise.get_future().get()};
+    loop->sync([&] {
+        auto pipe{loop->m_io_context.provider->newTwoWayPipe()};
+        connection = std::make_unique<mp::Connection>(*loop, kj::mv(pipe.ends[0]));
+        connection_cleanup = connection->m_cleanup;
+        server.emplace(kj::heap<mp::ProxyServer<ipc::capnp::messages::Echo>>(std::make_shared<CleanupEcho>(cleanup), *connection));
+    });
+
+    std::promise<void> wait_promise;
+    auto wait_done{wait_promise.get_future()};
+    std::thread wait_thread{[&] {
+        loop->waitForAsyncCleanup({connection_cleanup});
+        wait_promise.set_value();
+    }};
+    BOOST_CHECK(wait_done.wait_for(std::chrono::milliseconds{50}) == std::future_status::timeout);
+
+    loop->sync([&] { server.reset(); });
+    BOOST_CHECK(cleanup_started.wait_for(std::chrono::seconds{5}) == std::future_status::ready);
+    BOOST_CHECK(wait_done.wait_for(std::chrono::milliseconds{50}) == std::future_status::timeout);
+
+    cleanup->allow.set_value();
+    wait_thread.join();
+    BOOST_CHECK(wait_done.wait_for(std::chrono::seconds{0}) == std::future_status::ready);
+    loop->sync([&] { connection.reset(); });
+    loop_ref.reset();
+    loop_thread.join();
+}
+
+//! Test ipc::Protocol disconnectIncoming() waits for disconnected server objects to clean up.
+void IpcDisconnectIncomingTest(const fs::path& datadir)
+{
+    auto cleanup{std::make_shared<CleanupState>()};
+    auto cleanup_started{cleanup->started.get_future()};
+    std::unique_ptr<interfaces::Init> init{std::make_unique<TestInit>(cleanup)};
+    std::unique_ptr<ipc::Protocol> server_protocol{ipc::capnp::MakeCapnpProtocol()};
+    std::unique_ptr<ipc::Protocol> client_protocol{ipc::capnp::MakeCapnpProtocol()};
+    std::unique_ptr<ipc::Process> process{ipc::MakeProcess()};
+
+    std::string address{strprintf("unix:%s", TempPath("bitcoin_sock_disconnect_XXXXXX"))};
+    int serve_fd{process->bind(datadir, "test_bitcoin", address)};
+    BOOST_CHECK_GE(serve_fd, 0);
+    server_protocol->listen(serve_fd, "test-serve", *init);
+
+    int connect_fd{process->connect(datadir, "test_bitcoin", address)};
+    std::unique_ptr<interfaces::Init> remote_init{client_protocol->connect(connect_fd, "test-connect")};
+    std::unique_ptr<interfaces::Echo> remote_echo{remote_init->makeEcho()};
+    BOOST_CHECK_EQUAL(remote_echo->echo("echo test"), "echo test");
+
+    std::promise<void> disconnected_promise;
+    auto disconnected{disconnected_promise.get_future()};
+    std::thread disconnect_thread{[&] {
+        server_protocol->disconnectIncoming();
+        disconnected_promise.set_value();
+    }};
+
+    BOOST_CHECK(cleanup_started.wait_for(std::chrono::seconds{5}) == std::future_status::ready);
+    BOOST_CHECK(disconnected.wait_for(std::chrono::milliseconds{50}) == std::future_status::timeout);
+
+    cleanup->allow.set_value();
+    disconnect_thread.join();
+    BOOST_CHECK(disconnected.wait_for(std::chrono::seconds{0}) == std::future_status::ready);
 }
 
 //! Test ipc::Process bind() and connect() methods connecting over a unix socket.

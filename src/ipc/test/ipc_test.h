@@ -25,6 +25,8 @@ public:
 
 void IpcPipeTest();
 void IpcSocketPairTest();
+void IpcAsyncCleanupWaitTest();
+void IpcDisconnectIncomingTest(const fs::path& datadir);
 void IpcSocketTest(const fs::path& datadir);
 
 #endif // BITCOIN_IPC_TEST_IPC_TEST_H
