@@ -22,6 +22,7 @@
 #include <sstream>
 #include <string>
 #include <thread>
+#include <vector>
 
 namespace mp {
 struct ThreadContext;
@@ -275,6 +276,9 @@ public:
     //! blocking the event loop thread.
     void addAsyncCleanup(std::function<void()> fn);
 
+    //! Wait for asynchronous cleanup functions and disconnected server objects to finish.
+    void waitForAsyncCleanup(const std::vector<std::shared_ptr<ConnectionCleanup>>& cleanup = {});
+
     //! Start asynchronous worker thread if necessary. This is only done if
     //! there are ProxyServerBase::m_impl objects that need to be destroyed
     //! asynchronously, without tying up the event loop thread. This can happen
@@ -307,6 +311,9 @@ public:
 
     //! Callback functions to run on async thread.
     std::optional<CleanupList> m_async_fns MP_GUARDED_BY(m_mutex);
+
+    //! Number of asynchronous cleanup callbacks currently running.
+    int m_async_fns_running MP_GUARDED_BY(m_mutex) = 0;
 
     //! Pipe read handle used to wake up the event loop thread.
     int m_wait_fd = -1;
@@ -356,6 +363,18 @@ public:
 
     //! Hook called on the worker thread just before returning results.
     std::function<void()> testing_hook_async_request_done;
+};
+
+//! State associated with a connection that allows shutdown code to wait until
+//! all server objects created by the connection have been destroyed. This state
+//! is shared with ProxyServerBase objects because they can outlive the
+//! Connection when an IPC request is still executing on a worker thread.
+struct ConnectionCleanup
+{
+    explicit ConnectionCleanup(EventLoop& loop) : m_loop{loop} {}
+
+    EventLoop& m_loop;
+    int m_server_count MP_GUARDED_BY(m_loop.m_mutex) = 0;
 };
 
 //! Single element task queue used to handle recursive capnp calls. (If the
@@ -423,13 +442,13 @@ class Connection
 {
 public:
     Connection(EventLoop& loop, kj::Own<kj::AsyncIoStream>&& stream_)
-        : m_loop(loop), m_stream(kj::mv(stream_)),
+        : m_loop(loop), m_cleanup{std::make_shared<ConnectionCleanup>(loop)}, m_stream(kj::mv(stream_)),
           m_network(*m_stream, ::capnp::rpc::twoparty::Side::CLIENT, ::capnp::ReaderOptions()),
           m_rpc_system(::capnp::makeRpcClient(m_network)) {}
     Connection(EventLoop& loop,
         kj::Own<kj::AsyncIoStream>&& stream_,
         const std::function<::capnp::Capability::Client(Connection&)>& make_client)
-        : m_loop(loop), m_stream(kj::mv(stream_)),
+        : m_loop(loop), m_cleanup{std::make_shared<ConnectionCleanup>(loop)}, m_stream(kj::mv(stream_)),
           m_network(*m_stream, ::capnp::rpc::twoparty::Side::SERVER, ::capnp::ReaderOptions()),
           m_rpc_system(::capnp::makeRpcServer(m_network, make_client(*this))) {}
 
@@ -439,6 +458,12 @@ public:
     //! asynchronous cleanup functions to run in a worker thread (to run
     //! destructors of m_impl instances owned by ProxyServer objects).
     ~Connection();
+
+    //! Disconnect the connection and run cleanup functions. Must be called from
+    //! the event loop thread. This is called by the destructor, but may be
+    //! called earlier to cancel requests while keeping Connection state alive
+    //! until in-flight requests finish unwinding.
+    void disconnect();
 
     //! Register synchronous cleanup function to run on event loop thread (with
     //! access to capnp thread local variables) when disconnect() is called.
@@ -460,6 +485,8 @@ public:
     }
 
     EventLoopRef m_loop;
+    std::shared_ptr<ConnectionCleanup> m_cleanup;
+    bool m_disconnected{false};
     kj::Own<kj::AsyncIoStream> m_stream;
     LoggingErrorHandler m_error_handler{*m_loop};
     //! TaskSet used to cancel the m_network.onDisconnect() handler for remote
@@ -577,9 +604,11 @@ ProxyClientBase<Interface, Impl>::~ProxyClientBase() noexcept
 
 template <typename Interface, typename Impl>
 ProxyServerBase<Interface, Impl>::ProxyServerBase(std::shared_ptr<Impl> impl, Connection& connection)
-    : m_impl(std::move(impl)), m_context(&connection)
+    : m_impl(std::move(impl)), m_context(&connection), m_cleanup{connection.m_cleanup}
 {
     assert(m_impl);
+    const Lock lock(m_context.loop->m_mutex);
+    ++m_cleanup->m_server_count;
 }
 
 //! ProxyServer destructor, called from the EventLoop thread by Cap'n Proto
@@ -623,6 +652,12 @@ ProxyServerBase<Interface, Impl>::~ProxyServerBase()
         });
     }
     assert(m_context.cleanup_fns.empty());
+    {
+        const Lock lock(m_context.loop->m_mutex);
+        assert(m_cleanup->m_server_count > 0);
+        --m_cleanup->m_server_count;
+        m_context.loop->m_cv.notify_all();
+    }
 }
 
 //! If the capnp interface defined a special "destroy" method, as described the
@@ -838,6 +873,7 @@ void _Serve(EventLoop& loop, kj::Own<kj::AsyncIoStream>&& stream, InitImpl& init
     MP_LOG(loop, Log::Info) << "IPC server: socket connected.";
     it->onDisconnect([&loop, it] {
         MP_LOG(loop, Log::Info) << "IPC server: socket disconnected.";
+        if (it->m_disconnected) return;
         loop.m_incoming_connections.erase(it);
     });
 }

@@ -82,11 +82,18 @@ ProxyContext::ProxyContext(Connection* connection) : connection(connection), loo
 
 Connection::~Connection()
 {
-    // Connection destructor is always called on the event loop thread. If this
-    // is a local disconnect, it will trigger I/O, so this needs to run on the
-    // event loop thread, and if there was a remote disconnect, this is called
-    // by an onDisconnect callback directly from the event loop thread.
+    disconnect();
+}
+
+void Connection::disconnect()
+{
+    // Connection cleanup always runs on the event loop thread. If this is a
+    // local disconnect, it will trigger I/O, so this needs to run on the event
+    // loop thread, and if there was a remote disconnect, this is called by an
+    // onDisconnect callback directly from the event loop thread.
     assert(std::this_thread::get_id() == m_loop->m_thread_id);
+    if (m_disconnected) return;
+    m_disconnected = true;
 
     // Try to cancel any calls that may be executing.
     m_canceler.cancel("Interrupted by disconnect");
@@ -196,6 +203,19 @@ void EventLoop::addAsyncCleanup(std::function<void()> fn)
     startAsyncThread();
 }
 
+void EventLoop::waitForAsyncCleanup(const std::vector<std::shared_ptr<ConnectionCleanup>>& cleanup)
+{
+    Lock lock(m_mutex);
+    m_cv.wait(lock.m_lock, [this, &cleanup, &lock]() MP_REQUIRES(m_mutex) {
+        for (const auto& connection_cleanup : cleanup) {
+            assert(&connection_cleanup->m_loop == this);
+            lock.assert_locked(connection_cleanup->m_loop.m_mutex);
+            if (connection_cleanup->m_server_count > 0) return false;
+        }
+        return !m_async_fns || (m_async_fns->empty() && m_async_fns_running == 0);
+    });
+}
+
 EventLoop::EventLoop(const char* exe_name, LogOptions log_opts, void* context)
     : m_exe_name(exe_name),
       m_io_context(kj::setupAsyncIo()),
@@ -215,6 +235,7 @@ EventLoop::~EventLoop()
     const Lock lock(m_mutex);
     KJ_ASSERT(m_post_fn == nullptr);
     KJ_ASSERT(!m_async_fns);
+    KJ_ASSERT(m_async_fns_running == 0);
     KJ_ASSERT(m_wait_fd == -1);
     KJ_ASSERT(m_post_fd == -1);
     KJ_ASSERT(m_num_clients == 0);
@@ -300,7 +321,16 @@ void EventLoop::startAsyncThread()
                     EventLoopRef ref{*this, &lock};
                     const std::function<void()> fn = std::move(m_async_fns->front());
                     m_async_fns->pop_front();
-                    Unlock(lock, fn);
+                    ++m_async_fns_running;
+                    try {
+                        Unlock(lock, fn);
+                    } catch (...) {
+                        --m_async_fns_running;
+                        m_cv.notify_all();
+                        throw;
+                    }
+                    --m_async_fns_running;
+                    m_cv.notify_all();
                     // Important to relock because of the wait() call below.
                     ref.reset(/*relock=*/true);
                     // Continue without waiting in case there are more async_fns
