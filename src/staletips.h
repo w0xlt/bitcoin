@@ -15,6 +15,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <ios>
+#include <string>
 #include <vector>
 
 namespace node {
@@ -36,6 +37,11 @@ struct StaleTipInfo {
     bool have_block{false};
     uint256 fork_point{};
     int fork_length{0};
+};
+
+struct StaleTipAnnouncement {
+    StaleFork fork;
+    uint32_t seqno{0};
 };
 
 struct StaleTipCompressedHeader {
@@ -60,6 +66,12 @@ struct StaleTipCompressedHeader {
     }
 };
 
+class StaleTipHeadersLimitExceeded : public std::ios_base::failure
+{
+public:
+    explicit StaleTipHeadersLimitExceeded(const std::string& message) : std::ios_base::failure{message} {}
+};
+
 class StaleTipData
 {
 public:
@@ -68,7 +80,7 @@ public:
     bool m_have_block{false};
 
     StaleTipData() = default;
-    explicit StaleTipData(const StaleFork& fork) EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
+    StaleTipData(const StaleFork& fork, bool have_block) EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
 
     std::pair<uint256, std::vector<CBlockHeader>> ReconstructHeaders() const;
 
@@ -101,7 +113,7 @@ public:
             throw std::ios_base::failure("staletip headers empty");
         }
         if (size > MAX_STALETIP_HEADERS) {
-            throw std::ios_base::failure("staletip headers limit exceeded");
+            throw StaleTipHeadersLimitExceeded{"staletip headers limit exceeded"};
         }
 
         m_headers.clear();
@@ -135,7 +147,8 @@ private:
     int m_recent_window{STALETIP_RECENT_WINDOW};
     size_t m_max_headers{MAX_STALETIP_HEADERS};
 
-    const CBlockIndex* GetEligibleForkPoint(const CChain& chain, const CBlockIndex& stale_tip) const EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
+    const CBlockIndex* GetEligibleForkPoint(const CChain& chain, const CBlockIndex& stale_tip, bool require_signet_block_data = true, bool allow_more_work = false) const EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
+    bool IsStaleTipEligible(const CChain& chain, const CBlockIndex* stale_tip, bool require_signet_block_data = true, bool allow_more_work = false) const EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
     void Add(const CBlockIndex& stale_tip) EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
 
 public:
@@ -155,9 +168,11 @@ public:
 
     void Initialize(ChainType chain_type, node::BlockManager& blockman, const CChain& chain) EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
 
-    bool AddStaleTip(const CChain& chain, const CBlockIndex* stale_tip) EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
+    bool AddStaleTip(const CChain& chain, const CBlockIndex* stale_tip, bool allow_more_work = false) EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
+    bool CanRequestStaleTipBlock(const CChain& chain, const CBlockIndex* stale_tip) const EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
 
     std::vector<StaleFork> GetStaleTips(const CChain& chain) const EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
+    std::vector<StaleTipAnnouncement> GetTipsToAnnounce(const CChain& chain, bool want_blocks) const EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
     std::vector<StaleTipInfo> GetStaleTipInfo(const CChain& chain) const EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
 };
 
