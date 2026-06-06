@@ -15,6 +15,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <ios>
+#include <string>
 #include <vector>
 
 namespace node {
@@ -52,6 +53,15 @@ struct StaleTipInfo {
     int fork_length{0};
 };
 
+/** A stale fork due to be announced to peers via a `staletip` message. */
+struct StaleTipAnnouncement {
+    //! Stale fork to announce.
+    StaleFork fork;
+    //! Sequence number assigned when the tip's headers (or block data) became
+    //! known, used to announce tips in the order they were discovered.
+    uint32_t seqno{0};
+};
+
 /** A block header without its previous block hash, as serialized in `staletip`
  *  messages. The omitted previous block hash is reconstructed from the
  *  preceding header in the message (or from the fork point for the first
@@ -78,6 +88,16 @@ struct StaleTipCompressedHeader {
     }
 };
 
+/** Thrown when deserializing a `staletip` payload that declares more than
+ *  MAX_STALETIP_HEADERS headers. Distinguished from other deserialization
+ *  failures so that such messages can be ignored without disconnecting the
+ *  peer, as longer branches are valid but relayed via normal headers sync. */
+class StaleTipHeadersLimitExceeded : public std::ios_base::failure
+{
+public:
+    explicit StaleTipHeadersLimitExceeded(const std::string& message) : std::ios_base::failure{message} {}
+};
+
 /** Contents of a `staletip` P2P message: an announcement of a stale branch,
  *  consisting of the fork point hash, the compressed headers of the branch and
  *  whether the announcer has the stale tip's block data. */
@@ -96,7 +116,7 @@ public:
     StaleTipData() = default;
     /** Construct an announcement for `fork`, compressing the headers between
      *  `fork.fork_point` (exclusive) and `fork.tip` (inclusive). */
-    explicit StaleTipData(const StaleFork& fork) EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
+    StaleTipData(const StaleFork& fork, bool have_block) EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
 
     /** Rebuild the full block headers from `m_headers` by computing each
      *  header's previous block hash, starting from `m_fork_point`.
@@ -126,8 +146,9 @@ public:
     }
 
     /**
-     * @throws std::ios_base::failure if the payload is malformed or declares
-     *         more than MAX_STALETIP_HEADERS headers.
+     * @throws StaleTipHeadersLimitExceeded if more than MAX_STALETIP_HEADERS
+     *         headers are declared, std::ios_base::failure for any other
+     *         malformed payload.
      */
     template <typename Stream>
     void Unserialize(Stream& s)
@@ -139,7 +160,7 @@ public:
             throw std::ios_base::failure("staletip headers empty");
         }
         if (size > MAX_STALETIP_HEADERS) {
-            throw std::ios_base::failure("staletip headers limit exceeded");
+            throw StaleTipHeadersLimitExceeded{"staletip headers limit exceeded"};
         }
 
         m_headers.clear();
@@ -196,9 +217,17 @@ private:
     /** Find the fork point of `stale_tip` with the active chain, checking that
      *  the tip is eligible for tracking and relay.
      *
+     * @param[in] require_signet_block_data Whether to enforce the signet
+     *            requirement that the tip's block data is available.
+     * @param[in] allow_more_work Permit tips with more work than the active
+     *            tip. Used when a block is disconnected during a reorg, as it
+     *            may temporarily have more work than the new active tip.
      * @return The fork point, or nullptr if the tip is not eligible.
      */
-    const CBlockIndex* GetEligibleForkPoint(const CChain& chain, const CBlockIndex& stale_tip) const EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
+    const CBlockIndex* GetEligibleForkPoint(const CChain& chain, const CBlockIndex& stale_tip, bool require_signet_block_data = true, bool allow_more_work = false) const EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
+    /** Whether `stale_tip` is eligible for tracking and relay, including the
+     *  signet deduplication of header variants. See GetEligibleForkPoint(). */
+    bool IsStaleTipEligible(const CChain& chain, const CBlockIndex* stale_tip, bool require_signet_block_data = true, bool allow_more_work = false) const EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
     /** Insert `stale_tip` into the cache, dropping any tracked tips that it
      *  descends from. If the tip is already tracked, only its block data
      *  availability is updated. Does nothing if one of its descendants is
@@ -227,14 +256,26 @@ public:
      *  already present in the block index. Called at startup. */
     void Initialize(ChainType chain_type, node::BlockManager& blockman, const CChain& chain) EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
 
-    /** Track `stale_tip` if it is eligible (see GetEligibleForkPoint()).
+    /** Track `stale_tip` if it is eligible (see IsStaleTipEligible()).
      *
      * @return Whether the tip was eligible.
      */
-    bool AddStaleTip(const CChain& chain, const CBlockIndex* stale_tip) EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
+    bool AddStaleTip(const CChain& chain, const CBlockIndex* stale_tip, bool allow_more_work = false) EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
+    /** Whether the block data for `stale_tip` may be requested from a peer.
+     *  Unlike AddStaleTip(), this does not require the block data to already
+     *  be available on signet, as it is exactly what would be requested. */
+    bool CanRequestStaleTipBlock(const CChain& chain, const CBlockIndex* stale_tip) const EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
 
     /** Get the tracked tips that are still eligible, with their fork points. */
     std::vector<StaleFork> GetStaleTips(const CChain& chain) const EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
+    /** Get the tracked tips that are still eligible, in the order they were
+     *  added.
+     *
+     * @param[in] want_blocks If true, only return tips whose block data is
+     *            available, ordered by when the block data was obtained. Used
+     *            for peers that prefer announcements with block data.
+     */
+    std::vector<StaleTipAnnouncement> GetTipsToAnnounce(const CChain& chain, bool want_blocks) const EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
     /** Get a summary of the tracked tips that are still eligible. */
     std::vector<StaleTipInfo> GetStaleTipInfo(const CChain& chain) const EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
 };
