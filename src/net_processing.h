@@ -11,6 +11,7 @@
 #include <node/txorphanage.h>
 #include <private_broadcast.h>
 #include <protocol.h>
+#include <staletips.h>
 #include <uint256.h>
 #include <util/expected.h>
 #include <validationinterface.h>
@@ -71,6 +72,7 @@ struct CNodeStateStats {
 struct PeerManagerInfo {
     std::chrono::seconds median_outbound_time_offset{0s};
     bool ignores_incoming_txs{false};
+    std::vector<StaleTipInfo> stale_tips;
 };
 
 class PeerManager : public CValidationInterface, public NetEventsInterface
