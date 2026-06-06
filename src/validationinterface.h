@@ -130,6 +130,20 @@ protected:
      */
     virtual void BlockDisconnected(const std::shared_ptr<const CBlock> &block, const CBlockIndex* pindex) {}
     /**
+     * Whether this listener wants AcceptedNotActive notifications. Header
+     * acceptance is frequent during headers sync, so the notification is only
+     * generated when at least one registered listener wants it, and only
+     * delivered to listeners that do.
+     */
+    virtual bool WantsAcceptedNotActive() const { return false; }
+    /**
+     * Notifies listeners that a block header or block was accepted, but is not
+     * on the active chain.
+     *
+     * Called on a background thread.
+     */
+    virtual void AcceptedNotActive(const CBlockIndex* pindex) {}
+    /**
      * Notifies listeners of the new active block chain on-disk.
      *
      * Prior to this callback, any updates are not guaranteed to persist on disk
@@ -225,6 +239,7 @@ public:
     void MempoolTransactionsRemovedForBlock(const std::vector<RemovedMempoolTransactionInfo>&, unsigned int nBlockHeight);
     void BlockConnected(const kernel::ChainstateRole&, std::shared_ptr<const CBlock>, const CBlockIndex* pindex);
     void BlockDisconnected(std::shared_ptr<const CBlock>, const CBlockIndex* pindex);
+    void AcceptedNotActive(const CBlockIndex* pindex);
     void ChainStateFlushed(const kernel::ChainstateRole&, const CBlockLocator&);
     void BlockChecked(const std::shared_ptr<const CBlock>&, const BlockValidationState&);
     void NewPoWValidBlock(const CBlockIndex *, const std::shared_ptr<const CBlock>&);

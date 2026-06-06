@@ -3777,6 +3777,16 @@ void Chainstate::TryAddBlockIndexCandidate(CBlockIndex* pindex)
     }
 }
 
+void ChainstateManager::MaybeNotifyAcceptedNotActive(const CBlockIndex& pindex)
+{
+    AssertLockHeld(cs_main);
+
+    const CBlockIndex* active_tip{ActiveTip()};
+    if (m_options.signals && active_tip != nullptr && pindex.nChainWork <= active_tip->nChainWork && !ActiveChain().Contains(pindex)) {
+        m_options.signals->AcceptedNotActive(&pindex);
+    }
+}
+
 /** Mark a block as having its data received and checked (up to BLOCK_VALID_TRANSACTIONS). */
 void ChainstateManager::ReceivedBlockTransactions(const CBlock& block, CBlockIndex* pindexNew, const FlatFilePos& pos)
 {
@@ -3803,6 +3813,8 @@ void ChainstateManager::ReceivedBlockTransactions(const CBlock& block, CBlockInd
     }
     pindexNew->RaiseValidity(BLOCK_VALID_TRANSACTIONS);
     m_blockman.m_dirty_blockindex.insert(pindexNew);
+
+    MaybeNotifyAcceptedNotActive(*pindexNew);
 
     if (pindexNew->pprev == nullptr || pindexNew->pprev->HaveNumChainTxs()) {
         // If pindexNew is the genesis block or all parents are BLOCK_VALID_TRANSACTIONS.
@@ -4199,7 +4211,7 @@ static bool ContextualCheckBlock(const CBlock& block, BlockValidationState& stat
     return true;
 }
 
-bool ChainstateManager::AcceptBlockHeader(const CBlockHeader& block, BlockValidationState& state, CBlockIndex** ppindex, bool min_pow_checked)
+bool ChainstateManager::AcceptBlockHeader(const CBlockHeader& block, BlockValidationState& state, CBlockIndex** ppindex, bool min_pow_checked, bool notify_accepted_not_active)
 {
     AssertLockHeld(cs_main);
 
@@ -4248,6 +4260,8 @@ bool ChainstateManager::AcceptBlockHeader(const CBlockHeader& block, BlockValida
     }
     CBlockIndex* pindex{m_blockman.AddToBlockIndex(block, m_best_header)};
 
+    if (notify_accepted_not_active) MaybeNotifyAcceptedNotActive(*pindex);
+
     if (ppindex)
         *ppindex = pindex;
 
@@ -4260,9 +4274,11 @@ bool ChainstateManager::ProcessNewBlockHeaders(std::span<const CBlockHeader> hea
     AssertLockNotHeld(cs_main);
     {
         LOCK(cs_main);
+        const CBlockIndex* last_new_header{nullptr};
         for (const CBlockHeader& header : headers) {
+            const bool new_header{!m_blockman.m_block_index.contains(header.GetHash())};
             CBlockIndex *pindex = nullptr; // Use a temp pindex instead of ppindex to avoid a const_cast
-            bool accepted{AcceptBlockHeader(header, state, &pindex, min_pow_checked)};
+            bool accepted{AcceptBlockHeader(header, state, &pindex, min_pow_checked, /*notify_accepted_not_active=*/false)};
             CheckBlockIndex();
 
             if (!accepted) {
@@ -4271,7 +4287,9 @@ bool ChainstateManager::ProcessNewBlockHeaders(std::span<const CBlockHeader> hea
             if (ppindex) {
                 *ppindex = pindex;
             }
+            if (new_header) last_new_header = pindex;
         }
+        if (last_new_header != nullptr) MaybeNotifyAcceptedNotActive(*last_new_header);
     }
     if (NotifyHeaderTip()) {
         if (IsInitialBlockDownload() && ppindex && *ppindex) {
