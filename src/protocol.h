@@ -18,6 +18,7 @@
 #include <cstdint>
 #include <limits>
 #include <string>
+#include <string_view>
 
 /** Message header.
  * (4) message start.
@@ -268,6 +269,10 @@ inline constexpr const char* SENDTXRCNCL{"sendtxrcncl"};
  * BIP 434 Peer feature negotiation
  */
 inline constexpr const char* FEATURE{"feature"};
+/**
+ * Stale-tip relay announcement.
+ */
+inline constexpr const char* STALETIP{"staletip"};
 }; // namespace NetMsgType
 
 /** All known message types (see above). Keep this in the same order as the list of messages above. */
@@ -308,13 +313,14 @@ inline const std::array ALL_NET_MESSAGE_TYPES{std::to_array<std::string>({
     NetMsgType::WTXIDRELAY,
     NetMsgType::SENDTXRCNCL,
     NetMsgType::FEATURE,
+    NetMsgType::STALETIP,
 })};
 
 static constexpr size_t MAX_FEATUREID_LENGTH{80};
 static constexpr size_t MAX_FEATUREDATA_LENGTH{512};
 
 namespace NetMsgFeature {
-//inline constexpr std::string_view FOO{"BIP-FOO"};
+inline constexpr std::string_view STALETIP{"https://github.com/ajtowns/bitcoin/tree/202601-staletips"};
 }
 
 /** nServices flags */
