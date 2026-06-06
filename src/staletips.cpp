@@ -220,6 +220,29 @@ std::vector<StaleFork> StaleTips::GetStaleTips(const CChain& chain) const
     return tips;
 }
 
+std::vector<StaleTipAnnouncement> StaleTips::GetTipsToAnnounce(const CChain& chain, uint32_t last_announced_seqno, bool want_blocks) const
+{
+    AssertLockHeld(::cs_main);
+
+    std::vector<StaleTipAnnouncement> announcements;
+    announcements.reserve(m_tips.size());
+
+    for (const auto& entry : m_tips) {
+        if (entry.tip == nullptr) continue;
+
+        const uint32_t seqno{want_blocks ? entry.block_seqno : entry.header_seqno};
+        if (seqno == 0 || seqno <= last_announced_seqno) continue;
+
+        const CBlockIndex* fork_point{GetEligibleForkPoint(chain, *entry.tip)};
+        if (fork_point == nullptr) continue;
+
+        announcements.push_back({.fork = {.fork_point = fork_point, .tip = entry.tip}, .seqno = seqno});
+    }
+
+    std::ranges::sort(announcements, {}, &StaleTipAnnouncement::seqno);
+    return announcements;
+}
+
 std::vector<StaleTipInfo> StaleTips::GetStaleTipInfo(const CChain& chain) const
 {
     AssertLockHeld(::cs_main);

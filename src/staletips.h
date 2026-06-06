@@ -38,6 +38,11 @@ struct StaleTipInfo {
     int fork_length{0};
 };
 
+struct StaleTipAnnouncement {
+    StaleFork fork;
+    uint32_t seqno{0};
+};
+
 struct StaleTipCompressedHeader {
     int32_t version{0};
     uint256 merkle_root{};
@@ -158,6 +163,7 @@ public:
     bool AddStaleTip(const CChain& chain, const CBlockIndex* stale_tip) EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
 
     std::vector<StaleFork> GetStaleTips(const CChain& chain) const EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
+    std::vector<StaleTipAnnouncement> GetTipsToAnnounce(const CChain& chain, uint32_t last_announced_seqno, bool want_blocks) const EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
     std::vector<StaleTipInfo> GetStaleTipInfo(const CChain& chain) const EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
 };
 
