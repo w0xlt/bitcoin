@@ -18,6 +18,7 @@
 #include <cstdint>
 #include <limits>
 #include <string>
+#include <string_view>
 
 /** Message header.
  * (4) message start.
@@ -268,6 +269,13 @@ inline constexpr const char* SENDTXRCNCL{"sendtxrcncl"};
  * BIP 434 Peer feature negotiation
  */
 inline constexpr const char* FEATURE{"feature"};
+/**
+ * Announces a recently seen stale branch of the block tree.
+ * Contains the fork point hash, the compressed headers of the branch and
+ * whether block data is available for its tip.
+ * Only sent after negotiating the staletip feature via BIP 434.
+ */
+inline constexpr const char* STALETIP{"staletip"};
 }; // namespace NetMsgType
 
 /** All known message types (see above). Keep this in the same order as the list of messages above. */
@@ -308,13 +316,24 @@ inline const std::array ALL_NET_MESSAGE_TYPES{std::to_array<std::string>({
     NetMsgType::WTXIDRELAY,
     NetMsgType::SENDTXRCNCL,
     NetMsgType::FEATURE,
+    NetMsgType::STALETIP,
 })};
 
 static constexpr size_t MAX_FEATUREID_LENGTH{80};
 static constexpr size_t MAX_FEATUREDATA_LENGTH{512};
 
 namespace NetMsgFeature {
-//inline constexpr std::string_view FOO{"BIP-FOO"};
+/**
+ * BIP 434 feature id for stale-tip relay.
+ * The feature data is a single byte indicating whether announcements are
+ * preferred once block data is available for the stale tip.
+ *
+ * The id is an interim repository URL, as BIP 434 prescribes for
+ * experimental features without an assigned BIP number. Once the stale-tip
+ * BIP is assigned a number, this should be replaced with the BIP-number
+ * based identifier (e.g. "BIPnnn"), in lockstep with other implementations.
+ */
+inline constexpr std::string_view STALETIP{"https://github.com/ajtowns/bitcoin/tree/202601-staletips"};
 }
 
 /** nServices flags */
