@@ -208,7 +208,7 @@ BOOST_AUTO_TEST_CASE(staletip_malformed_payloads)
     WriteCompactSize(too_many, MAX_STALETIP_HEADERS + 1);
     for (size_t i{0}; i <= MAX_STALETIP_HEADERS; ++i) too_many << StaleTipCompressedHeader{};
     too_many << uint8_t{0};
-    BOOST_CHECK_THROW(DecodeExact(too_many), std::ios_base::failure);
+    BOOST_CHECK_THROW(DecodeExact(too_many), StaleTipHeadersLimitExceeded);
 }
 
 BOOST_AUTO_TEST_CASE(staletip_cache_basic)
@@ -235,6 +235,35 @@ BOOST_AUTO_TEST_CASE(staletip_cache_basic)
     info = tips.GetStaleTipInfo(tree.active_chain);
     BOOST_REQUIRE_EQUAL(info.size(), 1U);
     BOOST_CHECK(info[0].have_block);
+
+    const StaleFork stale_fork{.fork_point = tip->pprev, .tip = stale};
+    const StaleTipData announce_without_block{stale_fork, false};
+    const StaleTipData announce_with_block{stale_fork, true};
+    BOOST_CHECK(!announce_without_block.m_have_block);
+    BOOST_CHECK(announce_with_block.m_have_block);
+}
+
+BOOST_AUTO_TEST_CASE(staletip_announce_defers_for_block_preferring_peers)
+{
+    LOCK(::cs_main);
+
+    BlockTree tree;
+    CBlockIndex* tip{tree.Add(nullptr, true, true)};
+    for (int i{0}; i < 4; ++i) tip = tree.Add(tip, true, true);
+    CBlockIndex* stale{tree.Add(Assert(tip->pprev), false)};
+
+    StaleTips tips;
+    BOOST_CHECK(tips.AddStaleTip(tree.active_chain, stale));
+
+    // A header-only tip is announced promptly to peers that do not prefer
+    // block data, but deferred for block-preferring peers until the block
+    // data is obtained.
+    BOOST_CHECK_EQUAL(tips.GetTipsToAnnounce(tree.active_chain, /*want_blocks=*/false).size(), 1U);
+    BOOST_CHECK(tips.GetTipsToAnnounce(tree.active_chain, /*want_blocks=*/true).empty());
+
+    stale->nStatus |= BLOCK_VALID_TRANSACTIONS | BLOCK_HAVE_DATA;
+    BOOST_CHECK(tips.AddStaleTip(tree.active_chain, stale));
+    BOOST_REQUIRE_EQUAL(tips.GetTipsToAnnounce(tree.active_chain, /*want_blocks=*/true).size(), 1U);
 }
 
 BOOST_AUTO_TEST_CASE(staletip_cache_policy)
@@ -280,6 +309,29 @@ BOOST_AUTO_TEST_CASE(staletip_cache_extending_tip_replaces_old_tip)
     BOOST_CHECK_EQUAL(info[0].fork_length, 2);
 }
 
+BOOST_AUTO_TEST_CASE(staletip_cache_reorged_tip)
+{
+    LOCK(::cs_main);
+
+    BlockTree tree;
+    CBlockIndex* active{tree.Add(nullptr, true, true)};
+    for (int i{0}; i < 3; ++i) active = tree.Add(active, true, true);
+
+    StaleTips tips;
+    tree.active_chain.SetTip(*Assert(active->pprev));
+    BOOST_CHECK(!tips.AddStaleTip(tree.active_chain, active));
+    BOOST_CHECK(tips.AddStaleTip(tree.active_chain, active, /*allow_more_work=*/true));
+    BOOST_CHECK(tips.GetStaleTipInfo(tree.active_chain).empty());
+
+    CBlockIndex* new_active{tree.Add(Assert(active->pprev), false, true)};
+    new_active = tree.Add(new_active, false, true);
+    tree.active_chain.SetTip(*new_active);
+
+    const auto info{tips.GetStaleTipInfo(tree.active_chain)};
+    BOOST_REQUIRE_EQUAL(info.size(), 1U);
+    BOOST_CHECK_EQUAL(info[0].hash.ToString(), active->GetBlockHash().ToString());
+}
+
 BOOST_AUTO_TEST_CASE(staletip_cache_network_policy)
 {
     LOCK(::cs_main);
@@ -291,6 +343,7 @@ BOOST_AUTO_TEST_CASE(staletip_cache_network_policy)
     CBlockIndex* fork{active->pprev};
     CBlockIndex* headers_only{tree.Add(fork, false)};
     StaleTips signet_tips{ChainType::SIGNET};
+    BOOST_CHECK(signet_tips.CanRequestStaleTipBlock(tree.active_chain, headers_only));
     BOOST_CHECK(!signet_tips.AddStaleTip(tree.active_chain, headers_only));
 
     headers_only->nStatus |= BLOCK_VALID_TRANSACTIONS | BLOCK_HAVE_DATA;
