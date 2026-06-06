@@ -391,7 +391,7 @@ void Shutdown(NodeContext& node)
     node.txindex.reset();
     node.txospenderindex.reset();
     node.coin_stats_index.reset();
-    DestroyAllBlockFilterIndexes();
+    DestroyAllBlockFilterIndexes(node);
 
     // Any future callbacks will be dropped. This should absolutely be safe - if
     // missing a callback results in an unrecoverable situation, unclean shutdown
@@ -1587,6 +1587,9 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
 
     PeerManager::Options peerman_opts{};
     ApplyArgsManOptions(args, peerman_opts);
+    peerman_opts.get_block_filter_index = [&node](BlockFilterType filter_type) {
+        return GetBlockFilterIndex(node, filter_type);
+    };
 
     {
         // Read asmap file if configured or embedded asmap data and initialize
@@ -1920,8 +1923,8 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
     }
 
     for (const auto& filter_type : g_enabled_filter_types) {
-        InitBlockFilterIndex([&]{ return interfaces::MakeChain(node); }, filter_type, index_cache_sizes.filter_index, false, do_reindex);
-        node.indexes.emplace_back(GetBlockFilterIndex(filter_type));
+        InitBlockFilterIndex(node, [&]{ return interfaces::MakeChain(node); }, filter_type, index_cache_sizes.filter_index, false, do_reindex);
+        node.indexes.emplace_back(GetBlockFilterIndex(node, filter_type));
     }
 
     if (args.GetBoolArg("-coinstatsindex", DEFAULT_COINSTATSINDEX)) {

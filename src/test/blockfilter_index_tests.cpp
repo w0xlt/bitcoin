@@ -296,36 +296,36 @@ BOOST_FIXTURE_TEST_CASE(blockfilter_index_init_destroy, BasicTestingSetup)
 {
     BlockFilterIndex* filter_index;
 
-    filter_index = GetBlockFilterIndex(BlockFilterType::BASIC);
+    filter_index = GetBlockFilterIndex(m_node, BlockFilterType::BASIC);
     BOOST_CHECK(filter_index == nullptr);
 
-    BOOST_CHECK(InitBlockFilterIndex([&]{ return interfaces::MakeChain(m_node); }, BlockFilterType::BASIC, 1_MiB, true, false));
+    BOOST_CHECK(InitBlockFilterIndex(m_node, [&]{ return interfaces::MakeChain(m_node); }, BlockFilterType::BASIC, 1_MiB, true, false));
 
-    filter_index = GetBlockFilterIndex(BlockFilterType::BASIC);
+    filter_index = GetBlockFilterIndex(m_node, BlockFilterType::BASIC);
     BOOST_CHECK(filter_index != nullptr);
     BOOST_CHECK(filter_index->GetFilterType() == BlockFilterType::BASIC);
 
     // Initialize returns false if index already exists.
-    BOOST_CHECK(!InitBlockFilterIndex([&]{ return interfaces::MakeChain(m_node); }, BlockFilterType::BASIC, 1_MiB, true, false));
+    BOOST_CHECK(!InitBlockFilterIndex(m_node, [&]{ return interfaces::MakeChain(m_node); }, BlockFilterType::BASIC, 1_MiB, true, false));
 
     int iter_count = 0;
-    ForEachBlockFilterIndex([&iter_count](BlockFilterIndex& _index) { iter_count++; });
+    ForEachBlockFilterIndex(m_node, [&iter_count](BlockFilterIndex& _index) { iter_count++; });
     BOOST_CHECK_EQUAL(iter_count, 1);
 
-    BOOST_CHECK(DestroyBlockFilterIndex(BlockFilterType::BASIC));
+    BOOST_CHECK(DestroyBlockFilterIndex(m_node, BlockFilterType::BASIC));
 
     // Destroy returns false because index was already destroyed.
-    BOOST_CHECK(!DestroyBlockFilterIndex(BlockFilterType::BASIC));
+    BOOST_CHECK(!DestroyBlockFilterIndex(m_node, BlockFilterType::BASIC));
 
-    filter_index = GetBlockFilterIndex(BlockFilterType::BASIC);
+    filter_index = GetBlockFilterIndex(m_node, BlockFilterType::BASIC);
     BOOST_CHECK(filter_index == nullptr);
 
     // Reinitialize index.
-    BOOST_CHECK(InitBlockFilterIndex([&]{ return interfaces::MakeChain(m_node); }, BlockFilterType::BASIC, 1_MiB, true, false));
+    BOOST_CHECK(InitBlockFilterIndex(m_node, [&]{ return interfaces::MakeChain(m_node); }, BlockFilterType::BASIC, 1_MiB, true, false));
 
-    DestroyAllBlockFilterIndexes();
+    DestroyAllBlockFilterIndexes(m_node);
 
-    filter_index = GetBlockFilterIndex(BlockFilterType::BASIC);
+    filter_index = GetBlockFilterIndex(m_node, BlockFilterType::BASIC);
     BOOST_CHECK(filter_index == nullptr);
 }
 

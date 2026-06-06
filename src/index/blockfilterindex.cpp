@@ -14,6 +14,7 @@
 #include <index/db_key.h>
 #include <interfaces/chain.h>
 #include <interfaces/types.h>
+#include <node/context.h>
 #include <serialize.h>
 #include <streams.h>
 #include <sync.h>
@@ -26,11 +27,9 @@
 
 #include <cerrno>
 #include <exception>
-#include <map>
 #include <optional>
 #include <stdexcept>
 #include <string>
-#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -70,8 +69,6 @@ struct DBVal {
 };
 
 }; // namespace
-
-static std::map<BlockFilterType, BlockFilterIndex> g_filter_indexes;
 
 BlockFilterIndex::BlockFilterIndex(std::unique_ptr<interfaces::Chain> chain, BlockFilterType filter_type,
                                    size_t n_cache_size, bool f_memory, bool f_wipe)
@@ -432,33 +429,47 @@ bool BlockFilterIndex::LookupFilterHashRange(int start_height, const CBlockIndex
     return true;
 }
 
-BlockFilterIndex* GetBlockFilterIndex(BlockFilterType filter_type)
+BlockFilterIndex* GetBlockFilterIndex(node::NodeContext& node, BlockFilterType filter_type)
 {
-    auto it = g_filter_indexes.find(filter_type);
-    return it != g_filter_indexes.end() ? &it->second : nullptr;
+    for (const auto& index : node.block_filter_indexes) {
+        if (index->GetFilterType() == filter_type) return index.get();
+    }
+    return nullptr;
 }
 
-void ForEachBlockFilterIndex(std::function<void (BlockFilterIndex&)> fn)
+const BlockFilterIndex* GetBlockFilterIndex(const node::NodeContext& node, BlockFilterType filter_type)
 {
-    for (auto& entry : g_filter_indexes) fn(entry.second);
+    for (const auto& index : node.block_filter_indexes) {
+        if (index->GetFilterType() == filter_type) return index.get();
+    }
+    return nullptr;
 }
 
-bool InitBlockFilterIndex(std::function<std::unique_ptr<interfaces::Chain>()> make_chain, BlockFilterType filter_type,
+void ForEachBlockFilterIndex(node::NodeContext& node, std::function<void (BlockFilterIndex&)> fn)
+{
+    for (auto& index : node.block_filter_indexes) fn(*index);
+}
+
+bool InitBlockFilterIndex(node::NodeContext& node, std::function<std::unique_ptr<interfaces::Chain>()> make_chain, BlockFilterType filter_type,
                           size_t n_cache_size, bool f_memory, bool f_wipe)
 {
-    auto result = g_filter_indexes.emplace(std::piecewise_construct,
-                                           std::forward_as_tuple(filter_type),
-                                           std::forward_as_tuple(make_chain(), filter_type,
-                                                                 n_cache_size, f_memory, f_wipe));
-    return result.second;
+    if (GetBlockFilterIndex(node, filter_type)) return false;
+    node.block_filter_indexes.emplace_back(std::make_unique<BlockFilterIndex>(make_chain(), filter_type, n_cache_size, f_memory, f_wipe));
+    return true;
 }
 
-bool DestroyBlockFilterIndex(BlockFilterType filter_type)
+bool DestroyBlockFilterIndex(node::NodeContext& node, BlockFilterType filter_type)
 {
-    return g_filter_indexes.erase(filter_type);
+    for (auto it{node.block_filter_indexes.begin()}; it != node.block_filter_indexes.end(); ++it) {
+        if ((*it)->GetFilterType() == filter_type) {
+            node.block_filter_indexes.erase(it);
+            return true;
+        }
+    }
+    return false;
 }
 
-void DestroyAllBlockFilterIndexes()
+void DestroyAllBlockFilterIndexes(node::NodeContext& node)
 {
-    g_filter_indexes.clear();
+    node.block_filter_indexes.clear();
 }

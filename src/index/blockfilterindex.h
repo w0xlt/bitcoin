@@ -24,6 +24,9 @@
 class BlockFilter;
 class CBlockIndex;
 enum class BlockFilterType : uint8_t;
+namespace node {
+struct NodeContext;
+}
 
 static const char* const DEFAULT_BLOCKFILTERINDEX = "0";
 
@@ -101,16 +104,17 @@ public:
  * Get a block filter index by type. Returns nullptr if index has not been initialized or was
  * already destroyed.
  */
-BlockFilterIndex* GetBlockFilterIndex(BlockFilterType filter_type);
+BlockFilterIndex* GetBlockFilterIndex(node::NodeContext& node, BlockFilterType filter_type);
+const BlockFilterIndex* GetBlockFilterIndex(const node::NodeContext& node, BlockFilterType filter_type);
 
 /** Iterate over all running block filter indexes, invoking fn on each. */
-void ForEachBlockFilterIndex(std::function<void (BlockFilterIndex&)> fn);
+void ForEachBlockFilterIndex(node::NodeContext& node, std::function<void (BlockFilterIndex&)> fn);
 
 /**
  * Initialize a block filter index for the given type if one does not already exist. Returns true if
  * a new index is created and false if one has already been initialized.
  */
-bool InitBlockFilterIndex(std::function<std::unique_ptr<interfaces::Chain>()> make_chain, BlockFilterType filter_type,
+bool InitBlockFilterIndex(node::NodeContext& node, std::function<std::unique_ptr<interfaces::Chain>()> make_chain, BlockFilterType filter_type,
                           size_t n_cache_size, bool f_memory = false, bool f_wipe = false);
 
 /**
@@ -118,9 +122,9 @@ bool InitBlockFilterIndex(std::function<std::unique_ptr<interfaces::Chain>()> ma
  * just releases the allocated memory and closes the database connection, it does not delete the
  * index data.
  */
-bool DestroyBlockFilterIndex(BlockFilterType filter_type);
+bool DestroyBlockFilterIndex(node::NodeContext& node, BlockFilterType filter_type);
 
 /** Destroy all open block filter indexes. */
-void DestroyAllBlockFilterIndexes();
+void DestroyAllBlockFilterIndexes(node::NodeContext& node);
 
 #endif // BITCOIN_INDEX_BLOCKFILTERINDEX_H
