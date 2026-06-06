@@ -3779,6 +3779,11 @@ void ChainstateManager::ReceivedBlockTransactions(const CBlock& block, CBlockInd
     pindexNew->RaiseValidity(BLOCK_VALID_TRANSACTIONS);
     m_blockman.m_dirty_blockindex.insert(pindexNew);
 
+    const CBlockIndex* active_tip{ActiveTip()};
+    if (m_options.signals && active_tip != nullptr && pindexNew->nChainWork <= active_tip->nChainWork && !ActiveChain().Contains(*pindexNew)) {
+        m_options.signals->AcceptedNotActive(pindexNew);
+    }
+
     if (pindexNew->pprev == nullptr || pindexNew->pprev->HaveNumChainTxs()) {
         // If pindexNew is the genesis block or all parents are BLOCK_VALID_TRANSACTIONS.
         std::deque<CBlockIndex*> queue;
@@ -4222,6 +4227,11 @@ bool ChainstateManager::AcceptBlockHeader(const CBlockHeader& block, BlockValida
         return state.Invalid(BlockValidationResult::BLOCK_HEADER_LOW_WORK, "too-little-chainwork");
     }
     CBlockIndex* pindex{m_blockman.AddToBlockIndex(block, m_best_header)};
+
+    const CBlockIndex* active_tip{ActiveTip()};
+    if (m_options.signals && active_tip != nullptr && pindex->nChainWork <= active_tip->nChainWork && !ActiveChain().Contains(*pindex)) {
+        m_options.signals->AcceptedNotActive(pindex);
+    }
 
     if (ppindex)
         *ppindex = pindex;
