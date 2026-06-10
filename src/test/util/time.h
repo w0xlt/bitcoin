@@ -72,8 +72,24 @@ public:
     void set(std::chrono::seconds t) { set(NodeSeconds{t}); }
 
     /// Change mocktime by the given duration delta.
-    void operator+=(std::chrono::seconds d) { set(m_t += d); }
-    void operator-=(std::chrono::seconds d) { set(m_t -= d); }
+    void operator+=(std::chrono::seconds d)
+    {
+        CheckGlobalMockTimeInSync();
+        set(m_t += d);
+    }
+    void operator-=(std::chrono::seconds d)
+    {
+        CheckGlobalMockTimeInSync();
+        set(m_t -= d);
+    }
+
+private:
+    /// Detect out-of-band ::SetMockTime calls, which would silently desync
+    /// this clock from the global mocktime and could move time backwards on
+    /// the next relative change. (GetMockTime() returns 0s when mocktime is
+    /// disabled, indistinguishable from a clock set to the epoch; both count
+    /// as in sync here.)
+    void CheckGlobalMockTimeInSync() const { Assert(GetMockTime() == m_t.time_since_epoch()); }
 };
 
 #endif // BITCOIN_TEST_UTIL_TIME_H
