@@ -52,7 +52,7 @@ VariantHeaderResult CompareVariantHeaders(const CBlockIndex& candidate, const CB
 
 } // namespace
 
-StaleTipData::StaleTipData(const StaleFork& fork)
+StaleTipData::StaleTipData(const StaleFork& fork, bool have_block)
 {
     AssertLockHeld(::cs_main);
     Assume(fork.fork_point != nullptr);
@@ -60,7 +60,7 @@ StaleTipData::StaleTipData(const StaleFork& fork)
     Assume(HasAncestor(*fork.tip, *fork.fork_point));
 
     m_fork_point = fork.fork_point->GetBlockHash();
-    m_have_block = fork.tip->nStatus & BLOCK_HAVE_DATA;
+    m_have_block = have_block;
 
     const int fork_length{fork.tip->nHeight - fork.fork_point->nHeight};
     if (fork_length <= 0) return;
@@ -100,16 +100,16 @@ std::pair<uint256, std::vector<CBlockHeader>> StaleTipData::ReconstructHeaders()
     return {prev_hash, headers};
 }
 
-const CBlockIndex* StaleTips::GetEligibleForkPoint(const CChain& chain, const CBlockIndex& stale_tip) const
+const CBlockIndex* StaleTips::GetEligibleForkPoint(const CChain& chain, const CBlockIndex& stale_tip, bool require_signet_block_data, bool allow_more_work) const
 {
     const CBlockIndex* active_tip{chain.Tip()};
     if (active_tip == nullptr) return nullptr;
     if (chain.Contains(stale_tip)) return nullptr;
     if (stale_tip.nStatus & (BLOCK_FAILED_VALID | BLOCK_FAILED_CHILD)) return nullptr;
     if (stale_tip.nHeight < active_tip->nHeight - m_recent_window) return nullptr;
-    if (stale_tip.nChainWork > active_tip->nChainWork) return nullptr;
+    if (!allow_more_work && stale_tip.nChainWork > active_tip->nChainWork) return nullptr;
 
-    if (m_chain_type == ChainType::SIGNET && !(stale_tip.nStatus & BLOCK_HAVE_DATA)) return nullptr;
+    if (require_signet_block_data && m_chain_type == ChainType::SIGNET && !(stale_tip.nStatus & BLOCK_HAVE_DATA)) return nullptr;
 
     if (m_chain_type == ChainType::TESTNET || m_chain_type == ChainType::TESTNET4) {
         arith_uint256 target;
@@ -124,6 +124,19 @@ const CBlockIndex* StaleTips::GetEligibleForkPoint(const CChain& chain, const CB
     if (fork_length <= 0 || static_cast<size_t>(fork_length) > m_max_headers) return nullptr;
 
     return fork_point;
+}
+
+bool StaleTips::IsStaleTipEligible(const CChain& chain, const CBlockIndex* stale_tip, bool require_signet_block_data, bool allow_more_work) const
+{
+    AssertLockHeld(::cs_main);
+    if (stale_tip == nullptr) return false;
+    if (GetEligibleForkPoint(chain, *stale_tip, require_signet_block_data, allow_more_work) == nullptr) return false;
+
+    if (m_chain_type == ChainType::SIGNET && chain.Tip() != nullptr) {
+        if (CompareVariantHeaders(*stale_tip, *chain.Tip()) == VariantHeaderResult::PREFER_OLD) return false;
+    }
+
+    return true;
 }
 
 void StaleTips::Add(const CBlockIndex& stale_tip)
@@ -197,18 +210,19 @@ void StaleTips::Initialize(node::BlockManager& blockman, const CChain& chain)
     }
 }
 
-bool StaleTips::AddStaleTip(const CChain& chain, const CBlockIndex* stale_tip)
+bool StaleTips::AddStaleTip(const CChain& chain, const CBlockIndex* stale_tip, bool allow_more_work)
 {
     AssertLockHeld(::cs_main);
-    if (stale_tip == nullptr) return false;
-    if (GetEligibleForkPoint(chain, *stale_tip) == nullptr) return false;
-
-    if (m_chain_type == ChainType::SIGNET && chain.Tip() != nullptr) {
-        if (CompareVariantHeaders(*stale_tip, *chain.Tip()) == VariantHeaderResult::PREFER_OLD) return false;
-    }
+    if (!IsStaleTipEligible(chain, stale_tip, /*require_signet_block_data=*/true, allow_more_work)) return false;
 
     Add(*stale_tip);
     return true;
+}
+
+bool StaleTips::CanRequestStaleTipBlock(const CChain& chain, const CBlockIndex* stale_tip) const
+{
+    AssertLockHeld(::cs_main);
+    return IsStaleTipEligible(chain, stale_tip, /*require_signet_block_data=*/false);
 }
 
 bool StaleTips::CanServeStaleBranchBlock(const CChain& chain, const CBlockIndex* block) const
@@ -244,6 +258,42 @@ std::vector<StaleFork> StaleTips::GetStaleTips(const CChain& chain) const
     }
 
     return tips;
+}
+
+std::vector<StaleTipAnnouncement> StaleTips::GetTipsToAnnounce(const CChain& chain, bool want_blocks) const
+{
+    AssertLockHeld(::cs_main);
+
+    std::vector<StaleTipAnnouncement> announcements;
+    announcements.reserve(m_tips.size());
+
+    for (const auto& entry : m_tips) {
+        if (entry.tip == nullptr) continue;
+
+        const uint32_t seqno{want_blocks ? entry.block_seqno : entry.header_seqno};
+        if (seqno == 0) continue;
+
+        const CBlockIndex* fork_point{GetEligibleForkPoint(chain, *entry.tip)};
+        if (fork_point == nullptr) continue;
+
+        announcements.push_back({.fork = {.fork_point = fork_point, .tip = entry.tip}, .seqno = seqno});
+    }
+
+    std::ranges::sort(announcements, {}, &StaleTipAnnouncement::seqno);
+    return announcements;
+}
+
+std::set<uint32_t> StaleTips::GetTrackedSeqnos() const
+{
+    AssertLockHeld(::cs_main);
+
+    std::set<uint32_t> seqnos;
+    for (const auto& entry : m_tips) {
+        if (entry.tip == nullptr) continue;
+        seqnos.insert(entry.header_seqno);
+        if (entry.block_seqno != 0) seqnos.insert(entry.block_seqno);
+    }
+    return seqnos;
 }
 
 std::vector<StaleTipInfo> StaleTips::GetStaleTipInfo(const CChain& chain) const
