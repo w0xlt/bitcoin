@@ -134,6 +134,19 @@ RPCMethod walletpassphrasechange()
     std::shared_ptr<CWallet> const pwallet = GetWalletForJSONRPCRequest(request);
     if (!pwallet) return UniValue::VNULL;
 
+    {
+        LOCK(pwallet->cs_wallet);
+        if (!pwallet->HasEncryptionKeys()) {
+            throw JSONRPCError(RPC_WALLET_WRONG_ENC_STATE, "Error: running with an unencrypted wallet, but walletpassphrasechange was called.");
+        }
+
+        if (pwallet->IsScanningWithPassphrase()) {
+            throw JSONRPCError(RPC_WALLET_ERROR, "Error: the wallet is currently being used to rescan the blockchain for related transactions. Please call `abortrescan` before changing the passphrase.");
+        }
+    }
+
+    LOCK2(pwallet->m_relock_mutex, pwallet->cs_wallet);
+
     if (!pwallet->HasEncryptionKeys()) {
         throw JSONRPCError(RPC_WALLET_WRONG_ENC_STATE, "Error: running with an unencrypted wallet, but walletpassphrasechange was called.");
     }
@@ -141,8 +154,6 @@ RPCMethod walletpassphrasechange()
     if (pwallet->IsScanningWithPassphrase()) {
         throw JSONRPCError(RPC_WALLET_ERROR, "Error: the wallet is currently being used to rescan the blockchain for related transactions. Please call `abortrescan` before changing the passphrase.");
     }
-
-    LOCK2(pwallet->m_relock_mutex, pwallet->cs_wallet);
 
     SecureString strOldWalletPass;
     strOldWalletPass.reserve(100);
@@ -199,6 +210,19 @@ RPCMethod walletlock()
     std::shared_ptr<CWallet> const pwallet = GetWalletForJSONRPCRequest(request);
     if (!pwallet) return UniValue::VNULL;
 
+    {
+        LOCK(pwallet->cs_wallet);
+        if (!pwallet->HasEncryptionKeys()) {
+            throw JSONRPCError(RPC_WALLET_WRONG_ENC_STATE, "Error: running with an unencrypted wallet, but walletlock was called.");
+        }
+
+        if (pwallet->IsScanningWithPassphrase()) {
+            throw JSONRPCError(RPC_WALLET_ERROR, "Error: the wallet is currently being used to rescan the blockchain for related transactions. Please call `abortrescan` before locking the wallet.");
+        }
+    }
+
+    LOCK2(pwallet->m_relock_mutex, pwallet->cs_wallet);
+
     if (!pwallet->HasEncryptionKeys()) {
         throw JSONRPCError(RPC_WALLET_WRONG_ENC_STATE, "Error: running with an unencrypted wallet, but walletlock was called.");
     }
@@ -206,8 +230,6 @@ RPCMethod walletlock()
     if (pwallet->IsScanningWithPassphrase()) {
         throw JSONRPCError(RPC_WALLET_ERROR, "Error: the wallet is currently being used to rescan the blockchain for related transactions. Please call `abortrescan` before locking the wallet.");
     }
-
-    LOCK2(pwallet->m_relock_mutex, pwallet->cs_wallet);
 
     pwallet->Lock();
     pwallet->nRelockTime = 0;
@@ -256,6 +278,19 @@ RPCMethod encryptwallet()
         throw JSONRPCError(RPC_WALLET_ENCRYPTION_FAILED, "Error: wallet does not contain private keys, nothing to encrypt.");
     }
 
+    {
+        LOCK(pwallet->cs_wallet);
+        if (pwallet->HasEncryptionKeys()) {
+            throw JSONRPCError(RPC_WALLET_WRONG_ENC_STATE, "Error: running with an encrypted wallet, but encryptwallet was called.");
+        }
+
+        if (pwallet->IsScanningWithPassphrase()) {
+            throw JSONRPCError(RPC_WALLET_ERROR, "Error: the wallet is currently being used to rescan the blockchain for related transactions. Please call `abortrescan` before encrypting the wallet.");
+        }
+    }
+
+    LOCK2(pwallet->m_relock_mutex, pwallet->cs_wallet);
+
     if (pwallet->HasEncryptionKeys()) {
         throw JSONRPCError(RPC_WALLET_WRONG_ENC_STATE, "Error: running with an encrypted wallet, but encryptwallet was called.");
     }
@@ -263,8 +298,6 @@ RPCMethod encryptwallet()
     if (pwallet->IsScanningWithPassphrase()) {
         throw JSONRPCError(RPC_WALLET_ERROR, "Error: the wallet is currently being used to rescan the blockchain for related transactions. Please call `abortrescan` before encrypting the wallet.");
     }
-
-    LOCK2(pwallet->m_relock_mutex, pwallet->cs_wallet);
 
     SecureString strWalletPass;
     strWalletPass.reserve(100);
