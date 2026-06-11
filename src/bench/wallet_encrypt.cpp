@@ -77,6 +77,7 @@ static void WalletEncrypt(benchmark::Bench& bench, unsigned int key_count)
         .run([&] {
             wallet->EncryptWallet(secure_pass);
 
+            LOCK(wallet->cs_wallet);
             for (const auto& [_, key] : wallet->mapMasterKeys){
                 assert(key.nDeriveIterations == CMasterKey::DEFAULT_DERIVE_ITERATIONS);
             }

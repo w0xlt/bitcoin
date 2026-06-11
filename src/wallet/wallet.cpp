@@ -3373,20 +3373,17 @@ bool CWallet::IsTxImmatureCoinBase(const CWalletTx& wtx) const
 
 bool CWallet::IsLocked() const
 {
-    if (!HasEncryptionKeys()) {
-        return false;
-    }
     LOCK(cs_wallet);
-    return vMasterKey.empty();
+    return HasEncryptionKeys() && vMasterKey.empty();
 }
 
 bool CWallet::Lock()
 {
-    if (!HasEncryptionKeys())
-        return false;
-
     {
         LOCK2(m_relock_mutex, cs_wallet);
+        if (!HasEncryptionKeys())
+            return false;
+
         if (!vMasterKey.empty()) {
             memory_cleanse(vMasterKey.data(), vMasterKey.size() * sizeof(decltype(vMasterKey)::value_type));
             vMasterKey.clear();
@@ -3561,6 +3558,7 @@ bool CWallet::WithEncryptionKey(std::function<bool (const CKeyingMaterial&)> cb)
 
 bool CWallet::HasEncryptionKeys() const
 {
+    LOCK(cs_wallet);
     return !mapMasterKeys.empty();
 }
 

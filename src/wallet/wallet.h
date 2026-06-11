@@ -468,8 +468,8 @@ public:
     const std::string& GetName() const { return m_name; }
 
     typedef std::map<unsigned int, CMasterKey> MasterKeyMap;
-    MasterKeyMap mapMasterKeys;
-    unsigned int nMasterKeyMaxID = 0;
+    MasterKeyMap mapMasterKeys GUARDED_BY(cs_wallet);
+    unsigned int nMasterKeyMaxID GUARDED_BY(cs_wallet) = 0;
 
     /** Construct wallet with specified name and database implementation. */
     CWallet(interfaces::Chain* chain, const std::string& name, std::unique_ptr<WalletDatabase> database)
@@ -597,9 +597,9 @@ public:
     int64_t nRelockTime GUARDED_BY(cs_wallet){0};
 
     // Used to prevent concurrent calls to walletpassphrase RPC.
-    Mutex m_unlock_mutex;
+    Mutex m_unlock_mutex ACQUIRED_BEFORE(cs_wallet);
     // Used to prevent deleting the passphrase from memory when it is still in use.
-    RecursiveMutex m_relock_mutex;
+    RecursiveMutex m_relock_mutex ACQUIRED_BEFORE(cs_wallet);
 
     bool Unlock(const SecureString& strWalletPassphrase);
     bool ChangeWalletPassphrase(const SecureString& strOldWalletPassphrase, const SecureString& strNewWalletPassphrase);
