@@ -993,6 +993,13 @@ void DescriptorScriptPubKeyMan::ReturnDestination(int64_t index, bool internal, 
 std::map<CKeyID, CKey> DescriptorScriptPubKeyMan::GetKeys() const
 {
     AssertLockHeld(cs_desc_man);
+    if (m_map_crypted_keys.empty()) return m_map_keys;
+
+    // Beyond this point the wallet's encryption state is consulted, which
+    // takes cs_wallet. Callers reaching here (encrypted wallets) must
+    // already hold cs_wallet, or lock-order tracking would record a
+    // cs_desc_man -> cs_wallet order that conflicts with the usual
+    // cs_wallet -> cs_desc_man order.
     if (m_storage.HasEncryptionKeys() && !m_storage.IsLocked()) {
         KeyMap keys;
         for (const auto& key_pair : m_map_crypted_keys) {
@@ -1018,8 +1025,16 @@ bool DescriptorScriptPubKeyMan::HasPrivKey(const CKeyID& keyid) const
 std::optional<CKey> DescriptorScriptPubKeyMan::GetKey(const CKeyID& keyid) const
 {
     AssertLockHeld(cs_desc_man);
+    if (const auto it = m_map_keys.find(keyid); it != m_map_keys.end()) {
+        return it->second;
+    }
+
+    if (m_map_crypted_keys.empty()) return std::nullopt;
+
+    // See the comment in GetKeys(): from here on callers must already
+    // hold cs_wallet.
     if (m_storage.HasEncryptionKeys() && !m_storage.IsLocked()) {
-        const auto& it = m_map_crypted_keys.find(keyid);
+        const auto it = m_map_crypted_keys.find(keyid);
         if (it == m_map_crypted_keys.end()) {
             return std::nullopt;
         }
@@ -1032,11 +1047,7 @@ std::optional<CKey> DescriptorScriptPubKeyMan::GetKey(const CKeyID& keyid) const
         }
         return key;
     }
-    const auto& it = m_map_keys.find(keyid);
-    if (it == m_map_keys.end()) {
-        return std::nullopt;
-    }
-    return it->second;
+    return std::nullopt;
 }
 
 bool DescriptorScriptPubKeyMan::TopUp(unsigned int size)
