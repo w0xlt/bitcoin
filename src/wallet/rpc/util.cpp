@@ -84,6 +84,7 @@ std::shared_ptr<CWallet> GetWalletForJSONRPCRequest(const JSONRPCRequest& reques
 
 void EnsureWalletIsUnlocked(const CWallet& wallet)
 {
+    AssertLockHeld(wallet.cs_wallet);
     if (wallet.IsLocked()) {
         throw JSONRPCError(RPC_WALLET_UNLOCK_NEEDED, "Error: Please enter the wallet passphrase with walletpassphrase first.");
     }

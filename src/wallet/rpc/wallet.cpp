@@ -868,6 +868,8 @@ RPCMethod addhdkey()
                 throw JSONRPCError(RPC_WALLET_ERROR, "addhdkey is not available for wallets without private keys");
             }
 
+            LOCK(wallet->cs_wallet);
+
             EnsureWalletIsUnlocked(*wallet);
 
             CExtKey hdkey;
@@ -887,7 +889,6 @@ RPCMethod addhdkey()
                 }
             }
 
-            LOCK(wallet->cs_wallet);
             std::string desc_str = "unused(" + EncodeExtKey(hdkey) + ")";
             FlatSigningProvider keys;
             std::string error;

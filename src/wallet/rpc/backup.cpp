@@ -521,11 +521,11 @@ RPCMethod listdescriptors()
     if (wallet->IsWalletFlagSet(WALLET_FLAG_DISABLE_PRIVATE_KEYS) && priv) {
         throw JSONRPCError(RPC_WALLET_ERROR, "Can't get private descriptor string for watch-only wallets");
     }
+    LOCK(wallet->cs_wallet);
+
     if (priv) {
         EnsureWalletIsUnlocked(*wallet);
     }
-
-    LOCK(wallet->cs_wallet);
 
     const auto active_spk_mans = wallet->GetActiveScriptPubKeyMans();
 

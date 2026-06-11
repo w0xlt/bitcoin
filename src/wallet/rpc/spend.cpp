@@ -168,7 +168,7 @@ static void PreventOutdatedOptions(const UniValue& options)
     }
 }
 
-UniValue SendMoney(CWallet& wallet, const CCoinControl &coin_control, std::vector<CRecipient> &recipients, mapValue_t map_value, bool verbose)
+UniValue SendMoney(CWallet& wallet, const CCoinControl &coin_control, std::vector<CRecipient> &recipients, mapValue_t map_value, bool verbose) EXCLUSIVE_LOCKS_REQUIRED(wallet.cs_wallet)
 {
     EnsureWalletIsUnlocked(wallet);
 
@@ -1645,6 +1645,8 @@ RPCMethod walletprocesspsbt()
     bool bip32derivs = request.params[3].isNull() ? true : request.params[3].get_bool();
     bool finalize = request.params[4].isNull() ? true : request.params[4].get_bool();
     bool complete = true;
+
+    LOCK(pwallet->cs_wallet);
 
     if (sign) EnsureWalletIsUnlocked(*pwallet);
 
