@@ -7,6 +7,7 @@
 #include <test/util/common.h>
 #include <test/util/setup_common.h>
 #include <script/solver.h>
+#include <support/allocators/secure.h>
 #include <wallet/scriptpubkeyman.h>
 #include <wallet/wallet.h>
 #include <wallet/test/util.h>
@@ -36,6 +37,47 @@ BOOST_AUTO_TEST_CASE(DescriptorScriptPubKeyManTests)
     BOOST_CHECK(spk_man2 != nullptr);
     auto signprov_keypath_nums_h = spk_man2->GetSigningProvider(XOnlyPubKey::NUMS_H.GetEvenCorrespondingCPubKey());
     BOOST_CHECK(signprov_keypath_nums_h == nullptr);
+}
+
+BOOST_AUTO_TEST_CASE(descriptor_spkm_getkey_encryption_states)
+{
+    CWallet keystore(m_node.chain.get(), "", CreateMockableWalletDatabase());
+
+    CKey key = GenerateRandomKey();
+    const CKeyID keyid{key.GetPubKey().GetID()};
+    const CKeyID unknown_keyid{GenerateRandomKey().GetPubKey().GetID()};
+    DescriptorScriptPubKeyMan* spk_man = CreateDescriptor(keystore, "wpkh(" + EncodeSecret(key) + ")", /*success=*/true);
+    BOOST_REQUIRE(spk_man != nullptr);
+
+    // Plain wallet: the key is served from the unencrypted key map.
+    {
+        LOCK2(keystore.cs_wallet, spk_man->cs_desc_man);
+        BOOST_CHECK(spk_man->HasPrivKey(keyid));
+        const auto plain_key = spk_man->GetKey(keyid);
+        BOOST_REQUIRE(plain_key.has_value());
+        BOOST_CHECK(*plain_key == key);
+        BOOST_CHECK(!spk_man->GetKey(unknown_keyid).has_value());
+    }
+
+    // Encrypted and locked: the key is present but not retrievable.
+    const SecureString pass{"passphrase"};
+    BOOST_REQUIRE(keystore.EncryptWallet(pass));
+    BOOST_REQUIRE(keystore.IsLocked());
+    {
+        LOCK2(keystore.cs_wallet, spk_man->cs_desc_man);
+        BOOST_CHECK(spk_man->HasPrivKey(keyid));
+        BOOST_CHECK(!spk_man->GetKey(keyid).has_value());
+    }
+
+    // Encrypted and unlocked: the key is decrypted on demand and matches.
+    BOOST_REQUIRE(keystore.Unlock(pass));
+    {
+        LOCK2(keystore.cs_wallet, spk_man->cs_desc_man);
+        const auto decrypted_key = spk_man->GetKey(keyid);
+        BOOST_REQUIRE(decrypted_key.has_value());
+        BOOST_CHECK(*decrypted_key == key);
+        BOOST_CHECK(!spk_man->GetKey(unknown_keyid).has_value());
+    }
 }
 
 BOOST_AUTO_TEST_CASE(desc_spkm_topup_fail)
