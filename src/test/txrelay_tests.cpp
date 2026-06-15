@@ -4,11 +4,15 @@
 
 #include <node/txrelay.h>
 #include <primitives/block.h>
+#include <random.h>
 #include <test/util/setup_common.h>
 
 #include <boost/test/unit_test.hpp>
 
+#include <atomic>
 #include <chrono>
+#include <set>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -75,10 +79,10 @@ BOOST_AUTO_TEST_CASE(txrelay_state_accessors)
     tx_relay.SetLastInvSequence(42);
     BOOST_CHECK_EQUAL(tx_relay.GetLastInvSequence(), 42U);
 
-    BOOST_CHECK(!tx_relay.StartTxInventoryBatch(/*send_trickle=*/true, std::chrono::microseconds::min()).m_send_mempool);
+    BOOST_CHECK(!tx_relay.StartTxInventoryBatch(/*send_trickle=*/true).SendMempool());
     tx_relay.SetSendMempool();
-    BOOST_CHECK(tx_relay.StartTxInventoryBatch(/*send_trickle=*/true, std::chrono::microseconds::min()).m_send_mempool);
-    BOOST_CHECK(!tx_relay.StartTxInventoryBatch(/*send_trickle=*/true, std::chrono::microseconds::min()).m_send_mempool);
+    BOOST_CHECK(tx_relay.StartTxInventoryBatch(/*send_trickle=*/true).SendMempool());
+    BOOST_CHECK(!tx_relay.StartTxInventoryBatch(/*send_trickle=*/true).SendMempool());
 
     tx_relay.SetFeeFilterReceived(123);
     BOOST_CHECK_EQUAL(tx_relay.GetFeeFilterReceived(), 123);
@@ -89,8 +93,8 @@ BOOST_AUTO_TEST_CASE(txrelay_inventory_batch_schedules_before_snapshot)
     node::TxRelay tx_relay;
 
     auto batch{tx_relay.StartTxInventoryBatch(/*send_trickle=*/false, 1us)};
-    BOOST_CHECK(batch.m_send_trickle);
-    BOOST_CHECK(batch.m_inv_send_time_reached);
+    BOOST_CHECK(batch.SendTrickle());
+    BOOST_CHECK(batch.InvSendTimeReached());
     tx_relay.SetNextInvSendTime(2us);
 
     const uint256 hash{uint256::ONE};
@@ -98,8 +102,8 @@ BOOST_AUTO_TEST_CASE(txrelay_inventory_batch_schedules_before_snapshot)
     BOOST_CHECK_EQUAL(tx_relay.GetInventoryStats().m_inv_to_send, 1U);
 
     auto early_batch{tx_relay.StartTxInventoryBatch(/*send_trickle=*/false, 1us)};
-    BOOST_CHECK(!early_batch.m_send_trickle);
-    BOOST_CHECK(!early_batch.m_inv_send_time_reached);
+    BOOST_CHECK(!early_batch.SendTrickle());
+    BOOST_CHECK(!early_batch.InvSendTimeReached());
 }
 
 // StartTxInventoryBatch drops queued inventory at snapshot time when the peer
@@ -116,8 +120,8 @@ BOOST_AUTO_TEST_CASE(txrelay_inventory_batch_cleared_when_relay_disabled)
     BOOST_CHECK_EQUAL(tx_relay.GetInventoryStats().m_inv_to_send, 1U);
 
     tx_relay.SetRelayTxs(false); // peer asked us not to relay transactions
-    auto batch{tx_relay.StartTxInventoryBatch(/*send_trickle=*/true, std::chrono::microseconds::min())};
-    BOOST_CHECK_EQUAL(batch.m_tx_inventory_to_send.size(), 0U);
+    auto batch{tx_relay.StartTxInventoryBatch(/*send_trickle=*/true)};
+    BOOST_CHECK_EQUAL(batch.QueuedCandidates().size(), 0U);
     BOOST_CHECK_EQUAL(tx_relay.GetInventoryStats().m_inv_to_send, 0U);
 }
 
@@ -131,13 +135,127 @@ BOOST_AUTO_TEST_CASE(txrelay_inventory_batch_moves_and_returns_queued_inventory)
     tx_relay.PushInventory(hash, Wtxid::FromUint256(hash));
     BOOST_CHECK_EQUAL(tx_relay.GetInventoryStats().m_inv_to_send, 1U);
 
-    auto batch{tx_relay.StartTxInventoryBatch(/*send_trickle=*/true, std::chrono::microseconds::min())};
-    BOOST_CHECK(batch.m_send_trickle);
-    BOOST_CHECK_EQUAL(batch.m_tx_inventory_to_send.size(), 1U);
+    auto batch{tx_relay.StartTxInventoryBatch(/*send_trickle=*/true)};
+    BOOST_CHECK(batch.SendTrickle());
+    BOOST_CHECK_EQUAL(batch.QueuedCandidates().size(), 1U);
     BOOST_CHECK_EQUAL(tx_relay.GetInventoryStats().m_inv_to_send, 0U);
 
-    tx_relay.ReturnTxInventory(std::move(batch.m_tx_inventory_to_send));
+    tx_relay.ReturnTxInventory(std::move(batch));
     BOOST_CHECK_EQUAL(tx_relay.GetInventoryStats().m_inv_to_send, 1U);
+
+    auto processed_batch{tx_relay.StartTxInventoryBatch(/*send_trickle=*/true)};
+    processed_batch.EraseQueued(Wtxid::FromUint256(hash));
+    tx_relay.ReturnTxInventory(std::move(processed_batch));
+    BOOST_CHECK_EQUAL(tx_relay.GetInventoryStats().m_inv_to_send, 0U);
+}
+
+// Conservation invariant (single-threaded): across repeated snapshot/drain
+// rounds, the inventory the batch hands out is exactly what is pending, and the
+// union of everything "sent" (erased from a batch) with everything still queued
+// always equals the originally queued set. No wtxid is invented or dropped by
+// the StartTxInventoryBatch swap / ReturnTxInventory merge.
+BOOST_AUTO_TEST_CASE(txrelay_inventory_batch_conserves_inventory)
+{
+    node::TxRelay tx_relay;
+    tx_relay.SetRelayTxs(true);
+    tx_relay.SetNextInvSendTime(1us); // open the announcement gate
+
+    constexpr size_t N{200};
+    std::set<Wtxid> queued; // ground truth of what is still pending
+    for (size_t i = 0; i < N; ++i) {
+        const uint256 hash{m_rng.rand256()};
+        tx_relay.PushInventory(hash, Wtxid::FromUint256(hash));
+        queued.insert(Wtxid::FromUint256(hash));
+    }
+    BOOST_CHECK_EQUAL(tx_relay.GetInventoryStats().m_inv_to_send, queued.size());
+
+    std::set<Wtxid> sent;
+    for (int round = 0; round < 8 && !queued.empty(); ++round) {
+        auto batch{tx_relay.StartTxInventoryBatch(/*send_trickle=*/true)};
+
+        // The swap empties the live queue and hands us exactly what was pending.
+        BOOST_CHECK_EQUAL(tx_relay.GetInventoryStats().m_inv_to_send, 0U);
+        const auto candidates{batch.QueuedCandidates()};
+        BOOST_CHECK(std::set<Wtxid>(candidates.begin(), candidates.end()) == queued);
+
+        // "Send" a random subset by erasing it from the batch; the remainder is
+        // returned to the live queue.
+        for (const auto& wtxid : candidates) {
+            if (m_rng.randbool()) {
+                batch.EraseQueued(wtxid);
+                BOOST_CHECK(sent.insert(wtxid).second); // never sent twice
+                queued.erase(wtxid);
+            }
+        }
+        tx_relay.ReturnTxInventory(std::move(batch));
+
+        // Conservation after the round: live queue == ground-truth remainder.
+        BOOST_CHECK_EQUAL(tx_relay.GetInventoryStats().m_inv_to_send, queued.size());
+    }
+
+    // The sent set and the remaining queue partition the original, no overlap.
+    auto final_batch{tx_relay.StartTxInventoryBatch(/*send_trickle=*/true)};
+    const auto remaining{final_batch.QueuedCandidates()};
+    BOOST_CHECK(std::set<Wtxid>(remaining.begin(), remaining.end()) == queued);
+    for (const auto& wtxid : remaining) BOOST_CHECK(!sent.contains(wtxid));
+}
+
+// Conservation invariant under concurrency: one thread keeps queuing inventory
+// via PushInventory() while another keeps draining via the snapshot/merge batch
+// (as SendMessages() does, holding no TxRelay mutex during the drain). Every
+// queued wtxid must be drained exactly once -- none lost to the swap, none
+// duplicated by the merge. Run under ThreadSanitizer to also check that the
+// only synchronization is TxRelay's own mutex (no data race introduced by
+// moving work out of the lock).
+BOOST_AUTO_TEST_CASE(txrelay_inventory_batch_conserves_under_concurrent_push)
+{
+    node::TxRelay tx_relay;
+    tx_relay.SetRelayTxs(true);
+    tx_relay.SetNextInvSendTime(1us); // open the announcement gate
+
+    // A fixed universe of distinct wtxids, each queued exactly once.
+    constexpr size_t N{2000};
+    std::set<Wtxid> expected;
+    while (expected.size() < N) expected.insert(Wtxid::FromUint256(m_rng.rand256()));
+    const std::vector<Wtxid> universe{expected.begin(), expected.end()};
+
+    std::atomic<bool> producer_done{false};
+
+    // Producer thread: queue every wtxid once, concurrently with the drainer.
+    // Performs no Boost.Test assertions (those run only on the main thread).
+    std::thread producer{[&] {
+        for (const auto& wtxid : universe) {
+            tx_relay.PushInventory(wtxid.ToUint256(), wtxid);
+        }
+        producer_done.store(true);
+    }};
+
+    // Drainer (main thread): repeatedly snapshot the queue and "send" every
+    // candidate by erasing it, recording what was drained. After the producer
+    // is done, keep draining until a post-join snapshot comes back empty --
+    // i.e. nothing is left pending or in flight.
+    std::set<Wtxid> drained;
+    auto drain_once = [&] {
+        auto batch{tx_relay.StartTxInventoryBatch(/*send_trickle=*/true)};
+        const auto candidates{batch.QueuedCandidates()};
+        for (const auto& wtxid : candidates) {
+            BOOST_CHECK(drained.insert(wtxid).second); // each drained at most once
+            batch.EraseQueued(wtxid);
+        }
+        tx_relay.ReturnTxInventory(std::move(batch)); // nothing left to return
+        return candidates.empty();
+    };
+
+    while (!producer_done.load()) drain_once();
+
+    producer.join();
+
+    while (!drain_once()) {}
+
+    // Every queued wtxid was drained exactly once; queue is empty at the end.
+    BOOST_CHECK(drained == expected);
+    BOOST_CHECK_EQUAL(drained.size(), N);
+    BOOST_CHECK_EQUAL(tx_relay.GetInventoryStats().m_inv_to_send, 0U);
 }
 
 // MakeMerkleBlock returns nullopt when no bloom filter is loaded, and a
