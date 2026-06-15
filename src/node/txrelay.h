@@ -22,6 +22,7 @@
 #include <set>
 #include <span>
 #include <utility>
+#include <vector>
 
 namespace node {
 
@@ -171,11 +172,29 @@ public:
         return m_tx_inventory_to_send.empty() && m_next_inv_send_time == std::chrono::microseconds{0};
     }
 
-    struct TxInventoryBatch {
+    class TxInventoryBatch
+    {
+        friend class TxRelay;
+
+        TxInventoryBatch() = default;
+
         bool m_send_trickle{false};
         bool m_send_mempool{false};
         CAmount m_fee_filter_received{0};
         std::set<Wtxid> m_tx_inventory_to_send;
+
+    public:
+        TxInventoryBatch(const TxInventoryBatch&) = delete;
+        TxInventoryBatch& operator=(const TxInventoryBatch&) = delete;
+        TxInventoryBatch(TxInventoryBatch&&) noexcept = default;
+        TxInventoryBatch& operator=(TxInventoryBatch&&) noexcept = default;
+
+        bool SendTrickle() const { return m_send_trickle; }
+        bool SendMempool() const { return m_send_mempool; }
+        CAmount FeeFilterReceived() const { return m_fee_filter_received; }
+        size_t QueuedSize() const { return m_tx_inventory_to_send.size(); }
+        std::vector<Wtxid> QueuedCandidates() const { return {m_tx_inventory_to_send.begin(), m_tx_inventory_to_send.end()}; }
+        void EraseQueued(const Wtxid& wtxid) { m_tx_inventory_to_send.erase(wtxid); }
     };
 
     TxInventoryBatch StartTxInventoryBatch(bool send_trickle, std::optional<std::chrono::microseconds> next_inv_send_time)
@@ -200,12 +219,12 @@ public:
         return batch;
     }
 
-    void ReturnTxInventory(std::set<Wtxid> tx_inventory_to_send) EXCLUSIVE_LOCKS_REQUIRED(!m_tx_inventory_mutex)
+    void ReturnTxInventory(TxInventoryBatch&& batch) EXCLUSIVE_LOCKS_REQUIRED(!m_tx_inventory_mutex)
     {
-        if (tx_inventory_to_send.empty()) return;
+        if (batch.m_tx_inventory_to_send.empty()) return;
 
         LOCK(m_tx_inventory_mutex);
-        m_tx_inventory_to_send.merge(tx_inventory_to_send);
+        m_tx_inventory_to_send.merge(batch.m_tx_inventory_to_send);
     }
 
     bool TxInventoryKnownContains(const uint256& hash) const EXCLUSIVE_LOCKS_REQUIRED(!m_tx_inventory_mutex)

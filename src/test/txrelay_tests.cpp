@@ -75,10 +75,10 @@ BOOST_AUTO_TEST_CASE(txrelay_state_accessors)
     tx_relay.SetLastInvSequence(42);
     BOOST_CHECK_EQUAL(tx_relay.GetLastInvSequence(), 42U);
 
-    BOOST_CHECK(!tx_relay.StartTxInventoryBatch(/*send_trickle=*/true, std::nullopt).m_send_mempool);
+    BOOST_CHECK(!tx_relay.StartTxInventoryBatch(/*send_trickle=*/true, std::nullopt).SendMempool());
     tx_relay.SetSendMempool();
-    BOOST_CHECK(tx_relay.StartTxInventoryBatch(/*send_trickle=*/true, std::nullopt).m_send_mempool);
-    BOOST_CHECK(!tx_relay.StartTxInventoryBatch(/*send_trickle=*/true, std::nullopt).m_send_mempool);
+    BOOST_CHECK(tx_relay.StartTxInventoryBatch(/*send_trickle=*/true, std::nullopt).SendMempool());
+    BOOST_CHECK(!tx_relay.StartTxInventoryBatch(/*send_trickle=*/true, std::nullopt).SendMempool());
 
     tx_relay.SetFeeFilterReceived(123);
     BOOST_CHECK_EQUAL(tx_relay.GetFeeFilterReceived(), 123);
@@ -95,12 +95,18 @@ BOOST_AUTO_TEST_CASE(txrelay_inventory_batch_moves_and_returns_queued_inventory)
     BOOST_CHECK_EQUAL(tx_relay.GetInventoryStats().m_inv_to_send, 1U);
 
     auto batch{tx_relay.StartTxInventoryBatch(/*send_trickle=*/true, std::nullopt)};
-    BOOST_CHECK(batch.m_send_trickle);
-    BOOST_CHECK_EQUAL(batch.m_tx_inventory_to_send.size(), 1U);
+    BOOST_CHECK(batch.SendTrickle());
+    BOOST_CHECK_EQUAL(batch.QueuedSize(), 1U);
+    BOOST_CHECK_EQUAL(batch.QueuedCandidates().size(), 1U);
     BOOST_CHECK_EQUAL(tx_relay.GetInventoryStats().m_inv_to_send, 0U);
 
-    tx_relay.ReturnTxInventory(std::move(batch.m_tx_inventory_to_send));
+    tx_relay.ReturnTxInventory(std::move(batch));
     BOOST_CHECK_EQUAL(tx_relay.GetInventoryStats().m_inv_to_send, 1U);
+
+    auto processed_batch{tx_relay.StartTxInventoryBatch(/*send_trickle=*/true, std::nullopt)};
+    processed_batch.EraseQueued(Wtxid::FromUint256(hash));
+    tx_relay.ReturnTxInventory(std::move(processed_batch));
+    BOOST_CHECK_EQUAL(tx_relay.GetInventoryStats().m_inv_to_send, 0U);
 }
 
 BOOST_AUTO_TEST_SUITE_END()
