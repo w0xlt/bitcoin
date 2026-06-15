@@ -9,6 +9,7 @@
 #include <boost/test/unit_test.hpp>
 
 #include <chrono>
+#include <utility>
 #include <vector>
 
 using namespace std::chrono_literals;
@@ -43,7 +44,7 @@ BOOST_AUTO_TEST_CASE(txrelay_inventory_gated_until_send_scheduled)
     BOOST_CHECK_EQUAL(tx_relay.GetInventoryStats().m_inv_to_send, 0U);
     BOOST_CHECK(tx_relay.IsInventoryPristine());
 
-    WITH_LOCK(tx_relay.m_tx_inventory_mutex, tx_relay.m_next_inv_send_time = 1us);
+    tx_relay.SetNextInvSendTime(1us);
     BOOST_CHECK(!tx_relay.IsInventoryPristine());
 
     tx_relay.PushInventory(hash, wtxid);
@@ -53,7 +54,8 @@ BOOST_AUTO_TEST_CASE(txrelay_inventory_gated_until_send_scheduled)
 BOOST_AUTO_TEST_CASE(txrelay_known_inventory_not_requeued)
 {
     node::TxRelay tx_relay;
-    WITH_LOCK(tx_relay.m_tx_inventory_mutex, tx_relay.m_next_inv_send_time = 1us);
+    tx_relay.SetRelayTxs(true);
+    tx_relay.SetNextInvSendTime(1us);
 
     const uint256 first_hash{uint256::ONE};
     tx_relay.PushInventory(first_hash, Wtxid::FromUint256(first_hash));
@@ -70,15 +72,72 @@ BOOST_AUTO_TEST_CASE(txrelay_state_accessors)
     node::TxRelay tx_relay;
 
     BOOST_CHECK_EQUAL(tx_relay.GetLastInvSequence(), 1U);
-    WITH_LOCK(tx_relay.m_tx_inventory_mutex, tx_relay.m_last_inv_sequence = 42);
+    tx_relay.SetLastInvSequence(42);
     BOOST_CHECK_EQUAL(tx_relay.GetLastInvSequence(), 42U);
 
-    BOOST_CHECK(!WITH_LOCK(tx_relay.m_tx_inventory_mutex, return tx_relay.m_send_mempool));
+    BOOST_CHECK(!tx_relay.StartTxInventoryBatch(/*send_trickle=*/true, std::chrono::microseconds::min()).m_send_mempool);
     tx_relay.SetSendMempool();
-    BOOST_CHECK(WITH_LOCK(tx_relay.m_tx_inventory_mutex, return tx_relay.m_send_mempool));
+    BOOST_CHECK(tx_relay.StartTxInventoryBatch(/*send_trickle=*/true, std::chrono::microseconds::min()).m_send_mempool);
+    BOOST_CHECK(!tx_relay.StartTxInventoryBatch(/*send_trickle=*/true, std::chrono::microseconds::min()).m_send_mempool);
 
     tx_relay.SetFeeFilterReceived(123);
     BOOST_CHECK_EQUAL(tx_relay.GetFeeFilterReceived(), 123);
+}
+
+BOOST_AUTO_TEST_CASE(txrelay_inventory_batch_schedules_before_snapshot)
+{
+    node::TxRelay tx_relay;
+
+    auto batch{tx_relay.StartTxInventoryBatch(/*send_trickle=*/false, 1us)};
+    BOOST_CHECK(batch.m_send_trickle);
+    BOOST_CHECK(batch.m_inv_send_time_reached);
+    tx_relay.SetNextInvSendTime(2us);
+
+    const uint256 hash{uint256::ONE};
+    tx_relay.PushInventory(hash, Wtxid::FromUint256(hash));
+    BOOST_CHECK_EQUAL(tx_relay.GetInventoryStats().m_inv_to_send, 1U);
+
+    auto early_batch{tx_relay.StartTxInventoryBatch(/*send_trickle=*/false, 1us)};
+    BOOST_CHECK(!early_batch.m_send_trickle);
+    BOOST_CHECK(!early_batch.m_inv_send_time_reached);
+}
+
+// StartTxInventoryBatch drops queued inventory at snapshot time when the peer
+// has disabled tx relay. This exercises the nested bloom-lock branch (the only
+// place both mutexes are held, in the m_tx_inventory_mutex -> m_bloom_filter_mutex
+// order).
+BOOST_AUTO_TEST_CASE(txrelay_inventory_batch_cleared_when_relay_disabled)
+{
+    node::TxRelay tx_relay;
+    tx_relay.SetNextInvSendTime(1us); // open the gate (PushInventory ignores the relay flag)
+
+    const uint256 hash{uint256::ONE};
+    tx_relay.PushInventory(hash, Wtxid::FromUint256(hash));
+    BOOST_CHECK_EQUAL(tx_relay.GetInventoryStats().m_inv_to_send, 1U);
+
+    tx_relay.SetRelayTxs(false); // peer asked us not to relay transactions
+    auto batch{tx_relay.StartTxInventoryBatch(/*send_trickle=*/true, std::chrono::microseconds::min())};
+    BOOST_CHECK_EQUAL(batch.m_tx_inventory_to_send.size(), 0U);
+    BOOST_CHECK_EQUAL(tx_relay.GetInventoryStats().m_inv_to_send, 0U);
+}
+
+BOOST_AUTO_TEST_CASE(txrelay_inventory_batch_moves_and_returns_queued_inventory)
+{
+    node::TxRelay tx_relay;
+    tx_relay.SetRelayTxs(true);
+    tx_relay.SetNextInvSendTime(1us);
+
+    const uint256 hash{uint256::ONE};
+    tx_relay.PushInventory(hash, Wtxid::FromUint256(hash));
+    BOOST_CHECK_EQUAL(tx_relay.GetInventoryStats().m_inv_to_send, 1U);
+
+    auto batch{tx_relay.StartTxInventoryBatch(/*send_trickle=*/true, std::chrono::microseconds::min())};
+    BOOST_CHECK(batch.m_send_trickle);
+    BOOST_CHECK_EQUAL(batch.m_tx_inventory_to_send.size(), 1U);
+    BOOST_CHECK_EQUAL(tx_relay.GetInventoryStats().m_inv_to_send, 0U);
+
+    tx_relay.ReturnTxInventory(std::move(batch.m_tx_inventory_to_send));
+    BOOST_CHECK_EQUAL(tx_relay.GetInventoryStats().m_inv_to_send, 1U);
 }
 
 // MakeMerkleBlock returns nullopt when no bloom filter is loaded, and a
