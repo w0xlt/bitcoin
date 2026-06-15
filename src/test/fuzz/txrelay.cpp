@@ -15,6 +15,8 @@
 #include <cassert>
 #include <chrono>
 #include <cstdint>
+#include <optional>
+#include <utility>
 #include <vector>
 
 FUZZ_TARGET(txrelay)
@@ -57,14 +59,14 @@ FUZZ_TARGET(txrelay)
             },
             [&] {
                 tx_relay.SetSendMempool();
-                assert(WITH_LOCK(tx_relay.m_tx_inventory_mutex, return tx_relay.m_send_mempool));
+                assert(tx_relay.StartTxInventoryBatch(/*send_trickle=*/true, std::nullopt).m_send_mempool);
             },
             [&] {
                 fee_filter_received = provider.ConsumeIntegral<CAmount>();
                 tx_relay.SetFeeFilterReceived(fee_filter_received);
             },
             [&] {
-                WITH_LOCK(tx_relay.m_tx_inventory_mutex, tx_relay.m_next_inv_send_time = std::chrono::microseconds{provider.ConsumeIntegral<int64_t>()});
+                tx_relay.SetNextInvSendTime(std::chrono::microseconds{provider.ConsumeIntegral<int64_t>()});
             },
             [&] {
                 const uint256 hash{ConsumeUInt256(provider)};
@@ -76,6 +78,10 @@ FUZZ_TARGET(txrelay)
                 (void)tx_relay.GetLastInvSequence();
                 assert(tx_relay.GetRelayTxs() == relay_txs);
                 assert(tx_relay.GetFeeFilterReceived() == fee_filter_received);
+            },
+            [&] {
+                auto batch{tx_relay.StartTxInventoryBatch(provider.ConsumeBool(), std::nullopt)};
+                tx_relay.ReturnTxInventory(std::move(batch.m_tx_inventory_to_send));
             });
     }
 }
