@@ -58,7 +58,7 @@ FUZZ_TARGET(txrelay)
             },
             [&] {
                 tx_relay.SetSendMempool();
-                assert(tx_relay.StartTxInventoryBatch(/*send_trickle=*/true, std::chrono::microseconds::min()).m_send_mempool);
+                assert(tx_relay.StartTxInventoryBatch(/*send_trickle=*/true).SendMempool());
             },
             [&] {
                 fee_filter_received = provider.ConsumeIntegral<CAmount>();
@@ -79,8 +79,11 @@ FUZZ_TARGET(txrelay)
                 assert(tx_relay.GetFeeFilterReceived() == fee_filter_received);
             },
             [&] {
-                auto batch{tx_relay.StartTxInventoryBatch(provider.ConsumeBool(), std::chrono::microseconds::min())};
-                tx_relay.ReturnTxInventory(std::move(batch.m_tx_inventory_to_send));
+                auto batch{tx_relay.StartTxInventoryBatch(provider.ConsumeBool())};
+                for (const auto& wtxid : batch.QueuedCandidates()) {
+                    if (provider.ConsumeBool()) batch.EraseQueued(wtxid);
+                }
+                tx_relay.ReturnTxInventory(std::move(batch));
             });
     }
 }
