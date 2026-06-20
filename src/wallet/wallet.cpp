@@ -1821,11 +1821,15 @@ void CWallet::MaybeUpdateBirthTime(int64_t time)
  * be called whenever new keys are added to the wallet, with the oldest key
  * creation time.
  *
- * @return Earliest timestamp that could be successfully scanned from. Timestamp
- * returned will be higher than startTime if relevant blocks could not be read.
+ * @return RescanResult returning status and the earliest timestamp that could be
+ * successfully scanned from. Timestamp returned will be higher than startTime if
+ * relevant blocks could not be read.
  */
-int64_t CWallet::RescanFromTime(int64_t startTime, const WalletRescanReserver& reserver)
+CWallet::RescanResult CWallet::RescanFromTime(int64_t startTime, const WalletRescanReserver& reserver)
 {
+    RescanResult res;
+    res.scanned_time = startTime;
+
     // Find starting block. May be null if nCreateTime is greater than the
     // highest blockchain timestamp, in which case there is nothing that needs
     // to be scanned.
@@ -1834,16 +1838,19 @@ int64_t CWallet::RescanFromTime(int64_t startTime, const WalletRescanReserver& r
     bool start = chain().findFirstBlockWithTimeAndHeight(startTime - TIMESTAMP_WINDOW, 0, FoundBlock().hash(start_block).height(start_height));
     WalletLogPrintf("%s: Rescanning last %i blocks\n", __func__, start ? WITH_LOCK(cs_wallet, return GetLastBlockHeight()) - start_height + 1 : 0);
 
-    if (start) {
-        // TODO: this should take into account failure by ScanResult::USER_ABORT
-        ScanResult result = ScanForWalletTransactions(start_block, start_height, /*max_height=*/{}, reserver, /*save_progress=*/false);
-        if (result.status == ScanResult::FAILURE) {
-            int64_t time_max;
-            CHECK_NONFATAL(chain().findBlock(result.last_failed_block, FoundBlock().maxTime(time_max)));
-            return time_max + TIMESTAMP_WINDOW + 1;
-        }
+    if (!start) {
+        if (fAbortRescan || chain().shutdownRequested()) res.status = ScanResult::USER_ABORT;
+        return res;
     }
-    return startTime;
+
+    ScanResult scan_result = ScanForWalletTransactions(start_block, start_height, /*max_height=*/{}, reserver, /*save_progress=*/false);
+    res.status = scan_result.status;
+    if (scan_result.status == ScanResult::FAILURE) {
+        int64_t time_max;
+        CHECK_NONFATAL(chain().findBlock(scan_result.last_failed_block, FoundBlock().maxTime(time_max)));
+        res.scanned_time = time_max + TIMESTAMP_WINDOW + 1;
+    }
+    return res;
 }
 
 /**

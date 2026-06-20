@@ -217,30 +217,56 @@ BOOST_FIXTURE_TEST_CASE(scan_for_wallet_transactions_abort, TestChain100Setup)
 {
     CWallet wallet(m_node.chain.get(), "", CreateMockableWalletDatabase());
     uint256 genesis_hash;
+    int64_t no_scan_time;
     {
         LOCK(wallet.cs_wallet);
         LOCK(Assert(m_node.chainman)->GetMutex());
         wallet.SetWalletFlag(WALLET_FLAG_DESCRIPTORS);
         wallet.SetLastBlockProcessed(m_node.chainman->ActiveChain().Height(), m_node.chainman->ActiveChain().Tip()->GetBlockHash());
         genesis_hash = m_node.chainman->ActiveChain().Genesis()->GetBlockHash();
+        no_scan_time = m_node.chainman->ActiveChain().Tip()->GetBlockTimeMax() + TIMESTAMP_WINDOW + 1;
     }
 
-    // An abort requested while no rescan is held is stale and must
-    // not cancel a later scan.
-    wallet.AbortRescan();
-    WalletRescanReserver reserver(wallet);
-    BOOST_CHECK(reserver.reserve());
-    BOOST_CHECK(!wallet.IsAbortingRescan());
+    {
+        // An abort requested while no rescan is held is stale and must
+        // not cancel a later scan.
+        wallet.AbortRescan();
+        WalletRescanReserver reserver(wallet);
+        BOOST_CHECK(reserver.reserve());
+        BOOST_CHECK(!wallet.IsAbortingRescan());
 
-    // An abort requested after the reservation but before the scan starts
-    // (e.g. while importdescriptors is still deriving keys) must cancel the
-    // scan.
-    wallet.AbortRescan();
-    CWallet::ScanResult result = wallet.ScanForWalletTransactions(genesis_hash, /*start_height=*/0, /*max_height=*/{}, reserver, /*save_progress=*/false);
-    BOOST_CHECK_EQUAL(result.status, CWallet::ScanResult::USER_ABORT);
-    BOOST_CHECK(result.last_scanned_block.IsNull());
-    BOOST_CHECK(!result.last_scanned_height);
-    BOOST_CHECK(result.last_failed_block.IsNull());
+        // An abort requested after the reservation but before the scan starts
+        // (e.g. while importdescriptors is still deriving keys) must cancel the
+        // scan.
+        wallet.AbortRescan();
+        CWallet::ScanResult result = wallet.ScanForWalletTransactions(genesis_hash, /*start_height=*/0, /*max_height=*/{}, reserver, /*save_progress=*/false);
+        BOOST_CHECK_EQUAL(result.status, CWallet::ScanResult::USER_ABORT);
+        BOOST_CHECK(result.last_scanned_block.IsNull());
+        BOOST_CHECK(!result.last_scanned_height);
+        BOOST_CHECK(result.last_failed_block.IsNull());
+    }
+
+    {
+        // RescanFromTime should propagate the abort status directly so callers
+        // do not need to inspect the wallet abort flag after it returns.
+        WalletRescanReserver reserver(wallet);
+        BOOST_CHECK(reserver.reserve());
+        wallet.AbortRescan();
+        CWallet::RescanResult result = wallet.RescanFromTime(/*startTime=*/0, reserver);
+        BOOST_CHECK_EQUAL(result.status, CWallet::ScanResult::USER_ABORT);
+        BOOST_CHECK_EQUAL(result.scanned_time, 0);
+    }
+
+    {
+        // RescanFromTime should also propagate abort status if the timestamp is
+        // after the current chain tip and no scan loop is started.
+        WalletRescanReserver reserver(wallet);
+        BOOST_CHECK(reserver.reserve());
+        wallet.AbortRescan();
+        CWallet::RescanResult result = wallet.RescanFromTime(no_scan_time, reserver);
+        BOOST_CHECK_EQUAL(result.status, CWallet::ScanResult::USER_ABORT);
+        BOOST_CHECK_EQUAL(result.scanned_time, no_scan_time);
+    }
 }
 
 // This test verifies that wallet settings can be added and removed

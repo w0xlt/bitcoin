@@ -634,10 +634,8 @@ public:
     void blockConnected(const kernel::ChainstateRole& role, const interfaces::BlockInfo& block) override;
     void blockDisconnected(const interfaces::BlockInfo& block) override;
     void updatedBlockTip() override;
-    int64_t RescanFromTime(int64_t startTime, const WalletRescanReserver& reserver);
-
     struct ScanResult {
-        enum { SUCCESS, FAILURE, USER_ABORT } status = SUCCESS;
+        enum Status { SUCCESS, FAILURE, USER_ABORT } status = SUCCESS;
 
         //! Hash and height of most recent block that was successfully scanned.
         //! Unset if no blocks were scanned due to read errors or the chain
@@ -651,6 +649,15 @@ public:
         //! USER_ABORT.
         uint256 last_failed_block;
     };
+    struct RescanResult {
+        ScanResult::Status status = ScanResult::SUCCESS;
+
+        //! Earliest timestamp that could be successfully scanned from. Timestamp
+        //! will be higher than the requested start time if relevant blocks could
+        //! not be read.
+        int64_t scanned_time = 0;
+    };
+    RescanResult RescanFromTime(int64_t startTime, const WalletRescanReserver& reserver);
     ScanResult ScanForWalletTransactions(const uint256& start_block, int start_height, std::optional<int> max_height, const WalletRescanReserver& reserver, bool save_progress);
     void transactionRemovedFromMempool(const CTransactionRef& tx, MemPoolRemovalReason reason) override;
     /** Set the next time this wallet should resend transactions to 12-36 hours from now, ~1 day on average. */
