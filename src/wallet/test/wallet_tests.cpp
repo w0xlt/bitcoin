@@ -244,6 +244,7 @@ BOOST_FIXTURE_TEST_CASE(scan_for_wallet_transactions_abort, TestChain100Setup)
         BOOST_CHECK(result.last_scanned_block.IsNull());
         BOOST_CHECK(!result.last_scanned_height);
         BOOST_CHECK(result.last_failed_block.IsNull());
+        BOOST_CHECK(!wallet.IsAbortingRescan());
     }
 
     {
@@ -255,6 +256,7 @@ BOOST_FIXTURE_TEST_CASE(scan_for_wallet_transactions_abort, TestChain100Setup)
         CWallet::RescanResult result = wallet.RescanFromTime(/*startTime=*/0, reserver);
         BOOST_CHECK_EQUAL(result.status, CWallet::ScanResult::USER_ABORT);
         BOOST_CHECK_EQUAL(result.scanned_time, 0);
+        BOOST_CHECK(!wallet.IsAbortingRescan());
     }
 
     {
@@ -266,6 +268,7 @@ BOOST_FIXTURE_TEST_CASE(scan_for_wallet_transactions_abort, TestChain100Setup)
         CWallet::RescanResult result = wallet.RescanFromTime(no_scan_time, reserver);
         BOOST_CHECK_EQUAL(result.status, CWallet::ScanResult::USER_ABORT);
         BOOST_CHECK_EQUAL(result.scanned_time, no_scan_time);
+        BOOST_CHECK(!wallet.IsAbortingRescan());
     }
 }
 

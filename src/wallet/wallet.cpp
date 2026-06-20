@@ -1840,6 +1840,7 @@ CWallet::RescanResult CWallet::RescanFromTime(int64_t startTime, const WalletRes
 
     if (!start) {
         if (fAbortRescan || chain().shutdownRequested()) res.status = ScanResult::USER_ABORT;
+        fAbortRescan = false;
         return res;
     }
 
@@ -2021,6 +2022,7 @@ CWallet::ScanResult CWallet::ScanForWalletTransactions(const uint256& start_bloc
     } else {
         WalletLogPrintf("Rescan completed in %15dms\n", Ticks<std::chrono::milliseconds>(reserver.now() - start_time));
     }
+    fAbortRescan = false;
     return result;
 }
 
