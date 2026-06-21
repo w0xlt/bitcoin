@@ -146,12 +146,11 @@ FUZZ_TARGET(connman, .init = initialize_connman)
                 NodeId id = node_ids.empty() || fuzzed_data_provider.ConsumeBool()
                     ? fuzzed_data_provider.ConsumeIntegral<NodeId>()
                     : PickValue(fuzzed_data_provider, node_ids);
-                (void)connman.ForNode(id, [&](CNode* pnode) {
-                    (void)pnode->GetId();
-                    (void)pnode->IsInboundConn();
-                    (void)pnode->IsFullOutboundConn();
-                    return true;
-                });
+                if (auto node_info{connman.GetConnectedNodeInfo(id)}) {
+                    (void)node_info->m_id;
+                    (void)(node_info->m_conn_type == ConnectionType::INBOUND);
+                    (void)(node_info->m_conn_type == ConnectionType::OUTBOUND_FULL_RELAY);
+                }
             },
             [&] {
                 auto max_addresses = fuzzed_data_provider.ConsumeIntegral<size_t>();

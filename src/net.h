@@ -1275,6 +1275,15 @@ public:
 
     bool ForNode(NodeId id, std::function<bool(CNode* pnode)> func) EXCLUSIVE_LOCKS_REQUIRED(!m_nodes_mutex);
 
+    struct NodeInfo {
+        NodeId m_id;
+        ConnectionType m_conn_type;
+    };
+
+    std::optional<NodeInfo> GetConnectedNodeInfo(NodeId id) const EXCLUSIVE_LOCKS_REQUIRED(!m_nodes_mutex);
+    bool SetNodeBip152HighBandwidthTo(NodeId id, bool high_bandwidth) EXCLUSIVE_LOCKS_REQUIRED(!m_nodes_mutex);
+    bool PushMessageToNode(NodeId id, CSerializedNetMsg&& msg) EXCLUSIVE_LOCKS_REQUIRED(!m_nodes_mutex, !m_total_bytes_sent_mutex);
+
     void PushMessage(CNode* pnode, CSerializedNetMsg&& msg) EXCLUSIVE_LOCKS_REQUIRED(!m_total_bytes_sent_mutex);
 
     using NodeFn = std::function<void(CNode*)>;

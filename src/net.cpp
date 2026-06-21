@@ -4212,6 +4212,47 @@ bool CConnman::ForNode(NodeId id, std::function<bool(CNode* pnode)> func)
     return found != nullptr && NodeFullyConnected(found) && func(found);
 }
 
+std::optional<CConnman::NodeInfo> CConnman::GetConnectedNodeInfo(NodeId id) const
+{
+    AssertLockNotHeld(m_nodes_mutex);
+
+    LOCK(m_nodes_mutex);
+    for (const CNode* pnode : m_nodes) {
+        if (pnode->GetId() == id && NodeFullyConnected(pnode)) {
+            return NodeInfo{pnode->GetId(), pnode->m_conn_type};
+        }
+    }
+    return std::nullopt;
+}
+
+bool CConnman::SetNodeBip152HighBandwidthTo(NodeId id, bool high_bandwidth)
+{
+    AssertLockNotHeld(m_nodes_mutex);
+
+    LOCK(m_nodes_mutex);
+    for (CNode* pnode : m_nodes) {
+        if (pnode->GetId() == id && NodeFullyConnected(pnode)) {
+            pnode->m_bip152_highbandwidth_to = high_bandwidth;
+            return true;
+        }
+    }
+    return false;
+}
+
+bool CConnman::PushMessageToNode(NodeId id, CSerializedNetMsg&& msg)
+{
+    AssertLockNotHeld(m_nodes_mutex);
+
+    LOCK(m_nodes_mutex);
+    for (CNode* pnode : m_nodes) {
+        if (pnode->GetId() == id && NodeFullyConnected(pnode)) {
+            PushMessage(pnode, std::move(msg));
+            return true;
+        }
+    }
+    return false;
+}
+
 CSipHasher CConnman::GetDeterministicRandomizer(uint64_t id) const
 {
     return CSipHasher(nSeed0, nSeed1).Write(id);
