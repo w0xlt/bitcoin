@@ -2544,7 +2544,9 @@ std::unordered_set<Network> CConnman::GetReachableEmptyNetworks() const
 
 bool CConnman::MultipleManualOrFullOutboundConns(Network net) const
 {
-    AssertLockHeld(m_nodes_mutex);
+    AssertLockNotHeld(m_nodes_mutex);
+
+    LOCK(m_nodes_mutex);
     return m_network_conn_counts[net] > 1;
 }
 
@@ -3932,6 +3934,18 @@ bool CConnman::DisconnectNode(NodeId id)
     return false;
 }
 
+bool CConnman::MarkNodeForDisconnect(NodeId id)
+{
+    LOCK(m_nodes_mutex);
+    for (CNode* pnode : m_nodes) {
+        if (pnode->GetId() == id) {
+            pnode->fDisconnect = true;
+            return true;
+        }
+    }
+    return false;
+}
+
 void CConnman::RecordBytesRecv(uint64_t bytes)
 {
     nTotalBytesRecv += bytes;
@@ -4126,6 +4140,18 @@ bool CConnman::NodeFullyConnected(const CNode* pnode)
     return pnode && pnode->fSuccessfullyConnected && !pnode->fDisconnect;
 }
 
+static CConnman::NodeInfo MakeNodeInfo(const CNode& node)
+{
+    return {
+        .m_id = node.GetId(),
+        .m_conn_type = node.m_conn_type,
+        .m_network = node.addr.GetNetwork(),
+        .m_connected = node.m_connected,
+        .m_last_block_time = node.m_last_block_time,
+        .m_common_version = node.GetCommonVersion(),
+    };
+}
+
 /// Private broadcast connections only need to send certain message types.
 /// Other messages are not needed and may degrade privacy.
 static bool IsOutboundMessageAllowedInPrivateBroadcast(std::string_view type) noexcept
@@ -4197,19 +4223,19 @@ void CConnman::PushMessage(CNode* pnode, CSerializedNetMsg&& msg)
     if (nBytesSent) RecordBytesSent(nBytesSent);
 }
 
-bool CConnman::ForNode(NodeId id, std::function<bool(CNode* pnode)> func)
+std::vector<CConnman::NodeInfo> CConnman::GetConnectedNodesInfo() const
 {
     AssertLockNotHeld(m_nodes_mutex);
 
-    CNode* found = nullptr;
+    std::vector<NodeInfo> nodes_info;
     LOCK(m_nodes_mutex);
-    for (auto&& pnode : m_nodes) {
-        if(pnode->GetId() == id) {
-            found = pnode;
-            break;
+    nodes_info.reserve(m_nodes.size());
+    for (const CNode* pnode : m_nodes) {
+        if (NodeFullyConnected(pnode)) {
+            nodes_info.push_back(MakeNodeInfo(*pnode));
         }
     }
-    return found != nullptr && NodeFullyConnected(found) && func(found);
+    return nodes_info;
 }
 
 std::optional<CConnman::NodeInfo> CConnman::GetConnectedNodeInfo(NodeId id) const
@@ -4219,7 +4245,7 @@ std::optional<CConnman::NodeInfo> CConnman::GetConnectedNodeInfo(NodeId id) cons
     LOCK(m_nodes_mutex);
     for (const CNode* pnode : m_nodes) {
         if (pnode->GetId() == id && NodeFullyConnected(pnode)) {
-            return NodeInfo{pnode->GetId(), pnode->m_conn_type};
+            return MakeNodeInfo(*pnode);
         }
     }
     return std::nullopt;

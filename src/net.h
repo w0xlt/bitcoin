@@ -1270,40 +1270,21 @@ public:
     bool CheckIncomingNonce(uint64_t nonce) EXCLUSIVE_LOCKS_REQUIRED(!m_nodes_mutex);
     void ASMapHealthCheck();
 
-    // alias for thread safety annotations only, not defined
-    Mutex& GetNodesMutex() const LOCK_RETURNED(m_nodes_mutex);
-
-    bool ForNode(NodeId id, std::function<bool(CNode* pnode)> func) EXCLUSIVE_LOCKS_REQUIRED(!m_nodes_mutex);
-
     struct NodeInfo {
         NodeId m_id;
         ConnectionType m_conn_type;
+        Network m_network;
+        NodeClock::time_point m_connected;
+        std::chrono::seconds m_last_block_time;
+        int m_common_version;
     };
 
+    std::vector<NodeInfo> GetConnectedNodesInfo() const EXCLUSIVE_LOCKS_REQUIRED(!m_nodes_mutex);
     std::optional<NodeInfo> GetConnectedNodeInfo(NodeId id) const EXCLUSIVE_LOCKS_REQUIRED(!m_nodes_mutex);
     bool SetNodeBip152HighBandwidthTo(NodeId id, bool high_bandwidth) EXCLUSIVE_LOCKS_REQUIRED(!m_nodes_mutex);
     bool PushMessageToNode(NodeId id, CSerializedNetMsg&& msg) EXCLUSIVE_LOCKS_REQUIRED(!m_nodes_mutex, !m_total_bytes_sent_mutex);
 
     void PushMessage(CNode* pnode, CSerializedNetMsg&& msg) EXCLUSIVE_LOCKS_REQUIRED(!m_total_bytes_sent_mutex);
-
-    using NodeFn = std::function<void(CNode*)>;
-    void ForEachNode(const NodeFn& func) EXCLUSIVE_LOCKS_REQUIRED(!m_nodes_mutex)
-    {
-        LOCK(m_nodes_mutex);
-        for (auto&& node : m_nodes) {
-            if (NodeFullyConnected(node))
-                func(node);
-        }
-    };
-
-    void ForEachNode(const NodeFn& func) const EXCLUSIVE_LOCKS_REQUIRED(!m_nodes_mutex)
-    {
-        LOCK(m_nodes_mutex);
-        for (auto&& node : m_nodes) {
-            if (NodeFullyConnected(node))
-                func(node);
-        }
-    };
 
     // Addrman functions
     /**
@@ -1383,6 +1364,8 @@ public:
     bool DisconnectNode(const CSubNet& subnet) EXCLUSIVE_LOCKS_REQUIRED(!m_nodes_mutex);
     bool DisconnectNode(const CNetAddr& addr) EXCLUSIVE_LOCKS_REQUIRED(!m_nodes_mutex);
     bool DisconnectNode(NodeId id) EXCLUSIVE_LOCKS_REQUIRED(!m_nodes_mutex);
+    /** Mark a node for disconnection by id without logging; callers log their own context. */
+    bool MarkNodeForDisconnect(NodeId id) EXCLUSIVE_LOCKS_REQUIRED(!m_nodes_mutex);
 
     //! Used to convey which local services we are offering peers during node
     //! connection.
@@ -1422,7 +1405,7 @@ public:
     /** Return true if we should disconnect the peer for failing an inactivity check. */
     bool ShouldRunInactivityChecks(const CNode& node, NodeClock::time_point now) const;
 
-    bool MultipleManualOrFullOutboundConns(Network net) const EXCLUSIVE_LOCKS_REQUIRED(m_nodes_mutex);
+    bool MultipleManualOrFullOutboundConns(Network net) const EXCLUSIVE_LOCKS_REQUIRED(!m_nodes_mutex);
 
 private:
     struct ListenSocket {

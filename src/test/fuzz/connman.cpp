@@ -240,12 +240,12 @@ FUZZ_TARGET(connman, .init = initialize_connman)
                 connman.SocketHandlerPublic();
             });
     }
-    connman.ForEachNode([](CNode* pnode) {
-        (void)pnode->GetId();
-        (void)pnode->IsInboundConn();
-        (void)pnode->IsFullOutboundConn();
-        (void)pnode->ConnectionTypeAsString();
-    });
+    for (const auto& node_info : connman.GetConnectedNodesInfo()) {
+        (void)node_info.m_id;
+        (void)(node_info.m_conn_type == ConnectionType::INBOUND);
+        (void)(node_info.m_conn_type == ConnectionType::OUTBOUND_FULL_RELAY);
+        (void)ConnectionTypeAsString(node_info.m_conn_type);
+    }
     (void)connman.GetAddedNodeInfo(fuzzed_data_provider.ConsumeBool());
     (void)connman.GetExtraFullOutboundCount();
     (void)connman.GetLocalServices();

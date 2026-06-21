@@ -2153,25 +2153,27 @@ void PeerManagerImpl::NewPoWValidBlock(const CBlockIndex *pindex, const std::sha
         m_most_recent_block_txs = std::move(most_recent_block_txs);
     }
 
-    m_connman.ForEachNode([this, pindex, &lazy_ser, &hashBlock](CNode* pnode) EXCLUSIVE_LOCKS_REQUIRED(::cs_main) {
-        AssertLockHeld(::cs_main);
-
-        if (pnode->GetCommonVersion() < INVALID_CB_NO_BAN_VERSION || pnode->fDisconnect)
-            return;
-        ProcessBlockAvailability(pnode->GetId());
-        CNodeState &state = *State(pnode->GetId());
+    for (const auto& node_info : m_connman.GetConnectedNodesInfo()) {
+        if (node_info.m_common_version < INVALID_CB_NO_BAN_VERSION) {
+            continue;
+        }
+        ProcessBlockAvailability(node_info.m_id);
+        CNodeState* state_ptr{State(node_info.m_id)};
+        if (!state_ptr) continue;
+        CNodeState& state{*state_ptr};
         // If the peer has, or we announced to them the previous block already,
         // but we don't think they have this one, go ahead and announce it
         if (state.m_requested_hb_cmpctblocks && !PeerHasHeader(&state, pindex) && PeerHasHeader(&state, pindex->pprev)) {
 
             LogDebug(BCLog::NET, "%s sending header-and-ids %s to peer=%d\n", "PeerManager::NewPoWValidBlock",
-                    hashBlock.ToString(), pnode->GetId());
+                    hashBlock.ToString(), node_info.m_id);
 
             const CSerializedNetMsg& ser_cmpctblock{lazy_ser.get()};
-            PushMessage(*pnode, ser_cmpctblock.Copy());
-            state.pindexBestHeaderSent = pindex;
+            if (m_connman.PushMessageToNode(node_info.m_id, ser_cmpctblock.Copy())) {
+                state.pindexBestHeaderSent = pindex;
+            }
         }
-    });
+    }
 }
 
 /**
@@ -5283,42 +5285,43 @@ void PeerManagerImpl::EvictExtraOutboundPeers(NodeClock::time_point now)
     // to temporarily in order to sync our tip; see net.cpp.
     // Note that we use higher nodeid as a measure for most recent connection.
     if (m_connman.GetExtraBlockRelayCount() > 0) {
-        std::pair<NodeId, std::chrono::seconds> youngest_peer{-1, 0}, next_youngest_peer{-1, 0};
+        std::optional<CConnman::NodeInfo> youngest_peer, next_youngest_peer;
 
-        m_connman.ForEachNode([&](CNode* pnode) {
-            if (!pnode->IsBlockOnlyConn() || pnode->fDisconnect) return;
-            if (pnode->GetId() > youngest_peer.first) {
+        for (const auto& node_info : m_connman.GetConnectedNodesInfo()) {
+            if (node_info.m_conn_type != ConnectionType::BLOCK_RELAY) continue;
+            if (!youngest_peer || node_info.m_id > youngest_peer->m_id) {
                 next_youngest_peer = youngest_peer;
-                youngest_peer.first = pnode->GetId();
-                youngest_peer.second = pnode->m_last_block_time;
+                youngest_peer = node_info;
             }
-        });
-        NodeId to_disconnect = youngest_peer.first;
-        if (youngest_peer.second > next_youngest_peer.second) {
+        }
+        std::optional<CConnman::NodeInfo> to_disconnect{youngest_peer};
+        // A missing second-youngest peer is treated as a last-block time of 0,
+        // matching the original sentinel behavior: when the youngest peer gave
+        // us a block more recently we fall back to the (possibly nonexistent)
+        // second youngest, which leaves a lone block-relay peer connected.
+        const std::chrono::seconds next_youngest_last_block{next_youngest_peer ? next_youngest_peer->m_last_block_time : std::chrono::seconds{0}};
+        if (youngest_peer && youngest_peer->m_last_block_time > next_youngest_last_block) {
             // Our newest block-relay-only peer gave us a block more recently;
             // disconnect our second youngest.
-            to_disconnect = next_youngest_peer.first;
+            to_disconnect = next_youngest_peer;
         }
-        m_connman.ForNode(to_disconnect, [&](CNode* pnode) EXCLUSIVE_LOCKS_REQUIRED(::cs_main) {
-            AssertLockHeld(::cs_main);
+        if (to_disconnect) {
             // Make sure we're not getting a block right now, and that
             // we've been connected long enough for this eviction to happen
             // at all.
             // Note that we only request blocks from a peer if we learn of a
             // valid headers chain with at least as much work as our tip.
-            CNodeState *node_state = State(pnode->GetId());
+            CNodeState *node_state = State(to_disconnect->m_id);
             if (node_state == nullptr ||
-                (now - pnode->m_connected >= MINIMUM_CONNECT_TIME && node_state->vBlocksInFlight.empty())) {
-                pnode->fDisconnect = true;
+                (now - to_disconnect->m_connected >= MINIMUM_CONNECT_TIME && node_state->vBlocksInFlight.empty())) {
+                m_connman.MarkNodeForDisconnect(to_disconnect->m_id);
                 LogDebug(BCLog::NET, "disconnecting extra block-relay-only peer=%d (last block received at time %d)\n",
-                         pnode->GetId(), count_seconds(pnode->m_last_block_time));
-                return true;
+                         to_disconnect->m_id, count_seconds(to_disconnect->m_last_block_time));
             } else {
                 LogDebug(BCLog::NET, "keeping block-relay-only peer=%d chosen for eviction (connect time: %d, blocks_in_flight: %d)\n",
-                         pnode->GetId(), TicksSinceEpoch<std::chrono::seconds>(pnode->m_connected), node_state->vBlocksInFlight.size());
+                         to_disconnect->m_id, TicksSinceEpoch<std::chrono::seconds>(to_disconnect->m_connected), node_state->vBlocksInFlight.size());
             }
-            return false;
-        });
+        }
     }
 
     // Check whether we have too many outbound-full-relay peers
@@ -5329,47 +5332,41 @@ void PeerManagerImpl::EvictExtraOutboundPeers(NodeClock::time_point now)
         // connection (higher node id)
         // Protect peers from eviction if we don't have another connection
         // to their network, counting both outbound-full-relay and manual peers.
-        NodeId worst_peer = -1;
+        std::optional<CConnman::NodeInfo> worst_peer;
         int64_t oldest_block_announcement = std::numeric_limits<int64_t>::max();
 
-        m_connman.ForEachNode([&](CNode* pnode) EXCLUSIVE_LOCKS_REQUIRED(::cs_main, m_connman.GetNodesMutex()) {
-            AssertLockHeld(::cs_main);
-
+        for (const auto& node_info : m_connman.GetConnectedNodesInfo()) {
             // Only consider outbound-full-relay peers that are not already
             // marked for disconnection
-            if (!pnode->IsFullOutboundConn() || pnode->fDisconnect) return;
-            CNodeState *state = State(pnode->GetId());
-            if (state == nullptr) return; // shouldn't be possible, but just in case
+            if (node_info.m_conn_type != ConnectionType::OUTBOUND_FULL_RELAY) continue;
+            CNodeState *state = State(node_info.m_id);
+            if (state == nullptr) continue; // shouldn't be possible, but just in case
             // Don't evict our protected peers
-            if (state->m_chain_sync.m_protect) return;
+            if (state->m_chain_sync.m_protect) continue;
             // If this is the only connection on a particular network that is
             // OUTBOUND_FULL_RELAY or MANUAL, protect it.
-            if (!m_connman.MultipleManualOrFullOutboundConns(pnode->addr.GetNetwork())) return;
-            if (state->m_last_block_announcement < oldest_block_announcement || (state->m_last_block_announcement == oldest_block_announcement && pnode->GetId() > worst_peer)) {
-                worst_peer = pnode->GetId();
+            if (!m_connman.MultipleManualOrFullOutboundConns(node_info.m_network)) continue;
+            if (state->m_last_block_announcement < oldest_block_announcement || (state->m_last_block_announcement == oldest_block_announcement && (!worst_peer || node_info.m_id > worst_peer->m_id))) {
+                worst_peer = node_info;
                 oldest_block_announcement = state->m_last_block_announcement;
             }
-        });
-        if (worst_peer != -1) {
-            bool disconnected = m_connman.ForNode(worst_peer, [&](CNode* pnode) EXCLUSIVE_LOCKS_REQUIRED(::cs_main) {
-                AssertLockHeld(::cs_main);
-
+        }
+        if (worst_peer) {
+            bool disconnected{false};
+            if (CNodeState* state{State(worst_peer->m_id)}) {
                 // Only disconnect a peer that has been connected to us for
                 // some reasonable fraction of our check-frequency, to give
                 // it time for new information to have arrived.
                 // Also don't disconnect any peer we're trying to download a
                 // block from.
-                CNodeState &state = *State(pnode->GetId());
-                if (now - pnode->m_connected > MINIMUM_CONNECT_TIME && state.vBlocksInFlight.empty()) {
-                    LogDebug(BCLog::NET, "disconnecting extra outbound peer=%d (last block announcement received at time %d)\n", pnode->GetId(), oldest_block_announcement);
-                    pnode->fDisconnect = true;
-                    return true;
+                if (now - worst_peer->m_connected > MINIMUM_CONNECT_TIME && state->vBlocksInFlight.empty()) {
+                    LogDebug(BCLog::NET, "disconnecting extra outbound peer=%d (last block announcement received at time %d)\n", worst_peer->m_id, oldest_block_announcement);
+                    disconnected = m_connman.MarkNodeForDisconnect(worst_peer->m_id);
                 } else {
                     LogDebug(BCLog::NET, "keeping outbound peer=%d chosen for eviction (connect time: %d, blocks_in_flight: %d)\n",
-                             pnode->GetId(), TicksSinceEpoch<std::chrono::seconds>(pnode->m_connected), state.vBlocksInFlight.size());
-                    return false;
+                             worst_peer->m_id, TicksSinceEpoch<std::chrono::seconds>(worst_peer->m_connected), state->vBlocksInFlight.size());
                 }
-            });
+            }
             if (disconnected) {
                 // If we disconnected an extra peer, that means we successfully
                 // connected to at least one peer after the last time we
