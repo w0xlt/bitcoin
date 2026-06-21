@@ -4269,14 +4269,24 @@ bool CConnman::PushMessageToNode(NodeId id, CSerializedNetMsg&& msg)
 {
     AssertLockNotHeld(m_nodes_mutex);
 
-    LOCK(m_nodes_mutex);
-    for (CNode* pnode : m_nodes) {
-        if (pnode->GetId() == id && NodeFullyConnected(pnode)) {
-            PushMessage(pnode, std::move(msg));
-            return true;
+    struct NodeRef {
+        CNode* m_node{nullptr};
+        ~NodeRef() { if (m_node) m_node->Release(); }
+    } found;
+
+    {
+        LOCK(m_nodes_mutex);
+        for (CNode* pnode : m_nodes) {
+            if (pnode->GetId() == id && NodeFullyConnected(pnode)) {
+                found.m_node = pnode->AddRef();
+                break;
+            }
         }
     }
-    return false;
+
+    if (!found.m_node || !NodeFullyConnected(found.m_node)) return false;
+    PushMessage(found.m_node, std::move(msg));
+    return true;
 }
 
 CSipHasher CConnman::GetDeterministicRandomizer(uint64_t id) const

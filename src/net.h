@@ -1270,6 +1270,11 @@ public:
     bool CheckIncomingNonce(uint64_t nonce) EXCLUSIVE_LOCKS_REQUIRED(!m_nodes_mutex);
     void ASMapHealthCheck();
 
+    /**
+     * Snapshot of selected CNode state copied while `m_nodes_mutex` is held.
+     * Callers should use this instead of keeping CNode pointers when they only
+     * need metadata.
+     */
     struct NodeInfo {
         NodeId m_id;
         ConnectionType m_conn_type;
@@ -1279,9 +1284,20 @@ public:
         int m_common_version;
     };
 
+    /** Return copied metadata for currently fully connected nodes. */
     std::vector<NodeInfo> GetConnectedNodesInfo() const EXCLUSIVE_LOCKS_REQUIRED(!m_nodes_mutex);
+    /** Return copied metadata for a currently fully connected node. */
     std::optional<NodeInfo> GetConnectedNodeInfo(NodeId id) const EXCLUSIVE_LOCKS_REQUIRED(!m_nodes_mutex);
+    /** Return whether a currently fully connected node was found and updated. */
     bool SetNodeBip152HighBandwidthTo(NodeId id, bool high_bandwidth) EXCLUSIVE_LOCKS_REQUIRED(!m_nodes_mutex);
+    /**
+     * Push a message to a currently fully connected node.
+     *
+     * The node is referenced while `m_nodes_mutex` is held, but message pushing
+     * is performed after releasing `m_nodes_mutex`.
+     *
+     * @return Whether the node was found and the message was pushed.
+     */
     bool PushMessageToNode(NodeId id, CSerializedNetMsg&& msg) EXCLUSIVE_LOCKS_REQUIRED(!m_nodes_mutex, !m_total_bytes_sent_mutex);
 
     void PushMessage(CNode* pnode, CSerializedNetMsg&& msg) EXCLUSIVE_LOCKS_REQUIRED(!m_total_bytes_sent_mutex);
