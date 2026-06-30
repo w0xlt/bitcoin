@@ -10,6 +10,8 @@
 #include <wallet/transaction.h>
 #include <wallet/wallet.h>
 
+#include <optional>
+
 namespace wallet {
 bool InputIsMine(const CWallet& wallet, const CTxIn& txin) EXCLUSIVE_LOCKS_REQUIRED(wallet.cs_wallet);
 
@@ -35,6 +37,17 @@ struct COutputEntry
     CAmount amount;
     int vout;
 };
+struct WalletTxHistoryAccounting
+{
+    WalletTxInputOwnership input_ownership;
+    CAmount debit;  //!< Non-negative sum of wallet-owned input values.
+    CAmount credit; //!< Non-negative sum of wallet-owned output values.
+    // Non-negative fee paid by the wallet, or nullopt when the wallet's fee
+    // share cannot be determined.
+    std::optional<CAmount> fee;
+};
+WalletTxHistoryAccounting CachedTxGetHistoryAccounting(const CWallet& wallet, const CWalletTx& wtx)
+    EXCLUSIVE_LOCKS_REQUIRED(wallet.cs_wallet);
 void CachedTxGetAmounts(const CWallet& wallet, const CWalletTx& wtx,
                         std::list<COutputEntry>& listReceived,
                         std::list<COutputEntry>& listSent,
