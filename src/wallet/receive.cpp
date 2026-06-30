@@ -205,7 +205,14 @@ WalletTxHistoryAccounting CachedTxGetHistoryAccounting(const CWallet& wallet, co
     if (input_ownership == WalletTxInputOwnership::ALL) {
         fee = debit - wtx.tx->GetValueOut();
     } else if (input_ownership == WalletTxInputOwnership::PARTIAL) {
-        CachedTxAllForeignInputsKnownZeroValue(wallet, wtx);
+        // Even when all foreign input values are known, a nonzero foreign
+        // contribution means the wallet may not have paid the full fee. The
+        // total fee may be computable, but the wallet's share cannot be
+        // determined. Only when every foreign input is zero did the wallet
+        // supply the transaction's entire input value, so it paid the full fee.
+        if (CachedTxAllForeignInputsKnownZeroValue(wallet, wtx)) {
+            fee = debit - wtx.tx->GetValueOut();
+        }
     }
     return {input_ownership, debit, credit, fee};
 }
@@ -220,7 +227,7 @@ void CachedTxGetAmounts(const CWallet& wallet, const CWalletTx& wtx,
     listReceived.clear();
     listSent.clear();
     const WalletTxHistoryAccounting accounting{CachedTxGetHistoryAccounting(wallet, wtx)};
-    const bool can_report_sent_outputs{accounting.input_ownership == WalletTxInputOwnership::ALL};
+    const bool can_report_sent_outputs{accounting.fee.has_value()};
 
     // Compute fee:
     if (accounting.fee.has_value()) {
@@ -233,8 +240,8 @@ void CachedTxGetAmounts(const CWallet& wallet, const CWalletTx& wtx,
         const CTxOut& txout = wtx.tx->vout[i];
         bool ismine = wallet.IsMine(txout);
         // Only need to handle txouts if either:
-        //   1) the wallet provided all input value, so the output can be
-        //      reported as sent
+        //   1) the wallet supplied the transaction's entire input value, so
+        //      the output can be reported as sent
         //   2) the output is ours, so it can be reported as received
         if (can_report_sent_outputs)
         {
@@ -256,7 +263,8 @@ void CachedTxGetAmounts(const CWallet& wallet, const CWalletTx& wtx,
 
         COutputEntry output = {address, txout.nValue, (int)i};
 
-        // Only report sent outputs when the wallet provided all input value.
+        // Only report sent outputs when the wallet supplied the transaction's
+        // entire input value.
         if (can_report_sent_outputs)
             listSent.push_back(output);
 

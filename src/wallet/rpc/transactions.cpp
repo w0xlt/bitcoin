@@ -299,6 +299,11 @@ static bool IsMixedInput(const WalletTxHistoryAccounting& accounting)
     return accounting.input_ownership == WalletTxInputOwnership::PARTIAL;
 }
 
+static bool NeedsMixedInputSendSummary(const WalletTxHistoryAccounting& accounting)
+{
+    return IsMixedInput(accounting) && !accounting.fee.has_value();
+}
+
 static void PushMixedInputFields(UniValue& entry, const WalletTxHistoryAccounting& accounting)
 {
     entry.pushKV("involves_mixed_inputs", true);
@@ -342,9 +347,10 @@ static void AppendWalletTxEntries(const CWallet& wallet, const CWalletTx& wtx, i
 
     const WalletTxHistoryAccounting accounting{CachedTxGetHistoryAccounting(wallet, wtx)};
     const bool is_mixed_input{IsMixedInput(accounting)};
+    const bool needs_mixed_input_send_summary{NeedsMixedInputSendSummary(accounting)};
     CachedTxGetAmounts(wallet, wtx, listReceived, listSent, nFee, include_change);
 
-    if (is_mixed_input && !filter_label.has_value()) {
+    if (needs_mixed_input_send_summary && !filter_label.has_value()) {
         UniValue entry(UniValue::VOBJ);
         PushMixedInputSendSummary(entry, accounting);
         if (fLong) {
@@ -369,6 +375,9 @@ static void AppendWalletTxEntries(const CWallet& wallet, const CWalletTx& wtx, i
             }
             entry.pushKV("vout", s.vout);
             entry.pushKV("fee", ValueFromAmount(-nFee));
+            if (is_mixed_input) {
+                PushMixedInputFields(entry, accounting);
+            }
             if (fLong)
                 WalletTxToJSON(wallet, wtx, entry);
             entry.pushKV("abandoned", wtx.isAbandoned());
@@ -469,7 +478,9 @@ RPCMethod listtransactions()
                 "For instance, a wallet transaction that pays three addresses — one wallet-owned and two external — will produce \n"
                 "four entries. The payment to the wallet-owned address appears both as a send entry and as a receive entry. \n"
                 "As a result, the RPC response will contain one entry in the receive category and three entries in the send category.\n"
-                "In a transaction with both wallet-owned and non-wallet inputs, non-wallet inputs may pay for some outputs or fees. \n"
+                "A transaction with both wallet-owned and non-wallet inputs is reported with normal per-output send/receive entries if \n"
+                "the wallet has the parent transaction for every non-wallet input and each spent output has zero value. Otherwise \n"
+                "non-wallet inputs may pay for some outputs or fees. \n"
                 "The wallet cannot tell which non-wallet outputs are payments made by this wallet or how much of the fee it paid. \n"
                 "It reports one mixed-input send summary whose amount is the total value of wallet-owned inputs with its sign reversed. The summary \n"
                 "is marked with involves_mixed_inputs and has no address or vout because it is not tied to one output. It has no fee because \n"
@@ -607,7 +618,9 @@ RPCMethod listsinceblock()
         "Get all transactions in blocks since block [blockhash], or all transactions if omitted.\n"
                 "If \"blockhash\" is no longer a part of the main chain, transactions from the fork point onward are included.\n"
                 "Additionally, if include_removed is set, transactions affecting the wallet which were removed are returned in the \"removed\" array.\n"
-                "In a transaction with both wallet-owned and non-wallet inputs, non-wallet inputs may pay for some outputs or fees. \n"
+                "A transaction with both wallet-owned and non-wallet inputs is reported with normal per-output send/receive entries if \n"
+                "the wallet has the parent transaction for every non-wallet input and each spent output has zero value. Otherwise \n"
+                "non-wallet inputs may pay for some outputs or fees. \n"
                 "The wallet cannot tell which non-wallet outputs are payments made by this wallet or how much of the fee it paid. \n"
                 "It reports one mixed-input send summary whose amount is the total value of wallet-owned inputs with its sign reversed. The summary \n"
                 "is marked with involves_mixed_inputs and has no address or vout because it is not tied to one output. It has no fee because \n"
@@ -770,7 +783,7 @@ RPCMethod gettransaction()
                                 {RPCResult::Type::BOOL, "involves_mixed_inputs", /*optional=*/true, "Only present if the transaction spends both wallet-owned and non-wallet inputs."},
                                 {RPCResult::Type::STR_AMOUNT, "wallet_debit", /*optional=*/true, "Only present if involves_mixed_inputs is true. Total value of wallet-owned inputs spent by this transaction."},
                                 {RPCResult::Type::STR_AMOUNT, "wallet_credit", /*optional=*/true, "Only present if involves_mixed_inputs is true. Total value of wallet-owned outputs created by this transaction."},
-                                                 }},
+                            }},
                         }},
                         {RPCResult::Type::STR_HEX, "hex", "Raw data for transaction"},
                         {RPCResult::Type::OBJ, "decoded", /*optional=*/true, "The decoded transaction (only present when `verbose` is passed)",
