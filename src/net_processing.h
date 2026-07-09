@@ -12,6 +12,7 @@
 #include <node/types.h>
 #include <private_broadcast.h>
 #include <protocol.h>
+#include <staletips.h>
 #include <uint256.h>
 #include <util/expected.h>
 #include <validationinterface.h>
@@ -39,6 +40,18 @@ class Warnings;
 
 /** Whether transaction reconciliation protocol should be enabled by default. */
 static constexpr bool DEFAULT_TXRECONCILIATION_ENABLE{false};
+/** Mode of operation for stale-tip relay (-staletips). */
+enum class StaleTipMode {
+    //! Stale-tip relay disabled.
+    NONE,
+    //! Track stale tips and announce them to peers once their headers are known.
+    HEADERS,
+    //! Additionally download stale tip block data, and prefer receiving
+    //! announcements from peers once they have block data available.
+    BLOCKS,
+};
+/** Whether stale-tip relay should be enabled by default. */
+static constexpr StaleTipMode DEFAULT_STALETIP_MODE{StaleTipMode::NONE};
 /** Default number of non-mempool transactions to keep around for block reconstruction. Includes
     orphan, replaced, and rejected transactions. */
 static const uint32_t DEFAULT_BLOCK_RECONSTRUCTION_EXTRA_TXN{100};
@@ -73,6 +86,8 @@ struct PeerManagerInfo {
     std::chrono::seconds median_outbound_time_offset{0s};
     bool ignores_incoming_txs{false};
     bool private_broadcast{DEFAULT_PRIVATE_BROADCAST};
+    //! Recently seen stale tips that are being tracked.
+    std::vector<StaleTipInfo> stale_tips;
 };
 
 class PeerManager : public CValidationInterface, public NetEventsInterface
@@ -83,6 +98,8 @@ public:
         bool ignore_incoming_txs{DEFAULT_BLOCKSONLY};
         //! Whether transaction reconciliation protocol is enabled
         bool reconcile_txs{DEFAULT_TXRECONCILIATION_ENABLE};
+        //! Whether stale-tip relay is enabled and which stale-tip data we prefer.
+        StaleTipMode stale_tip_mode{DEFAULT_STALETIP_MODE};
         //! Number of non-mempool transactions to keep around for block reconstruction. Includes
         //! orphan, replaced, and rejected transactions.
         uint32_t max_extra_txs{DEFAULT_BLOCK_RECONSTRUCTION_EXTRA_TXN};
