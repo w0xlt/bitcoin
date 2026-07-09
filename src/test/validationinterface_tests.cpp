@@ -4,14 +4,17 @@
 
 #include <boost/test/unit_test.hpp>
 #include <consensus/validation.h>
+#include <pow.h>
 #include <primitives/block.h>
 #include <scheduler.h>
 #include <test/util/setup_common.h>
 #include <util/check.h>
+#include <validation.h>
 #include <validationinterface.h>
 
 #include <atomic>
 #include <memory>
+#include <vector>
 
 BOOST_FIXTURE_TEST_SUITE(validationinterface_tests, ChainTestingSetup)
 
@@ -97,6 +100,54 @@ BOOST_AUTO_TEST_CASE(unregister_all_during_call)
     BOOST_CHECK(!destroyed);
     shared.reset();
     BOOST_CHECK(destroyed);
+}
+
+BOOST_FIXTURE_TEST_CASE(processnewblockheaders_coalesces_accepted_not_active, TestChain100Setup)
+{
+    struct TestSubscriber final : CValidationInterface {
+        std::vector<const CBlockIndex*> m_accepted_not_active;
+
+        bool WantsAcceptedNotActive() const override { return true; }
+
+        void AcceptedNotActive(const CBlockIndex* pindex) override
+        {
+            m_accepted_not_active.push_back(pindex);
+        }
+    };
+
+    m_node.validation_signals->SyncWithValidationInterfaceQueue();
+    const auto sub{std::make_shared<TestSubscriber>()};
+    m_node.validation_signals->RegisterSharedValidationInterface(sub);
+
+    const auto& consensus{Params().GetConsensus()};
+    const CBlockIndex* fork{nullptr};
+    {
+        LOCK(cs_main);
+        fork = Assert(m_node.chainman->ActiveChain().Tip())->GetAncestor(97);
+    }
+    uint256 prev_hash{fork->GetBlockHash()};
+    uint32_t time{static_cast<uint32_t>(fork->GetBlockTime() + 1)};
+    std::vector<CBlockHeader> headers;
+    for (uint32_t i{0}; i < 3; ++i) {
+        CBlockHeader header;
+        header.nVersion = 4;
+        header.hashPrevBlock = prev_hash;
+        header.hashMerkleRoot = uint256{static_cast<uint8_t>(i + 1)};
+        header.nTime = time++;
+        header.nBits = fork->nBits;
+        while (!CheckProofOfWork(header.GetHash(), header.nBits, consensus)) ++header.nNonce;
+        prev_hash = header.GetHash();
+        headers.push_back(header);
+    }
+
+    BlockValidationState state;
+    const CBlockIndex* tip{nullptr};
+    BOOST_CHECK(Assert(m_node.chainman)->ProcessNewBlockHeaders(headers, /*min_pow_checked=*/true, state, &tip));
+    m_node.validation_signals->SyncWithValidationInterfaceQueue();
+
+    BOOST_REQUIRE_EQUAL(sub->m_accepted_not_active.size(), 1U);
+    BOOST_CHECK_EQUAL(sub->m_accepted_not_active.front()->GetBlockHash().ToString(),
+                      Assert(tip)->GetBlockHash().ToString());
 }
 
 BOOST_AUTO_TEST_SUITE_END()

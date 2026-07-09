@@ -945,6 +945,7 @@ private:
     CBlockIndex* m_last_notified_header GUARDED_BY(GetMutex()){nullptr};
 
     bool NotifyHeaderTip() LOCKS_EXCLUDED(GetMutex());
+    void MaybeNotifyAcceptedNotActive(const CBlockIndex& pindex) EXCLUSIVE_LOCKS_REQUIRED(cs_main);
 
     //! Internal helper for ActivateSnapshot().
     //!
@@ -969,7 +970,8 @@ private:
         const CBlockHeader& block,
         BlockValidationState& state,
         CBlockIndex** ppindex,
-        bool min_pow_checked) EXCLUSIVE_LOCKS_REQUIRED(cs_main);
+        bool min_pow_checked,
+        bool notify_accepted_not_active = true) EXCLUSIVE_LOCKS_REQUIRED(cs_main);
     friend Chainstate;
 
     /** Most recent headers presync progress update, for rate-limiting. */
