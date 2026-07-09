@@ -2,9 +2,9 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
-#include <kernel/cs_main.h>
 #include <chain.h>
 #include <arith_uint256.h>
+#include <kernel/cs_main.h>
 #include <staletips.h>
 #include <streams.h>
 #include <test/util/setup_common.h>
@@ -246,9 +246,67 @@ BOOST_AUTO_TEST_CASE(staletip_cache_basic)
     BOOST_CHECK(!info[0].have_block);
 
     stale->nStatus |= BLOCK_VALID_TRANSACTIONS | BLOCK_HAVE_DATA;
+    BOOST_CHECK(tips.AddStaleTip(tree.active_chain, stale));
     info = tips.GetStaleTipInfo(tree.active_chain);
     BOOST_REQUIRE_EQUAL(info.size(), 1U);
     BOOST_CHECK(info[0].have_block);
+
+    const StaleFork stale_fork{.fork_point = tip->pprev, .tip = stale};
+    const StaleTipMessage announce_without_block{stale_fork, false};
+    const StaleTipMessage announce_with_block{stale_fork, true};
+    BOOST_CHECK(!announce_without_block.m_have_block);
+    BOOST_CHECK(announce_with_block.m_have_block);
+}
+
+BOOST_AUTO_TEST_CASE(staletip_announce_defers_for_block_preferring_peers)
+{
+    LOCK(::cs_main);
+
+    BlockTree tree;
+    CBlockIndex* tip{tree.Add(nullptr, true, true)};
+    for (int i{0}; i < 4; ++i) tip = tree.Add(tip, true, true);
+    CBlockIndex* stale{tree.Add(Assert(tip->pprev), false)};
+
+    StaleTipCache tips;
+    BOOST_CHECK(tips.AddStaleTip(tree.active_chain, stale));
+
+    // A header-only tip is announced promptly to peers that do not prefer
+    // block data, but deferred for block-preferring peers until the block
+    // data is obtained.
+    BOOST_CHECK_EQUAL(tips.GetTipsToAnnounce(tree.active_chain, /*want_blocks=*/false).size(), 1U);
+    BOOST_CHECK(tips.GetTipsToAnnounce(tree.active_chain, /*want_blocks=*/true).empty());
+
+    stale->nStatus |= BLOCK_VALID_TRANSACTIONS | BLOCK_HAVE_DATA;
+    BOOST_CHECK(tips.AddStaleTip(tree.active_chain, stale));
+    BOOST_REQUIRE_EQUAL(tips.GetTipsToAnnounce(tree.active_chain, /*want_blocks=*/true).size(), 1U);
+}
+
+BOOST_AUTO_TEST_CASE(staletip_tracked_seqnos)
+{
+    LOCK(::cs_main);
+
+    BlockTree tree;
+    CBlockIndex* tip{tree.Add(nullptr, true, true)};
+    for (int i{0}; i < 4; ++i) tip = tree.Add(tip, true, true);
+
+    CBlockIndex* stale{tree.Add(Assert(tip->pprev), false)};
+    StaleTipCache tips;
+    BOOST_CHECK(tips.GetTrackedSeqnos().empty());
+
+    BOOST_CHECK(tips.AddStaleTip(tree.active_chain, stale));
+    BOOST_CHECK_EQUAL(tips.GetTrackedSeqnos().size(), 1U);
+
+    stale->nStatus |= BLOCK_VALID_TRANSACTIONS | BLOCK_HAVE_DATA;
+    BOOST_CHECK(tips.AddStaleTip(tree.active_chain, stale));
+    const auto seqnos{tips.GetTrackedSeqnos()};
+    BOOST_CHECK_EQUAL(seqnos.size(), 2U);
+
+    // A temporarily ineligible tip (here: reorged onto the active chain) is
+    // no longer announceable, but remains tracked and keeps its sequence
+    // numbers, so per-peer announcement state is not expired for it.
+    tree.active_chain.SetTip(*stale);
+    BOOST_CHECK(tips.GetTipsToAnnounce(tree.active_chain, /*want_blocks=*/false).empty());
+    BOOST_CHECK(tips.GetTrackedSeqnos() == seqnos);
 }
 
 BOOST_AUTO_TEST_CASE(staletip_cache_policy)
@@ -422,12 +480,12 @@ BOOST_FIXTURE_TEST_CASE(staletip_initialize_orders_candidates_deterministically,
 
     StaleTipCache tips;
     tips.Initialize(blockman, active_chain);
-    const auto stale_tips{tips.GetStaleTips(active_chain)};
+    const auto announcements{tips.GetTipsToAnnounce(active_chain, /*want_blocks=*/false)};
 
-    BOOST_REQUIRE_EQUAL(stale_tips.size(), 3U);
-    BOOST_CHECK_EQUAL(stale_tips[0].tip->GetBlockHash().ToString(), same_height[0]->GetBlockHash().ToString());
-    BOOST_CHECK_EQUAL(stale_tips[1].tip->GetBlockHash().ToString(), same_height[1]->GetBlockHash().ToString());
-    BOOST_CHECK_EQUAL(stale_tips[2].tip->GetBlockHash().ToString(), lower_tip->GetBlockHash().ToString());
+    BOOST_REQUIRE_EQUAL(announcements.size(), 3U);
+    BOOST_CHECK_EQUAL(announcements[0].fork.tip->GetBlockHash().ToString(), same_height[0]->GetBlockHash().ToString());
+    BOOST_CHECK_EQUAL(announcements[1].fork.tip->GetBlockHash().ToString(), same_height[1]->GetBlockHash().ToString());
+    BOOST_CHECK_EQUAL(announcements[2].fork.tip->GetBlockHash().ToString(), lower_tip->GetBlockHash().ToString());
 }
 
 BOOST_AUTO_TEST_SUITE_END()
