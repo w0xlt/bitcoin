@@ -51,7 +51,7 @@ void initialize_process_messages()
     };
     g_setup = testing_setup.get();
     // Replace validation_signals before creating chainman and mempool so they use it.
-    g_setup->m_node.validation_signals = std::make_unique<ValidationSignals>(std::make_unique<ImmediateBackgroundTaskRunner>());
+    g_setup->m_node.validation_signals = std::make_unique<ValidationSignals>(std::make_unique<SerialBackgroundTaskRunner>());
     ResetChainmanAndMempool(*g_setup, init_clock);
 }
 
@@ -129,6 +129,8 @@ FUZZ_TARGET(process_messages, .init = initialize_process_messages)
                 more_work = connman.ProcessMessagesOnce(random_node);
             } catch (const std::ios_base::failure&) {
             }
+            // Keep async validation callbacks deterministic before relay logic observes their side effects.
+            node.validation_signals->SyncWithValidationInterfaceQueue();
             node.peerman->SendMessages(random_node);
         }
     }

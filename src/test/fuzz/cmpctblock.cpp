@@ -101,7 +101,6 @@ public:
     }
 };
 
-
 } // namespace
 
 extern void MakeRandDeterministicDANGEROUS(const uint256& seed) noexcept;
@@ -113,7 +112,7 @@ void initialize_cmpctblock()
     g_setup = testing_setup.get();
     g_nBits = Params().GenesisBlock().nBits;
     // Replace validation_signals before creating chainman and mempool so they use it.
-    testing_setup->m_node.validation_signals = std::make_unique<ValidationSignals>(std::make_unique<ImmediateBackgroundTaskRunner>());
+    testing_setup->m_node.validation_signals = std::make_unique<ValidationSignals>(std::make_unique<SerialBackgroundTaskRunner>());
     g_mature_coinbase = ResetChainmanAndMempool(*g_setup, init_clock);
 }
 
@@ -435,6 +434,8 @@ FUZZ_TARGET(cmpctblock, .init = initialize_cmpctblock)
             random_node.fPauseSend = false;
 
             more_work = connman.ProcessMessagesOnce(random_node);
+            // Keep async validation callbacks deterministic before relay logic observes their side effects.
+            setup->m_node.validation_signals->SyncWithValidationInterfaceQueue();
             peerman->SendMessages(random_node);
         }
 

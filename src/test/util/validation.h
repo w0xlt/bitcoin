@@ -10,8 +10,12 @@
 #include <util/task_runner.h>
 #include <validation.h>
 
+#include <condition_variable>
 #include <cstddef>
+#include <deque>
 #include <functional>
+#include <future>
+#include <mutex>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -23,13 +27,68 @@ class CValidationInterface;
 class FakeNodeClock;
 struct TestingSetup;
 
-/// Runs callbacks synchronously and deterministically, while avoiding DEBUG_LOCKORDER false positives.
-class ImmediateBackgroundTaskRunner : public util::TaskRunnerInterface
+/// Runs callbacks in order on a background thread, each in a fresh std::thread to avoid
+/// DEBUG_LOCKORDER false positives. Callbacks may take locks held by the thread that
+/// signals them, such as cs_main, so they must not run synchronously in that thread.
+/// Use flush() (for example through SyncWithValidationInterfaceQueue()) for determinism.
+class SerialBackgroundTaskRunner : public util::TaskRunnerInterface
 {
 public:
-    void insert(std::function<void()> func) override { std::thread(std::move(func)).join(); }
-    void flush() override {}
-    size_t size() override { return 0; }
+    SerialBackgroundTaskRunner() : m_worker{[this] { ProcessQueue(); }} {}
+    ~SerialBackgroundTaskRunner() override
+    {
+        {
+            std::lock_guard lock{m_mutex};
+            m_stop = true;
+        }
+        m_cv.notify_one();
+        m_worker.join();
+    }
+
+    void insert(std::function<void()> func) override
+    {
+        {
+            std::lock_guard lock{m_mutex};
+            m_tasks.emplace_back(std::move(func));
+        }
+        m_cv.notify_one();
+    }
+
+    void flush() override
+    {
+        std::promise<void> promise;
+        auto future{promise.get_future()};
+        insert([&promise] { promise.set_value(); });
+        future.wait();
+    }
+
+    size_t size() override
+    {
+        std::lock_guard lock{m_mutex};
+        return m_tasks.size();
+    }
+
+private:
+    void ProcessQueue()
+    {
+        while (true) {
+            std::function<void()> func;
+            {
+                std::unique_lock lock{m_mutex};
+                m_cv.wait(lock, [this] { return m_stop || !m_tasks.empty(); });
+                if (m_stop && m_tasks.empty()) return;
+                func = std::move(m_tasks.front());
+                m_tasks.pop_front();
+            }
+            std::thread(std::move(func)).join();
+        }
+    }
+
+    std::mutex m_mutex;
+    std::condition_variable m_cv;
+    std::deque<std::function<void()>> m_tasks;
+    bool m_stop{false};
+    std::thread m_worker;
 };
 
 struct TestBlockManager : public node::BlockManager {
