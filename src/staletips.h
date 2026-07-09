@@ -182,15 +182,15 @@ struct StaleTipMessage
 /** Cache of recently seen stale tips: tips of valid (or potentially valid)
  *  branches of the block tree that are not part of the active chain.
  *
- * At most MAX_RETAINED_STALETIPS tips are retained, for later relay to peers.
- * A tip is only tracked while it remains eligible: its branch forks off the
- * active chain by no more than `m_max_headers` blocks, its height is within
- * `m_recent_window` blocks of the active tip, it has no more work than the
- * active tip, and it is not known to be invalid. Stricter policies apply on
- * test networks: on signet the tip's block data must be available (the block
- * signature cannot be verified from headers alone) and header variants are
- * deduplicated, while on testnet the tip must meet a minimum difficulty so
- * that min-difficulty blocks are not relayed.
+ * At most MAX_RETAINED_STALETIPS tips are retained, for relay to peers. A tip
+ * is only tracked (and only relayed) while it remains eligible: its branch
+ * forks off the active chain by no more than `m_max_headers` blocks, its
+ * height is within `m_recent_window` blocks of the active tip, it has no more
+ * work than the active tip, and it is not known to be invalid. Stricter
+ * policies apply on test networks: on signet the tip's block data must be
+ * available (the block signature cannot be verified from headers alone) and
+ * header variants are deduplicated, while on testnet the tip must meet a
+ * minimum difficulty so that min-difficulty blocks are not relayed.
  */
 class StaleTipCache
 {
@@ -215,20 +215,25 @@ private:
     size_t m_max_headers{MAX_STALETIP_HEADERS};
 
     /** Find the fork point of `stale_tip` with the active chain, checking that
-     *  the tip is eligible for tracking.
+     *  the tip is eligible for tracking and relay.
      *
+     * @param[in] require_signet_block_data Whether to enforce the signet
+     *            requirement that the tip's block data is available.
      * @param[in] allow_more_work Permit tips with more work than the active
      *            tip. Used when a block is disconnected during a reorg, as it
      *            may temporarily have more work than the new active tip.
-     *
      * @return The fork point, or nullptr if the tip is not eligible.
      */
-    const CBlockIndex* GetEligibleForkPoint(const CChain& chain, const CBlockIndex& stale_tip, bool allow_more_work = false) const EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
+    const CBlockIndex* GetEligibleForkPoint(const CChain& chain, const CBlockIndex& stale_tip, bool require_signet_block_data = true, bool allow_more_work = false) const EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
+    /** Whether `stale_tip` is eligible for tracking and relay, including the
+     *  signet deduplication of header variants. See GetEligibleForkPoint(). */
+    bool IsStaleTipEligible(const CChain& chain, const CBlockIndex* stale_tip, bool require_signet_block_data = true, bool allow_more_work = false) const EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
     /** Insert `stale_tip` into the cache, dropping any tracked tips that it
-     *  descends from. Does nothing if one of its descendants is already
-     *  tracked, or if the cache is full of tips of greater or equal height. On
-     *  signet, tracked header variants of `stale_tip` are either kept in its
-     *  place or replaced by it, whichever has the longer branch. */
+     *  descends from. If the tip is already tracked, only its block data
+     *  availability is updated. Does nothing if one of its descendants is
+     *  already tracked, or if the cache is full of tips of greater or equal
+     *  height. On signet, tracked header variants of `stale_tip` are either
+     *  kept in its place or replaced by it, whichever has the longer branch. */
     bool Add(const CBlockIndex& stale_tip) EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
 
 public:
@@ -254,13 +259,23 @@ public:
     /** Whether no stale tips are currently retained. */
     bool Empty() const EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
 
-    /** Track `stale_tip` if it is eligible (see GetEligibleForkPoint()) and can
+    /** Track `stale_tip` if it is eligible (see IsStaleTipEligible()) and can
      *  be retained under the cache's resource limits.
      *
      * @return Whether the cache was updated to track `stale_tip` or its block
      *         data availability.
      */
     bool AddStaleTip(const CChain& chain, const CBlockIndex* stale_tip, bool allow_more_work = false) EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
+    /** Whether the block data for `stale_tip` may be requested from a peer.
+     *  Unlike AddStaleTip(), this does not require the block data to already
+     *  be available on signet, as it is exactly what would be requested. */
+    bool CanRequestStaleTipBlock(const CChain& chain, const CBlockIndex* stale_tip) const EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
+    /** Whether `block` is on a tracked, still-eligible stale branch whose tip
+     *  block data is available locally, making the block servable to peers
+     *  that request it in response to a `staletip` announcement with
+     *  `have_block` set. */
+    bool CanServeStaleBranchBlock(const CChain& chain, const CBlockIndex* block) const EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
+
     /** Get the tracked tips that are still eligible, with their fork points. */
     std::vector<StaleFork> GetStaleTips(const CChain& chain) const EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
     /** Get the tracked tips that are still eligible, in the order they were

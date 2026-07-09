@@ -717,7 +717,7 @@ void SetupServerArgs(ArgsManager& argsman, bool can_listen_ipc)
                        "connections through the Tor or I2P networks, without putting them in the mempool first. "
                        "Transactions submitted through the wallet are not affected by this option "
                        "(default: %u)",
-                    DEFAULT_PRIVATE_BROADCAST),
+                   DEFAULT_PRIVATE_BROADCAST),
                    ArgsManager::ALLOW_ANY,
                    OptionsCategory::NODE_RELAY);
     argsman.AddArg("-staletips=<mode>", "Enable stale-tip P2P announcements. Options are 'none', 'headers', or 'blocks' (default: none)", ArgsManager::ALLOW_ANY, OptionsCategory::NODE_RELAY);
@@ -1114,12 +1114,6 @@ bool AppInitParameterInteraction(const ArgsManager& args)
     if (args.GetBoolArg("-peerbloomfilters", DEFAULT_PEERBLOOMFILTERS))
         g_local_services = ServiceFlags(g_local_services | NODE_BLOOM);
 
-    if (const auto stale_tips{args.GetArg("-staletips")}) {
-        if (!args.IsArgNegated("-staletips") && !node::ParseStaleTipMode(*stale_tips)) {
-            return InitError(strprintf(_("Invalid value for -staletips=<mode>: '%s'. Expected one of none, headers, or blocks."), *stale_tips));
-        }
-    }
-
     const std::vector<std::string> test_options = args.GetArgs("-test");
     if (!test_options.empty()) {
         if (chainparams.GetChainType() != ChainType::REGTEST) {
@@ -1133,6 +1127,12 @@ bool AppInitParameterInteraction(const ArgsManager& args)
             if (it == TEST_OPTIONS_DOC.end()) {
                 InitWarning(strprintf(_("Unrecognised option \"%s\" provided in -test=<option>."), option));
             }
+        }
+    }
+
+    if (const auto stale_tips{args.GetArg("-staletips")}) {
+        if (!args.IsArgNegated("-staletips") && !node::ParseStaleTipMode(*stale_tips)) {
+            return InitError(strprintf(_("Invalid value for -staletips=<mode>: '%s'. Expected one of none, headers, or blocks."), *stale_tips));
         }
     }
 
