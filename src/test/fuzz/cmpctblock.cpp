@@ -45,11 +45,15 @@
 
 #include <boost/multi_index/detail/hash_index_iterator.hpp>
 
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <functional>
+#include <future>
 #include <iterator>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <thread>
@@ -135,13 +139,65 @@ void ResetChainmanAndMempool(TestingSetup& setup)
     }
 }
 
-//! Used to run tasks in a std::thread to avoid DEBUG_LOCKORDER false positives.
-class ImmediateBackgroundTaskRunner : public util::TaskRunnerInterface
+//! Used to run tasks in fresh std::threads to avoid DEBUG_LOCKORDER false positives.
+class SerialBackgroundTaskRunner : public util::TaskRunnerInterface
 {
 public:
-    void insert(std::function<void()> func) override { std::thread(std::move(func)).join(); }
-    void flush() override {}
-    size_t size() override { return 0; }
+    SerialBackgroundTaskRunner() : m_worker{[this] { ProcessQueue(); }} {}
+    ~SerialBackgroundTaskRunner() override
+    {
+        {
+            std::lock_guard lock{m_mutex};
+            m_stop = true;
+        }
+        m_cv.notify_one();
+        m_worker.join();
+    }
+
+    void insert(std::function<void()> func) override
+    {
+        {
+            std::lock_guard lock{m_mutex};
+            m_tasks.emplace_back(std::move(func));
+        }
+        m_cv.notify_one();
+    }
+
+    void flush() override
+    {
+        std::promise<void> promise;
+        auto future{promise.get_future()};
+        insert([&promise] { promise.set_value(); });
+        future.wait();
+    }
+
+    size_t size() override
+    {
+        std::lock_guard lock{m_mutex};
+        return m_tasks.size();
+    }
+
+private:
+    void ProcessQueue()
+    {
+        while (true) {
+            std::function<void()> func;
+            {
+                std::unique_lock lock{m_mutex};
+                m_cv.wait(lock, [this] { return m_stop || !m_tasks.empty(); });
+                if (m_stop && m_tasks.empty()) return;
+                func = std::move(m_tasks.front());
+                m_tasks.pop_front();
+            }
+            std::thread(std::move(func)).join();
+        }
+    }
+
+    std::mutex m_mutex;
+    std::condition_variable m_cv;
+    std::deque<std::function<void()>> m_tasks;
+    bool m_stop{false};
+    std::thread m_worker;
 };
 
 } // namespace
@@ -154,7 +210,7 @@ void initialize_cmpctblock()
     g_setup = testing_setup.get();
     g_nBits = Params().GenesisBlock().nBits;
     // Replace validation_signals before creating chainman and mempool so they use it.
-    testing_setup->m_node.validation_signals = std::make_unique<ValidationSignals>(std::make_unique<ImmediateBackgroundTaskRunner>());
+    testing_setup->m_node.validation_signals = std::make_unique<ValidationSignals>(std::make_unique<SerialBackgroundTaskRunner>());
     ResetChainmanAndMempool(*g_setup);
 }
 
@@ -475,6 +531,8 @@ FUZZ_TARGET(cmpctblock, .init = initialize_cmpctblock)
             random_node.fPauseSend = false;
 
             more_work = connman.ProcessMessagesOnce(random_node);
+            // Keep async validation callbacks deterministic before relay logic observes their side effects.
+            setup->m_node.validation_signals->SyncWithValidationInterfaceQueue();
             peerman->SendMessages(random_node);
         }
 
