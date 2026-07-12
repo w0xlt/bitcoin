@@ -10,6 +10,8 @@ from test_framework.messages import (
     CBlockHeader,
     CInv,
     MSG_BLOCK,
+    MSG_TYPE_MASK,
+    NODE_NETWORK,
     StaleTipCompressedHeader,
     msg_feature,
     msg_getdata,
@@ -22,6 +24,7 @@ from test_framework.util import assert_equal
 
 STALETIP_FEATURE = "https://github.com/ajtowns/bitcoin/tree/202601-staletips"
 FEATURE_VERSION = 70017
+MAX_BLOCKS_IN_TRANSIT_PER_PEER = 16
 
 
 class StaleTipPeer(P2PInterface):
@@ -31,6 +34,7 @@ class StaleTipPeer(P2PInterface):
         self.feature_data = feature_data
         self.blocks = []
         self.features = []
+        self.getdata = []
         self.invs = []
         self.staletips = []
 
@@ -45,6 +49,9 @@ class StaleTipPeer(P2PInterface):
     def on_block(self, message):
         self.blocks.append(message.block)
 
+    def on_getdata(self, message):
+        self.getdata.extend(message.inv)
+
     def on_inv(self, message):
         self.invs.extend(message.inv)
         super().on_inv(message)
@@ -57,6 +64,15 @@ class StaleTipPeer(P2PInterface):
             match = lambda _: True
         self.wait_until(lambda: any(match(staletip) for staletip in self.staletips))
         return next(staletip for staletip in self.staletips if match(staletip))
+
+    def wait_for_getdata_hash(self, block_hash):
+        self.wait_until(lambda: any(inv.hash == block_hash for inv in self.getdata))
+
+    def wait_for_getdata_hashes(self, block_hashes):
+        expected = set(block_hashes)
+        self.wait_until(lambda: expected.issubset({
+            inv.hash for inv in self.getdata if inv.type & MSG_TYPE_MASK == MSG_BLOCK
+        }))
 
     def wait_for_block_inv(self, block_hash):
         self.wait_until(lambda: any(inv.type == MSG_BLOCK and inv.hash == block_hash for inv in self.invs))
@@ -90,6 +106,12 @@ class P2PStaleTipTest(BitcoinTestFramework):
         self.test_no_reannouncement_after_transient_ineligibility()
         self.test_startup_seeding_only_when_enabled()
         self.test_serves_tracked_stale_branch()
+
+        self.restart_node(0, extra_args=["-debug=net", "-peertimeout=999", "-staletips=blocks"])
+        self.test_blocks_mode_ignores_non_witness_block_peer()
+        self.test_blocks_mode_requests_better_work_tip_block()
+        self.test_blocks_mode_requests_stale_branch_blocks()
+        self.test_blocks_mode_caps_stale_branch_requests_and_clears_timeout()
 
     def connect_peer(self, *, send_feature=True, feature_data=b"\x00", **kwargs):
         return self.nodes[0].add_p2p_connection(StaleTipPeer(send_feature=send_feature, feature_data=feature_data), **kwargs)
@@ -411,6 +433,62 @@ class P2PStaleTipTest(BitcoinTestFramework):
         unnegotiated_peer = self.connect_peer(send_feature=False)
         unnegotiated_peer.send_and_ping(msg_getdata([CInv(MSG_BLOCK, block.hash_int) for block in blocks]))
         assert_equal(unnegotiated_peer.blocks, [])
+        self.nodes[0].disconnect_p2ps()
+
+    def test_blocks_mode_ignores_non_witness_block_peer(self):
+        self.log.info("Test blocks mode does not request stale tip blocks from non-witness peers")
+        peer = self.connect_peer(feature_data=b"\x01", services=NODE_NETWORK)
+        block, fork_point_hash = self.stale_block()
+        peer.send_and_ping(self.staletip_msg(block, fork_point_hash, have_block=True))
+        self.assert_staletip_tracked(block)
+        assert_equal([inv.hash for inv in peer.getdata if inv.type & MSG_TYPE_MASK == MSG_BLOCK], [])
+        self.nodes[0].disconnect_p2ps()
+
+    def test_blocks_mode_requests_better_work_tip_block(self):
+        self.log.info("Test blocks mode requests block data for known better-work staletip headers")
+        header_peer = self.connect_peer(feature_data=b"\x01")
+        block, fork_point_hash = self.active_block()
+        header_peer.send_and_ping(self.staletip_msg(block, fork_point_hash, have_block=False))
+        assert_equal([inv.hash for inv in header_peer.getdata if inv.type & MSG_TYPE_MASK == MSG_BLOCK], [])
+        self.nodes[0].disconnect_p2ps()
+
+        peer = self.connect_peer(feature_data=b"\x01")
+        peer.send_and_ping(self.staletip_msg(block, fork_point_hash, have_block=True))
+        peer.wait_for_getdata_hash(block.hash_int)
+        self.nodes[0].disconnect_p2ps()
+
+    def test_blocks_mode_requests_stale_branch_blocks(self):
+        self.log.info("Test blocks mode requests missing stale branch blocks")
+        peer = self.connect_peer(feature_data=b"\x01")
+        blocks, fork_point_hash = self.stale_branch(length=2, fork_depth=2)
+        peer.send_and_ping(self.staletip_msg(blocks, fork_point_hash, have_block=True))
+        self.assert_staletip_tracked(blocks[-1])
+        expected_hashes = [block.hash_int for block in blocks]
+        peer.wait_for_getdata_hashes(expected_hashes)
+        assert_equal([inv.hash for inv in peer.getdata if inv.type & MSG_TYPE_MASK == MSG_BLOCK], expected_hashes)
+        self.nodes[0].disconnect_p2ps()
+
+    def test_blocks_mode_caps_stale_branch_requests_and_clears_timeout(self):
+        self.log.info("Test stale branch requests are capped and time out without disconnect")
+        node = self.nodes[0]
+        node.setmocktime(node.getblockheader(node.getbestblockhash())["time"] + 1)
+        peer = self.connect_peer(feature_data=b"\x01")
+
+        blocks, fork_point_hash = self.stale_branch(length=20, fork_depth=20)
+        peer.send_and_ping(self.staletip_msg(blocks, fork_point_hash, have_block=True))
+        self.assert_staletip_tracked(blocks[-1])
+
+        expected_hashes = [block.hash_int for block in blocks[:MAX_BLOCKS_IN_TRANSIT_PER_PEER]]
+        getdata_hashes = lambda: [inv.hash for inv in peer.getdata if inv.type & MSG_TYPE_MASK == MSG_BLOCK]
+        self.wait_until(lambda: getdata_hashes() == expected_hashes)
+        assert_equal(len(node.getpeerinfo()[0]["inflight"]), MAX_BLOCKS_IN_TRANSIT_PER_PEER)
+
+        with node.assert_debug_log(["Timeout downloading stale-tip branch block"]):
+            node.bumpmocktime(601)
+            peer.sync_with_ping()
+        self.wait_until(lambda: peer.is_connected and node.getpeerinfo()[0]["inflight"] == [])
+
+        node.setmocktime(0)
         self.nodes[0].disconnect_p2ps()
 
 
