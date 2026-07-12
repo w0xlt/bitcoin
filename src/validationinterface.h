@@ -133,6 +133,33 @@ protected:
      */
     virtual void BlockDisconnected(const std::shared_ptr<const CBlock> &block, const CBlockIndex* pindex) {}
     /**
+     * Whether this listener wants `AcceptedStaleTip` notifications.
+     *
+     * Header acceptance is frequent during headers sync, the notification is
+     * fired only for listeners that observe to this notification.
+     *
+     * Defaults to false.
+     */
+    virtual bool WantsAcceptedStaleTip() const { return false; }
+    /**
+     * Notifies listeners that a block header or block was accepted off the
+     * active chain, for stale-tip tracking. Headers with more work than the
+     * active tip are pending candidates to reconsider once it catches up.
+     * Blocks with no more work than the active tip on the way to a higher-work
+     * best known header, such as ancestors in a better chain during a reorg,
+     * are not notified, as they are expected to be connected.
+     *
+     * Header notifications from one ProcessNewBlockHeaders() call are coalesced
+     * to the last newly accepted header. A valid accepted prefix is still
+     * notified if a later header in the batch is rejected.
+     * Already-known headers do not generate another header notification.
+     * A later notification for the same index may occur when its block data
+     * becomes available.
+     *
+     * Called on a background thread.
+     */
+    virtual void AcceptedStaleTip(const CBlockIndex* pindex) {}
+    /**
      * Notifies listeners of the new active block chain on-disk.
      *
      * Prior to this callback, any updates are not guaranteed to persist on disk
@@ -228,6 +255,7 @@ public:
     void MempoolTransactionsRemovedForBlock(std::shared_ptr<const CBlock>, std::vector<RemovedMempoolTransactionInfo>, unsigned int block_height);
     void BlockConnected(const kernel::ChainstateRole&, std::shared_ptr<const CBlock>, const CBlockIndex* pindex);
     void BlockDisconnected(std::shared_ptr<const CBlock>, const CBlockIndex* pindex);
+    void AcceptedStaleTip(const CBlockIndex* pindex);
     void ChainStateFlushed(const kernel::ChainstateRole&, const CBlockLocator&);
     void BlockChecked(const std::shared_ptr<const CBlock>&, const BlockValidationState&);
     void NewPoWValidBlock(const CBlockIndex *, const std::shared_ptr<const CBlock>&);
