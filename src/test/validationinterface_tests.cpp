@@ -4,19 +4,33 @@
 
 #include <boost/test/unit_test.hpp>
 #include <consensus/validation.h>
+#include <pow.h>
 #include <primitives/block.h>
 #include <scheduler.h>
 #include <test/util/setup_common.h>
 #include <util/check.h>
+#include <validation.h>
 #include <validationinterface.h>
 
 #include <atomic>
 #include <memory>
+#include <vector>
 
 BOOST_FIXTURE_TEST_SUITE(validationinterface_tests, ChainTestingSetup)
 
 struct TestSubscriberNoop final : public CValidationInterface {
     void BlockChecked(const std::shared_ptr<const CBlock>&, const BlockValidationState&) override {}
+};
+
+struct StaleTipSubscriber final : CValidationInterface {
+    std::vector<const CBlockIndex*> m_accepted_stale_tips;
+
+    bool WantsAcceptedStaleTip() const override { return true; }
+
+    void AcceptedStaleTip(const CBlockIndex* pindex) override
+    {
+        m_accepted_stale_tips.push_back(pindex);
+    }
 };
 
 BOOST_AUTO_TEST_CASE(unregister_validation_interface_race)
@@ -97,6 +111,133 @@ BOOST_AUTO_TEST_CASE(unregister_all_during_call)
     BOOST_CHECK(!destroyed);
     shared.reset();
     BOOST_CHECK(destroyed);
+}
+
+BOOST_FIXTURE_TEST_CASE(processnewblockheaders_coalesces_accepted_stale_tip, TestChain100Setup)
+{
+    struct UninterestedSubscriber final : CValidationInterface {
+        size_t m_calls{0};
+
+        void AcceptedStaleTip(const CBlockIndex*) override { ++m_calls; }
+    };
+
+    m_node.validation_signals->SyncWithValidationInterfaceQueue();
+    const auto sub{std::make_shared<StaleTipSubscriber>()};
+    const auto uninterested{std::make_shared<UninterestedSubscriber>()};
+    m_node.validation_signals->RegisterSharedValidationInterface(sub);
+    m_node.validation_signals->RegisterSharedValidationInterface(uninterested);
+
+    const auto& consensus{Params().GetConsensus()};
+    const CBlockIndex* fork{nullptr};
+    {
+        LOCK(cs_main);
+        fork = Assert(m_node.chainman->ActiveChain().Tip())->GetAncestor(97);
+    }
+    uint256 prev_hash{fork->GetBlockHash()};
+    uint32_t time{static_cast<uint32_t>(fork->GetBlockTime() + 1)};
+    std::vector<CBlockHeader> headers;
+    for (uint32_t i{0}; i < 3; ++i) {
+        CBlockHeader header;
+        header.nVersion = 4;
+        header.hashPrevBlock = prev_hash;
+        header.hashMerkleRoot = uint256{static_cast<uint8_t>(i + 1)};
+        header.nTime = time++;
+        header.nBits = fork->nBits;
+        while (!CheckProofOfWork(header.GetHash(), header.nBits, consensus)) ++header.nNonce;
+        prev_hash = header.GetHash();
+        headers.push_back(header);
+    }
+
+    BlockValidationState state;
+    const CBlockIndex* tip{nullptr};
+    BOOST_CHECK(Assert(m_node.chainman)->ProcessNewBlockHeaders(headers, /*min_pow_checked=*/true, state, &tip));
+    m_node.validation_signals->SyncWithValidationInterfaceQueue();
+
+    BOOST_REQUIRE_EQUAL(sub->m_accepted_stale_tips.size(), 1U);
+    BOOST_CHECK_EQUAL(sub->m_accepted_stale_tips.front()->GetBlockHash().ToString(),
+                      Assert(tip)->GetBlockHash().ToString());
+    BOOST_CHECK_EQUAL(uninterested->m_calls, 0U);
+
+    BlockValidationState duplicate_state;
+    const CBlockIndex* duplicate_tip{nullptr};
+    BOOST_CHECK(Assert(m_node.chainman)->ProcessNewBlockHeaders(headers, /*min_pow_checked=*/true, duplicate_state, &duplicate_tip));
+    m_node.validation_signals->SyncWithValidationInterfaceQueue();
+    BOOST_CHECK_EQUAL(sub->m_accepted_stale_tips.size(), 1U);
+    BOOST_CHECK_EQUAL(Assert(duplicate_tip)->GetBlockHash().ToString(), Assert(tip)->GetBlockHash().ToString());
+    BOOST_CHECK_EQUAL(uninterested->m_calls, 0U);
+
+    // A header with more work than the active tip is not a stale tip, even
+    // though header acceptance does not activate it.
+    CBlockHeader better_work_header;
+    better_work_header.nVersion = 4;
+    better_work_header.hashPrevBlock = Assert(tip)->GetBlockHash();
+    better_work_header.hashMerkleRoot = uint256{uint8_t{4}};
+    better_work_header.nTime = time;
+    better_work_header.nBits = fork->nBits;
+    while (!CheckProofOfWork(better_work_header.GetHash(), better_work_header.nBits, consensus)) ++better_work_header.nNonce;
+    const std::vector<CBlockHeader> better_work_headers{better_work_header};
+    BOOST_CHECK(Assert(m_node.chainman)->ProcessNewBlockHeaders(better_work_headers, /*min_pow_checked=*/true, state));
+    m_node.validation_signals->SyncWithValidationInterfaceQueue();
+    BOOST_CHECK_EQUAL(sub->m_accepted_stale_tips.size(), 1U);
+}
+
+BOOST_FIXTURE_TEST_CASE(processnewblockheaders_notifies_accepted_prefix_before_failure, TestChain100Setup)
+{
+    m_node.validation_signals->SyncWithValidationInterfaceQueue();
+    const auto sub{std::make_shared<StaleTipSubscriber>()};
+    m_node.validation_signals->RegisterSharedValidationInterface(sub);
+
+    const auto& consensus{Params().GetConsensus()};
+    const CBlockIndex* fork{nullptr};
+    {
+        LOCK(cs_main);
+        fork = Assert(m_node.chainman->ActiveChain().Tip())->GetAncestor(97);
+    }
+    uint256 prev_hash{fork->GetBlockHash()};
+    uint32_t time{static_cast<uint32_t>(fork->GetBlockTime() + 1)};
+    std::vector<CBlockHeader> headers;
+    for (uint32_t i{0}; i < 2; ++i) {
+        CBlockHeader header;
+        header.nVersion = 4;
+        header.hashPrevBlock = prev_hash;
+        header.hashMerkleRoot = uint256{static_cast<uint8_t>(i + 10)};
+        header.nTime = time++;
+        header.nBits = fork->nBits;
+        while (!CheckProofOfWork(header.GetHash(), header.nBits, consensus)) ++header.nNonce;
+        prev_hash = header.GetHash();
+        headers.push_back(header);
+    }
+
+    CBlockHeader invalid_header;
+    invalid_header.nVersion = 4;
+    invalid_header.hashPrevBlock = prev_hash;
+    invalid_header.hashMerkleRoot = uint256{uint8_t{12}};
+    invalid_header.nTime = time;
+    invalid_header.nBits = 0;
+    headers.push_back(invalid_header);
+
+    BlockValidationState state;
+    const CBlockIndex* accepted_prefix_tip{nullptr};
+    BOOST_CHECK(!Assert(m_node.chainman)->ProcessNewBlockHeaders(headers, /*min_pow_checked=*/true, state, &accepted_prefix_tip));
+    BOOST_CHECK(state.IsInvalid());
+    m_node.validation_signals->SyncWithValidationInterfaceQueue();
+
+    BOOST_REQUIRE_EQUAL(sub->m_accepted_stale_tips.size(), 1U);
+    BOOST_CHECK_EQUAL(sub->m_accepted_stale_tips.front()->GetBlockHash().ToString(), headers[1].GetHash().ToString());
+    BOOST_CHECK_EQUAL(Assert(accepted_prefix_tip)->GetBlockHash().ToString(), headers[1].GetHash().ToString());
+
+    const std::vector<CBlockHeader> valid_prefix{headers.begin(), headers.end() - 1};
+    BlockValidationState duplicate_state;
+    BOOST_CHECK(Assert(m_node.chainman)->ProcessNewBlockHeaders(valid_prefix, /*min_pow_checked=*/true, duplicate_state));
+    m_node.validation_signals->SyncWithValidationInterfaceQueue();
+    BOOST_CHECK_EQUAL(sub->m_accepted_stale_tips.size(), 1U);
+
+    const std::vector<CBlockHeader> invalid_only{invalid_header};
+    BlockValidationState invalid_only_state;
+    BOOST_CHECK(!Assert(m_node.chainman)->ProcessNewBlockHeaders(invalid_only, /*min_pow_checked=*/true, invalid_only_state));
+    BOOST_CHECK(invalid_only_state.IsInvalid());
+    m_node.validation_signals->SyncWithValidationInterfaceQueue();
+    BOOST_CHECK_EQUAL(sub->m_accepted_stale_tips.size(), 1U);
 }
 
 BOOST_AUTO_TEST_SUITE_END()

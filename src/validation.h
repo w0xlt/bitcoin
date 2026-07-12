@@ -945,6 +945,7 @@ private:
     CBlockIndex* m_last_notified_header GUARDED_BY(GetMutex()){nullptr};
 
     bool NotifyHeaderTip() LOCKS_EXCLUDED(GetMutex());
+    void MaybeNotifyAcceptedStaleTip(const CBlockIndex& pindex) EXCLUSIVE_LOCKS_REQUIRED(cs_main);
 
     //! Internal helper for ActivateSnapshot().
     //!
@@ -964,12 +965,16 @@ private:
      * Caller must set min_pow_checked=true in order to add a new header to the
      * block index (permanent memory storage), indicating that the header is
      * known to be part of a sufficiently high-work chain (anti-dos check).
+     * @param[out] new_header Set to true only if this call successfully
+     *                        inserted a new block-index entry. False for
+     *                        duplicates and failures.
      */
     bool AcceptBlockHeader(
         const CBlockHeader& block,
         BlockValidationState& state,
         CBlockIndex** ppindex,
-        bool min_pow_checked) EXCLUSIVE_LOCKS_REQUIRED(cs_main);
+        bool min_pow_checked,
+        bool& new_header) EXCLUSIVE_LOCKS_REQUIRED(cs_main);
     friend Chainstate;
 
     /** Most recent headers presync progress update, for rate-limiting. */
