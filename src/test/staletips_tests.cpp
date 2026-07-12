@@ -409,6 +409,7 @@ BOOST_AUTO_TEST_CASE(staletip_cache_serve_policy)
     StaleTipCache tips;
     BOOST_CHECK(!tips.CanServeStaleBranchBlock(tree.active_chain, nullptr));
 
+    // A tracked header-only branch is not servable.
     BOOST_CHECK(tips.AddStaleTip(tree.active_chain, stale));
     BOOST_CHECK(!tips.CanServeStaleBranchBlock(tree.active_chain, stale));
     BOOST_CHECK(!tips.CanServeStaleBranchBlock(tree.active_chain, stale_parent));
@@ -421,9 +422,12 @@ BOOST_AUTO_TEST_CASE(staletip_cache_serve_policy)
     BOOST_CHECK(tips.CanServeStaleBranchBlock(tree.active_chain, stale));
     BOOST_CHECK(tips.CanServeStaleBranchBlock(tree.active_chain, stale_parent));
 
+    // A block with data that is not on a tracked stale branch is not servable.
     CBlockIndex* untracked{tree.Add(Assert(tip->pprev), false, true)};
     BOOST_CHECK(!tips.CanServeStaleBranchBlock(tree.active_chain, untracked));
 
+    // A tracked tip that is no longer eligible (here: reorged onto the
+    // active chain) is not servable.
     tree.active_chain.SetTip(*stale);
     BOOST_CHECK(!tips.CanServeStaleBranchBlock(tree.active_chain, stale));
     BOOST_CHECK(!tips.CanServeStaleBranchBlock(tree.active_chain, stale_parent));
@@ -565,6 +569,7 @@ BOOST_AUTO_TEST_CASE(staletip_cache_network_policy)
     CBlockIndex* fork{active->pprev};
     CBlockIndex* headers_only{tree.Add(fork, false)};
     StaleTipCache signet_tips{ChainType::SIGNET};
+    BOOST_CHECK(signet_tips.CanRequestStaleTipBlock(tree.active_chain, headers_only));
     BOOST_CHECK(!signet_tips.AddStaleTip(tree.active_chain, headers_only));
 
     headers_only->nStatus |= BLOCK_VALID_TRANSACTIONS | BLOCK_HAVE_DATA;
