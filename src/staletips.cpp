@@ -240,6 +240,24 @@ bool StaleTipCache::AddStaleTip(const CChain& chain, const CBlockIndex* stale_ti
     return Add(*stale_tip);
 }
 
+bool StaleTipCache::CanServeStaleBranchBlock(const CChain& chain, const CBlockIndex* block) const
+{
+    AssertLockHeld(::cs_main);
+    if (block == nullptr) return false;
+    if (!(block->nStatus & BLOCK_HAVE_DATA)) return false;
+
+    for (const auto& entry : m_tips) {
+        if (entry.tip == nullptr) continue;
+        if (!(entry.tip->nStatus & BLOCK_HAVE_DATA)) continue;
+
+        const CBlockIndex* fork_point{GetEligibleForkPoint(chain, *entry.tip)};
+        if (fork_point == nullptr) continue;
+        if (block->nHeight <= fork_point->nHeight || block->nHeight > entry.tip->nHeight) continue;
+        if (entry.tip->GetAncestor(block->nHeight) == block) return true;
+    }
+    return false;
+}
+
 std::vector<StaleFork> StaleTipCache::GetStaleTips(const CChain& chain) const
 {
     AssertLockHeld(::cs_main);
