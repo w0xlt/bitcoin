@@ -267,6 +267,11 @@ struct Peer {
      * Most peers use headers-first syncing, which doesn't use this mechanism */
     uint256 m_continuation_block GUARDED_BY(m_block_inv_mutex) {};
 
+    /** Whether this peer advertised valid stale-tip support via BIP434. */
+    bool m_stale_tip_negotiated GUARDED_BY(NetEventsInterface::g_msgproc_mutex){false};
+    /** Whether this peer prefers stale-tip announcements after block data is available. */
+    bool m_stale_tip_prefers_blocks GUARDED_BY(NetEventsInterface::g_msgproc_mutex){false};
+
     /** Set to true once initial VERSION message was sent (only relevant for outbound peers). */
     bool m_outbound_version_message_sent GUARDED_BY(NetEventsInterface::g_msgproc_mutex){false};
 
@@ -3803,8 +3808,13 @@ void PeerManagerImpl::ProcessMessage(Peer& peer, CNode& pfrom, const std::string
         }
 
         if (greatest_common_version >= FEATURE_VERSION) {
-            // announce supported features
-            // MakeAndPushFeature(pfrom, NetMsgFeature::FOO, uint32_t{1});
+            if (m_opts.stale_tip_mode != StaleTipMode::NONE) {
+                // Signet stale tips can only be validated with the full block data
+                // containing the signature, so always prefer block availability there.
+                const uint8_t prefers_blocks{m_opts.stale_tip_mode == StaleTipMode::BLOCKS ||
+                                             m_chainparams.GetChainType() == ChainType::SIGNET};
+                MakeAndPushFeature(pfrom, NetMsgFeature::STALETIP, prefers_blocks);
+            }
         }
 
         MakeAndPushMessage(pfrom, NetMsgType::VERACK);
@@ -4058,10 +4068,24 @@ void PeerManagerImpl::ProcessMessage(Peer& peer, CNode& pfrom, const std::string
             return;
         }
 
-        // if (feature_id == NetMsgFeature::FOO) {
-        //     ...
-        //     return;
-        // }
+        if (feature_id == NetMsgFeature::STALETIP) {
+            if (feature_data.size() != 1) {
+                LogDebug(BCLog::NET, "ignoring staletip feature with malformed data from peer=%d", pfrom.GetId());
+                return;
+            }
+
+            uint8_t prefers_blocks{0};
+            feature_data >> prefers_blocks;
+            if (prefers_blocks > 1) {
+                LogDebug(BCLog::NET, "ignoring staletip feature with invalid prefers_blocks=%u from peer=%d", prefers_blocks, pfrom.GetId());
+                return;
+            }
+
+            peer.m_stale_tip_negotiated = true;
+            peer.m_stale_tip_prefers_blocks = prefers_blocks;
+            LogDebug(BCLog::NET, "peer=%d supports staletip announcements with prefers_blocks=%u", pfrom.GetId(), prefers_blocks);
+            return;
+        }
 
         // ignore unknown feature_id
         LogDebug(BCLog::NET, "unknown feature advertised: %s", SanitizeString(feature_id));

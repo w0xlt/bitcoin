@@ -18,6 +18,7 @@
 #include <cstdint>
 #include <limits>
 #include <string>
+#include <string_view>
 
 /** Message header.
  * (4) message start.
@@ -322,7 +323,17 @@ static constexpr size_t MAX_FEATUREID_LENGTH{80};
 static constexpr size_t MAX_FEATUREDATA_LENGTH{512};
 
 namespace NetMsgFeature {
-//inline constexpr std::string_view FOO{"BIP-FOO"};
+/**
+ * BIP 434 feature id for stale-tip relay.
+ * The feature data is exactly one byte indicating whether announcements are
+ * preferred once block data is available for the stale tip.
+ *
+ * The id is an interim repository URL, as BIP 434 prescribes for
+ * experimental features without an assigned BIP number. Once the stale-tip
+ * BIP is assigned a number, this should be replaced with the BIP-number
+ * based identifier (e.g. "BIPnnn"), in lockstep with other implementations.
+ */
+inline constexpr std::string_view STALETIP{"https://github.com/ajtowns/bitcoin/tree/202601-staletips"};
 }
 
 /** nServices flags */
