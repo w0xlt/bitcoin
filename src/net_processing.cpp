@@ -1045,6 +1045,8 @@ private:
      * about and we fully-validated them at some point.
      */
     bool BlockRequestAllowed(const CBlockIndex& block_index) EXCLUSIVE_LOCKS_REQUIRED(cs_main);
+    /** Whether this negotiated peer may fetch a tracked stale branch block. */
+    bool StaleTipBlockRequestAllowed(const Peer& peer, const CBlockIndex& block_index) EXCLUSIVE_LOCKS_REQUIRED(g_msgproc_mutex, cs_main);
     bool AlreadyHaveBlock(const uint256& block_hash) EXCLUSIVE_LOCKS_REQUIRED(cs_main);
     void ProcessGetBlockData(CNode& pfrom, Peer& peer, const CInv& inv)
         EXCLUSIVE_LOCKS_REQUIRED(g_msgproc_mutex, !m_most_recent_block_mutex);
@@ -2006,6 +2008,14 @@ bool PeerManagerImpl::BlockRequestAllowed(const CBlockIndex& block_index)
            (GetBlockProofEquivalentTime(*m_chainman.m_best_header, block_index, *m_chainman.m_best_header, m_chainparams.GetConsensus()) < STALE_RELAY_AGE_LIMIT);
 }
 
+bool PeerManagerImpl::StaleTipBlockRequestAllowed(const Peer& peer, const CBlockIndex& block_index)
+{
+    AssertLockHeld(g_msgproc_mutex);
+    AssertLockHeld(cs_main);
+    return m_opts.stale_tip_mode != StaleTipMode::NONE && peer.m_stale_tip_negotiated &&
+           m_stale_tips.CanServeStaleBranchBlock(m_chainman.ActiveChain(), &block_index);
+}
+
 util::Expected<void, std::string> PeerManagerImpl::FetchBlock(NodeId peer_id, const CBlockIndex& block_index)
 {
     if (m_chainman.m_blockman.LoadingBlocks()) return util::Unexpected{"Loading blocks ..."};
@@ -2446,7 +2456,7 @@ void PeerManagerImpl::ProcessGetBlockData(CNode& pfrom, Peer& peer, const CInv& 
         if (!pindex) {
             return;
         }
-        if (!BlockRequestAllowed(*pindex)) {
+        if (!BlockRequestAllowed(*pindex) && !StaleTipBlockRequestAllowed(peer, *pindex)) {
             LogDebug(BCLog::NET, "%s: ignoring request from peer=%i for old block that isn't in the main chain\n", __func__, pfrom.GetId());
             return;
         }
@@ -5783,7 +5793,8 @@ void PeerManagerImpl::MaybeSendStaleTips(CNode& node, Peer& peer, CNodeState& st
         if (!PeerHasHeader(&state, announcement.fork.fork_point)) continue;
 
         const CBlockIndex& stale_tip{*announcement.fork.tip};
-        const bool have_block{(stale_tip.nStatus & BLOCK_HAVE_DATA) != 0 && BlockRequestAllowed(stale_tip)};
+        const bool have_block{(stale_tip.nStatus & BLOCK_HAVE_DATA) != 0 &&
+                              (BlockRequestAllowed(stale_tip) || StaleTipBlockRequestAllowed(peer, stale_tip))};
         // Signet stale tips can only be validated with the block data, and
         // peers may disconnect for announcements without it. Defer the
         // announcement until the block data can be served.
