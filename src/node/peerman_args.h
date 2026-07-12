@@ -7,9 +7,13 @@
 
 #include <net_processing.h>
 
+#include <optional>
+#include <string_view>
+
 class ArgsManager;
 
 namespace node {
+std::optional<StaleTipMode> ParseStaleTipMode(std::string_view mode);
 void ApplyArgsManOptions(const ArgsManager& argsman, PeerManager::Options& options);
 } // namespace node
 
