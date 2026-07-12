@@ -1187,6 +1187,8 @@ private:
      *  it is below our NODE_NETWORK_LIMITED threshold, or because the upload
      *  target is reached for historical blocks. Mirrors ProcessGetBlockData(). */
     bool BlockServingLimited(const CNode& node, const Peer& peer, const CBlockIndex& block_index) EXCLUSIVE_LOCKS_REQUIRED(cs_main);
+    /** Whether this negotiated peer may fetch a tracked stale branch block. */
+    bool StaleTipBlockRequestAllowed(const Peer& peer, const CBlockIndex& block_index) EXCLUSIVE_LOCKS_REQUIRED(g_msgproc_mutex, cs_main);
     bool AlreadyHaveBlock(const uint256& block_hash) EXCLUSIVE_LOCKS_REQUIRED(cs_main);
     void ProcessGetBlockData(CNode& pfrom, Peer& peer, const CInv& inv)
         EXCLUSIVE_LOCKS_REQUIRED(g_msgproc_mutex, !m_most_recent_block_mutex);
@@ -2220,6 +2222,14 @@ bool PeerManagerImpl::BlockServingLimited(const CNode& node, const Peer& peer, c
            tip != nullptr && tip->nHeight - block_index.nHeight > static_cast<int>(NODE_NETWORK_LIMITED_MIN_BLOCKS) + 2;
 }
 
+bool PeerManagerImpl::StaleTipBlockRequestAllowed(const Peer& peer, const CBlockIndex& block_index)
+{
+    AssertLockHeld(g_msgproc_mutex);
+    AssertLockHeld(cs_main);
+    return m_opts.stale_tip_mode != StaleTipMode::NONE && peer.m_stale_tip_negotiated &&
+           m_stale_tips.CanServeStaleBranchBlock(m_chainman.ActiveChain(), &block_index);
+}
+
 util::Expected<void, std::string> PeerManagerImpl::FetchBlock(NodeId peer_id, const CBlockIndex& block_index)
 {
     if (m_chainman.m_blockman.LoadingBlocks()) return util::Unexpected{"Loading blocks ..."};
@@ -2846,7 +2856,7 @@ void PeerManagerImpl::ProcessGetBlockData(CNode& pfrom, Peer& peer, const CInv& 
         if (!pindex) {
             return;
         }
-        if (!BlockRequestAllowed(*pindex)) {
+        if (!BlockRequestAllowed(*pindex) && !StaleTipBlockRequestAllowed(peer, *pindex)) {
             LogDebug(BCLog::NET, "%s: ignoring request from peer=%i for old block that isn't in the main chain\n", __func__, pfrom.GetId());
             return;
         }
@@ -5484,7 +5494,12 @@ void PeerManagerImpl::ProcessMessage(Peer& peer, CNode& pfrom, const std::string
             // mapBlockSource is only used for punishing peers and setting
             // which peers send us compact blocks, so the race between here and
             // cs_main in ProcessNewBlock is fine.
-            mapBlockSource.emplace(hash, std::make_pair(pfrom.GetId(), true));
+            // Stale branch blocks are relayed without being fully validated,
+            // so, as for compact blocks, don't punish a peer if a block on a
+            // stale branch it announced turns out to be invalid.
+            const CBlockIndex* block_index{m_chainman.m_blockman.LookupBlockIndex(hash)};
+            const bool may_punish{block_index == nullptr || !PeerAnnouncedStaleTip(peer, *block_index)};
+            mapBlockSource.emplace(hash, std::make_pair(pfrom.GetId(), may_punish));
 
             // Check claimed work on this block against our anti-dos thresholds.
             if (prev_block && prev_block->nChainWork + GetBlockProof(*pblock) >= GetAntiDoSWorkThreshold()) {
@@ -6285,12 +6300,14 @@ void PeerManagerImpl::MaybeSendStaleTips(CNode& node, Peer& peer, CNodeState& st
         // Only claim block data that requests from this peer would get, for
         // every block of the branch above its fork point on the active chain:
         // the peer may request them all, for example through normal block
-        // download if the branch has more work than its tip.
+        // download if the branch has more work than its tip. As these are
+        // blocks of a tracked stale branch, they are served to the peer when
+        // stored (see StaleTipBlockRequestAllowed()), unless serving is limited.
         bool have_block{true};
         bool missing_data{false};
         for (const CBlockIndex* block{fork.tip}; have_block && block != nullptr && block != announcement.fork.fork_point; block = block->pprev) {
             missing_data = (block->nStatus & BLOCK_HAVE_DATA) == 0;
-            have_block = !missing_data && BlockRequestAllowed(*block) && !BlockServingLimited(node, peer, *block);
+            have_block = !missing_data && !BlockServingLimited(node, peer, *block);
         }
         // Peers preferring block data wait for that of the whole branch, unless
         // that would substantially delay propagation.

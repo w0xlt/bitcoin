@@ -462,6 +462,46 @@ BOOST_AUTO_TEST_CASE(staletip_tracked_seqnos)
     BOOST_CHECK(tips.GetTrackedSeqnos() == seqnos);
 }
 
+BOOST_AUTO_TEST_CASE(staletip_cache_serve_policy)
+{
+    LOCK(::cs_main);
+
+    BlockTree tree;
+    CBlockIndex* tip{tree.Add(nullptr, true, true)};
+    for (int i{0}; i < 4; ++i) tip = tree.Add(tip, true, true);
+
+    CBlockIndex* stale_parent{tree.Add(Assert(Assert(tip->pprev)->pprev), false)};
+    CBlockIndex* stale{tree.Add(stale_parent, false)};
+    StaleTipCache tips;
+    BOOST_CHECK(!tips.CanServeStaleBranchBlock(tree.active_chain, nullptr));
+
+    // A tracked header-only branch is not servable.
+    BOOST_CHECK(tips.AddStaleTip(tree.active_chain, stale));
+    BOOST_CHECK(!tips.CanServeStaleBranchBlock(tree.active_chain, stale));
+    BOOST_CHECK(!tips.CanServeStaleBranchBlock(tree.active_chain, stale_parent));
+
+    // A stored block on the branch is servable even while the tip's block
+    // data is missing, for example when a header extended the branch.
+    stale_parent->nStatus |= BLOCK_VALID_TRANSACTIONS | BLOCK_HAVE_DATA;
+    BOOST_CHECK(tips.CanServeStaleBranchBlock(tree.active_chain, stale_parent));
+    BOOST_CHECK(!tips.CanServeStaleBranchBlock(tree.active_chain, stale));
+
+    stale->nStatus |= BLOCK_VALID_TRANSACTIONS | BLOCK_HAVE_DATA;
+    BOOST_CHECK(tips.AddStaleTip(tree.active_chain, stale));
+    BOOST_CHECK(tips.CanServeStaleBranchBlock(tree.active_chain, stale));
+    BOOST_CHECK(tips.CanServeStaleBranchBlock(tree.active_chain, stale_parent));
+
+    // A block with data that is not on a tracked stale branch is not servable.
+    CBlockIndex* untracked{tree.Add(Assert(tip->pprev), false, true)};
+    BOOST_CHECK(!tips.CanServeStaleBranchBlock(tree.active_chain, untracked));
+
+    // A tracked tip that is no longer eligible (here: reorged onto the
+    // active chain) is not servable.
+    tree.active_chain.SetTip(*stale);
+    BOOST_CHECK(!tips.CanServeStaleBranchBlock(tree.active_chain, stale));
+    BOOST_CHECK(!tips.CanServeStaleBranchBlock(tree.active_chain, stale_parent));
+}
+
 BOOST_AUTO_TEST_CASE(staletip_cache_policy)
 {
     LOCK(::cs_main);
