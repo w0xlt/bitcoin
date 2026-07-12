@@ -92,6 +92,17 @@ public:
             it = --it->count ? std::next(it) : m_list.erase(it);
         }
     }
+
+    //! Returns whether `f` returns true for any registered callback.
+    //! `f` is not evaluated again once a true result has been found.
+    template<typename F> bool Any(F&& f) EXCLUSIVE_LOCKS_REQUIRED(!m_mutex)
+    {
+        bool found{false};
+        Iterate([&](CValidationInterface& callbacks) {
+            found = found || f(callbacks);
+        });
+        return found;
+    }
 };
 
 ValidationSignals::ValidationSignals(std::unique_ptr<util::TaskRunnerInterface> task_runner)
@@ -248,6 +259,21 @@ void ValidationSignals::BlockDisconnected(std::shared_ptr<const CBlock> pblock, 
                           pindex->nHeight);
     auto event = [pblock = std::move(pblock), pindex, this] {
         m_internals->Iterate([&](CValidationInterface& callbacks) { callbacks.BlockDisconnected(pblock, pindex); });
+    };
+    ENQUEUE_AND_LOG_EVENT(std::move(event), std::move(log_msg));
+}
+
+void ValidationSignals::AcceptedStaleTip(const CBlockIndex* pindex)
+{
+    if (!m_internals->Any([](const CValidationInterface& callbacks) { return callbacks.WantsAcceptedStaleTip(); })) return;
+
+    auto log_msg = LOG_MSG("%s: block hash=%s block height=%d", __func__,
+                          pindex->GetBlockHash().ToString(),
+                          pindex->nHeight);
+    auto event = [pindex, this] {
+        m_internals->Iterate([&](CValidationInterface& callbacks) {
+            if (callbacks.WantsAcceptedStaleTip()) callbacks.AcceptedStaleTip(pindex);
+        });
     };
     ENQUEUE_AND_LOG_EVENT(std::move(event), std::move(log_msg));
 }

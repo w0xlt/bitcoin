@@ -3777,6 +3777,17 @@ void Chainstate::TryAddBlockIndexCandidate(CBlockIndex* pindex)
     }
 }
 
+void ChainstateManager::MaybeNotifyAcceptedStaleTip(const CBlockIndex& pindex)
+{
+    AssertLockHeld(cs_main);
+
+    if (!m_options.signals) return;
+    const CBlockIndex* active_tip{ActiveTip()};
+    if (active_tip != nullptr && pindex.nChainWork <= active_tip->nChainWork && !ActiveChain().Contains(pindex)) {
+        m_options.signals->AcceptedStaleTip(&pindex);
+    }
+}
+
 /** Mark a block as having its data received and checked (up to BLOCK_VALID_TRANSACTIONS). */
 void ChainstateManager::ReceivedBlockTransactions(const CBlock& block, CBlockIndex* pindexNew, const FlatFilePos& pos)
 {
@@ -3803,6 +3814,8 @@ void ChainstateManager::ReceivedBlockTransactions(const CBlock& block, CBlockInd
     }
     pindexNew->RaiseValidity(BLOCK_VALID_TRANSACTIONS);
     m_blockman.m_dirty_blockindex.insert(pindexNew);
+
+    MaybeNotifyAcceptedStaleTip(*pindexNew);
 
     if (pindexNew->pprev == nullptr || pindexNew->pprev->HaveNumChainTxs()) {
         // If pindexNew is the genesis block or all parents are BLOCK_VALID_TRANSACTIONS.
@@ -4199,15 +4212,17 @@ static bool ContextualCheckBlock(const CBlock& block, BlockValidationState& stat
     return true;
 }
 
-bool ChainstateManager::AcceptBlockHeader(const CBlockHeader& block, BlockValidationState& state, CBlockIndex** ppindex, bool min_pow_checked)
+bool ChainstateManager::AcceptBlockHeader(const CBlockHeader& block, BlockValidationState& state, CBlockIndex** ppindex, bool min_pow_checked, bool& is_new_header)
 {
     AssertLockHeld(cs_main);
+    is_new_header = false;
 
     // Check for duplicate
     uint256 hash = block.GetHash();
     BlockMap::iterator miSelf{m_blockman.m_block_index.find(hash)};
+    const bool header_missing{miSelf == m_blockman.m_block_index.end()};
     if (hash != GetConsensus().hashGenesisBlock) {
-        if (miSelf != m_blockman.m_block_index.end()) {
+        if (!header_missing) {
             // Block header is already known.
             CBlockIndex* pindex = &(miSelf->second);
             if (ppindex)
@@ -4247,6 +4262,7 @@ bool ChainstateManager::AcceptBlockHeader(const CBlockHeader& block, BlockValida
         return state.Invalid(BlockValidationResult::BLOCK_HEADER_LOW_WORK, "too-little-chainwork");
     }
     CBlockIndex* pindex{m_blockman.AddToBlockIndex(block, m_best_header)};
+    is_new_header = header_missing;
 
     if (ppindex)
         *ppindex = pindex;
@@ -4258,21 +4274,29 @@ bool ChainstateManager::AcceptBlockHeader(const CBlockHeader& block, BlockValida
 bool ChainstateManager::ProcessNewBlockHeaders(std::span<const CBlockHeader> headers, bool min_pow_checked, BlockValidationState& state, const CBlockIndex** ppindex)
 {
     AssertLockNotHeld(cs_main);
+    bool accepted{true};
     {
         LOCK(cs_main);
+        const CBlockIndex* last_new_header{nullptr};
         for (const CBlockHeader& header : headers) {
+            bool is_new_header{false};
             CBlockIndex *pindex = nullptr; // Use a temp pindex instead of ppindex to avoid a const_cast
-            bool accepted{AcceptBlockHeader(header, state, &pindex, min_pow_checked)};
+            accepted = AcceptBlockHeader(header, state, &pindex, min_pow_checked, is_new_header);
             CheckBlockIndex();
 
-            if (!accepted) {
-                return false;
-            }
+            // Break instead of returning so the accepted prefix is notified below.
+            if (!accepted) break;
             if (ppindex) {
                 *ppindex = pindex;
             }
+            if (is_new_header) last_new_header = pindex;
         }
+
+        // This is the single flush point for both success and partial failure.
+        // It must remain inside the cs_main scope.
+        if (last_new_header != nullptr) MaybeNotifyAcceptedStaleTip(*last_new_header);
     }
+    if (!accepted) return false;
     if (NotifyHeaderTip()) {
         if (IsInitialBlockDownload() && ppindex && *ppindex) {
             const CBlockIndex& last_accepted{**ppindex};
@@ -4321,11 +4345,14 @@ bool ChainstateManager::AcceptBlock(const std::shared_ptr<const CBlock>& pblock,
     CBlockIndex *pindexDummy = nullptr;
     CBlockIndex *&pindex = ppindex ? *ppindex : pindexDummy;
 
-    bool accepted_header{AcceptBlockHeader(block, state, &pindex, min_pow_checked)};
+    bool is_new_header{false};
+    bool accepted_header{AcceptBlockHeader(block, state, &pindex, min_pow_checked, is_new_header)};
     CheckBlockIndex();
 
     if (!accepted_header)
         return false;
+
+    if (is_new_header) MaybeNotifyAcceptedStaleTip(*pindex);
 
     // Check all requested blocks that we do not already have for validity and
     // save them to disk. Skip processing of unrequested blocks as an anti-DoS
