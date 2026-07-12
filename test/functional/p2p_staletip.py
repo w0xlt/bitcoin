@@ -12,6 +12,7 @@ from test_framework.messages import (
     MSG_BLOCK,
     StaleTipCompressedHeader,
     msg_feature,
+    msg_getdata,
     msg_inv,
     msg_staletip,
 )
@@ -28,6 +29,7 @@ class StaleTipPeer(P2PInterface):
         super().__init__()
         self.send_feature = send_feature
         self.feature_data = feature_data
+        self.blocks = []
         self.features = []
         self.invs = []
         self.staletips = []
@@ -39,6 +41,9 @@ class StaleTipPeer(P2PInterface):
 
     def on_feature(self, message):
         self.features.append(message)
+
+    def on_block(self, message):
+        self.blocks.append(message.block)
 
     def on_inv(self, message):
         self.invs.extend(message.inv)
@@ -55,6 +60,9 @@ class StaleTipPeer(P2PInterface):
 
     def wait_for_block_inv(self, block_hash):
         self.wait_until(lambda: any(inv.type == MSG_BLOCK and inv.hash == block_hash for inv in self.invs))
+
+    def wait_for_block_hash(self, block_hash):
+        self.wait_until(lambda: any(block.hash_int == block_hash for block in self.blocks))
 
 
 class P2PStaleTipTest(BitcoinTestFramework):
@@ -81,6 +89,7 @@ class P2PStaleTipTest(BitcoinTestFramework):
         self.test_peer_must_know_fork_point()
         self.test_no_reannouncement_after_transient_ineligibility()
         self.test_startup_seeding_only_when_enabled()
+        self.test_serves_tracked_stale_branch()
 
     def connect_peer(self, *, send_feature=True, feature_data=b"\x00", **kwargs):
         return self.nodes[0].add_p2p_connection(StaleTipPeer(send_feature=send_feature, feature_data=feature_data), **kwargs)
@@ -376,6 +385,33 @@ class P2PStaleTipTest(BitcoinTestFramework):
         # block index are seeded at startup.
         self.restart_node(0, extra_args=["-debug=net", "-peertimeout=999", "-staletips=headers"])
         assert len(node.getnetworkinfo()["staletips"]) > 0
+
+    def test_serves_tracked_stale_branch(self):
+        self.log.info("Test headers mode announces and serves tracked stale branch data")
+        node = self.nodes[0]
+        peer = self.connect_peer(feature_data=b"\x00")
+        peer.send_and_ping(msg_inv([CInv(MSG_BLOCK, int(node.getbestblockhash(), 16))]))
+
+        blocks, fork_point_hash = self.stale_branch(length=2, fork_depth=2)
+        for block in blocks:
+            assert node.submitblock(block.serialize().hex()) in (None, "inconclusive")
+        self.assert_staletip_tracked(blocks[-1])
+
+        staletip = peer.wait_for_staletip(
+            lambda msg: msg.hash_fork_point == fork_point_hash
+            and len(msg.headers) == 2
+            and msg.headers[-1].hashMerkleRoot == blocks[-1].hashMerkleRoot
+        )
+        assert_equal(staletip.have_block, True)
+
+        peer.send_without_ping(msg_getdata([CInv(MSG_BLOCK, block.hash_int) for block in blocks]))
+        for block in blocks:
+            peer.wait_for_block_hash(block.hash_int)
+
+        unnegotiated_peer = self.connect_peer(send_feature=False)
+        unnegotiated_peer.send_and_ping(msg_getdata([CInv(MSG_BLOCK, block.hash_int) for block in blocks]))
+        assert_equal(unnegotiated_peer.blocks, [])
+        self.nodes[0].disconnect_p2ps()
 
 
 if __name__ == "__main__":
