@@ -14,6 +14,7 @@
 #include <protocol.h>
 #include <staletips.h>
 #include <uint256.h>
+#include <util/chaintype.h>
 #include <util/expected.h>
 #include <validationinterface.h>
 
@@ -52,6 +53,9 @@ enum class StaleTipMode {
 };
 /** Whether stale-tip relay should be enabled by default. */
 inline constexpr StaleTipMode DEFAULT_STALETIP_MODE{StaleTipMode::NONE};
+/** Get the stale-tip relay mode to use on `chain_type`. Signet stale tips can
+ *  only be validated with their block data, so 'headers' acts as 'blocks' there. */
+StaleTipMode GetEffectiveStaleTipMode(StaleTipMode mode, ChainType chain_type);
 /** Default number of non-mempool transactions to keep around for block reconstruction. Includes
     orphan, replaced, and rejected transactions. */
 inline constexpr uint32_t DEFAULT_BLOCK_RECONSTRUCTION_EXTRA_TXN{100};

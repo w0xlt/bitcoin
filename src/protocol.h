@@ -18,6 +18,7 @@
 #include <cstdint>
 #include <limits>
 #include <string>
+#include <string_view>
 
 /** Message header.
  * (4) message start.
@@ -322,7 +323,12 @@ inline constexpr size_t MAX_FEATUREID_LENGTH{80};
 inline constexpr size_t MAX_FEATUREDATA_LENGTH{512};
 
 namespace NetMsgFeature {
-//inline constexpr std::string_view FOO{"BIP-FOO"};
+/**
+ * BIP 434 feature id for stale-tip relay (BIP 332).
+ * The feature data is exactly one byte indicating whether announcements are
+ * preferred once block data is available for the stale tip.
+ */
+inline constexpr std::string_view STALETIP{"BIP332"};
 }
 
 /** nServices flags */

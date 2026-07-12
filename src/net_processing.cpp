@@ -279,6 +279,11 @@ struct Peer {
      * Most peers use headers-first syncing, which doesn't use this mechanism */
     uint256 m_continuation_block GUARDED_BY(m_block_inv_mutex) {};
 
+    /** Whether this peer advertised valid stale-tip support via BIP434. */
+    bool m_stale_tip_negotiated GUARDED_BY(NetEventsInterface::g_msgproc_mutex){false};
+    /** Whether this peer prefers stale-tip announcements after block data is available. */
+    bool m_stale_tip_prefers_blocks GUARDED_BY(NetEventsInterface::g_msgproc_mutex){false};
+
     /** Set to true once initial VERSION message was sent (only relevant for outbound peers). */
     bool m_outbound_version_message_sent GUARDED_BY(NetEventsInterface::g_msgproc_mutex){false};
 
@@ -817,7 +822,7 @@ private:
         m_connman.PushMessage(&node, NetMsg::Make(std::move(msg_type), std::forward<Args>(args)...));
     }
     template <typename... Args>
-    [[maybe_unused]] void MakeAndPushFeature(CNode& node, std::string_view feature_id, Args&&... args) const
+    void MakeAndPushFeature(CNode& node, std::string_view feature_id, Args&&... args) const
     {
         if (!Assume(feature_id.size() >= 4 && feature_id.size() <= MAX_FEATUREID_LENGTH)) return;
         std::vector<unsigned char> feature_data;
@@ -2165,6 +2170,12 @@ std::unique_ptr<PeerManager> PeerManager::make(CConnman& connman, AddrMan& addrm
     return std::make_unique<PeerManagerImpl>(connman, addrman, banman, chainman, pool, warnings, opts);
 }
 
+StaleTipMode GetEffectiveStaleTipMode(StaleTipMode mode, ChainType chain_type)
+{
+    if (chain_type == ChainType::SIGNET && mode == StaleTipMode::HEADERS) return StaleTipMode::BLOCKS;
+    return mode;
+}
+
 PeerManagerImpl::PeerManagerImpl(CConnman& connman, AddrMan& addrman,
                                  BanMan* banman, ChainstateManager& chainman,
                                  CTxMemPool& pool, node::Warnings& warnings, Options opts)
@@ -2178,10 +2189,18 @@ PeerManagerImpl::PeerManagerImpl(CConnman& connman, AddrMan& addrman,
       m_mempool(pool),
       m_txdownloadman{node::TxDownloadOptions{pool, opts.deterministic_rng}},
       m_warnings{warnings},
-      m_opts{opts},
+      m_opts{[&] {
+          Options effective{opts};
+          effective.stale_tip_mode = GetEffectiveStaleTipMode(opts.stale_tip_mode, chainman.GetParams().GetChainType());
+          return effective;
+      }()},
       m_inbound_inv_bucket(/*rate=*/m_opts.tx_send_rate, /*mult=*/1.0),
       m_outbound_inv_bucket(/*rate=*/m_opts.tx_send_rate, /*mult=*/OUTBOUND_INVENTORY_BUCKET_MULTIPLIER)
 {
+    if (m_opts.stale_tip_mode != opts.stale_tip_mode) {
+        LogInfo("Using -staletips=blocks on signet, as signet stale tips can only be validated with their block data");
+    }
+
     // Stale tips are only tracked while stale-tip relay is enabled. Seed the
     // cache with those already in the block index.
     if (m_opts.stale_tip_mode != StaleTipMode::NONE) {
@@ -4117,8 +4136,10 @@ void PeerManagerImpl::ProcessMessage(Peer& peer, CNode& pfrom, const std::string
         }
 
         if (greatest_common_version >= FEATURE_VERSION) {
-            // announce supported features
-            // MakeAndPushFeature(pfrom, NetMsgFeature::FOO, uint32_t{1});
+            if (m_opts.stale_tip_mode != StaleTipMode::NONE) {
+                const uint8_t prefers_blocks{m_opts.stale_tip_mode == StaleTipMode::BLOCKS};
+                MakeAndPushFeature(pfrom, NetMsgFeature::STALETIP, prefers_blocks);
+            }
         }
 
         // If we have too many tx-relaying inbound peers, attempt to evict an existing one.
@@ -4374,10 +4395,24 @@ void PeerManagerImpl::ProcessMessage(Peer& peer, CNode& pfrom, const std::string
             return;
         }
 
-        // if (feature_id == NetMsgFeature::FOO) {
-        //     ...
-        //     return;
-        // }
+        if (feature_id == NetMsgFeature::STALETIP) {
+            if (feature_data.size() != 1) {
+                LogDebug(BCLog::NET, "ignoring staletip feature with malformed data from peer=%d", pfrom.GetId());
+                return;
+            }
+
+            uint8_t prefers_blocks{0};
+            feature_data >> prefers_blocks;
+            if (prefers_blocks > 1) {
+                LogDebug(BCLog::NET, "ignoring staletip feature with invalid prefers_blocks=%u from peer=%d", prefers_blocks, pfrom.GetId());
+                return;
+            }
+
+            peer.m_stale_tip_negotiated = true;
+            peer.m_stale_tip_prefers_blocks = prefers_blocks;
+            LogDebug(BCLog::NET, "peer=%d supports staletip announcements with prefers_blocks=%u", pfrom.GetId(), prefers_blocks);
+            return;
+        }
 
         // ignore unknown feature_id
         LogDebug(BCLog::NET, "unknown feature advertised: %s", SanitizeString(feature_id));

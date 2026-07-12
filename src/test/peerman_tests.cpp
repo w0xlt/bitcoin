@@ -14,6 +14,7 @@
 #include <sync.h>
 #include <test/util/setup_common.h>
 #include <test/util/time.h>
+#include <util/chaintype.h>
 #include <util/check.h>
 #include <validation.h>
 #include <validationinterface.h>
@@ -87,6 +88,17 @@ BOOST_AUTO_TEST_CASE(connections_desirable_service_flags)
     // Lastly, verify the stale tip checks can disallow limited peers connections after not receiving blocks for a prolonged period.
     clock += std::chrono::seconds{consensus.nPowTargetSpacing * NODE_NETWORK_LIMITED_ALLOW_CONN_BLOCKS + 1};
     BOOST_CHECK(peerman->GetDesirableServiceFlags(peer_flags) == ServiceFlags(NODE_NETWORK | NODE_WITNESS));
+}
+
+BOOST_AUTO_TEST_CASE(effective_stale_tip_mode)
+{
+    for (const auto chain_type : {ChainType::MAIN, ChainType::TESTNET, ChainType::TESTNET4, ChainType::SIGNET, ChainType::REGTEST}) {
+        BOOST_CHECK(GetEffectiveStaleTipMode(StaleTipMode::NONE, chain_type) == StaleTipMode::NONE);
+        BOOST_CHECK(GetEffectiveStaleTipMode(StaleTipMode::BLOCKS, chain_type) == StaleTipMode::BLOCKS);
+        // Signet stale tips can only be validated with their block data.
+        const auto headers_mode{chain_type == ChainType::SIGNET ? StaleTipMode::BLOCKS : StaleTipMode::HEADERS};
+        BOOST_CHECK(GetEffectiveStaleTipMode(StaleTipMode::HEADERS, chain_type) == headers_mode);
+    }
 }
 
 BOOST_AUTO_TEST_SUITE_END()
