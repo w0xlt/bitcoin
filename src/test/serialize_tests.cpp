@@ -10,6 +10,7 @@
 #include <util/strencodings.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <string>
 
@@ -101,6 +102,29 @@ BOOST_AUTO_TEST_CASE(sizes)
     BOOST_CHECK_EQUAL(GetSerializeSize(bool(0)), 1U);
     BOOST_CHECK_EQUAL(GetSerializeSize(std::array<uint8_t, 1>{0}), 1U);
     BOOST_CHECK_EQUAL(GetSerializeSize(std::array<uint8_t, 2>{0, 0}), 2U);
+}
+
+BOOST_AUTO_TEST_CASE(chrono_formatter)
+{
+    using MillisecondsTime = std::chrono::time_point<std::chrono::system_clock, std::chrono::milliseconds>;
+
+    const MillisecondsTime original{std::chrono::milliseconds{1234}};
+
+    DataStream seconds_stream{};
+    seconds_stream << Using<ChronoFormatter<int64_t, std::chrono::seconds>>(original);
+    BOOST_CHECK_EQUAL(HexStr(seconds_stream), "0100000000000000");
+
+    MillisecondsTime seconds_roundtrip{};
+    seconds_stream >> Using<ChronoFormatter<int64_t, std::chrono::seconds>>(seconds_roundtrip);
+    BOOST_CHECK_EQUAL(seconds_roundtrip.time_since_epoch().count(), 1000);
+
+    DataStream milliseconds_stream{};
+    milliseconds_stream << Using<ChronoFormatter<int64_t, std::chrono::milliseconds>>(original);
+    BOOST_CHECK_EQUAL(HexStr(milliseconds_stream), "d204000000000000");
+
+    MillisecondsTime milliseconds_roundtrip{};
+    milliseconds_stream >> Using<ChronoFormatter<int64_t, std::chrono::milliseconds>>(milliseconds_roundtrip);
+    BOOST_CHECK_EQUAL(milliseconds_roundtrip.time_since_epoch().count(), 1234);
 }
 
 BOOST_AUTO_TEST_CASE(varints)

@@ -450,7 +450,7 @@ public:
             use_v2 = params.enc == Encoding::V2;
         }
 
-        READWRITE(Using<LossyChronoFormatter<uint32_t>>(obj.nTime));
+        READWRITE(Using<LossyChronoFormatter<uint32_t, std::chrono::seconds>>(obj.nTime));
         // nServices is serialized as CompactSize in V2; as uint64_t in V1.
         if (use_v2) {
             uint64_t services_tmp;

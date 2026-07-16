@@ -14,6 +14,7 @@
 #include <util/overflow.h>
 
 #include <algorithm>
+#include <chrono>
 #include <concepts>
 #include <cstdint>
 #include <cstring>
@@ -579,28 +580,33 @@ struct CompactSizeFormatter
     }
 };
 
-template <typename U, bool LOSSY = false>
+/** Formatter for time points. U is the serialized integer type, and
+ * SerDuration specifies the serialized duration period. */
+template <typename U, typename SerDuration, bool LOSSY = false>
 struct ChronoFormatter {
     template <typename Stream, typename Tp>
     void Unser(Stream& s, Tp& tp)
     {
         U u;
         s >> u;
+        using D = std::chrono::duration<typename Tp::duration::rep, typename SerDuration::period>;
         // Lossy deserialization does not make sense, so force Wnarrowing
-        tp = Tp{typename Tp::duration{typename Tp::duration::rep{u}}};
+        tp = Tp{D{typename D::rep{u}}};
     }
     template <typename Stream, typename Tp>
     void Ser(Stream& s, Tp tp)
     {
+        using D = std::chrono::duration<typename Tp::duration::rep, typename SerDuration::period>;
+        const auto count{std::chrono::duration_cast<D>(tp.time_since_epoch()).count()};
         if constexpr (LOSSY) {
-            s << U(tp.time_since_epoch().count());
+            s << U(count);
         } else {
-            s << U{tp.time_since_epoch().count()};
+            s << U{count};
         }
     }
 };
-template <typename U>
-using LossyChronoFormatter = ChronoFormatter<U, true>;
+template <typename U, typename SerDuration>
+using LossyChronoFormatter = ChronoFormatter<U, SerDuration, true>;
 
 class CompactSizeReader
 {
