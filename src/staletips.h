@@ -9,6 +9,7 @@
 #include <kernel/cs_main.h>
 #include <serialize.h>
 #include <uint256.h>
+#include <util/chaintype.h>
 #include <util/check.h>
 
 #include <array>
@@ -180,7 +181,11 @@ struct StaleTipMessage
  * A tip is only tracked while it remains eligible: its branch forks off the
  * active chain by no more than `m_max_headers` blocks, its height is within
  * `m_recent_window` blocks of the active tip, it has no more work than the
- * active tip, and it is not known to be invalid.
+ * active tip, and it is not known to be invalid. Stricter policies apply on
+ * test networks: on signet the tip's block data must be available (the block
+ * signature cannot be verified from headers alone) and header variants are
+ * deduplicated, while on testnet the tip must meet a minimum difficulty so
+ * that min-difficulty blocks are not relayed.
  */
 class StaleTipCache
 {
@@ -196,6 +201,7 @@ private:
     std::array<Entry, MAX_RETAINED_STALETIPS> m_tips{};
     //! Sequence number to assign to the next addition.
     uint32_t m_next_seqno{1};
+    ChainType m_chain_type{ChainType::MAIN};
     //! Tips more than this many blocks below the active tip are not tracked.
     int m_recent_window{STALETIP_RECENT_WINDOW};
     //! Maximum stale branch length to track.
@@ -209,14 +215,24 @@ private:
     const CBlockIndex* GetEligibleForkPoint(const CChain& chain, const CBlockIndex& stale_tip) const EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
     /** Insert `stale_tip` into the cache, dropping any tracked tips that it
      *  descends from. Does nothing if one of its descendants is already
-     *  tracked, or if the cache is full of tips of greater or equal height. */
+     *  tracked, or if the cache is full of tips of greater or equal height. On
+     *  signet, tracked header variants of `stale_tip` are either kept in its
+     *  place or replaced by it, whichever has the longer branch. */
     bool Add(const CBlockIndex& stale_tip) EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
 
 public:
+    /** Maximum target allowed for testnet stale-tip relay policy. */
+    static const uint256 TESTNET_MAX_TARGET;
+
     StaleTipCache() = default;
-    /** Construct a cache with non-default policy parameters. */
+    /** Construct a cache with a non-default chain type or policy parameters. */
+    explicit StaleTipCache(ChainType chain_type, int recent_window = STALETIP_RECENT_WINDOW, size_t max_headers = MAX_STALETIP_HEADERS)
+        : m_chain_type{chain_type}, m_recent_window{recent_window}, m_max_headers{max_headers}
+    {
+    }
+
     explicit StaleTipCache(int recent_window, size_t max_headers)
-        : m_recent_window{recent_window}, m_max_headers{max_headers}
+        : StaleTipCache{ChainType::MAIN, recent_window, max_headers}
     {
     }
 

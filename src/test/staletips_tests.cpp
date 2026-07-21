@@ -427,4 +427,54 @@ BOOST_AUTO_TEST_CASE(staletip_cache_full_without_lower_tip_drops_candidate)
     BOOST_CHECK(std::ranges::none_of(info, [&](const StaleTipInfo& tip) { return tip.hash == dropped->GetBlockHash(); }));
 }
 
+BOOST_AUTO_TEST_CASE(staletip_cache_network_policy)
+{
+    LOCK(::cs_main);
+
+    BlockTree tree;
+    CBlockIndex* active{tree.Add(nullptr, true, true)};
+    for (int i{0}; i < 3; ++i) active = tree.Add(active, true, true);
+
+    CBlockIndex* fork{active->pprev};
+    CBlockIndex* headers_only{tree.Add(fork, false)};
+    StaleTipCache signet_tips{ChainType::SIGNET};
+    BOOST_CHECK(!signet_tips.AddStaleTip(tree.active_chain, headers_only));
+
+    headers_only->nStatus |= BLOCK_VALID_TRANSACTIONS | BLOCK_HAVE_DATA;
+    BOOST_CHECK(signet_tips.AddStaleTip(tree.active_chain, headers_only));
+
+    CBlockIndex* low_difficulty{tree.Add(fork, false, true, /*bits=*/0x207fffff)};
+    StaleTipCache testnet_tips{ChainType::TESTNET};
+    BOOST_CHECK(!testnet_tips.AddStaleTip(tree.active_chain, low_difficulty));
+    StaleTipCache testnet4_tips{ChainType::TESTNET4};
+    BOOST_CHECK(!testnet4_tips.AddStaleTip(tree.active_chain, low_difficulty));
+}
+
+BOOST_AUTO_TEST_CASE(staletip_cache_signet_variant_policy)
+{
+    LOCK(::cs_main);
+
+    BlockTree tree;
+    CBlockIndex* active{tree.Add(nullptr, true, true)};
+    for (int i{0}; i < 3; ++i) active = tree.Add(active, true, true);
+
+    CBlockIndex* fork{Assert(Assert(active->pprev)->pprev)};
+    const uint256 shared_merkle_root{uint8_t{42}};
+    CBlockIndex* first_variant{tree.Add(fork, false, true, /*bits=*/0x1d00ffff, shared_merkle_root)};
+    CBlockIndex* second_variant{tree.Add(fork, false, true, /*bits=*/0x1d00ffff, shared_merkle_root)};
+
+    StaleTipCache tips{ChainType::SIGNET};
+    BOOST_CHECK(tips.AddStaleTip(tree.active_chain, first_variant));
+    BOOST_CHECK(!tips.AddStaleTip(tree.active_chain, second_variant));
+
+    CBlockIndex* extended_second{tree.Add(second_variant, false, true)};
+    BOOST_CHECK(tips.AddStaleTip(tree.active_chain, extended_second));
+    const auto info{tips.GetStaleTipInfo(tree.active_chain)};
+    BOOST_REQUIRE_EQUAL(info.size(), 1U);
+    BOOST_CHECK_EQUAL(info.front().hash.ToString(), extended_second->GetBlockHash().ToString());
+
+    CBlockIndex* active_variant{tree.Add(active->pprev, false, true, /*bits=*/0x1d00ffff, active->hashMerkleRoot)};
+    BOOST_CHECK(!tips.AddStaleTip(tree.active_chain, active_variant));
+}
+
 BOOST_AUTO_TEST_SUITE_END()

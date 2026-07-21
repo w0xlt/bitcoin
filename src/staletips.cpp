@@ -4,11 +4,14 @@
 
 #include <staletips.h>
 
+#include <arith_uint256.h>
 #include <chain.h>
 #include <util/check.h>
 
 #include <utility>
 #include <vector>
+
+const uint256 StaleTipCache::TESTNET_MAX_TARGET{uint256::FromHex("0000000000000fffffffffffffffffffffffffffffffffffffffffffffffffff").value()};
 
 namespace {
 
@@ -16,6 +19,34 @@ namespace {
 bool HasAncestor(const CBlockIndex& block, const CBlockIndex& ancestor)
 {
     return block.nHeight >= ancestor.nHeight && block.GetAncestor(ancestor.nHeight) == &ancestor;
+}
+
+enum class VariantHeaderResult {
+    //! The tips are not variants of each other; track both.
+    PREFER_BOTH,
+    //! The existing tip's branch extends a variant of the candidate; keep it.
+    PREFER_OLD,
+    //! The candidate's branch extends a variant of the existing tip; replace it.
+    PREFER_NEW,
+};
+
+/** Determine which of two stale tips to keep when their branches may contain
+ *  variant headers: headers with the same previous block and merkle root that
+ *  differ in other fields. On low-difficulty networks such as signet, valid
+ *  variants of a block are cheap to produce by grinding such fields, so only
+ *  the first seen variant is tracked and advertised to avoid amplifying
+ *  header spam. */
+VariantHeaderResult CompareVariantHeaders(const CBlockIndex& candidate, const CBlockIndex& existing)
+{
+    auto same_variant = [](const CBlockIndex* a, const CBlockIndex* b) {
+        return a != nullptr && b != nullptr && a->pprev == b->pprev && a->hashMerkleRoot == b->hashMerkleRoot;
+    };
+
+    if (candidate.nHeight > existing.nHeight) {
+        return same_variant(&existing, candidate.GetAncestor(existing.nHeight)) ? VariantHeaderResult::PREFER_NEW : VariantHeaderResult::PREFER_BOTH;
+    }
+
+    return same_variant(existing.GetAncestor(candidate.nHeight), &candidate) ? VariantHeaderResult::PREFER_OLD : VariantHeaderResult::PREFER_BOTH;
 }
 
 } // namespace
@@ -81,6 +112,14 @@ const CBlockIndex* StaleTipCache::GetEligibleForkPoint(const CChain& chain, cons
     if (stale_tip.nHeight < active_tip->nHeight - m_recent_window) return nullptr;
     if (stale_tip.nChainWork > active_tip->nChainWork) return nullptr;
 
+    if (m_chain_type == ChainType::SIGNET && !(stale_tip.nStatus & BLOCK_HAVE_DATA)) return nullptr;
+
+    if (m_chain_type == ChainType::TESTNET || m_chain_type == ChainType::TESTNET4) {
+        arith_uint256 target;
+        target.SetCompact(stale_tip.nBits);
+        if (target > UintToArith256(TESTNET_MAX_TARGET)) return nullptr;
+    }
+
     const CBlockIndex* fork_point{chain.FindFork(stale_tip)};
     if (fork_point == nullptr) return nullptr;
 
@@ -117,6 +156,15 @@ bool StaleTipCache::Add(const CBlockIndex& stale_tip)
         }
         if (HasAncestor(*entry.tip, stale_tip)) return false;
 
+        if (m_chain_type == ChainType::SIGNET) {
+            const auto variant_result{CompareVariantHeaders(stale_tip, *entry.tip)};
+            if (variant_result == VariantHeaderResult::PREFER_OLD) return false;
+            if (variant_result == VariantHeaderResult::PREFER_NEW) {
+                replace.push_back(&entry);
+                continue;
+            }
+        }
+
         if (entry.tip->nHeight < stale_tip.nHeight && better_evict_candidate(evict, entry)) {
             evict = &entry;
         }
@@ -138,6 +186,10 @@ bool StaleTipCache::AddStaleTip(const CChain& chain, const CBlockIndex* stale_ti
     AssertLockHeld(::cs_main);
     if (stale_tip == nullptr) return false;
     if (GetEligibleForkPoint(chain, *stale_tip) == nullptr) return false;
+
+    if (m_chain_type == ChainType::SIGNET && chain.Tip() != nullptr) {
+        if (CompareVariantHeaders(*stale_tip, *chain.Tip()) == VariantHeaderResult::PREFER_OLD) return false;
+    }
 
     return Add(*stale_tip);
 }
