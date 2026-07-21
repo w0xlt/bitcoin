@@ -9,6 +9,7 @@
 #include <kernel/cs_main.h>
 #include <serialize.h>
 #include <uint256.h>
+#include <util/chaintype.h>
 #include <util/check.h>
 
 #include <array>
@@ -183,7 +184,11 @@ struct StaleTipMessage
  * most recently added. A tip is only tracked while it remains eligible: its
  * branch forks off the active chain by no more than `m_max_headers` blocks, its
  * height is within `m_recent_window` blocks of the active tip, it has no more
- * work than the active tip, and it is not known to be invalid.
+ * work than the active tip, and it is not known to be invalid. Stricter
+ * policies apply on test networks: on signet the tip's block data must be
+ * available (the block signature cannot be verified from headers alone) and
+ * header variants are deduplicated, while on testnet the tip must meet a
+ * minimum difficulty so that min-difficulty blocks are not relayed.
  */
 class StaleTipCache
 {
@@ -199,6 +204,7 @@ private:
     std::array<Entry, MAX_RETAINED_STALETIPS> m_tips{};
     //! Sequence number to assign to the next addition.
     uint32_t m_next_seqno{1};
+    ChainType m_chain_type{ChainType::MAIN};
     //! Tips more than this many blocks below the active tip are not tracked.
     int m_recent_window{STALETIP_RECENT_WINDOW};
     //! Maximum stale branch length to track.
@@ -209,7 +215,8 @@ private:
     std::deque<const CBlockIndex*> m_long_branch_tips;
 
     /** Find the fork point of `stale_tip` with the active chain, checking that
-     *  the tip is eligible for tracking.
+     *  the tip is eligible for tracking. On signet, header variants of
+     *  active-chain blocks are not eligible, as they are duplicates of them.
      *
      * @return The fork point, or nullptr if the tip is not eligible.
      */
@@ -220,7 +227,9 @@ private:
      *  else the tip with the least chainwork (the least recently added, for
      *  equal chainwork), unless all tracked tips have more chainwork than
      *  `stale_tip`. Does nothing if a valid descendant is already tracked, or
-     *  if it is on a branch that is still too long to track. */
+     *  if it is on a branch that is still too long to track. On signet,
+     *  tracked header variants of `stale_tip` are either kept in its place or
+     *  replaced by it, whichever has the longer branch. */
     bool Add(const CChain& chain, const CBlockIndex& stale_tip) EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
     /** Whether `block` is a recent block, not known to be invalid, that forks
      *  off the active chain by more than `m_max_headers` blocks. */
@@ -231,16 +240,24 @@ private:
     void AddLongBranchTip(const CBlockIndex& tip) EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
 
 public:
+    /** Maximum target allowed for testnet stale-tip relay policy. */
+    static const uint256 TESTNET_MAX_TARGET;
+
     StaleTipCache() = default;
-    /** Construct a cache with non-default policy parameters. */
-    explicit StaleTipCache(int recent_window, size_t max_headers)
-        : m_recent_window{recent_window}, m_max_headers{max_headers}
+    /** Construct a cache with a non-default chain type or policy parameters. */
+    explicit StaleTipCache(ChainType chain_type, int recent_window = STALETIP_RECENT_WINDOW, size_t max_headers = MAX_STALETIP_HEADERS)
+        : m_chain_type{chain_type}, m_recent_window{recent_window}, m_max_headers{max_headers}
     {
     }
 
     /** Whether a stale tip at `height` is recent enough to be tracked: no
      *  more than `m_recent_window` blocks below the active tip. */
     bool IsRecentHeight(const CChain& chain, int height) const EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
+    /** Whether a stale tip with compact proof-of-work target `bits` is
+     *  difficult enough to be tracked. Only restricts testnet, where
+     *  min-difficulty blocks are cheap to produce, and where invalid compact
+     *  targets are rejected. */
+    bool MeetsMinimumDifficulty(uint32_t bits) const;
 
     /** Track `stale_tip` if it is eligible (see GetEligibleForkPoint()) and can
      *  be retained under the cache's resource limits. If `stale_tip` extends a

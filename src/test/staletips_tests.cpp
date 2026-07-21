@@ -334,7 +334,7 @@ BOOST_AUTO_TEST_CASE(staletip_cache_policy)
     CBlockIndex* old_fork{active};
     for (int i{0}; i < 10; ++i) active = tree.Add(active, true, true);
 
-    StaleTipCache tips{/*recent_window=*/3, /*max_headers=*/2};
+    StaleTipCache tips{ChainType::MAIN, /*recent_window=*/3, /*max_headers=*/2};
     BOOST_CHECK(!tips.AddStaleTip(tree.active_chain, tree.Add(old_fork, false)));
 
     CBlockIndex* fork{Assert(Assert(active->pprev)->pprev)};
@@ -485,12 +485,82 @@ BOOST_AUTO_TEST_CASE(staletip_cache_evicts_by_chainwork_not_height)
     BOOST_CHECK(std::ranges::any_of(info, [&](const StaleTipInfo& tip) { return tip.hash == replacement->GetBlockHash(); }));
 }
 
+BOOST_AUTO_TEST_CASE(staletip_cache_network_policy)
+{
+    LOCK(::cs_main);
+
+    BlockTree tree;
+    CBlockIndex* active{tree.Add(nullptr, true, true)};
+    for (int i{0}; i < 3; ++i) active = tree.Add(active, true, true);
+
+    CBlockIndex* fork{active->pprev};
+    CBlockIndex* headers_only{tree.Add(fork, false)};
+    StaleTipCache signet_tips{ChainType::SIGNET};
+    BOOST_CHECK(!signet_tips.AddStaleTip(tree.active_chain, headers_only));
+
+    headers_only->nStatus |= BLOCK_VALID_TRANSACTIONS | BLOCK_HAVE_DATA;
+    BOOST_CHECK(signet_tips.AddStaleTip(tree.active_chain, headers_only));
+
+    CBlockIndex* low_difficulty{tree.Add(fork, false, true, /*bits=*/0x207fffff)};
+    StaleTipCache testnet_tips{ChainType::TESTNET};
+    BOOST_CHECK(!testnet_tips.AddStaleTip(tree.active_chain, low_difficulty));
+    StaleTipCache testnet4_tips{ChainType::TESTNET4};
+    BOOST_CHECK(!testnet4_tips.AddStaleTip(tree.active_chain, low_difficulty));
+}
+
+BOOST_AUTO_TEST_CASE(staletip_cache_signet_variant_policy)
+{
+    LOCK(::cs_main);
+
+    BlockTree tree;
+    CBlockIndex* active{tree.Add(nullptr, true, true)};
+    for (int i{0}; i < 3; ++i) active = tree.Add(active, true, true);
+
+    CBlockIndex* fork{Assert(Assert(active->pprev)->pprev)};
+    const uint256 shared_merkle_root{uint8_t{42}};
+    CBlockIndex* first_variant{tree.Add(fork, false, true, /*bits=*/0x1d00ffff, shared_merkle_root)};
+    CBlockIndex* second_variant{tree.Add(fork, false, true, /*bits=*/0x1d00ffff, shared_merkle_root)};
+
+    StaleTipCache tips{ChainType::SIGNET};
+    BOOST_CHECK(tips.AddStaleTip(tree.active_chain, first_variant));
+    BOOST_CHECK(!tips.AddStaleTip(tree.active_chain, second_variant));
+
+    CBlockIndex* extended_second{tree.Add(second_variant, false, true)};
+    BOOST_CHECK(tips.AddStaleTip(tree.active_chain, extended_second));
+    const auto info{tips.GetStaleTipInfo(tree.active_chain)};
+    BOOST_REQUIRE_EQUAL(info.size(), 1U);
+    BOOST_CHECK_EQUAL(info.front().hash.ToString(), extended_second->GetBlockHash().ToString());
+
+    CBlockIndex* active_variant{tree.Add(active->pprev, false, true, /*bits=*/0x1d00ffff, active->hashMerkleRoot)};
+    BOOST_CHECK(!tips.AddStaleTip(tree.active_chain, active_variant));
+}
+
+BOOST_AUTO_TEST_CASE(staletip_cache_signet_variant_of_new_active_block)
+{
+    LOCK(::cs_main);
+
+    BlockTree tree;
+    CBlockIndex* active{tree.Add(nullptr, true, true)};
+    for (int i{0}; i < 3; ++i) active = tree.Add(active, true, true);
+
+    StaleTipCache tips{ChainType::SIGNET};
+    CBlockIndex* stale{tree.Add(active->pprev, false, true, /*bits=*/0x1d00ffff, uint256{uint8_t{42}})};
+    BOOST_CHECK(tips.AddStaleTip(tree.active_chain, stale));
+    BOOST_CHECK_EQUAL(tips.GetStaleTipInfo(tree.active_chain).size(), 1U);
+
+    // Once a header variant of the tracked tip is on the active chain, the
+    // tip is a duplicate of it and no longer eligible.
+    CBlockIndex* variant{tree.Add(active->pprev, true, true, /*bits=*/0x1d00ffff, stale->hashMerkleRoot)};
+    BOOST_CHECK(tree.active_chain.Tip() == variant);
+    BOOST_CHECK(tips.GetStaleTipInfo(tree.active_chain).empty());
+}
+
 BOOST_AUTO_TEST_CASE(staletip_cache_recent_height)
 {
     LOCK(::cs_main);
 
     BlockTree tree;
-    StaleTipCache tips{/*recent_window=*/3, /*max_headers=*/2};
+    StaleTipCache tips{ChainType::MAIN, /*recent_window=*/3, /*max_headers=*/2};
     BOOST_CHECK(!tips.IsRecentHeight(tree.active_chain, 0));
 
     CBlockIndex* active{tree.Add(nullptr, true, true)};
@@ -498,6 +568,25 @@ BOOST_AUTO_TEST_CASE(staletip_cache_recent_height)
     BOOST_CHECK(!tips.IsRecentHeight(tree.active_chain, active->nHeight - 4));
     BOOST_CHECK(tips.IsRecentHeight(tree.active_chain, active->nHeight - 3));
     BOOST_CHECK(tips.IsRecentHeight(tree.active_chain, active->nHeight + 1));
+}
+
+BOOST_AUTO_TEST_CASE(staletip_cache_minimum_difficulty)
+{
+    // Testnet stale tips must have a target no higher than TESTNET_MAX_TARGET,
+    // a difficulty well above testnet's minimum difficulty.
+    for (const auto chain_type : {ChainType::TESTNET, ChainType::TESTNET4}) {
+        const StaleTipCache tips{chain_type};
+        BOOST_CHECK(tips.MeetsMinimumDifficulty(0x1a0fffff));
+        BOOST_CHECK(!tips.MeetsMinimumDifficulty(0x1a100000));
+        BOOST_CHECK(!tips.MeetsMinimumDifficulty(0x1d00ffff));
+        // Negative, overflowing and zero compact targets are invalid.
+        BOOST_CHECK(!tips.MeetsMinimumDifficulty(0x1a8fffff));
+        BOOST_CHECK(!tips.MeetsMinimumDifficulty(0x23000100));
+        BOOST_CHECK(!tips.MeetsMinimumDifficulty(0));
+    }
+    for (const auto chain_type : {ChainType::MAIN, ChainType::SIGNET, ChainType::REGTEST}) {
+        BOOST_CHECK(StaleTipCache{chain_type}.MeetsMinimumDifficulty(0x207fffff));
+    }
 }
 
 BOOST_AUTO_TEST_CASE(staletip_cache_long_branch_not_tracked)
@@ -508,7 +597,7 @@ BOOST_AUTO_TEST_CASE(staletip_cache_long_branch_not_tracked)
     CBlockIndex* active{tree.Add(nullptr, true, true)};
     for (int i{0}; i < 10; ++i) active = tree.Add(active, true, true);
 
-    StaleTipCache tips{/*recent_window=*/STALETIP_RECENT_WINDOW, /*max_headers=*/2};
+    StaleTipCache tips{ChainType::MAIN, /*recent_window=*/STALETIP_RECENT_WINDOW, /*max_headers=*/2};
     CBlockIndex* fork{Assert(active->GetAncestor(active->nHeight - 3))};
     CBlockIndex* stale1{tree.Add(fork, false)};
     CBlockIndex* stale2{tree.Add(stale1, false)};
@@ -533,7 +622,7 @@ BOOST_AUTO_TEST_CASE(staletip_cache_invalid_long_branch_not_remembered)
     CBlockIndex* active{tree.Add(nullptr, true, true)};
     for (int i{0}; i < 10; ++i) active = tree.Add(active, true, true);
 
-    StaleTipCache tips{/*recent_window=*/STALETIP_RECENT_WINDOW, /*max_headers=*/2};
+    StaleTipCache tips{ChainType::MAIN, /*recent_window=*/STALETIP_RECENT_WINDOW, /*max_headers=*/2};
     CBlockIndex* fork{Assert(active->GetAncestor(active->nHeight - 3))};
     CBlockIndex* stale1{tree.Add(fork, false)};
     CBlockIndex* stale2{tree.Add(stale1, false)};
@@ -579,7 +668,7 @@ BOOST_AUTO_TEST_CASE(staletip_cache_long_branch_with_invalid_tip)
     CBlockIndex* active{tree.Add(nullptr, true, true)};
     for (int i{0}; i < 10; ++i) active = tree.Add(active, true, true);
 
-    StaleTipCache tips{/*recent_window=*/STALETIP_RECENT_WINDOW, /*max_headers=*/2};
+    StaleTipCache tips{ChainType::MAIN, /*recent_window=*/STALETIP_RECENT_WINDOW, /*max_headers=*/2};
     CBlockIndex* fork{Assert(active->GetAncestor(active->nHeight - 4))};
     CBlockIndex* stale1{tree.Add(fork, false)};
     CBlockIndex* stale2{tree.Add(stale1, false)};
@@ -603,7 +692,7 @@ BOOST_AUTO_TEST_CASE(staletip_cache_long_branch_after_reorg)
     CBlockIndex* active{tree.Add(nullptr, true, true)};
     for (int i{0}; i < 10; ++i) active = tree.Add(active, true, true);
 
-    StaleTipCache tips{/*recent_window=*/STALETIP_RECENT_WINDOW, /*max_headers=*/2};
+    StaleTipCache tips{ChainType::MAIN, /*recent_window=*/STALETIP_RECENT_WINDOW, /*max_headers=*/2};
     CBlockIndex* fork{Assert(active->GetAncestor(active->nHeight - 3))};
     CBlockIndex* stale1{tree.Add(fork, false)};
     CBlockIndex* stale2{tree.Add(stale1, false)};
