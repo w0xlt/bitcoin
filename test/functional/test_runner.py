@@ -219,6 +219,8 @@ BASE_SCRIPTS = [
     'p2p_addrv2_relay.py',
     'p2p_compactblocks_hb.py --v1transport',
     'p2p_compactblocks_hb.py --v2transport',
+    'p2p_manual_high_bandwidth.py --v1transport',
+    'p2p_manual_high_bandwidth.py --v2transport',
     'p2p_disconnect_ban.py --v1transport',
     'p2p_disconnect_ban.py --v2transport',
     'feature_posix_fs_permissions.py',

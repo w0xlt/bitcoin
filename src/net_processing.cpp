@@ -458,6 +458,8 @@ struct CNodeState {
     bool m_requested_hb_cmpctblocks{false};
     /** Whether this peer will send us cmpctblocks if we request them. */
     bool m_provides_cmpctblocks{false};
+    /** Whether the operator manually requested high-bandwidth compact block announcements. */
+    bool m_bip152_hb_to_manual{false};
 
     /** State used to enforce CHAIN_SYNC_TIMEOUT and EXTRA_PEER_CHECK_INTERVAL logic.
       *
@@ -534,6 +536,8 @@ public:
     void StartScheduledTasks(CScheduler& scheduler) override;
     void CheckForStaleTipAndEvictPeers() override;
     util::Expected<void, std::string> FetchBlock(NodeId peer_id, const CBlockIndex& block_index) override
+        EXCLUSIVE_LOCKS_REQUIRED(!m_peer_mutex);
+    util::Expected<bool, std::string> SetPeerHighBandwidth(NodeId peer_id, bool high_bandwidth) override
         EXCLUSIVE_LOCKS_REQUIRED(!m_peer_mutex);
     bool GetNodeStateStats(NodeId nodeid, CNodeStateStats& stats) const override EXCLUSIVE_LOCKS_REQUIRED(!m_peer_mutex);
     std::vector<node::TxOrphanage::OrphanInfo> GetOrphanTransactions() override EXCLUSIVE_LOCKS_REQUIRED(!m_tx_download_mutex);
@@ -998,6 +1002,9 @@ private:
     /** Apply a BIP152 high-bandwidth state transition to a fully connected peer. */
     void ApplyHighBandwidthState(CNode& node, bool high_bandwidth) EXCLUSIVE_LOCKS_REQUIRED(cs_main);
 
+    /** Apply the effective state requested by the automatic and manual sources. */
+    void ReconcileHighBandwidthState(CNode& node, const CNodeState& state) EXCLUSIVE_LOCKS_REQUIRED(cs_main);
+
     /** Nodes selected automatically to announce using compact blocks. */
     std::list<NodeId> m_automatic_high_bandwidth_peers GUARDED_BY(cs_main);
 
@@ -1296,6 +1303,20 @@ void PeerManagerImpl::ApplyHighBandwidthState(CNode& node, bool high_bandwidth)
     node.m_bip152_highbandwidth_to = high_bandwidth;
 }
 
+void PeerManagerImpl::ReconcileHighBandwidthState(CNode& node, const CNodeState& state)
+{
+    AssertLockHeld(cs_main);
+
+    // SENDCMPCT negotiation may arrive before VERACK. Do not send the manual
+    // request until the connection is fully established and version 2 compact
+    // block support has been observed.
+    if (!node.fSuccessfullyConnected || !state.m_provides_cmpctblocks) return;
+
+    const bool automatically_selected{
+        std::ranges::find(m_automatic_high_bandwidth_peers, node.GetId()) != m_automatic_high_bandwidth_peers.end()};
+    ApplyHighBandwidthState(node, automatically_selected || state.m_bip152_hb_to_manual);
+}
+
 void PeerManagerImpl::MaybeSetPeerAsAnnouncingHeaderAndIDs(NodeId nodeid)
 {
     AssertLockHeld(cs_main);
@@ -1336,17 +1357,20 @@ void PeerManagerImpl::MaybeSetPeerAsAnnouncingHeaderAndIDs(NodeId nodeid)
     }
     const bool nodeid_was_appended{m_connman.ForNode(nodeid, [this](CNode* pfrom) EXCLUSIVE_LOCKS_REQUIRED(::cs_main) {
         AssertLockHeld(::cs_main);
-        ApplyHighBandwidthState(*pfrom, /*high_bandwidth=*/true);
         m_automatic_high_bandwidth_peers.push_back(pfrom->GetId());
+        ReconcileHighBandwidthState(*pfrom, *Assert(State(pfrom->GetId())));
         return true;
     })};
     if (nodeid_was_appended && m_automatic_high_bandwidth_peers.size() > MAX_AUTO_HIGH_BANDWIDTH_PEERS) {
         // Keep the automatic BIP152 high-bandwidth selection within its limit.
-        m_connman.ForNode(m_automatic_high_bandwidth_peers.front(), [this](CNode* pnodeStop) EXCLUSIVE_LOCKS_REQUIRED(::cs_main) {
-            ApplyHighBandwidthState(*pnodeStop, /*high_bandwidth=*/false);
+        const NodeId evicted_nodeid{m_automatic_high_bandwidth_peers.front()};
+        m_automatic_high_bandwidth_peers.pop_front();
+        m_connman.ForNode(evicted_nodeid, [this](CNode* pnodeStop) EXCLUSIVE_LOCKS_REQUIRED(::cs_main) {
+            if (const CNodeState* state{State(pnodeStop->GetId())}) {
+                ReconcileHighBandwidthState(*pnodeStop, *state);
+            }
             return true;
         });
-        m_automatic_high_bandwidth_peers.pop_front();
     }
 }
 
@@ -1828,6 +1852,7 @@ bool PeerManagerImpl::GetNodeStateStats(NodeId nodeid, CNodeStateStats& stats) c
             return false;
         stats.nSyncHeight = state->pindexBestKnownBlock ? state->pindexBestKnownBlock->nHeight : -1;
         stats.nCommonHeight = state->pindexLastCommonBlock ? state->pindexLastCommonBlock->nHeight : -1;
+        stats.m_bip152_hb_to_manual = state->m_bip152_hb_to_manual;
         for (const QueuedBlock& queue : state->vBlocksInFlight) {
             if (queue.pindex)
                 stats.vHeightInFlight.push_back(queue.pindex->nHeight);
@@ -2033,6 +2058,42 @@ util::Expected<void, std::string> PeerManagerImpl::FetchBlock(NodeId peer_id, co
     LogDebug(BCLog::NET, "Requesting block %s from peer=%d\n",
                  hash.ToString(), peer_id);
     return {};
+}
+
+util::Expected<bool, std::string> PeerManagerImpl::SetPeerHighBandwidth(NodeId peer_id, bool high_bandwidth)
+{
+    LOCK(cs_main);
+
+    CNodeState* const state{State(peer_id)};
+    if (!state) return util::Unexpected{"Peer does not exist"};
+
+    std::optional<std::string> error;
+    bool effective_state{false};
+    const bool peer_fully_connected{m_connman.ForNode(peer_id, [&](CNode* node) EXCLUSIVE_LOCKS_REQUIRED(::cs_main) {
+        AssertLockHeld(::cs_main);
+
+        if (high_bandwidth && m_opts.ignore_incoming_txs) {
+            error = "Cannot enable high-bandwidth compact block announcements in blocksonly mode";
+            return true;
+        }
+        if (high_bandwidth && (node->IsPrivateBroadcastConn() || node->IsAddrFetchConn() || node->IsFeelerConn())) {
+            error = strprintf("Connection type %s does not support manual high-bandwidth compact block announcements", node->ConnectionTypeAsString());
+            return true;
+        }
+        if (high_bandwidth && !state->m_provides_cmpctblocks) {
+            error = "Peer has not negotiated version 2 compact block support";
+            return true;
+        }
+
+        state->m_bip152_hb_to_manual = high_bandwidth;
+        ReconcileHighBandwidthState(*node, *state);
+        effective_state = node->m_bip152_highbandwidth_to.load();
+        return true;
+    })};
+
+    if (!peer_fully_connected) return util::Unexpected{"Peer is not fully connected"};
+    if (error) return util::Unexpected{std::move(*error)};
+    return effective_state;
 }
 
 std::unique_ptr<PeerManager> PeerManager::make(CConnman& connman, AddrMan& addrman,
@@ -3946,6 +4007,12 @@ void PeerManagerImpl::ProcessMessage(Peer& peer, CNode& pfrom, const std::string
         }
 
         pfrom.fSuccessfullyConnected = true;
+        {
+            LOCK(cs_main);
+            if (const CNodeState* state{State(pfrom.GetId())}) {
+                ReconcileHighBandwidthState(pfrom, *state);
+            }
+        }
         return;
     }
 
@@ -3976,6 +4043,7 @@ void PeerManagerImpl::ProcessMessage(Peer& peer, CNode& pfrom, const std::string
         // save whether peer selects us as BIP152 high-bandwidth peer
         // (receiving sendcmpct(1) signals high-bandwidth, sendcmpct(0) low-bandwidth)
         pfrom.m_bip152_highbandwidth_from = sendcmpct_hb;
+        ReconcileHighBandwidthState(pfrom, *nodestate);
         return;
     }
 

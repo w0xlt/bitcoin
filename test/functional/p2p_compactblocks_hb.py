@@ -95,6 +95,32 @@ class CompactBlocksConnectionTest(BitcoinTestFramework):
             assert status[nodeid - 2]
         assert_equal(status, [False, True, True, True])
 
+        self.log.info("Testing that manual selection is independent of the automatic limit...")
+
+        # Clearing the manual source of an automatically selected peer must not
+        # change its effective state.
+        automatic_peer_id = self.peer_info(1, 3)["id"]
+        result = self.nodes[1].setpeerhighbandwidth(automatic_peer_id, True)
+        assert_equal(result["bip152_hb_to_manual"], True)
+        assert_equal(result["bip152_hb_to"], True)
+        result = self.nodes[1].setpeerhighbandwidth(automatic_peer_id, False)
+        assert_equal(result["bip152_hb_to_manual"], False)
+        assert_equal(result["bip152_hb_to"], True)
+
+        # Peer 2 is not automatically selected. Selecting it manually adds a
+        # fourth effective peer without consuming one of the three automatic
+        # slots.
+        manual_peer_id = self.peer_info(1, 2)["id"]
+        result = self.nodes[1].setpeerhighbandwidth(manual_peer_id, True)
+        assert_equal(result["bip152_hb_to_manual"], True)
+        assert_equal(result["bip152_hb_to"], True)
+        assert_equal(sum(peer["bip152_hb_to"] for peer in self.nodes[1].getpeerinfo()), 4)
+
+        result = self.nodes[1].setpeerhighbandwidth(manual_peer_id, False)
+        assert_equal(result["bip152_hb_to_manual"], False)
+        assert_equal(result["bip152_hb_to"], False)
+        assert_equal(sum(peer["bip152_hb_to"] for peer in self.nodes[1].getpeerinfo()), 3)
+
 
 if __name__ == '__main__':
     CompactBlocksConnectionTest(__file__).main()

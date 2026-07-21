@@ -166,6 +166,7 @@ static RPCMethod getpeerinfo()
                     {RPCResult::Type::STR, "subver", "The string version"},
                     {RPCResult::Type::BOOL, "inbound", "Inbound (true) or Outbound (false)"},
                     {RPCResult::Type::BOOL, "bip152_hb_to", "Whether we selected peer as (compact blocks) high-bandwidth peer"},
+                    {RPCResult::Type::BOOL, "bip152_hb_to_manual", "Whether the peer's high-bandwidth state was manually requested"},
                     {RPCResult::Type::BOOL, "bip152_hb_from", "Whether peer selected us as (compact blocks) high-bandwidth peer"},
                     {RPCResult::Type::NUM, "presynced_headers", "The current height of header pre-synchronization with this peer, or -1 if no low-work sync is in progress"},
                     {RPCResult::Type::NUM, "synced_headers", "The last header we have in common with this peer"},
@@ -272,6 +273,7 @@ static RPCMethod getpeerinfo()
         obj.pushKV("subver", stats.cleanSubVer);
         obj.pushKV("inbound", stats.fInbound);
         obj.pushKV("bip152_hb_to", stats.m_bip152_highbandwidth_to);
+        obj.pushKV("bip152_hb_to_manual", statestats.m_bip152_hb_to_manual);
         obj.pushKV("bip152_hb_from", stats.m_bip152_highbandwidth_from);
         obj.pushKV("presynced_headers", statestats.presync_height);
         obj.pushKV("synced_headers", statestats.nSyncHeight);
@@ -312,6 +314,51 @@ static RPCMethod getpeerinfo()
     }
 
     return ret;
+},
+    };
+}
+
+static RPCMethod setpeerhighbandwidth()
+{
+    return RPCMethod{
+        "setpeerhighbandwidth",
+        "Manually enable or disable BIP152 high-bandwidth compact block announcements from a peer.\n"
+        "This setting applies only to the current connection and is not persisted.\n"
+        "Manual selection is independent of the three-peer automatic selection limit, so enabling it may result in more than three high-bandwidth peers.\n"
+        "The peer must be fully connected and must have negotiated version 2 compact block support before high-bandwidth mode can be enabled.\n"
+        "Disabling clears only the manual selection; a peer selected automatically may remain in effective high-bandwidth mode.",
+        {
+            {"peer_id", RPCArg::Type::NUM, RPCArg::Optional::NO, "The peer id (see getpeerinfo)"},
+            {"high_bandwidth", RPCArg::Type::BOOL, RPCArg::Optional::NO, "Whether to request high-bandwidth compact block announcements"},
+        },
+        RPCResult{
+            RPCResult::Type::OBJ, "", "The updated state",
+            {
+                {RPCResult::Type::NUM, "peer_id", "The peer id"},
+                {RPCResult::Type::BOOL, "bip152_hb_to_manual", "Whether manual high-bandwidth mode is requested"},
+                {RPCResult::Type::BOOL, "bip152_hb_to", "The effective high-bandwidth state, including automatic selection"},
+            }},
+        RPCExamples{
+            HelpExampleCli("setpeerhighbandwidth", "0 true")
+            + HelpExampleRpc("setpeerhighbandwidth", "0, true")
+        },
+        [](const RPCMethod& self, const JSONRPCRequest& request) -> UniValue
+{
+    NodeContext& node = EnsureAnyNodeContext(request.context);
+    PeerManager& peerman = EnsurePeerman(node);
+
+    const NodeId peer_id{request.params[0].getInt<int64_t>()};
+    const bool high_bandwidth{request.params[1].get_bool()};
+    const auto effective_state{peerman.SetPeerHighBandwidth(peer_id, high_bandwidth)};
+    if (!effective_state) {
+        throw JSONRPCError(RPC_MISC_ERROR, effective_state.error());
+    }
+
+    UniValue result{UniValue::VOBJ};
+    result.pushKV("peer_id", peer_id);
+    result.pushKV("bip152_hb_to_manual", high_bandwidth);
+    result.pushKV("bip152_hb_to", *effective_state);
+    return result;
 },
     };
 }
@@ -1264,6 +1311,7 @@ void RegisterNetRPCCommands(CRPCTable& t)
         {"network", &getconnectioncount},
         {"network", &ping},
         {"network", &getpeerinfo},
+        {"network", &setpeerhighbandwidth},
         {"network", &addnode},
         {"network", &disconnectnode},
         {"network", &getaddednodeinfo},

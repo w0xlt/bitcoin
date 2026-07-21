@@ -153,6 +153,7 @@ class NetTest(BitcoinTestFramework):
                 "addr_relay_enabled": False,
                 "bip152_hb_from": False,
                 "bip152_hb_to": False,
+                "bip152_hb_to_manual": False,
                 "bytesrecv_per_msg": {},
                 "bytessent_per_msg": {},
                 "connection_type": "inbound",

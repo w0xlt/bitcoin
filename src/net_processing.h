@@ -67,6 +67,7 @@ struct CNodeStateStats {
     ServiceFlags their_services;
     int64_t presync_height{-1};
     std::chrono::seconds time_offset{0};
+    bool m_bip152_hb_to_manual{false};
 };
 
 struct PeerManagerInfo {
@@ -110,6 +111,17 @@ public:
      * @param[in]  block_index  The blockindex
      */
     virtual util::Expected<void, std::string> FetchBlock(NodeId peer_id, const CBlockIndex& block_index) = 0;
+
+    /**
+     * Set or clear the manual source of a peer's BIP152 high-bandwidth state.
+     *
+     * The automatic high-bandwidth selection remains independent. Clearing
+     * the manual source therefore does not necessarily disable the effective
+     * high-bandwidth state.
+     *
+     * @return The peer's effective high-bandwidth state, or an error.
+     */
+    virtual util::Expected<bool, std::string> SetPeerHighBandwidth(NodeId peer_id, bool high_bandwidth) = 0;
 
     /** Begin running background tasks, should only be called once */
     virtual void StartScheduledTasks(CScheduler& scheduler) = 0;
