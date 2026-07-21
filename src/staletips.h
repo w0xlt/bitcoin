@@ -222,9 +222,13 @@ private:
      *  the tip is eligible for tracking. On signet, header variants of
      *  active-chain blocks are not eligible, as they are duplicates of them.
      *
+     * @param[in] allow_more_work Permit tips with more work than the active
+     *            tip. Used when a block is disconnected during a reorg, as it
+     *            may temporarily have more work than the new active tip.
+     *
      * @return The fork point, or nullptr if the tip is not eligible.
      */
-    const CBlockIndex* GetEligibleForkPoint(const CChain& chain, const CBlockIndex& stale_tip) const EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
+    const CBlockIndex* GetEligibleForkPoint(const CChain& chain, const CBlockIndex& stale_tip, bool allow_more_work = false) const EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
     /** Insert `stale_tip` into the cache, dropping any tracked tips that it
      *  descends from, and any tracked descendants known to be invalid. If the
      *  cache is full, a tracked tip that is no longer eligible is evicted, or
@@ -274,7 +278,7 @@ public:
      *
      * @return Whether the cache was updated to track `stale_tip`.
      */
-    bool AddStaleTip(const CChain& chain, const CBlockIndex* stale_tip) EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
+    bool AddStaleTip(const CChain& chain, const CBlockIndex* stale_tip, bool allow_more_work = false) EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
     /** Get the tracked tips that are still eligible, with their fork points. */
     std::vector<StaleFork> GetStaleTips(const CChain& chain) const EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
     /** Get a summary of the tracked tips that are still eligible. */

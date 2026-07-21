@@ -126,14 +126,14 @@ bool StaleTipCache::MeetsMinimumDifficulty(uint32_t bits) const
     return !negative && !overflow && target != 0 && target <= UintToArith256(TESTNET_MAX_TARGET);
 }
 
-const CBlockIndex* StaleTipCache::GetEligibleForkPoint(const CChain& chain, const CBlockIndex& stale_tip) const
+const CBlockIndex* StaleTipCache::GetEligibleForkPoint(const CChain& chain, const CBlockIndex& stale_tip, bool allow_more_work) const
 {
     const CBlockIndex* active_tip{chain.Tip()};
     if (active_tip == nullptr) return nullptr;
     if (chain.Contains(stale_tip)) return nullptr;
     if (stale_tip.nStatus & (BLOCK_FAILED_VALID | BLOCK_FAILED_CHILD)) return nullptr;
     if (!IsRecentHeight(chain, stale_tip.nHeight)) return nullptr;
-    if (stale_tip.nChainWork > active_tip->nChainWork) return nullptr;
+    if (!allow_more_work && stale_tip.nChainWork > active_tip->nChainWork) return nullptr;
 
     if (m_chain_type == ChainType::SIGNET && !(stale_tip.nStatus & BLOCK_HAVE_DATA)) return nullptr;
 
@@ -287,7 +287,7 @@ void StaleTipCache::Initialize(node::BlockManager& blockman, const CChain& chain
     }
 }
 
-bool StaleTipCache::AddStaleTip(const CChain& chain, const CBlockIndex* stale_tip)
+bool StaleTipCache::AddStaleTip(const CChain& chain, const CBlockIndex* stale_tip, bool allow_more_work)
 {
     AssertLockHeld(::cs_main);
     if (stale_tip == nullptr) return false;
@@ -295,7 +295,7 @@ bool StaleTipCache::AddStaleTip(const CChain& chain, const CBlockIndex* stale_ti
         AddLongBranchTip(*stale_tip);
         return false;
     }
-    if (GetEligibleForkPoint(chain, *stale_tip) == nullptr) return false;
+    if (GetEligibleForkPoint(chain, *stale_tip, allow_more_work) == nullptr) return false;
 
     return Add(chain, *stale_tip);
 }

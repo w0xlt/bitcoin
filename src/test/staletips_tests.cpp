@@ -498,6 +498,29 @@ BOOST_AUTO_TEST_CASE(staletip_cache_evicts_by_chainwork_not_height)
     BOOST_CHECK(std::ranges::any_of(info, [&](const StaleTipInfo& tip) { return tip.hash == replacement->GetBlockHash(); }));
 }
 
+BOOST_AUTO_TEST_CASE(staletip_cache_reorged_tip)
+{
+    LOCK(::cs_main);
+
+    BlockTree tree;
+    CBlockIndex* active{tree.Add(nullptr, true, true)};
+    for (int i{0}; i < 3; ++i) active = tree.Add(active, true, true);
+
+    StaleTipCache tips;
+    tree.active_chain.SetTip(*Assert(active->pprev));
+    BOOST_CHECK(!tips.AddStaleTip(tree.active_chain, active));
+    BOOST_CHECK(tips.AddStaleTip(tree.active_chain, active, /*allow_more_work=*/true));
+    BOOST_CHECK(tips.GetStaleTipInfo(tree.active_chain).empty());
+
+    CBlockIndex* new_active{tree.Add(Assert(active->pprev), false, true)};
+    new_active = tree.Add(new_active, false, true);
+    tree.active_chain.SetTip(*new_active);
+
+    const auto info{tips.GetStaleTipInfo(tree.active_chain)};
+    BOOST_REQUIRE_EQUAL(info.size(), 1U);
+    BOOST_CHECK_EQUAL(info[0].hash.ToString(), active->GetBlockHash().ToString());
+}
+
 BOOST_AUTO_TEST_CASE(staletip_cache_network_policy)
 {
     LOCK(::cs_main);
@@ -625,6 +648,14 @@ BOOST_AUTO_TEST_CASE(staletip_cache_long_branch_not_tracked)
     stale1->nStatus |= BLOCK_VALID_TRANSACTIONS | BLOCK_HAVE_DATA;
     BOOST_CHECK(!tips.AddStaleTip(tree.active_chain, stale1));
     BOOST_CHECK(!tips.AddStaleTip(tree.active_chain, stale2));
+
+    // As when a long branch is disconnected from the tip down, its blocks
+    // within the length limit are not tracked either.
+    StaleTipCache reorg_tips{ChainType::MAIN, /*recent_window=*/STALETIP_RECENT_WINDOW, /*max_headers=*/2};
+    BOOST_CHECK(!reorg_tips.AddStaleTip(tree.active_chain, stale3, /*allow_more_work=*/true));
+    BOOST_CHECK(!reorg_tips.AddStaleTip(tree.active_chain, stale2, /*allow_more_work=*/true));
+    BOOST_CHECK(!reorg_tips.AddStaleTip(tree.active_chain, stale1, /*allow_more_work=*/true));
+    BOOST_CHECK(reorg_tips.GetStaleTipInfo(tree.active_chain).empty());
 }
 
 BOOST_AUTO_TEST_CASE(staletip_cache_invalid_long_branch_not_remembered)
