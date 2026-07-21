@@ -6,8 +6,11 @@
 
 #include <arith_uint256.h>
 #include <chain.h>
+#include <node/blockstorage.h>
 #include <util/check.h>
 
+#include <algorithm>
+#include <set>
 #include <utility>
 #include <vector>
 
@@ -248,6 +251,40 @@ bool StaleTipCache::Add(const CChain& chain, const CBlockIndex& stale_tip)
     target->tip = &stale_tip;
     target->header_seqno = m_next_seqno++;
     return true;
+}
+
+void StaleTipCache::Initialize(node::BlockManager& blockman, const CChain& chain)
+{
+    AssertLockHeld(::cs_main);
+
+    const CBlockIndex* active_tip{chain.Tip()};
+    if (active_tip == nullptr) return;
+
+    const int min_height{std::max<int>(active_tip->nHeight - m_recent_window, 0)};
+    std::vector<const CBlockIndex*> tips;
+    std::set<const CBlockIndex*> parents;
+
+    for (const auto& [_, block_index] : blockman.m_block_index) {
+        if (!block_index.IsValid(BLOCK_VALID_TREE)) continue;
+        if (block_index.nHeight < min_height) continue;
+        if (block_index.pprev != nullptr) parents.insert(block_index.pprev);
+        if (chain.Contains(block_index)) continue;
+        tips.push_back(&block_index);
+    }
+    // A block with known children is not the tip of a stale branch.
+    std::erase_if(tips, [&](const CBlockIndex* tip) { return parents.contains(tip); });
+
+    std::ranges::sort(tips, [](const CBlockIndex* a, const CBlockIndex* b) {
+        if (a->nHeight != b->nHeight) return a->nHeight > b->nHeight;
+        return a->GetBlockHash() < b->GetBlockHash();
+    });
+
+    for (const CBlockIndex* tip : tips) {
+        if (IsLongBranchTip(chain, *tip)) AddLongBranchTip(*tip);
+    }
+    for (const CBlockIndex* tip : tips) {
+        if (GetEligibleForkPoint(chain, *tip) != nullptr) (void)Add(chain, *tip);
+    }
 }
 
 bool StaleTipCache::AddStaleTip(const CChain& chain, const CBlockIndex* stale_tip)

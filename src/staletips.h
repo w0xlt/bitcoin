@@ -20,6 +20,10 @@
 #include <string>
 #include <vector>
 
+namespace node {
+class BlockManager;
+} // namespace node
+
 /** Maximum number of compressed headers permitted in a `staletip` message. */
 static constexpr size_t MAX_STALETIP_HEADERS{20};
 /** Default number of blocks below the active tip within which a stale tip is
@@ -258,6 +262,11 @@ public:
      *  min-difficulty blocks are cheap to produce, and where invalid compact
      *  targets are rejected. */
     bool MeetsMinimumDifficulty(uint32_t bits) const;
+
+    /** Seed the cache with any eligible stale tips already present in the
+     *  block index, scanning all block index entries. Only blocks without
+     *  known children are considered tips. Called at startup. */
+    void Initialize(node::BlockManager& blockman, const CChain& chain) EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
 
     /** Track `stale_tip` if it is eligible (see GetEligibleForkPoint()) and can
      *  be retained under the cache's resource limits. If `stale_tip` extends a

@@ -126,6 +126,19 @@ struct BlockTree
     }
 };
 
+CBlockIndex* AddBlockIndex(node::BlockManager& blockman, CBlockIndex*& best_header, const CBlockIndex* prev, uint32_t nonce) EXCLUSIVE_LOCKS_REQUIRED(::cs_main)
+{
+    CBlockHeader header;
+    header.nVersion = 4;
+    header.hashPrevBlock = prev ? prev->GetBlockHash() : uint256::ZERO;
+    header.hashMerkleRoot = uint256{static_cast<uint8_t>(nonce)};
+    header.nTime = 1'700'000'000 + nonce;
+    header.nBits = 0x1d00ffff;
+    header.nNonce = nonce;
+
+    return blockman.AddToBlockIndex(header, best_header);
+}
+
 } // namespace
 
 BOOST_AUTO_TEST_CASE(staletip_testvector_deserialize)
@@ -733,6 +746,69 @@ BOOST_AUTO_TEST_CASE(staletip_cache_evicts_ineligible_tip_first)
     const auto info{tips.GetStaleTipInfo(tree.active_chain)};
     BOOST_CHECK_EQUAL(info.size(), MAX_RETAINED_STALETIPS);
     BOOST_CHECK(std::ranges::any_of(info, [&](const StaleTipInfo& tip) { return tip.hash == low_work->GetBlockHash(); }));
+}
+
+BOOST_FIXTURE_TEST_CASE(staletip_initialize_skips_long_branches_and_interior_blocks, ChainTestingSetup)
+{
+    LOCK(::cs_main);
+
+    auto& blockman{m_node.chainman->m_blockman};
+    CBlockIndex* best_header{nullptr};
+    CChain active_chain;
+
+    CBlockIndex* active{nullptr};
+    for (uint32_t nonce{1}; nonce <= 10; ++nonce) {
+        active = AddBlockIndex(blockman, best_header, active, nonce);
+        active_chain.SetTip(*active);
+    }
+
+    // A branch of three blocks is too long, so none of its blocks is tracked.
+    const CBlockIndex* fork{active->GetAncestor(active->nHeight - 4)};
+    const CBlockIndex* long_branch{fork};
+    for (uint32_t nonce{100}; nonce < 103; ++nonce) long_branch = AddBlockIndex(blockman, best_header, long_branch, nonce);
+    // Of a branch of two blocks, only the tip is tracked.
+    const CBlockIndex* short_branch{AddBlockIndex(blockman, best_header, fork, 200)};
+    short_branch = AddBlockIndex(blockman, best_header, short_branch, 201);
+
+    StaleTipCache tips{ChainType::MAIN, /*recent_window=*/STALETIP_RECENT_WINDOW, /*max_headers=*/2};
+    tips.Initialize(blockman, active_chain);
+    const auto info{tips.GetStaleTipInfo(active_chain)};
+    BOOST_REQUIRE_EQUAL(info.size(), 1U);
+    BOOST_CHECK_EQUAL(info.front().hash.ToString(), short_branch->GetBlockHash().ToString());
+    BOOST_CHECK(!tips.AddStaleTip(active_chain, long_branch->pprev));
+}
+
+BOOST_FIXTURE_TEST_CASE(staletip_initialize_orders_candidates_deterministically, ChainTestingSetup)
+{
+    LOCK(::cs_main);
+
+    auto& blockman{m_node.chainman->m_blockman};
+    CBlockIndex* best_header{nullptr};
+    CChain active_chain;
+
+    CBlockIndex* active{nullptr};
+    for (uint32_t nonce{1}; nonce <= 5; ++nonce) {
+        active = AddBlockIndex(blockman, best_header, active, nonce);
+        active_chain.SetTip(*active);
+    }
+
+    CBlockIndex* lower_tip{AddBlockIndex(blockman, best_header, active->GetAncestor(active->nHeight - 2), 100)};
+    CBlockIndex* same_height_a{AddBlockIndex(blockman, best_header, active->pprev, 101)};
+    CBlockIndex* same_height_b{AddBlockIndex(blockman, best_header, active->pprev, 102)};
+
+    std::vector<const CBlockIndex*> same_height{same_height_a, same_height_b};
+    std::ranges::sort(same_height, [](const CBlockIndex* a, const CBlockIndex* b) {
+        return a->GetBlockHash() < b->GetBlockHash();
+    });
+
+    StaleTipCache tips;
+    tips.Initialize(blockman, active_chain);
+    const auto stale_tips{tips.GetStaleTips(active_chain)};
+
+    BOOST_REQUIRE_EQUAL(stale_tips.size(), 3U);
+    BOOST_CHECK_EQUAL(stale_tips[0].tip->GetBlockHash().ToString(), same_height[0]->GetBlockHash().ToString());
+    BOOST_CHECK_EQUAL(stale_tips[1].tip->GetBlockHash().ToString(), same_height[1]->GetBlockHash().ToString());
+    BOOST_CHECK_EQUAL(stale_tips[2].tip->GetBlockHash().ToString(), lower_tip->GetBlockHash().ToString());
 }
 
 BOOST_AUTO_TEST_SUITE_END()
