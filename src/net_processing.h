@@ -151,6 +151,9 @@ public:
     /** Get peer manager info. */
     virtual PeerManagerInfo GetInfo() const = 0;
 
+    /** Get the recently seen stale tips that are being tracked. */
+    virtual std::vector<StaleTipInfo> GetStaleTipInfo() const = 0;
+
     /** Get info about transactions currently being privately broadcast. */
     virtual std::vector<PrivateBroadcast::TxBroadcastInfo> GetPrivateBroadcastInfo() const = 0;
 

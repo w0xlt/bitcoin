@@ -2,8 +2,7 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
-#include <rpc/register.h> // IWYU pragma: associated
-#include <rpc/server.h>
+#include <net.h>
 
 #include <addrman.h>
 #include <addrman_impl.h>
@@ -12,7 +11,6 @@
 #include <clientversion.h>
 #include <core_io.h>
 #include <crypto/hex_base.h>
-#include <net.h>
 #include <net_permissions.h>
 #include <net_processing.h>
 #include <net_types.h>
@@ -26,10 +24,13 @@
 #include <policy/feerate.h>
 #include <protocol.h>
 #include <rpc/protocol.h>
+#include <rpc/register.h> // IWYU pragma: associated
 #include <rpc/request.h>
+#include <rpc/server.h>
 #include <rpc/server_util.h>
 #include <rpc/util.h>
 #include <semaphore_grant.h>
+#include <staletips.h>
 #include <sync.h>
 #include <tinyformat.h>
 #include <txmempool.h>
@@ -701,6 +702,17 @@ static RPCMethod getnetworkinfo()
                             }
                           }
                         }},
+                        {RPCResult::Type::ARR, "staletips", "recent stale tips tracked for relay (empty with -staletips=none)",
+                        {
+                            {RPCResult::Type::OBJ, "", "",
+                            {
+                                {RPCResult::Type::STR_HEX, "hash", "stale tip block hash"},
+                                {RPCResult::Type::NUM, "height", "stale tip height"},
+                                {RPCResult::Type::BOOL, "have_block", "whether the stale tip block data is available"},
+                                {RPCResult::Type::STR_HEX, "fork_point", "active-chain fork point block hash"},
+                                {RPCResult::Type::NUM, "fork_length", "number of stale headers after the fork point"},
+                            }},
+                        }},
                         {RPCResult::Type::NUM, "connections", "the total number of connections"},
                         {RPCResult::Type::NUM, "connections_in", "the number of inbound connections"},
                         {RPCResult::Type::NUM, "connections_out", "the number of outbound connections"},
@@ -769,6 +781,17 @@ static RPCMethod getnetworkinfo()
     invbuckets.pushKV("inbound", buckjson(peerman_info.inbound_bucket));
     invbuckets.pushKV("outbound", buckjson(peerman_info.outbound_bucket));
     obj.pushKV("inv_buckets", invbuckets);
+    UniValue stale_tips(UniValue::VARR);
+    for (const auto& tip : EnsurePeerman(node).GetStaleTipInfo()) {
+        UniValue stale_tip(UniValue::VOBJ);
+        stale_tip.pushKV("hash", tip.hash.ToString());
+        stale_tip.pushKV("height", tip.height);
+        stale_tip.pushKV("have_block", tip.have_block);
+        stale_tip.pushKV("fork_point", tip.fork_point.ToString());
+        stale_tip.pushKV("fork_length", tip.fork_length);
+        stale_tips.push_back(std::move(stale_tip));
+    }
+    obj.pushKV("staletips", std::move(stale_tips));
     obj.pushKV("networkactive", connman.GetNetworkActive());
     obj.pushKV("connections", connman.GetNodeCount(ConnectionDirection::Both));
     obj.pushKV("connections_in", connman.GetNodeCount(ConnectionDirection::In));
