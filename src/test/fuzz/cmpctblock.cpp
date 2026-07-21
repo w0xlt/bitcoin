@@ -138,6 +138,7 @@ FUZZ_TARGET(cmpctblock, .init = initialize_cmpctblock)
                                      /*banman=*/nullptr, chainman,
                                      mempool, *setup->m_node.warnings,
                                      PeerManager::Options{
+                                         .stale_tip_mode = fuzzed_data_provider.PickValueInArray({StaleTipMode::NONE, StaleTipMode::HEADERS, StaleTipMode::BLOCKS}),
                                          .deterministic_rng = true,
                                      });
     connman.SetMsgProc(peerman.get());

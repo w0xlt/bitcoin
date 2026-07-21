@@ -81,6 +81,7 @@ FUZZ_TARGET(process_messages, .init = initialize_process_messages)
                                      *node.mempool, *node.warnings,
                                      PeerManager::Options{
                                          .reconcile_txs = true,
+                                         .stale_tip_mode = fuzzed_data_provider.PickValueInArray({StaleTipMode::NONE, StaleTipMode::HEADERS, StaleTipMode::BLOCKS}),
                                          .deterministic_rng = true,
                                      });
     connman.SetMsgProc(node.peerman.get());
