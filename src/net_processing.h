@@ -12,6 +12,7 @@
 #include <node/types.h>
 #include <private_broadcast.h>
 #include <protocol.h>
+#include <staletips.h>
 #include <uint256.h>
 #include <util/expected.h>
 #include <validationinterface.h>
