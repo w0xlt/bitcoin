@@ -86,6 +86,8 @@ struct PeerManagerInfo {
     std::chrono::seconds median_outbound_time_offset{0s};
     bool ignores_incoming_txs{false};
     bool private_broadcast{DEFAULT_PRIVATE_BROADCAST};
+    //! Recently seen stale tips that are being tracked.
+    std::vector<StaleTipInfo> stale_tips;
 };
 
 class PeerManager : public CValidationInterface, public NetEventsInterface

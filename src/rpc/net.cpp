@@ -659,6 +659,17 @@ static RPCMethod getnetworkinfo()
                         }},
                         {RPCResult::Type::BOOL, "localrelay", "true if transaction relay is requested from peers"},
                         {RPCResult::Type::NUM, "timeoffset", "the time offset"},
+                        {RPCResult::Type::ARR, "staletips", "recent stale tips accepted locally",
+                        {
+                            {RPCResult::Type::OBJ, "", "",
+                            {
+                                {RPCResult::Type::STR_HEX, "hash", "stale tip block hash"},
+                                {RPCResult::Type::NUM, "height", "stale tip height"},
+                                {RPCResult::Type::BOOL, "have_block", "whether the stale tip block data is available"},
+                                {RPCResult::Type::STR_HEX, "fork_point", "active-chain fork point block hash"},
+                                {RPCResult::Type::NUM, "fork_length", "number of stale headers after the fork point"},
+                            }},
+                        }},
                         {RPCResult::Type::NUM, "connections", "the total number of connections"},
                         {RPCResult::Type::NUM, "connections_in", "the number of inbound connections"},
                         {RPCResult::Type::NUM, "connections_out", "the number of outbound connections"},
@@ -716,6 +727,17 @@ static RPCMethod getnetworkinfo()
         auto peerman_info{node.peerman->GetInfo()};
         obj.pushKV("localrelay", !peerman_info.ignores_incoming_txs);
         obj.pushKV("timeoffset", Ticks<std::chrono::seconds>(peerman_info.median_outbound_time_offset));
+        UniValue stale_tips(UniValue::VARR);
+        for (const auto& tip : peerman_info.stale_tips) {
+            UniValue stale_tip(UniValue::VOBJ);
+            stale_tip.pushKV("hash", tip.hash.ToString());
+            stale_tip.pushKV("height", tip.height);
+            stale_tip.pushKV("have_block", tip.have_block);
+            stale_tip.pushKV("fork_point", tip.fork_point.ToString());
+            stale_tip.pushKV("fork_length", tip.fork_length);
+            stale_tips.push_back(std::move(stale_tip));
+        }
+        obj.pushKV("staletips", std::move(stale_tips));
     }
     if (node.connman) {
         obj.pushKV("networkactive", node.connman->GetNetworkActive());
