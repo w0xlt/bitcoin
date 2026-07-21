@@ -205,6 +205,12 @@ static constexpr size_t MAX_ADDR_PROCESSING_TOKEN_BUCKET{MAX_ADDR_TO_SEND};
 static constexpr size_t NUM_PRIVATE_BROADCAST_PER_TX{3};
 /** Private broadcast connections must complete within this time. Disconnect the peer if it takes longer. */
 static constexpr auto PRIVATE_BROADCAST_MAX_CONNECTION_LIFETIME{3min};
+/** Maximum number of recently accepted headers with more work than the active
+ *  tip that are remembered, to be tracked as stale tips if the active chain
+ *  catches up without them. They are candidates for the stale-tip cache, which
+ *  retains no more tips, while normally only the headers of new blocks not yet
+ *  connected are pending. */
+static constexpr size_t MAX_PENDING_STALE_TIPS{MAX_RETAINED_STALETIPS};
 
 // Internal stuff
 namespace {
@@ -580,6 +586,8 @@ public:
         EXCLUSIVE_LOCKS_REQUIRED(!m_tx_download_mutex);
     void BlockDisconnected(const std::shared_ptr<const CBlock> &block, const CBlockIndex* pindex) override
         EXCLUSIVE_LOCKS_REQUIRED(!m_tx_download_mutex);
+    bool WantsAcceptedStaleTip() const override { return m_opts.stale_tip_mode != StaleTipMode::NONE; }
+    void AcceptedStaleTip(const CBlockIndex* pindex) override;
     void UpdatedBlockTip(const CBlockIndex *pindexNew, const CBlockIndex *pindexFork, bool fInitialDownload) override
         EXCLUSIVE_LOCKS_REQUIRED(!m_peer_mutex);
     void BlockChecked(const std::shared_ptr<const CBlock>& block, const BlockValidationState& state) override
@@ -878,6 +886,27 @@ private:
 
     /** Next time to check for stale tip */
     std::chrono::seconds m_stale_tip_check_time GUARDED_BY(cs_main){0s};
+
+    /** Cache of recently seen stale tips. */
+    StaleTipCache m_stale_tips GUARDED_BY(cs_main){m_chainparams.GetChainType()};
+    /** Whether to seed m_stale_tips again from the block index once out of
+     *  initial block download and caught up with the best known header, as
+     *  stale headers may have been learned while behind it: they had more
+     *  work than the active tip at the time, so were not tracked. Set when
+     *  starting behind the best known header, such as during initial block
+     *  download or a reindex. */
+    std::atomic_bool m_reseed_stale_tips{false};
+    /** Recently accepted headers that had more work than the active tip, so
+     *  were not stale then, oldest first. Once the active chain has as much
+     *  work without them, for example because a competing block won a race
+     *  and some of their branch's block data is still missing, they are
+     *  added to m_stale_tips. */
+    std::deque<const CBlockIndex*> m_pending_stale_tips GUARDED_BY(cs_main);
+    /** Remember an accepted header with more work than the active tip, see
+     *  m_pending_stale_tips. */
+    void AddPendingStaleTip(const CBlockIndex& block_index) EXCLUSIVE_LOCKS_REQUIRED(cs_main);
+    /** Track the pending headers that the active chain has caught up with. */
+    void UpdatePendingStaleTips() EXCLUSIVE_LOCKS_REQUIRED(cs_main);
 
     node::Warnings& m_warnings;
     TimeOffsets m_outbound_time_offsets{m_warnings};
@@ -2146,6 +2175,16 @@ PeerManagerImpl::PeerManagerImpl(CConnman& connman, AddrMan& addrman,
       m_inbound_inv_bucket(/*rate=*/m_opts.tx_send_rate, /*mult=*/1.0),
       m_outbound_inv_bucket(/*rate=*/m_opts.tx_send_rate, /*mult=*/OUTBOUND_INVENTORY_BUCKET_MULTIPLIER)
 {
+    // Stale tips are only tracked while stale-tip relay is enabled. Seed the
+    // cache with those already in the block index.
+    if (m_opts.stale_tip_mode != StaleTipMode::NONE) {
+        LOCK(::cs_main);
+        m_stale_tips.Initialize(m_chainman.m_blockman, m_chainman.ActiveChain());
+        const CBlockIndex* active_tip{m_chainman.ActiveTip()};
+        m_reseed_stale_tips = m_chainman.IsInitialBlockDownload() || active_tip == nullptr ||
+                              (m_chainman.m_best_header != nullptr && active_tip->nChainWork < m_chainman.m_best_header->nChainWork);
+    }
+
     // While Erlay support is incomplete, it must be enabled explicitly via -txreconciliation.
     // This argument can go away after Erlay support is complete.
     if (opts.reconcile_txs) {
@@ -2223,8 +2262,28 @@ void PeerManagerImpl::BlockConnected(
 
 void PeerManagerImpl::BlockDisconnected(const std::shared_ptr<const CBlock> &block, const CBlockIndex* pindex)
 {
+    if (m_opts.stale_tip_mode != StaleTipMode::NONE &&
+        WITH_LOCK(::cs_main, return m_stale_tips.AddStaleTip(m_chainman.ActiveChain(), pindex, /*allow_more_work=*/true))) {
+        m_connman.WakeMessageHandler();
+    }
+
     LOCK(m_tx_download_mutex);
     m_txdownloadman.BlockDisconnected();
+}
+
+void PeerManagerImpl::AcceptedStaleTip(const CBlockIndex* pindex)
+{
+    bool added{false};
+    {
+        LOCK(::cs_main);
+        const CBlockIndex* active_tip{m_chainman.ActiveTip()};
+        if (pindex != nullptr && active_tip != nullptr && pindex->nChainWork > active_tip->nChainWork) {
+            AddPendingStaleTip(*pindex);
+        } else {
+            added = m_stale_tips.AddStaleTip(m_chainman.ActiveChain(), pindex);
+        }
+    }
+    if (added) m_connman.WakeMessageHandler();
 }
 
 /**
@@ -2282,6 +2341,33 @@ void PeerManagerImpl::NewPoWValidBlock(const CBlockIndex *pindex, const std::sha
     });
 }
 
+void PeerManagerImpl::AddPendingStaleTip(const CBlockIndex& block_index)
+{
+    AssertLockHeld(cs_main);
+    if (m_opts.stale_tip_mode == StaleTipMode::NONE) return;
+    // Like the cache, ignore headers that are cheap to produce on testnet.
+    if (!m_stale_tips.MeetsMinimumDifficulty(block_index.nBits)) return;
+    // A pending descendant makes its ancestors redundant.
+    if (std::ranges::any_of(m_pending_stale_tips, [&](const CBlockIndex* pending) { return pending->GetAncestor(block_index.nHeight) == &block_index; })) return;
+    std::erase_if(m_pending_stale_tips, [&](const CBlockIndex* pending) { return block_index.GetAncestor(pending->nHeight) == pending; });
+    m_pending_stale_tips.push_back(&block_index);
+    if (m_pending_stale_tips.size() > MAX_PENDING_STALE_TIPS) m_pending_stale_tips.pop_front();
+}
+
+void PeerManagerImpl::UpdatePendingStaleTips()
+{
+    AssertLockHeld(cs_main);
+    const CChain& chain{m_chainman.ActiveChain()};
+    const CBlockIndex* active_tip{chain.Tip()};
+    if (active_tip == nullptr) return;
+    std::erase_if(m_pending_stale_tips, [&](const CBlockIndex* pending) EXCLUSIVE_LOCKS_REQUIRED(cs_main) {
+        if (pending->nStatus & BLOCK_FAILED_VALID) return true;
+        if (pending->nChainWork > active_tip->nChainWork) return false;
+        if (!chain.Contains(*pending) && m_stale_tips.AddStaleTip(chain, pending)) m_connman.WakeMessageHandler();
+        return true;
+    });
+}
+
 /**
  * Update our best height and announce any block hashes which weren't previously
  * in m_chainman.ActiveChain() to our peers.
@@ -2289,6 +2375,19 @@ void PeerManagerImpl::NewPoWValidBlock(const CBlockIndex *pindex, const std::sha
 void PeerManagerImpl::UpdatedBlockTip(const CBlockIndex *pindexNew, const CBlockIndex *pindexFork, bool fInitialDownload)
 {
     SetBestBlock(pindexNew->nHeight, std::chrono::seconds{pindexNew->GetBlockTime()});
+
+    if (m_reseed_stale_tips && !fInitialDownload) {
+        LOCK(::cs_main);
+        const CBlockIndex* active_tip{m_chainman.ActiveTip()};
+        if (active_tip != nullptr && m_chainman.m_best_header != nullptr &&
+            active_tip->nChainWork >= m_chainman.m_best_header->nChainWork && m_reseed_stale_tips.exchange(false)) {
+            m_stale_tips.Initialize(m_chainman.m_blockman, m_chainman.ActiveChain());
+        }
+    }
+    if (m_opts.stale_tip_mode != StaleTipMode::NONE) {
+        LOCK(::cs_main);
+        UpdatePendingStaleTips();
+    }
 
     // Don't relay inventory during initial block download.
     if (fInitialDownload) return;
@@ -2329,6 +2428,18 @@ void PeerManagerImpl::BlockChecked(const std::shared_ptr<const CBlock>& block, c
     LOCK(cs_main);
 
     const uint256 hash(block->GetHash());
+
+    // A tracked stale tip descending from an invalid block may have kept its
+    // parent from being tracked, so reconsider the parent. Blocks only found
+    // invalid when connected have their parent on the active chain, which
+    // BlockDisconnected() handles if it is disconnected.
+    if (m_opts.stale_tip_mode != StaleTipMode::NONE && state.IsInvalid()) {
+        const CBlockIndex* block_index{m_chainman.m_blockman.LookupBlockIndex(hash)};
+        if (block_index != nullptr && (block_index->nStatus & BLOCK_FAILED_VALID) &&
+            m_stale_tips.AddStaleTip(m_chainman.ActiveChain(), block_index->pprev)) {
+            m_connman.WakeMessageHandler();
+        }
+    }
     std::map<uint256, std::pair<NodeId, bool>>::iterator it = mapBlockSource.find(hash);
 
     // If the block failed validation, we know where it came from and we're still connected
@@ -3175,6 +3286,7 @@ void PeerManagerImpl::UpdatePeerStateForReceivedHeaders(CNode& pfrom,
 
     if (received_new_header && last_header.nChainWork > m_chainman.ActiveChain().Tip()->nChainWork) {
         nodestate->m_last_block_announcement = NodeClock::now();
+        AddPendingStaleTip(last_header);
     }
 
     // If we're in IBD, we want outbound peers that will serve us a useful
@@ -3687,6 +3799,12 @@ void PeerManagerImpl::ProcessBlock(CNode& node, const std::shared_ptr<const CBlo
         // this block to disk).
         LOCK(cs_main);
         RemoveBlockRequest(block->GetHash(), std::nullopt);
+        // A full block may remain unconnected because an ancestor's data is
+        // missing. Remember it in case a competing chain catches up first.
+        const CBlockIndex* block_index{m_chainman.m_blockman.LookupBlockIndex(block->GetHash())};
+        if (block_index != nullptr && block_index->nChainWork > m_chainman.ActiveTip()->nChainWork) {
+            AddPendingStaleTip(*block_index);
+        }
     } else {
         LOCK(cs_main);
         mapBlockSource.erase(block->GetHash());
@@ -4867,6 +4985,7 @@ void PeerManagerImpl::ProcessMessage(Peer& peer, CNode& pfrom, const std::string
         // peer's last block announcement time
         if (received_new_header && pindex->nChainWork > m_chainman.ActiveChain().Tip()->nChainWork) {
             nodestate->m_last_block_announcement = NodeClock::now();
+            AddPendingStaleTip(*pindex);
         }
 
         if (pindex->nStatus & BLOCK_HAVE_DATA) // Nothing to do here

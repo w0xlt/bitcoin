@@ -269,7 +269,8 @@ public:
 
     /** Seed the cache with any eligible stale tips already present in the
      *  block index, scanning all block index entries. Only blocks without
-     *  known children are considered tips. Called at startup. */
+     *  known children are considered tips. Called at startup, and possibly
+     *  again later for tips that were not eligible when learned. */
     void Initialize(node::BlockManager& blockman, const CChain& chain) EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
 
     /** Track `stale_tip` if it is eligible (see GetEligibleForkPoint()) and can
