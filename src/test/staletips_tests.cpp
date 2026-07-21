@@ -440,6 +440,29 @@ BOOST_AUTO_TEST_CASE(staletip_cache_full_without_lower_tip_drops_candidate)
     BOOST_CHECK(std::ranges::none_of(info, [&](const StaleTipInfo& tip) { return tip.hash == dropped->GetBlockHash(); }));
 }
 
+BOOST_AUTO_TEST_CASE(staletip_cache_reorged_tip)
+{
+    LOCK(::cs_main);
+
+    BlockTree tree;
+    CBlockIndex* active{tree.Add(nullptr, true, true)};
+    for (int i{0}; i < 3; ++i) active = tree.Add(active, true, true);
+
+    StaleTipCache tips;
+    tree.active_chain.SetTip(*Assert(active->pprev));
+    BOOST_CHECK(!tips.AddStaleTip(tree.active_chain, active));
+    BOOST_CHECK(tips.AddStaleTip(tree.active_chain, active, /*allow_more_work=*/true));
+    BOOST_CHECK(tips.GetStaleTipInfo(tree.active_chain).empty());
+
+    CBlockIndex* new_active{tree.Add(Assert(active->pprev), false, true)};
+    new_active = tree.Add(new_active, false, true);
+    tree.active_chain.SetTip(*new_active);
+
+    const auto info{tips.GetStaleTipInfo(tree.active_chain)};
+    BOOST_REQUIRE_EQUAL(info.size(), 1U);
+    BOOST_CHECK_EQUAL(info[0].hash.ToString(), active->GetBlockHash().ToString());
+}
+
 BOOST_AUTO_TEST_CASE(staletip_cache_network_policy)
 {
     LOCK(::cs_main);
