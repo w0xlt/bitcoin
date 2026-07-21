@@ -136,6 +136,8 @@ static constexpr auto BLOCK_STALLING_TIMEOUT_MAX{64s};
 /** Maximum depth of blocks we're willing to serve as compact blocks to peers
  *  when requested. For older blocks, a regular BLOCK response will be sent. */
 static const int MAX_CMPCTBLOCK_DEPTH = 5;
+/** Maximum number of peers selected automatically for BIP152 high-bandwidth announcements. */
+static constexpr size_t MAX_AUTO_HIGH_BANDWIDTH_PEERS{3};
 /** Maximum depth of blocks we're willing to respond to GETBLOCKTXN requests for. */
 static const int MAX_BLOCKTXN_DEPTH = 10;
 static_assert(MAX_BLOCKTXN_DEPTH <= MIN_BLOCKS_TO_KEEP, "MAX_BLOCKTXN_DEPTH too high");
@@ -988,13 +990,16 @@ private:
     /**
      * When a peer sends us a valid block, instruct it to announce blocks to us
      * using CMPCTBLOCK if possible by adding its nodeid to the end of
-     * lNodesAnnouncingHeaderAndIDs, and keeping that list under a certain size by
-     * removing the first element if necessary.
+     * m_automatic_high_bandwidth_peers, and keeping that list under a certain
+     * size by removing the first element if necessary.
      */
     void MaybeSetPeerAsAnnouncingHeaderAndIDs(NodeId nodeid) EXCLUSIVE_LOCKS_REQUIRED(cs_main, !m_peer_mutex);
 
-    /** Stack of nodes which we have set to announce using compact blocks */
-    std::list<NodeId> lNodesAnnouncingHeaderAndIDs GUARDED_BY(cs_main);
+    /** Apply a BIP152 high-bandwidth state transition to a fully connected peer. */
+    void ApplyHighBandwidthState(CNode& node, bool high_bandwidth) EXCLUSIVE_LOCKS_REQUIRED(cs_main);
+
+    /** Nodes selected automatically to announce using compact blocks. */
+    std::list<NodeId> m_automatic_high_bandwidth_peers GUARDED_BY(cs_main);
 
     /** Number of peers from which we're downloading blocks. */
     int m_peers_downloading_from GUARDED_BY(cs_main) = 0;
@@ -1281,6 +1286,16 @@ bool PeerManagerImpl::BlockRequested(NodeId nodeid, const CBlockIndex& block, st
     return true;
 }
 
+void PeerManagerImpl::ApplyHighBandwidthState(CNode& node, bool high_bandwidth)
+{
+    AssertLockHeld(cs_main);
+
+    if (node.m_bip152_highbandwidth_to == high_bandwidth) return;
+
+    MakeAndPushMessage(node, NetMsgType::SENDCMPCT, high_bandwidth, CMPCTBLOCKS_VERSION);
+    node.m_bip152_highbandwidth_to = high_bandwidth;
+}
+
 void PeerManagerImpl::MaybeSetPeerAsAnnouncingHeaderAndIDs(NodeId nodeid)
 {
     AssertLockHeld(cs_main);
@@ -1298,10 +1313,10 @@ void PeerManagerImpl::MaybeSetPeerAsAnnouncingHeaderAndIDs(NodeId nodeid)
     }
 
     int num_outbound_hb_peers = 0;
-    for (std::list<NodeId>::iterator it = lNodesAnnouncingHeaderAndIDs.begin(); it != lNodesAnnouncingHeaderAndIDs.end(); it++) {
+    for (auto it = m_automatic_high_bandwidth_peers.begin(); it != m_automatic_high_bandwidth_peers.end(); ++it) {
         if (*it == nodeid) {
-            lNodesAnnouncingHeaderAndIDs.erase(it);
-            lNodesAnnouncingHeaderAndIDs.push_back(nodeid);
+            m_automatic_high_bandwidth_peers.erase(it);
+            m_automatic_high_bandwidth_peers.push_back(nodeid);
             return;
         }
         PeerRef peer_ref{GetPeerRef(*it)};
@@ -1310,33 +1325,28 @@ void PeerManagerImpl::MaybeSetPeerAsAnnouncingHeaderAndIDs(NodeId nodeid)
     if (peer && peer->m_is_inbound) {
         // If we're adding an inbound HB peer, make sure we're not removing
         // our last outbound HB peer in the process.
-        if (lNodesAnnouncingHeaderAndIDs.size() >= 3 && num_outbound_hb_peers == 1) {
-            PeerRef remove_peer{GetPeerRef(lNodesAnnouncingHeaderAndIDs.front())};
+        if (m_automatic_high_bandwidth_peers.size() >= MAX_AUTO_HIGH_BANDWIDTH_PEERS && num_outbound_hb_peers == 1) {
+            PeerRef remove_peer{GetPeerRef(m_automatic_high_bandwidth_peers.front())};
             if (remove_peer && !remove_peer->m_is_inbound) {
                 // Put the HB outbound peer in the second slot, so that it
                 // doesn't get removed.
-                std::swap(lNodesAnnouncingHeaderAndIDs.front(), *std::next(lNodesAnnouncingHeaderAndIDs.begin()));
+                std::swap(m_automatic_high_bandwidth_peers.front(), *std::next(m_automatic_high_bandwidth_peers.begin()));
             }
         }
     }
     const bool nodeid_was_appended{m_connman.ForNode(nodeid, [this](CNode* pfrom) EXCLUSIVE_LOCKS_REQUIRED(::cs_main) {
         AssertLockHeld(::cs_main);
-        MakeAndPushMessage(*pfrom, NetMsgType::SENDCMPCT, /*high_bandwidth=*/true, /*version=*/CMPCTBLOCKS_VERSION);
-        // save BIP152 bandwidth state: we select peer to be high-bandwidth
-        pfrom->m_bip152_highbandwidth_to = true;
-        lNodesAnnouncingHeaderAndIDs.push_back(pfrom->GetId());
+        ApplyHighBandwidthState(*pfrom, /*high_bandwidth=*/true);
+        m_automatic_high_bandwidth_peers.push_back(pfrom->GetId());
         return true;
     })};
-    if (nodeid_was_appended && lNodesAnnouncingHeaderAndIDs.size() > 3) {
-        // As per BIP152, we only get 3 of our peers to announce
-        // blocks using compact encodings.
-        m_connman.ForNode(lNodesAnnouncingHeaderAndIDs.front(), [this](CNode* pnodeStop) {
-            MakeAndPushMessage(*pnodeStop, NetMsgType::SENDCMPCT, /*high_bandwidth=*/false, /*version=*/CMPCTBLOCKS_VERSION);
-            // save BIP152 bandwidth state: we select peer to be low-bandwidth
-            pnodeStop->m_bip152_highbandwidth_to = false;
+    if (nodeid_was_appended && m_automatic_high_bandwidth_peers.size() > MAX_AUTO_HIGH_BANDWIDTH_PEERS) {
+        // Keep the automatic BIP152 high-bandwidth selection within its limit.
+        m_connman.ForNode(m_automatic_high_bandwidth_peers.front(), [this](CNode* pnodeStop) EXCLUSIVE_LOCKS_REQUIRED(::cs_main) {
+            ApplyHighBandwidthState(*pnodeStop, /*high_bandwidth=*/false);
             return true;
         });
-        lNodesAnnouncingHeaderAndIDs.pop_front();
+        m_automatic_high_bandwidth_peers.pop_front();
     }
 }
 
