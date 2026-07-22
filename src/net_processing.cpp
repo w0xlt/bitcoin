@@ -131,6 +131,13 @@ static const unsigned int MAX_INV_SZ = 50000;
 static const unsigned int MAX_GETDATA_SZ = 1000;
 /** Number of blocks that can be requested at any given time from a single peer. */
 static const int MAX_BLOCKS_IN_TRANSIT_PER_PEER = 16;
+/** Maximum number of optional stale-tip branch blocks that can be requested at
+ *  any given time from a single peer: enough for the longest branch a
+ *  staletip message announces. */
+static constexpr size_t MAX_STALE_BLOCK_REQUESTS_PER_PEER{MAX_STALETIP_HEADERS};
+/** Maximum number of announced stale branches with downloads deferred by the
+ *  per-peer request limit. */
+static constexpr size_t MAX_STALE_BRANCH_DOWNLOADS_PER_PEER{MAX_RETAINED_STALETIPS};
 /** Default time during which a peer must stall block download progress before being disconnected.
  * the actual timeout is increased temporarily if peers are disconnected for hitting the timeout */
 static constexpr auto BLOCK_STALLING_TIMEOUT_DEFAULT{2s};
@@ -237,6 +244,15 @@ struct StaleBlockRequest {
     uint256 hash;
     //! When the block was requested.
     std::chrono::microseconds time;
+};
+
+/** An announced stale branch whose missing blocks have not all been requested. */
+struct StaleBranchDownload {
+    //! Announced tip, used to recheck whether the branch remains eligible.
+    const CBlockIndex* tip;
+    //! Next block to consider, walking back towards the active chain. Advancing
+    //! past requests prevents retrying them after they time out.
+    const CBlockIndex* next_block;
 };
 
 /**
@@ -507,6 +523,8 @@ struct CNodeState {
     std::chrono::microseconds m_downloading_since{0us};
     //! Optional stale-tip branch block requests to this peer, oldest first.
     std::deque<StaleBlockRequest> m_stale_block_requests;
+    //! Unfinished stale-branch downloads from this peer, oldest announcement first.
+    std::deque<StaleBranchDownload> m_stale_branch_downloads;
     //! Time before which block requests should not be sent to this peer.
     std::chrono::microseconds m_block_download_paused_until{0us};
     //! Whether we consider this a preferred download peer.
@@ -903,8 +921,11 @@ private:
     /** Send `staletip` messages for any new stale tips. */
     void MaybeSendStaleTips(CNode& node, Peer& peer, CNodeState& state) EXCLUSIVE_LOCKS_REQUIRED(g_msgproc_mutex, cs_main);
 
-    /** Add a stale tip to the cache and update peer state if appropriate. */
+    /** Add a stale tip to the cache and request missing branch blocks if appropriate. */
     void HandleStaleTip(CNode& pfrom, Peer& peer, const CBlockIndex* pindex, bool peer_has_block, bool received_new_header) EXCLUSIVE_LOCKS_REQUIRED(g_msgproc_mutex, cs_main);
+
+    /** Request missing stale-branch blocks up to the per-peer request limit. */
+    void MaybeRequestStaleBranchBlocks(CNode& node, Peer& peer, CNodeState& state) EXCLUSIVE_LOCKS_REQUIRED(g_msgproc_mutex, cs_main);
 
     FastRandomContext m_rng GUARDED_BY(NetEventsInterface::g_msgproc_mutex);
 
@@ -1083,6 +1104,8 @@ private:
      */
     bool BlockRequested(NodeId nodeid, const CBlockIndex& block, std::list<QueuedBlock>::iterator** pit = nullptr) EXCLUSIVE_LOCKS_REQUIRED(cs_main);
 
+    /** Track an optional request to a peer for `block`, on a stale-tip branch. */
+    void StaleBlockRequested(NodeId nodeid, const CBlockIndex& block) EXCLUSIVE_LOCKS_REQUIRED(cs_main);
     /** Stop tracking the optional stale-tip branch block request for `hash`,
      *  if it was sent to `from_peer` (or to any peer, if not given).
      *  @return Whether there was such a request. */
@@ -1211,7 +1234,7 @@ private:
      *  it is below our NODE_NETWORK_LIMITED threshold, or because the upload
      *  target is reached for historical blocks. Mirrors ProcessGetBlockData(). */
     bool BlockServingLimited(const CNode& node, const Peer& peer, const CBlockIndex& block_index) EXCLUSIVE_LOCKS_REQUIRED(cs_main);
-    /** Whether this negotiated peer may fetch a tracked stale branch block. */
+    /** Whether this negotiated peer may fetch an unvalidated tracked stale-tip branch block. */
     bool StaleTipBlockRequestAllowed(const Peer& peer, const CBlockIndex& block_index) EXCLUSIVE_LOCKS_REQUIRED(g_msgproc_mutex, cs_main);
     bool AlreadyHaveBlock(const uint256& block_hash) EXCLUSIVE_LOCKS_REQUIRED(cs_main);
     void ProcessGetBlockData(CNode& pfrom, Peer& peer, const CInv& inv)
@@ -1473,6 +1496,16 @@ bool PeerManagerImpl::BlockRequested(NodeId nodeid, const CBlockIndex& block, st
         *pit = &itInFlight->second.second;
     }
     return true;
+}
+
+void PeerManagerImpl::StaleBlockRequested(NodeId nodeid, const CBlockIndex& block)
+{
+    CNodeState* state{State(nodeid)};
+    assert(state != nullptr);
+    const uint256& hash{block.GetBlockHash()};
+    const bool inserted{m_stale_block_requests.emplace(hash, nodeid).second};
+    Assume(inserted);
+    state->m_stale_block_requests.push_back({.hash = hash, .time = GetTime<std::chrono::microseconds>()});
 }
 
 bool PeerManagerImpl::RemoveStaleBlockRequest(const uint256& hash, std::optional<NodeId> from_peer)
@@ -6407,17 +6440,123 @@ void PeerManagerImpl::HandleStaleTip(CNode& pfrom, Peer& peer, const CBlockIndex
     RememberReceivedStaleTip(peer, *pindex);
 
     const CBlockIndex* active_tip{m_chainman.ActiveTip()};
-    if (peer_has_block && active_tip != nullptr && pindex->nChainWork > active_tip->nChainWork) {
-        UpdatePeerStateForReceivedHeaders(pfrom, *pindex, received_new_header, /*may_have_more_headers=*/false);
-        HeadersDirectFetchBlocks(pfrom, peer, *pindex);
-    }
+    if (active_tip == nullptr) return;
+    const bool more_work{pindex->nChainWork > active_tip->nChainWork};
 
     if (m_chainman.ActiveChain().Contains(*pindex)) return;
     // A stale tip with more work than the active tip can only be tracked once
     // the active chain has caught up with it.
-    if (pindex->nChainWork > m_chainman.ActiveTip()->nChainWork) AddPendingStaleTip(*pindex);
+    if (more_work) AddPendingStaleTip(*pindex);
     if (m_stale_tips.AddStaleTip(m_chainman.ActiveChain(), pindex)) {
         m_connman.WakeMessageHandler();
+    }
+
+    if (!peer_has_block) return;
+    if (!more_work && (m_opts.stale_tip_mode != StaleTipMode::BLOCKS ||
+                      !m_stale_tips.CanRequestStaleTipBlock(m_chainman.ActiveChain(), pindex))) return;
+    if (!CanServeBlocks(peer)) return;
+    if (!CanServeWitnesses(peer) &&
+        DeploymentActiveAt(*pindex, m_chainman, Consensus::DEPLOYMENT_SEGWIT)) return;
+
+    CNodeState* state{State(pfrom.GetId())};
+    if (state == nullptr) return;
+
+    // have_block promises only the tip, so don't update pindexBestKnownBlock:
+    // normal block download would assume the peer can serve every ancestor.
+    if (more_work && received_new_header) state->m_last_block_announcement = NodeClock::now();
+
+    if (std::ranges::none_of(state->m_stale_branch_downloads, [&](const StaleBranchDownload& download) { return download.tip == pindex; })) {
+        state->m_stale_branch_downloads.push_back({.tip = pindex, .next_block = pindex});
+        if (state->m_stale_branch_downloads.size() > MAX_STALE_BRANCH_DOWNLOADS_PER_PEER) {
+            state->m_stale_branch_downloads.pop_front();
+        }
+    }
+    MaybeRequestStaleBranchBlocks(pfrom, peer, *state);
+}
+
+void PeerManagerImpl::MaybeRequestStaleBranchBlocks(CNode& node, Peer& peer, CNodeState& state)
+{
+    AssertLockHeld(g_msgproc_mutex);
+    AssertLockHeld(cs_main);
+
+    if (state.m_stale_branch_downloads.empty()) return;
+
+    // Like normal block download, don't request blocks that a pruned peer
+    // would not serve, as they are too far below its tip.
+    const CBlockIndex* active_tip{m_chainman.ActiveTip()};
+    const CBlockIndex* peer_tip{state.pindexBestKnownBlock != nullptr && state.pindexBestKnownBlock->nHeight > active_tip->nHeight ?
+                                state.pindexBestKnownBlock : active_tip};
+    const uint32_t fetch_flags{GetFetchFlags(peer)};
+
+    // Fetch promised higher-work tips through normal download tracking. Check
+    // every queued tip first, so optional ancestors or an older deferred branch
+    // cannot delay a better tip. Ancestor availability requires a separate
+    // ordinary block/header announcement before it implies mandatory download.
+    std::vector<CInv> promised_tips;
+    if (GetTime<std::chrono::microseconds>() >= state.m_block_download_paused_until) {
+        for (const StaleBranchDownload& download : state.m_stale_branch_downloads) {
+            if (state.vBlocksInFlight.size() >= MAX_BLOCKS_IN_TRANSIT_PER_PEER) break;
+            const CBlockIndex& tip{*download.tip};
+            if (tip.nChainWork <= active_tip->nChainWork || !tip.IsValid(BLOCK_VALID_TREE) ||
+                (tip.nStatus & BLOCK_HAVE_DATA) || IsBlockRequested(tip.GetBlockHash()) ||
+                (!CanServeWitnesses(peer) && DeploymentActiveAt(tip, m_chainman, Consensus::DEPLOYMENT_SEGWIT))) continue;
+
+            promised_tips.emplace_back(MSG_BLOCK | fetch_flags, tip.GetBlockHash());
+            BlockRequested(node.GetId(), tip);
+            LogDebug(BCLog::NET, "requesting higher-work staletip block %s from peer=%d", tip.GetBlockHash().ToString(), node.GetId());
+        }
+    }
+    if (!promised_tips.empty()) MakeAndPushMessage(node, NetMsgType::GETDATA, promised_tips);
+
+    while (!state.m_stale_branch_downloads.empty()) {
+        StaleBranchDownload& download{state.m_stale_branch_downloads.front()};
+        const bool more_work{download.tip->nChainWork > active_tip->nChainWork};
+        if (!download.tip->IsValid(BLOCK_VALID_TREE) ||
+            (!more_work && m_opts.stale_tip_mode != StaleTipMode::BLOCKS)) {
+            state.m_stale_branch_downloads.pop_front();
+            continue;
+        }
+        // Preserve a promised tip that could not yet enter normal download;
+        // don't downgrade it to an optional request or drop it with its branch.
+        if (more_work && !(download.tip->nStatus & BLOCK_HAVE_DATA) && !IsBlockRequested(download.tip->GetBlockHash())) return;
+        if (!m_stale_tips.CanRequestStaleTipBlock(m_chainman.ActiveChain(), download.tip, /*allow_more_work=*/true) ||
+            (!CanServeWitnesses(peer) && DeploymentActiveAt(*download.tip, m_chainman, Consensus::DEPLOYMENT_SEGWIT))) {
+            state.m_stale_branch_downloads.pop_front();
+            continue;
+        }
+
+        std::vector<CInv> getdata;
+        // Select blocks from the tip backwards, preserving the cursor when
+        // capacity runs out so that the rest of the branch can be requested later.
+        const CBlockIndex*& block{download.next_block};
+        for (; block != nullptr && !m_chainman.ActiveChain().Contains(*block); block = block->pprev) {
+            if (IsLimitedPeer(peer) && peer_tip->nHeight - block->nHeight >= static_cast<int>(NODE_NETWORK_LIMITED_MIN_BLOCKS) - 2) {
+                block = nullptr;
+                break;
+            }
+            if (block->nStatus & BLOCK_HAVE_DATA) continue;
+            if (IsBlockRequested(block->GetBlockHash()) || m_stale_block_requests.contains(block->GetBlockHash())) continue;
+            if (state.m_stale_block_requests.size() >= MAX_STALE_BLOCK_REQUESTS_PER_PEER) break;
+
+            getdata.emplace_back(MSG_BLOCK | fetch_flags, block->GetBlockHash());
+            StaleBlockRequested(node.GetId(), *block);
+            LogDebug(BCLog::NET, "requesting stale branch block %s from peer=%d", block->GetBlockHash().ToString(), node.GetId());
+        }
+
+        if (!getdata.empty()) {
+            // Request parents first, so that the branch is stored by the time the
+            // tip block arrives, which makes it announceable with block data. On
+            // signet, a stale tip is only tracked once its block data is stored,
+            // so request the tip first instead: otherwise each parent arriving
+            // first would be tracked and announced in turn. Block data, without
+            // which signet tips are not announced, is only claimed once the whole
+            // branch is stored.
+            if (m_chainparams.GetChainType() != ChainType::SIGNET) std::ranges::reverse(getdata);
+            MakeAndPushMessage(node, NetMsgType::GETDATA, getdata);
+        }
+
+        if (block != nullptr && !m_chainman.ActiveChain().Contains(*block)) return;
+        state.m_stale_branch_downloads.pop_front();
     }
 }
 
@@ -7039,6 +7178,7 @@ bool PeerManagerImpl::SendMessages(CNode& node)
             m_stale_block_requests.erase(hash);
             state.m_stale_block_requests.pop_front();
         }
+        MaybeRequestStaleBranchBlocks(node, peer, state);
         // Check for headers sync timeouts
         if (state.fSyncStarted && peer.m_headers_sync_timeout < std::chrono::microseconds::max()) {
             // Detect whether this is a stalling initial-headers-sync peer

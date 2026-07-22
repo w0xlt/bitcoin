@@ -5,6 +5,7 @@
 
 """Test stale-tip P2P relay."""
 
+from copy import deepcopy
 import time
 
 from test_framework.blocktools import create_block, create_coinbase
@@ -18,6 +19,8 @@ from test_framework.messages import (
     HeaderAndShortIDs,
     MSG_BLOCK,
     MSG_TYPE_MASK,
+    NODE_NETWORK,
+    NODE_NETWORK_LIMITED,
     NODE_WITNESS,
     StaleTipCompressedHeader,
     from_hex,
@@ -42,8 +45,10 @@ from test_framework.util import (
 
 STALETIP_FEATURE = "BIP332"
 FEATURE_VERSION = 70017
+MAX_STALE_BLOCK_REQUESTS_PER_PEER = 20
 MAX_ADVERTISED_STALETIPS = 10
 MAX_RETAINED_STALETIPS = 20
+STALETIP_BLOCK_WAIT = 60
 STALETIP_RECENT_WINDOW = 1000
 NODE_NETWORK_LIMITED_MIN_BLOCKS = 288
 
@@ -93,6 +98,12 @@ class StaleTipPeer(P2PInterface):
             for inv in self.getdata
         ))
 
+    def wait_for_getdata_hashes(self, block_hashes):
+        expected = set(block_hashes)
+        self.wait_until(lambda: expected.issubset({
+            inv.hash for inv in self.getdata if inv.type & MSG_TYPE_MASK == MSG_BLOCK
+        }))
+
     def wait_for_block_inv(self, block_hash):
         self.wait_until(lambda: any(inv.type == MSG_BLOCK and inv.hash == block_hash for inv in self.invs))
 
@@ -134,6 +145,8 @@ class P2PStaleTipTest(BitcoinTestFramework):
         self.test_peer_must_know_fork_point()
         self.test_no_reannouncement_after_transient_ineligibility()
         self.test_higher_work_staletip_requests_block()
+        self.test_higher_work_staletip_only_promises_tip()
+        self.test_higher_work_staletip_tip_ignores_stale_request_cap()
         self.test_known_invalid_staletip_ignored()
         self.test_startup_seeding_only_when_enabled()
         self.test_serves_tracked_stale_branch()
@@ -148,6 +161,21 @@ class P2PStaleTipTest(BitcoinTestFramework):
         self.test_more_work_full_block_tracked_after_catching_up()
         self.test_more_work_compact_block_tracked_after_catching_up()
         self.test_pruned_node_have_block()
+
+        self.restart_node(0, extra_args=["-debug=net", "-peertimeout=999", "-staletips=blocks"])
+        self.test_blocks_mode_ignores_non_witness_block_peer()
+        self.test_blocks_mode_respects_pruned_peer_depth()
+        self.test_blocks_mode_requests_stale_branch_blocks()
+        self.test_blocks_mode_staletip_not_announced_back_after_download()
+        self.test_blocks_mode_stops_waiting_for_block_data()
+        self.test_blocks_mode_initial_advertisement_limited()
+        self.test_blocks_mode_withheld_stale_block_does_not_delay_reorg()
+        self.test_blocks_mode_mutated_block_keeps_request_to_other_peer()
+        self.test_blocks_mode_stale_block_not_counted_for_eviction()
+        self.test_blocks_mode_waits_for_branch_block_data()
+        self.test_blocks_mode_invalid_child_does_not_hide_parent()
+        self.test_blocks_mode_caps_stale_branch_requests_and_clears_timeout()
+        self.test_blocks_mode_resumes_stale_branch_downloads()
 
     def connect_peer(self, *, send_feature=True, feature_data=b"\x00", **kwargs):
         return self.nodes[0].add_p2p_connection(StaleTipPeer(send_feature=send_feature, feature_data=feature_data), **kwargs)
@@ -413,6 +441,78 @@ class P2PStaleTipTest(BitcoinTestFramework):
         block_peer.send_and_ping(self.staletip_msg(block, fork_point_hash, have_block=True))
         block_peer.wait_for_getdata_hash(block.hash_int)
         self.nodes[0].disconnect_p2ps()
+
+    def test_higher_work_staletip_only_promises_tip(self):
+        self.log.info("Test a higher-work tip-only announcer is not disconnected for missing stale ancestors")
+        self.block_time_offset = getattr(self, "block_time_offset", 1)
+        node = self.nodes[0]
+        for mode in ("headers", "blocks"):
+            self.restart_node(0, extra_args=["-debug=net", "-peertimeout=999", f"-staletips={mode}"])
+            node.setmocktime(node.getblockheader(node.getbestblockhash())["time"] + 1)
+            peer = self.connect_peer(feature_data=b"\x00")
+            blocks, fork_point_hash = self.stale_branch(length=2, fork_depth=1)
+            parent, tip = blocks
+            peer.send_and_ping(self.staletip_msg(blocks, fork_point_hash, have_block=True))
+            peer.wait_for_getdata_hashes([parent.hash_int, tip.hash_int])
+            assert_equal(node.getpeerinfo()[0]["inflight"], [node.getblockheader(tip.hash_hex)["height"]])
+            peer.send_and_ping(msg_block(tip))
+            assert_equal(node.getblock(tip.hash_hex)["confirmations"], -1)
+
+            # have_block promises only the tip. A missing ancestor must time
+            # out without disconnecting this compliant peer or being retried.
+            with node.assert_debug_log([f"Timeout downloading stale-tip branch block {parent.hash_hex}"], unexpected_msgs=["Timeout downloading block"]):
+                node.bumpmocktime(601)
+                peer.sync_with_ping()
+            assert peer.is_connected
+            assert_equal(node.getpeerinfo()[0]["inflight"], [])
+            requested_hashes = [inv.hash for inv in peer.getdata if inv.type & MSG_TYPE_MASK == MSG_BLOCK]
+            assert_equal(requested_hashes.count(parent.hash_int), 1)
+            assert_equal(requested_hashes.count(tip.hash_int), 1)
+
+            # A separate ordinary headers announcement establishes the branch
+            # for normal download. Its ancestor can then be requested normally.
+            peer.send_and_ping(msg_headers([CBlockHeader(tip)]))
+            peer.wait_until(lambda: sum(inv.hash == parent.hash_int and inv.type & MSG_TYPE_MASK == MSG_BLOCK for inv in peer.getdata) == 2)
+            assert_equal(node.getpeerinfo()[0]["inflight"], [node.getblockheader(parent.hash_hex)["height"]])
+            peer.send_and_ping(msg_block(parent))
+            assert_equal(node.getbestblockhash(), tip.hash_hex)
+            node.setmocktime(0)
+            node.disconnect_p2ps()
+        self.restart_node(0, extra_args=["-debug=net", "-peertimeout=999", "-staletips=headers"])
+
+    def test_higher_work_staletip_tip_ignores_stale_request_cap(self):
+        self.log.info("Test optional stale requests do not delay a promised higher-work tip")
+        self.block_time_offset = getattr(self, "block_time_offset", 1)
+        self.restart_node(0, extra_args=["-debug=net", "-peertimeout=999", "-staletips=blocks"])
+        node = self.nodes[0]
+        node.setmocktime(node.getblockheader(node.getbestblockhash())["time"] + 1)
+        peer = self.connect_peer(feature_data=b"\x00")
+
+        stale, fork_point_hash = self.stale_branch(length=20, fork_depth=20)
+        peer.send_and_ping(self.staletip_msg(stale, fork_point_hash, have_block=True))
+        peer.wait_for_getdata_hashes([block.hash_int for block in stale])
+        blocks, fork_point_hash = self.stale_branch(length=2, fork_depth=1)
+        parent, tip = blocks
+        peer.send_and_ping(self.staletip_msg(blocks, fork_point_hash, have_block=True))
+        peer.wait_for_getdata_hash(tip.hash_int)
+        assert_equal(node.getpeerinfo()[0]["inflight"], [node.getblockheader(tip.hash_hex)["height"]])
+        assert not any(inv.hash == parent.hash_int for inv in peer.getdata)
+        peer.send_and_ping(msg_block(tip))
+
+        # When optional slots are freed, collect the missing ancestor without
+        # another announcement or retrying the expired requests or tip.
+        with node.assert_debug_log(["Timeout downloading stale-tip branch block"], unexpected_msgs=["Timeout downloading block"]):
+            node.bumpmocktime(601)
+            peer.sync_with_ping()
+        peer.wait_for_getdata_hash(parent.hash_int)
+        requested_hashes = [inv.hash for inv in peer.getdata if inv.type & MSG_TYPE_MASK == MSG_BLOCK]
+        assert_equal(requested_hashes, [block.hash_int for block in stale] + [tip.hash_int, parent.hash_int])
+        assert_equal(node.getpeerinfo()[0]["inflight"], [])
+        peer.send_and_ping(msg_block(parent))
+        assert_equal(node.getbestblockhash(), tip.hash_hex)
+        node.setmocktime(0)
+        node.disconnect_p2ps()
+        self.restart_node(0, extra_args=["-debug=net", "-peertimeout=999", "-staletips=headers"])
 
     def test_active_tip_announced_to_source_peer(self):
         self.log.info("Test active tip is announced even to peers that announced it first")
@@ -1072,6 +1172,315 @@ class P2PStaleTipTest(BitcoinTestFramework):
         assert_equal(peer.wait_for_staletip(lambda msg: self.staletip_tip_hash(msg) == deep.hash_int).have_block, False)
         assert_equal(peer.wait_for_staletip(lambda msg: self.staletip_tip_hash(msg) == shallow.hash_int).have_block, True)
         self.restart_node(0, extra_args=["-debug=net", "-peertimeout=999", "-staletips=headers"])
+
+    def test_blocks_mode_respects_pruned_peer_depth(self):
+        self.log.info("Test blocks mode does not request blocks a pruned peer would not serve")
+        peer = self.connect_peer(feature_data=b"\x01", services=NODE_NETWORK_LIMITED | NODE_WITNESS)
+        deep, fork_point_hash = self.stale_block(fork_depth=NODE_NETWORK_LIMITED_MIN_BLOCKS + 10)
+        peer.send_and_ping(self.staletip_msg(deep, fork_point_hash, have_block=True))
+        shallow, fork_point_hash = self.stale_block(fork_depth=2)
+        peer.send_and_ping(self.staletip_msg(shallow, fork_point_hash, have_block=True))
+        peer.wait_for_getdata_hash(shallow.hash_int)
+        assert deep.hash_int not in [inv.hash for inv in peer.getdata if inv.type & MSG_TYPE_MASK == MSG_BLOCK]
+        self.nodes[0].disconnect_p2ps()
+
+    def test_blocks_mode_ignores_non_witness_block_peer(self):
+        self.log.info("Test blocks mode does not request stale tip blocks from non-witness peers")
+        peer = self.connect_peer(feature_data=b"\x01", services=NODE_NETWORK)
+        block, fork_point_hash = self.stale_block()
+        peer.send_and_ping(self.staletip_msg(block, fork_point_hash, have_block=True))
+        self.assert_staletip_tracked(block)
+        assert_equal([inv.hash for inv in peer.getdata if inv.type & MSG_TYPE_MASK == MSG_BLOCK], [])
+        self.nodes[0].disconnect_p2ps()
+
+    def test_blocks_mode_requests_stale_branch_blocks(self):
+        self.log.info("Test blocks mode requests missing stale branch blocks")
+        peer = self.connect_peer(feature_data=b"\x01")
+        blocks, fork_point_hash = self.stale_branch(length=2, fork_depth=2)
+        peer.send_and_ping(self.staletip_msg(blocks, fork_point_hash, have_block=True))
+        self.assert_staletip_tracked(blocks[-1])
+        # Requested parents first.
+        expected_hashes = [block.hash_int for block in blocks]
+        peer.wait_for_getdata_hashes(expected_hashes)
+        assert_equal([inv.hash for inv in peer.getdata if inv.type & MSG_TYPE_MASK == MSG_BLOCK], expected_hashes)
+        self.nodes[0].disconnect_p2ps()
+
+    def test_blocks_mode_staletip_not_announced_back_after_download(self):
+        self.log.info("Test blocks mode does not announce a downloaded stale tip back to its announcer")
+        node = self.nodes[0]
+        active_tip_inv = msg_inv([CInv(MSG_BLOCK, int(node.getbestblockhash(), 16))])
+        source_peer = self.connect_peer(feature_data=b"\x01")
+        relay_peer = self.connect_peer(feature_data=b"\x01")
+        source_peer.send_and_ping(active_tip_inv)
+        relay_peer.send_and_ping(active_tip_inv)
+
+        block, fork_point_hash = self.stale_block()
+        matches_block = self.staletip_matcher(block, fork_point_hash)
+        source_peer.send_and_ping(self.staletip_msg(block, fork_point_hash, have_block=True))
+        source_peer.wait_for_getdata_hash(block.hash_int)
+        source_peer.send_and_ping(msg_block(block))
+
+        # Peers preferring blocks are sent the tip once its block data is stored.
+        staletip = relay_peer.wait_for_staletip(matches_block)
+        assert_equal(staletip.have_block, True)
+        # The tip becomes announceable asynchronously, so the source peer's
+        # announcement may be queued behind the first pong. The second pong
+        # comes after a message-handler pass that has seen the tip.
+        source_peer.sync_with_ping()
+        source_peer.sync_with_ping()
+        assert_equal([msg for msg in source_peer.staletips if matches_block(msg)], [])
+        self.nodes[0].disconnect_p2ps()
+
+    def test_blocks_mode_stops_waiting_for_block_data(self):
+        self.log.info("Test blocks mode announces a tip without block data to block-preferring peers after a wait")
+        node = self.nodes[0]
+        node.setmocktime(node.getblockheader(node.getbestblockhash())["time"] + 1)
+        source_peer = self.connect_peer(feature_data=b"\x00")
+        relay_peer = self.connect_peer(feature_data=b"\x01")
+        relay_peer.send_and_ping(msg_inv([CInv(MSG_BLOCK, int(node.getbestblockhash(), 16))]))
+
+        # Nobody announces having the block data, so it is not obtained.
+        block, fork_point_hash = self.stale_block()
+        matches_block = self.staletip_matcher(block, fork_point_hash)
+        source_peer.send_and_ping(self.staletip_msg(block, fork_point_hash))
+        self.assert_staletip_tracked(block)
+        relay_peer.sync_with_ping()
+        assert_equal([msg for msg in relay_peer.staletips if matches_block(msg)], [])
+
+        node.bumpmocktime(STALETIP_BLOCK_WAIT)
+        staletip = relay_peer.wait_for_staletip(matches_block)
+        assert_equal(staletip.have_block, False)
+
+        # Block data obtained later does not cause a second announcement. The
+        # second pong comes after a message-handler pass that has seen it.
+        assert node.submitblock(block.serialize().hex()) in (None, "inconclusive")
+        node.syncwithvalidationinterfacequeue()
+        relay_peer.sync_with_ping()
+        relay_peer.sync_with_ping()
+        assert_equal(len([msg for msg in relay_peer.staletips if matches_block(msg)]), 1)
+
+        node.setmocktime(0)
+        self.nodes[0].disconnect_p2ps()
+
+    def test_blocks_mode_initial_advertisement_limited(self):
+        self.log.info("Test known tips still waiting for block data count toward the initial advertisement limit")
+        node = self.nodes[0]
+        node.setmocktime(node.getblockheader(node.getbestblockhash())["time"] + 1)
+        # Move above the stale tips left by earlier subtests.
+        self.generate(node, MAX_ADVERTISED_STALETIPS + 2)
+
+        # Nobody announces having the block data of these tips.
+        source_peer = self.connect_peer(feature_data=b"\x00")
+        known_tips = []
+        for fork_depth in range(1, MAX_ADVERTISED_STALETIPS + 2):
+            block, fork_point_hash = self.stale_block(fork_depth=fork_depth)
+            source_peer.send_and_ping(self.staletip_msg(block, fork_point_hash))
+            known_tips.append(block)
+
+        relay_peer = self.connect_peer(feature_data=b"\x01")
+        relay_peer.send_and_ping(msg_inv([CInv(MSG_BLOCK, int(node.getbestblockhash(), 16))]))
+        node.bumpmocktime(STALETIP_BLOCK_WAIT)
+        advertised = {block.hash_int for block in known_tips[:MAX_ADVERTISED_STALETIPS]}
+        relay_peer.wait_until(lambda: {self.staletip_tip_hash(msg) for msg in relay_peer.staletips} == advertised)
+        relay_peer.sync_with_ping()
+        assert_equal(len(relay_peer.staletips), MAX_ADVERTISED_STALETIPS)
+
+        node.setmocktime(0)
+        self.nodes[0].disconnect_p2ps()
+
+    def test_blocks_mode_withheld_stale_block_does_not_delay_reorg(self):
+        self.log.info("Test a withheld stale branch block is still downloaded from others once its branch is needed")
+        node = self.nodes[0]
+        announcer = self.connect_peer(feature_data=b"\x01")
+        stale, fork_point_hash = self.stale_block()
+        announcer.send_and_ping(self.staletip_msg(stale, fork_point_hash, have_block=True))
+        announcer.wait_for_getdata_hash(stale.hash_int)
+
+        # The announcer withholds the block. Another peer extends its branch,
+        # making it the best chain, and is asked for both blocks right away.
+        extension = create_block(hashprev=stale.hash_int, height=node.getblockcount() + 1, ntime=stale.nTime + 1)
+        extension.solve()
+        peer = self.connect_peer(send_feature=False)
+        peer.send_and_ping(msg_headers([CBlockHeader(extension)]))
+        peer.wait_for_getdata_hashes([stale.hash_int, extension.hash_int])
+        peer.send_and_ping(msg_block(stale))
+        peer.send_and_ping(msg_block(extension))
+        assert_equal(node.getbestblockhash(), extension.hash_hex)
+        self.nodes[0].disconnect_p2ps()
+
+    def test_blocks_mode_mutated_block_keeps_request_to_other_peer(self):
+        self.log.info("Test a mutated block from one peer does not cancel the stale branch block request to another")
+        node = self.nodes[0]
+        announcer = self.connect_peer(feature_data=b"\x01")
+        # A stale block with less work than the tip is only stored if requested.
+        stale, fork_point_hash = self.stale_block(fork_depth=2)
+        announcer.send_and_ping(self.staletip_msg(stale, fork_point_hash, have_block=True))
+        announcer.wait_for_getdata_hash(stale.hash_int)
+
+        mutated = deepcopy(stale)
+        mutated.vtx[0].nLockTime = 1
+        assert_equal(mutated.hash_int, stale.hash_int)
+        attacker = self.connect_peer(send_feature=False)
+        with node.assert_debug_log(["Received mutated block"]):
+            attacker.send_without_ping(msg_block(mutated))
+            attacker.wait_for_disconnect()
+
+        announcer.send_and_ping(msg_block(stale))
+        assert_equal(node.getblock(stale.hash_hex)["hash"], stale.hash_hex)
+        self.nodes[0].disconnect_p2ps()
+
+    def test_blocks_mode_stale_block_not_counted_for_eviction(self):
+        self.log.info("Test a stale branch block does not count as a new block from the peer for inbound eviction")
+        node = self.nodes[0]
+        peer = self.connect_peer(feature_data=b"\x01")
+        block, fork_point_hash = self.stale_block(fork_depth=2)
+        peer.send_and_ping(self.staletip_msg(block, fork_point_hash, have_block=True))
+        peer.wait_for_getdata_hash(block.hash_int)
+        peer.send_and_ping(msg_block(block))
+        assert_equal(node.getblock(block.hash_hex)["hash"], block.hash_hex)
+        assert_equal(node.getpeerinfo()[0]["last_block"], 0)
+        self.nodes[0].disconnect_p2ps()
+
+    def test_blocks_mode_waits_for_branch_block_data(self):
+        self.log.info("Test peers preferring block data are sent a stale tip once the data of its whole branch is stored")
+        node = self.nodes[0]
+        # Freeze time, so the announcement isn't sent without block data
+        # after STALETIP_BLOCK_WAIT.
+        node.setmocktime(node.getblockheader(node.getbestblockhash())["time"] + 1)
+        active_tip_inv = msg_inv([CInv(MSG_BLOCK, int(node.getbestblockhash(), 16))])
+        source_peer = self.connect_peer(feature_data=b"\x01")
+        relay_peer = self.connect_peer(feature_data=b"\x01")
+        source_peer.send_and_ping(active_tip_inv)
+        relay_peer.send_and_ping(active_tip_inv)
+
+        blocks, fork_point_hash = self.stale_branch(length=2, fork_depth=2)
+        source_peer.send_and_ping(self.staletip_msg(blocks, fork_point_hash, have_block=True))
+        source_peer.wait_for_getdata_hashes([block.hash_int for block in blocks])
+        # The tip's block data arrives before its parent's. The tip becomes
+        # announceable asynchronously, so wait for a message-handler pass for
+        # the relay peer that has seen it: the second pong comes after one.
+        source_peer.send_and_ping(msg_block(blocks[1]))
+        node.syncwithvalidationinterfacequeue()
+        relay_peer.sync_with_ping()
+        relay_peer.sync_with_ping()
+        source_peer.send_and_ping(msg_block(blocks[0]))
+        staletip = relay_peer.wait_for_staletip(lambda msg: self.staletip_tip_hash(msg) == blocks[1].hash_int)
+        assert_equal(staletip.have_block, True)
+        node.setmocktime(0)
+        self.nodes[0].disconnect_p2ps()
+
+    def test_blocks_mode_invalid_child_does_not_hide_parent(self):
+        self.log.info("Test a stale block is tracked when its tracked child turns out invalid, in either arrival order")
+        node = self.nodes[0]
+        for child_first in (True, False):
+            peer = self.connect_peer(feature_data=b"\x01")
+            tip = node.getblock(node.getbestblockhash())
+            peer.send_and_ping(msg_inv([CInv(MSG_BLOCK, int(tip["hash"], 16))]))
+            fork_point = node.getblock(node.getblock(tip["previousblockhash"])["previousblockhash"])
+            fork_point_hash = int(fork_point["hash"], 16)
+            parent = create_block(hashprev=fork_point_hash, height=fork_point["height"] + 1, ntime=tip["time"] + self.block_time_offset)
+            self.block_time_offset += 1
+            parent.solve()
+            # The child's coinbase is for another height, so it is invalid.
+            child = create_block(hashprev=parent.hash_int, coinbase=create_coinbase(fork_point["height"] + 5), ntime=tip["time"] + self.block_time_offset)
+            self.block_time_offset += 1
+            child.solve()
+
+            peer.send_and_ping(self.staletip_msg([parent, child], fork_point_hash, have_block=True))
+            self.assert_staletip_tracked(child)
+            peer.wait_for_getdata_hashes([parent.hash_int, child.hash_int])
+            for block in ((child, parent) if child_first else (parent, child)):
+                peer.send_and_ping(msg_block(block))
+            self.assert_staletip_tracked(parent)
+            self.nodes[0].disconnect_p2ps()
+
+    def test_blocks_mode_caps_stale_branch_requests_and_clears_timeout(self):
+        self.log.info("Test stale branch requests are capped, leave block download alone, and time out without disconnect")
+        node = self.nodes[0]
+        node.setmocktime(node.getblockheader(node.getbestblockhash())["time"] + 1)
+        peer = self.connect_peer(feature_data=b"\x01")
+        def getdata_hashes():
+            return [inv.hash for inv in peer.getdata if inv.type & MSG_TYPE_MASK == MSG_BLOCK]
+
+        first, fork_point_hash = self.stale_block(fork_depth=2)
+        peer.send_and_ping(self.staletip_msg(first, fork_point_hash, have_block=True))
+        peer.wait_for_getdata_hash(first.hash_int)
+
+        # Once the cap is reached, the earliest blocks of a branch are
+        # deferred, while its tip is requested.
+        blocks, fork_point_hash = self.stale_branch(length=20, fork_depth=20)
+        peer.send_and_ping(self.staletip_msg(blocks, fork_point_hash, have_block=True))
+        self.assert_staletip_tracked(blocks[-1])
+        expected_hashes = [first.hash_int] + [block.hash_int for block in blocks[-(MAX_STALE_BLOCK_REQUESTS_PER_PEER - 1):]]
+        self.wait_until(lambda: getdata_hashes() == expected_hashes)
+        another, fork_point_hash = self.stale_block(fork_depth=3)
+        peer.send_and_ping(self.staletip_msg(another, fork_point_hash, have_block=True))
+        self.assert_staletip_tracked(another)
+        assert_equal(getdata_hashes(), expected_hashes)
+
+        # The optional requests do not use the peer's block download slots, so
+        # it is still asked for a new block on the active chain.
+        assert_equal(node.getpeerinfo()[0]["inflight"], [])
+        block, _ = self.active_block()
+        peer.send_and_ping(msg_headers([CBlockHeader(block)]))
+        peer.wait_for_getdata_hash(block.hash_int)
+        peer.send_and_ping(msg_block(block))
+        assert_equal(node.getbestblockhash(), block.hash_hex)
+
+        with node.assert_debug_log(["Timeout downloading stale-tip branch block"]):
+            node.bumpmocktime(601)
+            peer.sync_with_ping()
+        assert peer.is_connected
+        # Expired requests free capacity for the unfinished branch and the
+        # announcement received while every slot was occupied. Already
+        # attempted blocks are not retried.
+        resumed_hashes = [blocks[0].hash_int, another.hash_int]
+        peer.wait_for_getdata_hashes(resumed_hashes)
+        assert_equal(getdata_hashes(), expected_hashes + [block.hash_int] + resumed_hashes)
+
+        node.setmocktime(0)
+        self.nodes[0].disconnect_p2ps()
+
+    def test_blocks_mode_resumes_stale_branch_downloads(self):
+        self.log.info("Test stale branch downloads resume when earlier requests complete, without another announcement")
+        self.block_time_offset = getattr(self, "block_time_offset", 1)
+        self.restart_node(0, extra_args=["-debug=net", "-peertimeout=999", "-staletips=blocks"])
+        node = self.nodes[0]
+        node.setmocktime(node.getblockheader(node.getbestblockhash())["time"] + 1)
+        active_tip_inv = msg_inv([CInv(MSG_BLOCK, int(node.getbestblockhash(), 16))])
+        source_peer = self.connect_peer(feature_data=b"\x01")
+        relay_peer = self.connect_peer(feature_data=b"\x01")
+        source_peer.send_and_ping(active_tip_inv)
+        relay_peer.send_and_ping(active_tip_inv)
+
+        first, fork_point_hash = self.stale_block(fork_depth=2)
+        source_peer.send_and_ping(self.staletip_msg(first, fork_point_hash, have_block=True))
+        source_peer.wait_for_getdata_hash(first.hash_int)
+        blocks, fork_point_hash = self.stale_branch(length=20, fork_depth=20)
+        source_peer.send_and_ping(self.staletip_msg(blocks, fork_point_hash, have_block=True))
+        initial_hashes = [first.hash_int] + [block.hash_int for block in blocks[1:]]
+        self.wait_until(lambda: [inv.hash for inv in source_peer.getdata if inv.type & MSG_TYPE_MASK == MSG_BLOCK] == initial_hashes)
+
+        # Fill every request slot, then answer all of those requests. The
+        # oldest branch block must be requested without repeating staletip.
+        source_peer.send_and_ping(msg_block(first))
+        for block in blocks[1:]:
+            source_peer.send_and_ping(msg_block(block))
+        node.syncwithvalidationinterfacequeue()
+        source_peer.sync_with_ping()
+        source_peer.sync_with_ping()
+        assert_equal([inv.hash for inv in source_peer.getdata if inv.type & MSG_TYPE_MASK == MSG_BLOCK], initial_hashes + [blocks[0].hash_int])
+        relay_peer.sync_with_ping()
+        relay_peer.sync_with_ping()
+        assert not any(self.staletip_tip_hash(msg) == blocks[-1].hash_int for msg in relay_peer.staletips)
+
+        source_peer.send_and_ping(msg_block(blocks[0]))
+        staletip = relay_peer.wait_for_staletip(lambda msg: self.staletip_tip_hash(msg) == blocks[-1].hash_int)
+        assert_equal(staletip.have_block, True)
+        for block in blocks:
+            assert_equal(node.getblock(block.hash_hex)["hash"], block.hash_hex)
+        node.setmocktime(0)
+        self.nodes[0].disconnect_p2ps()
 
 
 if __name__ == "__main__":
