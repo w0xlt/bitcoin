@@ -7,34 +7,30 @@
 #define BITCOIN_NET_H
 
 #include <bip324.h>
-#include <chainparams.h>
-#include <common/bloom.h>
-#include <compat/compat.h>
-#include <consensus/amount.h>
 #include <crypto/siphash.h>
 #include <hash.h>
 #include <i2p.h>
-#include <kernel/messagestartchars.h>
 #include <net_permissions.h>
 #include <netaddress.h>
 #include <netbase.h>
-#include <netgroup.h>
 #include <node/connection_types.h>
 #include <node/protocol_version.h>
-#include <policy/feerate.h>
 #include <protocol.h>
 #include <random.h>
 #include <semaphore_grant.h>
-#include <span.h>
 #include <streams.h>
 #include <sync.h>
 #include <uint256.h>
 #include <util/check.h>
 #include <util/sock.h>
 #include <util/threadinterrupt.h>
+#include <util/time.h>
 
+#include <algorithm>
+#include <array>
 #include <atomic>
 #include <condition_variable>
+#include <cstddef>
 #include <cstdint>
 #include <deque>
 #include <functional>
@@ -43,16 +39,23 @@
 #include <memory>
 #include <optional>
 #include <queue>
+#include <semaphore>
+#include <span>
+#include <string>
 #include <string_view>
 #include <thread>
+#include <tuple>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 class AddrMan;
 class BanMan;
 class CChainParams;
+class CKey;
 class CNode;
 class CScheduler;
+class NetGroupManager;
 struct bilingual_str;
 
 /** Time after which to disconnect, after waiting for a ping response (or inactivity). */
@@ -116,7 +119,6 @@ struct AddedNodeInfo {
     bool fInbound;
 };
 
-class CNodeStats;
 class CClientUIInterface;
 
 struct CSerializedNetMsg {
@@ -894,8 +896,9 @@ public:
     /// UNIX epoch time of the last block received from this peer that we had
     /// not yet seen (e.g. not already received from another peer), that passed
     /// preliminary validity checks and was saved to disk, even if we don't
-    /// connect the block or it eventually fails to connect. Used as an inbound
-    /// peer eviction criterion in CConnman::AttemptToEvictConnection.
+    /// connect the block or it eventually fails to connect, except for blocks
+    /// only requested as stale-tip branch blocks. Used as an inbound peer
+    /// eviction criterion in CConnman::AttemptToEvictConnection.
     std::atomic<std::chrono::seconds> m_last_block_time{0s};
 
     /// UNIX epoch time of the last transaction received from this peer that we

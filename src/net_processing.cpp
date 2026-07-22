@@ -230,6 +230,15 @@ struct QueuedBlock {
     std::unique_ptr<PartiallyDownloadedBlock> partialBlock;
 };
 
+/** An optional request for a block on a stale-tip branch. Unlike QueuedBlock, it
+ *  is tracked apart from block download, which it must not delay or otherwise
+ *  affect, and it times out without penalty. */
+struct StaleBlockRequest {
+    uint256 hash;
+    //! When the block was requested.
+    std::chrono::microseconds time;
+};
+
 /**
  * Data structure for an individual peer. This struct is not protected by
  * cs_main since it does not contain validation-critical data.
@@ -496,6 +505,8 @@ struct CNodeState {
     std::list<QueuedBlock> vBlocksInFlight;
     //! When the first entry in vBlocksInFlight started downloading. Don't care when vBlocksInFlight is empty.
     std::chrono::microseconds m_downloading_since{0us};
+    //! Optional stale-tip branch block requests to this peer, oldest first.
+    std::deque<StaleBlockRequest> m_stale_block_requests;
     //! Time before which block requests should not be sent to this peer.
     std::chrono::microseconds m_block_download_paused_until{0us};
     //! Whether we consider this a preferred download peer.
@@ -1072,6 +1083,11 @@ private:
      */
     bool BlockRequested(NodeId nodeid, const CBlockIndex& block, std::list<QueuedBlock>::iterator** pit = nullptr) EXCLUSIVE_LOCKS_REQUIRED(cs_main);
 
+    /** Stop tracking the optional stale-tip branch block request for `hash`,
+     *  if it was sent to `from_peer` (or to any peer, if not given).
+     *  @return Whether there was such a request. */
+    bool RemoveStaleBlockRequest(const uint256& hash, std::optional<NodeId> from_peer) EXCLUSIVE_LOCKS_REQUIRED(cs_main);
+
     bool TipMayBeStale() EXCLUSIVE_LOCKS_REQUIRED(cs_main);
 
     /** Update pindexLastCommonBlock and add not-in-flight missing successors to vBlocks, until it has
@@ -1114,6 +1130,10 @@ private:
     /* Multimap used to preserve insertion order */
     typedef std::multimap<uint256, std::pair<NodeId, std::list<QueuedBlock>::iterator>> BlockDownloadMap;
     BlockDownloadMap mapBlocksInFlight GUARDED_BY(cs_main);
+    /** The peers that optional stale-tip branch blocks were requested from, by
+     *  block hash. Kept apart from mapBlocksInFlight, so that these requests do
+     *  not affect block download. */
+    std::map<uint256, NodeId> m_stale_block_requests GUARDED_BY(cs_main);
 
     /** When our tip was last updated. */
     std::atomic<std::chrono::seconds> m_last_tip_update{0s};
@@ -1126,8 +1146,12 @@ private:
         EXCLUSIVE_LOCKS_REQUIRED(!m_most_recent_block_mutex, peer.m_getdata_requests_mutex, NetEventsInterface::g_msgproc_mutex)
         LOCKS_EXCLUDED(::cs_main);
 
-    /** Process a new block. Perform any post-processing housekeeping */
-    void ProcessBlock(CNode& node, const std::shared_ptr<const CBlock>& block, bool force_processing, bool min_pow_checked);
+    /** Process a new block. Perform any post-processing housekeeping.
+     *  @param[in] stale_branch_block Whether the block was only requested as a
+     *             stale-tip branch block, so it does not count as a new block
+     *             from the peer for inbound eviction, as it is not expected
+     *             to extend our chain. */
+    void ProcessBlock(CNode& node, const std::shared_ptr<const CBlock>& block, bool force_processing, bool min_pow_checked, bool stale_branch_block = false);
 
     /** Process compact block txns  */
     void ProcessCompactBlockTxns(CNode& pfrom, Peer& peer, const BlockTransactions& block_transactions)
@@ -1448,6 +1472,18 @@ bool PeerManagerImpl::BlockRequested(NodeId nodeid, const CBlockIndex& block, st
     if (pit) {
         *pit = &itInFlight->second.second;
     }
+    return true;
+}
+
+bool PeerManagerImpl::RemoveStaleBlockRequest(const uint256& hash, std::optional<NodeId> from_peer)
+{
+    const auto it{m_stale_block_requests.find(hash)};
+    if (it == m_stale_block_requests.end()) return false;
+    if (from_peer && it->second != *from_peer) return false;
+    if (CNodeState* state{State(it->second)}) {
+        std::erase_if(state->m_stale_block_requests, [&](const StaleBlockRequest& request) { return request.hash == hash; });
+    }
+    m_stale_block_requests.erase(it);
     return true;
 }
 
@@ -1928,6 +1964,9 @@ void PeerManagerImpl::FinalizeNode(const CNode& node)
             }
         }
     }
+    for (const StaleBlockRequest& request : state->m_stale_block_requests) {
+        m_stale_block_requests.erase(request.hash);
+    }
     {
         LOCK(m_tx_download_mutex);
         m_txdownloadman.DisconnectedPeer(nodeid);
@@ -1944,6 +1983,7 @@ void PeerManagerImpl::FinalizeNode(const CNode& node)
     if (m_node_states.empty()) {
         // Do a consistency check after the last peer is removed.
         assert(mapBlocksInFlight.empty());
+        assert(m_stale_block_requests.empty());
         assert(m_num_preferred_download_peers == 0);
         assert(m_peers_downloading_from == 0);
         assert(m_outbound_peers_with_protect_from_disconnect == 0);
@@ -3922,12 +3962,12 @@ void PeerManagerImpl::ProcessGetCFCheckPt(CNode& node, Peer& peer, DataStream& v
               headers);
 }
 
-void PeerManagerImpl::ProcessBlock(CNode& node, const std::shared_ptr<const CBlock>& block, bool force_processing, bool min_pow_checked)
+void PeerManagerImpl::ProcessBlock(CNode& node, const std::shared_ptr<const CBlock>& block, bool force_processing, bool min_pow_checked, bool stale_branch_block)
 {
     bool new_block{false};
     m_chainman.ProcessNewBlock(block, force_processing, min_pow_checked, &new_block);
     if (new_block) {
-        node.m_last_block_time = GetTime<std::chrono::seconds>();
+        if (!stale_branch_block) node.m_last_block_time = GetTime<std::chrono::seconds>();
         // In case this block came from a different peer than we requested
         // from, we can erase the block request now anyway (as we just stored
         // this block to disk).
@@ -5478,19 +5518,28 @@ void PeerManagerImpl::ProcessMessage(Peer& peer, CNode& pfrom, const std::string
                            /*check_witness_root=*/DeploymentActiveAfter(prev_block, m_chainman, Consensus::DEPLOYMENT_SEGWIT))) {
             LogDebug(BCLog::NET, "Received mutated block from peer=%d\n", peer.m_id);
             Misbehaving(peer, "mutated block");
-            WITH_LOCK(cs_main, RemoveBlockRequest(pblock->GetHash(), peer.m_id));
+            LOCK(cs_main);
+            RemoveBlockRequest(pblock->GetHash(), peer.m_id);
+            RemoveStaleBlockRequest(pblock->GetHash(), peer.m_id);
             return;
         }
 
         bool forceProcessing = false;
         const uint256 hash(pblock->GetHash());
         bool min_pow_checked = false;
+        bool only_stale_block_request{false};
         {
             LOCK(cs_main);
             // Always process the block if we requested it, since we may
             // need it even when it's not a candidate for a new best tip.
             forceProcessing = IsBlockRequested(hash);
             RemoveBlockRequest(hash, pfrom.GetId());
+            // Having passed the mutation checks, this is the requested stale
+            // branch block, whichever peer it was requested from.
+            if (RemoveStaleBlockRequest(hash, std::nullopt)) {
+                only_stale_block_request = !forceProcessing;
+                forceProcessing = true;
+            }
             // mapBlockSource is only used for punishing peers and setting
             // which peers send us compact blocks, so the race between here and
             // cs_main in ProcessNewBlock is fine.
@@ -5506,7 +5555,14 @@ void PeerManagerImpl::ProcessMessage(Peer& peer, CNode& pfrom, const std::string
                 min_pow_checked = true;
             }
         }
-        ProcessBlock(pfrom, pblock, forceProcessing, min_pow_checked);
+        ProcessBlock(pfrom, pblock, forceProcessing, min_pow_checked, /*stale_branch_block=*/only_stale_block_request);
+        if (only_stale_block_request) {
+            // A stale-tip branch block is usually stored without being
+            // connected, so BlockChecked() would never remove its entry. Any
+            // invalidity found while processing it was reported already.
+            LOCK(cs_main);
+            mapBlockSource.erase(hash);
+        }
         return;
     }
 
@@ -6974,6 +7030,14 @@ bool PeerManagerImpl::SendMessages(CNode& node)
                 node.fDisconnect = true;
                 return true;
             }
+        }
+        // Optional stale-tip branch block requests time out without penalty.
+        while (!state.m_stale_block_requests.empty() &&
+               current_time > state.m_stale_block_requests.front().time + std::chrono::seconds{consensusParams.nPowTargetSpacing} * BLOCK_DOWNLOAD_TIMEOUT_BASE) {
+            const uint256 hash{state.m_stale_block_requests.front().hash};
+            LogDebug(BCLog::NET, "Timeout downloading stale-tip branch block %s from peer=%d", hash.ToString(), node.GetId());
+            m_stale_block_requests.erase(hash);
+            state.m_stale_block_requests.pop_front();
         }
         // Check for headers sync timeouts
         if (state.fSyncStarted && peer.m_headers_sync_timeout < std::chrono::microseconds::max()) {

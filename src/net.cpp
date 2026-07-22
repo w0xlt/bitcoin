@@ -10,6 +10,7 @@
 #include <addrdb.h>
 #include <addrman.h>
 #include <banman.h>
+#include <chainparams.h>
 #include <clientversion.h>
 #include <common/args.h>
 #include <common/netif.h>
@@ -23,6 +24,7 @@
 #include <net_permissions.h>
 #include <netaddress.h>
 #include <netbase.h>
+#include <netgroup.h>
 #include <node/eviction.h>
 #include <node/interface_ui.h>
 #include <protocol.h>
