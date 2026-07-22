@@ -31,18 +31,23 @@ static constexpr size_t MAX_STALETIP_HEADERS{20};
 /** Default number of blocks below the active tip within which a stale tip is
  *  still considered recent enough to be tracked and relayed. */
 static constexpr int STALETIP_RECENT_WINDOW{1000};
+/** Maximum number of stale tips, already known when stale-tip relay with a peer
+ *  begins, that are advertised to that peer. Tips learned later are relayed
+ *  regardless of this limit. */
+static constexpr size_t MAX_ADVERTISED_STALETIPS{10};
 /** Maximum number of stale tips retained in StaleTipCache. This is a local
- *  resource limit. */
+ *  resource limit, independent of MAX_ADVERTISED_STALETIPS. */
 static constexpr size_t MAX_RETAINED_STALETIPS{20};
 /** Maximum time to defer announcing a stale tip to peers that prefer block
- *  data while its block data is unavailable, so that propagation is not
- *  substantially delayed. */
+ *  data while its block data, or that of its branch, is unavailable, so that
+ *  propagation is not substantially delayed. */
 static constexpr auto STALETIP_BLOCK_WAIT{1min};
 
 /** A stale branch of the block tree, described by its tip and the point where
  *  it forks off the active chain. */
 struct StaleFork {
-    //! Last common ancestor of the stale tip and the active chain.
+    //! Last common ancestor of the stale tip and the active chain, or, when
+    //! announcing to a peer, a later block on the branch that the peer has.
     const CBlockIndex* fork_point{nullptr};
     //! Tip of the stale branch.
     const CBlockIndex* tip{nullptr};
@@ -69,6 +74,8 @@ struct StaleTipAnnouncement {
     //! Sequence number assigned when the tip's headers (or block data) became
     //! known, used to announce tips in the order they were discovered.
     uint32_t seqno{0};
+    //! Sequence number assigned when the tip's headers became known.
+    uint32_t header_seqno{0};
     //! Time the tip was added to the cache.
     NodeClock::time_point header_time{};
 };
@@ -123,8 +130,9 @@ struct StaleTipMessage
         std::vector<CBlockHeader> headers;
     };
 
-    //! Block hash of the last common ancestor of the stale tip and the
-    //! announcer's active chain.
+    //! Block hash of the block preceding the first header: the last common
+    //! ancestor of the stale tip and the announcer's active chain, or a later
+    //! block on the branch that the receiver is expected to have.
     uint256 m_fork_point{};
     //! Compressed headers from the first block after the fork point up to the
     //! stale tip, in height order.
@@ -230,6 +238,8 @@ private:
     std::array<Entry, MAX_RETAINED_STALETIPS> m_tips{};
     //! Sequence number to assign to the next addition.
     uint32_t m_next_seqno{1};
+    //! Number of tracked tips removed from the cache so far.
+    uint64_t m_removal_count{0};
     ChainType m_chain_type{ChainType::MAIN};
     //! Tips more than this many blocks below the active tip are not tracked.
     int m_recent_window{STALETIP_RECENT_WINDOW};
@@ -315,16 +325,28 @@ public:
      *            STALETIP_BLOCK_WAIT after they were added, and order tips
      *            with block data by when it was obtained. Used for peers that
      *            prefer announcements with block data.
+     * @param[in] skip_seqnos Skip tips whose sequence number or header
+     *            sequence number is in this set, such as tips already
+     *            announced to a peer, without checking their eligibility.
      */
-    std::vector<StaleTipAnnouncement> GetTipsToAnnounce(const CChain& chain, bool want_blocks) const EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
+    std::vector<StaleTipAnnouncement> GetTipsToAnnounce(const CChain& chain, bool want_blocks, const std::set<uint32_t>& skip_seqnos = {}) const EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
     /** Get the announcement sequence numbers of all retained tips, including
      *  tips that are currently ineligible for relay. Used to expire per-peer
      *  announcement state only when a tip is dropped from the cache, so that
      *  a temporarily ineligible tip (for example, one reorged onto the active
      *  chain and back) is not re-announced once it becomes eligible again. */
     std::set<uint32_t> GetTrackedSeqnos() const EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
+    /** Get the number of tracked tips removed from the cache so far, so that
+     *  per-peer announcement state only needs expiring when it changes. */
+    uint64_t GetRemovalCount() const EXCLUSIVE_LOCKS_REQUIRED(::cs_main) { return m_removal_count; }
     /** Get a summary of the tracked tips that are still eligible. */
     std::vector<StaleTipInfo> GetStaleTipInfo(const CChain& chain) const EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
 };
+
+/** Of the stale tips already known when stale-tip relay with a peer begins,
+ *  get those that are not advertised to it: all but the `max_tips` with the
+ *  greatest chainwork, preferring the most recently learned (highest sequence
+ *  number) when chainwork is equal. */
+std::vector<StaleTipAnnouncement> GetUnadvertisedStaleTips(std::vector<StaleTipAnnouncement> known_tips, size_t max_tips = MAX_ADVERTISED_STALETIPS) EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
 
 #endif // BITCOIN_STALETIPS_H

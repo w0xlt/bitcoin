@@ -20,6 +20,7 @@
 #include <deque>
 #include <ios>
 #include <memory>
+#include <set>
 #include <string>
 #include <utility>
 #include <vector>
@@ -406,6 +407,33 @@ BOOST_AUTO_TEST_CASE(staletip_announce_stops_waiting_for_block_data)
     BOOST_CHECK_EQUAL(announcements[0].seqno, header_announcements[0].seqno);
 }
 
+BOOST_AUTO_TEST_CASE(staletip_announce_skips_seqnos_and_counts_removals)
+{
+    LOCK(::cs_main);
+
+    BlockTree tree;
+    CBlockIndex* tip{tree.Add(nullptr, true, true)};
+    for (int i{0}; i < 4; ++i) tip = tree.Add(tip, true, true);
+
+    StaleTipCache tips;
+    CBlockIndex* stale{tree.Add(Assert(Assert(tip->pprev)->pprev), false)};
+    BOOST_CHECK(tips.AddStaleTip(tree.active_chain, stale));
+    const auto announcements{tips.GetTipsToAnnounce(tree.active_chain, /*want_blocks=*/false)};
+    BOOST_REQUIRE_EQUAL(announcements.size(), 1U);
+    const std::set<uint32_t> announced{announcements.front().seqno};
+    BOOST_CHECK(tips.GetTipsToAnnounce(tree.active_chain, /*want_blocks=*/false, announced).empty());
+    BOOST_CHECK_EQUAL(tips.GetRemovalCount(), 0U);
+
+    // Extending the tip replaces it, which removes it from the cache, and the
+    // extension is announced anew.
+    CBlockIndex* extension{tree.Add(stale, false)};
+    BOOST_CHECK(tips.AddStaleTip(tree.active_chain, extension));
+    BOOST_CHECK_EQUAL(tips.GetRemovalCount(), 1U);
+    const auto extension_announcements{tips.GetTipsToAnnounce(tree.active_chain, /*want_blocks=*/false, announced)};
+    BOOST_REQUIRE_EQUAL(extension_announcements.size(), 1U);
+    BOOST_CHECK(extension_announcements.front().fork.tip == extension);
+}
+
 BOOST_AUTO_TEST_CASE(staletip_tracked_seqnos)
 {
     LOCK(::cs_main);
@@ -592,6 +620,43 @@ BOOST_AUTO_TEST_CASE(staletip_cache_evicts_by_chainwork_not_height)
     BOOST_CHECK(std::ranges::any_of(info, [&](const StaleTipInfo& tip) { return tip.hash == stale_tips.front()->GetBlockHash(); }));
     BOOST_CHECK(std::ranges::none_of(info, [&](const StaleTipInfo& tip) { return tip.hash == stale_tips.at(1)->GetBlockHash(); }));
     BOOST_CHECK(std::ranges::any_of(info, [&](const StaleTipInfo& tip) { return tip.hash == replacement->GetBlockHash(); }));
+}
+
+BOOST_AUTO_TEST_CASE(staletip_unadvertised_prefers_greatest_work_then_newest)
+{
+    LOCK(::cs_main);
+
+    BlockTree tree;
+    CBlockIndex* genesis{tree.Add(nullptr, true, true)};
+
+    const auto add_tip = [&](std::vector<StaleTipAnnouncement>& known_tips, uint64_t chain_work, uint32_t seqno) EXCLUSIVE_LOCKS_REQUIRED(::cs_main) {
+        CBlockIndex* tip{tree.Add(genesis, false)};
+        tip->nChainWork = arith_uint256{chain_work};
+        known_tips.push_back({.fork = {.fork_point = genesis, .tip = tip}, .seqno = seqno});
+        return tip;
+    };
+    const auto unadvertised_tips = [](const std::vector<StaleTipAnnouncement>& known_tips) EXCLUSIVE_LOCKS_REQUIRED(::cs_main) {
+        std::set<const CBlockIndex*> tips;
+        for (const auto& announcement : GetUnadvertisedStaleTips(known_tips)) tips.insert(announcement.fork.tip);
+        return tips;
+    };
+
+    // Tips learned in order of increasing chainwork.
+    std::vector<StaleTipAnnouncement> known_tips;
+    std::vector<const CBlockIndex*> tips;
+    for (uint32_t i{1}; i <= MAX_ADVERTISED_STALETIPS; ++i) {
+        tips.push_back(add_tip(known_tips, 10 + i, i));
+    }
+    BOOST_CHECK(unadvertised_tips(known_tips).empty());
+
+    // The most recently learned tip is not advertised if it has the least
+    // chainwork.
+    const CBlockIndex* least_work{add_tip(known_tips, 1, 100)};
+    BOOST_CHECK(unadvertised_tips(known_tips) == std::set<const CBlockIndex*>{least_work});
+
+    // For equal chainwork, the most recently learned tip is advertised.
+    add_tip(known_tips, 11, 101);
+    BOOST_CHECK((unadvertised_tips(known_tips) == std::set<const CBlockIndex*>{least_work, tips.front()}));
 }
 
 BOOST_AUTO_TEST_CASE(staletip_cache_reorged_tip)

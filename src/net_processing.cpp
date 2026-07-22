@@ -211,6 +211,14 @@ static constexpr auto PRIVATE_BROADCAST_MAX_CONNECTION_LIFETIME{3min};
  *  retains no more tips, while normally only the headers of new blocks not yet
  *  connected are pending. */
 static constexpr size_t MAX_PENDING_STALE_TIPS{MAX_RETAINED_STALETIPS};
+/** Maximum number of stale tips announced by a peer that are remembered so they
+ *  are not announced back to it. Forgetting one only risks a redundant announcement. */
+static constexpr size_t MAX_STALETIPS_RECEIVED_PER_PEER{MAX_RETAINED_STALETIPS};
+/** Maximum number of stale tips announced to a peer that are remembered so they
+ *  are not announced to it again. This is more than the stale-tip cache retains,
+ *  so that a tip dropped from the cache for newer ones, which are announced too,
+ *  is still remembered. Forgetting one only risks a redundant announcement. */
+static constexpr size_t MAX_STALETIPS_SENT_PER_PEER{100};
 
 // Internal stuff
 namespace {
@@ -283,6 +291,25 @@ struct Peer {
     bool m_stale_tip_negotiated GUARDED_BY(NetEventsInterface::g_msgproc_mutex){false};
     /** Whether this peer prefers stale-tip announcements after block data is available. */
     bool m_stale_tip_prefers_blocks GUARDED_BY(NetEventsInterface::g_msgproc_mutex){false};
+    /** Whether stale-tip relay to this peer has begun, which limits the
+     *  already-known stale tips advertised to it. */
+    bool m_stale_tip_relay_started GUARDED_BY(NetEventsInterface::g_msgproc_mutex){false};
+    /** Sequence numbers of stale-tip announcements sent to this peer, or
+     *  skipped because the peer already has the tip or the tip was not
+     *  selected for advertisement when relay began. */
+    std::set<uint32_t> m_stale_tip_announced_seqnos GUARDED_BY(NetEventsInterface::g_msgproc_mutex);
+    /** Stale-tip cache removal count when `m_stale_tip_announced_seqnos` was
+     *  last expired. */
+    uint64_t m_stale_tip_removal_count GUARDED_BY(NetEventsInterface::g_msgproc_mutex){0};
+    /** Most recent stale tips announced to us by this peer, oldest first. The
+     *  peer has these headers and their ancestors, so they are not announced
+     *  back to it, and may be used as the fork point of later announcements
+     *  to it. */
+    std::deque<const CBlockIndex*> m_stale_tips_received GUARDED_BY(NetEventsInterface::g_msgproc_mutex);
+    /** Most recent stale tips announced to this peer, oldest first, so that a
+     *  tip dropped from the stale-tip cache and later tracked again is not
+     *  announced to it again. */
+    std::deque<const CBlockIndex*> m_stale_tips_sent GUARDED_BY(NetEventsInterface::g_msgproc_mutex);
 
     /** Set to true once initial VERSION message was sent (only relevant for outbound peers). */
     bool m_outbound_version_message_sent GUARDED_BY(NetEventsInterface::g_msgproc_mutex){false};
@@ -862,6 +889,9 @@ private:
     /** Send `feefilter` message. */
     void MaybeSendFeefilter(CNode& node, Peer& peer, std::chrono::microseconds current_time) EXCLUSIVE_LOCKS_REQUIRED(g_msgproc_mutex);
 
+    /** Send `staletip` messages for any new stale tips. */
+    void MaybeSendStaleTips(CNode& node, Peer& peer, CNodeState& state) EXCLUSIVE_LOCKS_REQUIRED(g_msgproc_mutex, cs_main);
+
     /** Add a stale tip to the cache and update peer state if appropriate. */
     void HandleStaleTip(CNode& pfrom, Peer& peer, const CBlockIndex* pindex, bool peer_has_block, bool received_new_header) EXCLUSIVE_LOCKS_REQUIRED(g_msgproc_mutex, cs_main);
 
@@ -1153,6 +1183,10 @@ private:
      * about and we fully-validated them at some point.
      */
     bool BlockRequestAllowed(const CBlockIndex& block_index) EXCLUSIVE_LOCKS_REQUIRED(cs_main);
+    /** Whether a request from `node` for `block_index` would be refused because
+     *  it is below our NODE_NETWORK_LIMITED threshold, or because the upload
+     *  target is reached for historical blocks. Mirrors ProcessGetBlockData(). */
+    bool BlockServingLimited(const CNode& node, const Peer& peer, const CBlockIndex& block_index) EXCLUSIVE_LOCKS_REQUIRED(cs_main);
     bool AlreadyHaveBlock(const uint256& block_hash) EXCLUSIVE_LOCKS_REQUIRED(cs_main);
     void ProcessGetBlockData(CNode& pfrom, Peer& peer, const CInv& inv)
         EXCLUSIVE_LOCKS_REQUIRED(g_msgproc_mutex, !m_most_recent_block_mutex);
@@ -1501,6 +1535,46 @@ static bool PeerHasHeader(CNodeState *state, const CBlockIndex *pindex) EXCLUSIV
     if (state->pindexBestHeaderSent && pindex == state->pindexBestHeaderSent->GetAncestor(pindex->nHeight))
         return true;
     return false;
+}
+
+/** Whether `peer` announced `tip`, or a descendant of it, to us via `staletip`. */
+static bool PeerAnnouncedStaleTip(const Peer& peer, const CBlockIndex& tip) EXCLUSIVE_LOCKS_REQUIRED(NetEventsInterface::g_msgproc_mutex)
+{
+    return std::ranges::any_of(peer.m_stale_tips_received, [&](const CBlockIndex* received) {
+        return received->GetAncestor(tip.nHeight) == &tip;
+    });
+}
+
+/** Remember that the peer announced `tip`, so it is not announced back.
+ *  Remembered ancestors of the tip become redundant. */
+static void RememberReceivedStaleTip(Peer& peer, const CBlockIndex& tip) EXCLUSIVE_LOCKS_REQUIRED(NetEventsInterface::g_msgproc_mutex)
+{
+    if (PeerAnnouncedStaleTip(peer, tip)) return;
+    std::erase_if(peer.m_stale_tips_received, [&](const CBlockIndex* received) {
+        return tip.GetAncestor(received->nHeight) == received;
+    });
+    peer.m_stale_tips_received.push_back(&tip);
+    if (peer.m_stale_tips_received.size() > MAX_STALETIPS_RECEIVED_PER_PEER) {
+        peer.m_stale_tips_received.pop_front();
+    }
+}
+
+/** Get the highest block on the stale branch of `fork`, above its fork point
+ *  and below its tip, that the peer certainly has, or nullptr. Tips announced
+ *  to the peer are not considered, as it may have ignored them. */
+static const CBlockIndex* PeerKnownStaleAncestor(const Peer& peer, const CNodeState& state, const StaleFork& fork) EXCLUSIVE_LOCKS_REQUIRED(NetEventsInterface::g_msgproc_mutex, cs_main)
+{
+    const CBlockIndex* best{nullptr};
+    auto consider = [&](const CBlockIndex* known) {
+        if (known == nullptr) return;
+        const CBlockIndex* ancestor{LastCommonAncestor(known, fork.tip)};
+        if (ancestor->nHeight <= fork.fork_point->nHeight || ancestor->nHeight >= fork.tip->nHeight) return;
+        if (best == nullptr || ancestor->nHeight > best->nHeight) best = ancestor;
+    };
+    for (const CBlockIndex* received : peer.m_stale_tips_received) consider(received);
+    consider(state.pindexBestKnownBlock);
+    consider(state.pindexBestHeaderSent);
+    return best;
 }
 
 void PeerManagerImpl::ProcessBlockAvailability(NodeId nodeid) {
@@ -2128,6 +2202,22 @@ bool PeerManagerImpl::BlockRequestAllowed(const CBlockIndex& block_index)
     return block_index.IsValid(BLOCK_VALID_SCRIPTS) && (m_chainman.m_best_header != nullptr) &&
            (m_chainman.m_best_header->GetBlockTime() - block_index.GetBlockTime() < STALE_RELAY_AGE_LIMIT) &&
            (GetBlockProofEquivalentTime(*m_chainman.m_best_header, block_index, *m_chainman.m_best_header, m_chainparams.GetConsensus()) < STALE_RELAY_AGE_LIMIT);
+}
+
+bool PeerManagerImpl::BlockServingLimited(const CNode& node, const Peer& peer, const CBlockIndex& block_index)
+{
+    AssertLockHeld(cs_main);
+    if (m_connman.OutboundTargetReached(/*historicalBlockServingLimit=*/true) &&
+        m_chainman.m_best_header != nullptr &&
+        m_chainman.m_best_header->GetBlockTime() - block_index.GetBlockTime() > HISTORICAL_BLOCK_AGE &&
+        !node.HasPermission(NetPermissionFlags::Download)) {
+        return true;
+    }
+    const CBlockIndex* tip{m_chainman.ActiveChain().Tip()};
+    return !node.HasPermission(NetPermissionFlags::NoBan) &&
+           (peer.m_our_services & NODE_NETWORK_LIMITED) == NODE_NETWORK_LIMITED &&
+           (peer.m_our_services & NODE_NETWORK) != NODE_NETWORK &&
+           tip != nullptr && tip->nHeight - block_index.nHeight > static_cast<int>(NODE_NETWORK_LIMITED_MIN_BLOCKS) + 2;
 }
 
 util::Expected<void, std::string> PeerManagerImpl::FetchBlock(NodeId peer_id, const CBlockIndex& block_index)
@@ -4569,6 +4659,9 @@ void PeerManagerImpl::ProcessMessage(Peer& peer, CNode& pfrom, const std::string
         const CBlockIndex* pindexLast{nullptr};
         if (!m_chainman.ProcessNewBlockHeaders(headers, /*min_pow_checked=*/true, state, &pindexLast)) {
             LogDebug(BCLog::NET, "ignoring staletip headers from peer=%d: %s", pfrom.GetId(), state.ToString());
+            // An accepted prefix of the headers may still be tracked as a
+            // stale tip, so don't announce it back to the peer.
+            if (pindexLast != nullptr) RememberReceivedStaleTip(peer, *pindexLast);
             return;
         }
 
@@ -6136,6 +6229,95 @@ void PeerManagerImpl::MaybeSendFeefilter(CNode& pto, Peer& peer, std::chrono::mi
     }
 }
 
+void PeerManagerImpl::MaybeSendStaleTips(CNode& node, Peer& peer, CNodeState& state)
+{
+    AssertLockHeld(g_msgproc_mutex);
+    AssertLockHeld(cs_main);
+
+    if (m_opts.stale_tip_mode == StaleTipMode::NONE) return;
+    if (!peer.m_stale_tip_negotiated) return;
+    if (m_chainman.IsInitialBlockDownload()) return;
+
+    const bool want_blocks{m_opts.stale_tip_mode == StaleTipMode::BLOCKS && peer.m_stale_tip_prefers_blocks};
+    if (!peer.m_stale_tip_relay_started) {
+        peer.m_stale_tip_relay_started = true;
+        // Of the tips already known now, including those still waiting for
+        // block data, only advertise up to MAX_ADVERTISED_STALETIPS. Skip the
+        // rest by their header sequence number, which also covers later block
+        // data. Tips learned from now on are relayed as usual.
+        auto known_tips{m_stale_tips.GetTipsToAnnounce(m_chainman.ActiveChain(), /*want_blocks=*/false)};
+        std::erase_if(known_tips, [&](const StaleTipAnnouncement& announcement) EXCLUSIVE_LOCKS_REQUIRED(g_msgproc_mutex, cs_main) {
+            return PeerAnnouncedStaleTip(peer, *announcement.fork.tip) || PeerHasHeader(&state, announcement.fork.tip);
+        });
+        for (const auto& unadvertised : GetUnadvertisedStaleTips(std::move(known_tips))) {
+            peer.m_stale_tip_announced_seqnos.insert(unadvertised.header_seqno);
+        }
+    }
+
+    if (m_stale_tips.Empty()) {
+        peer.m_stale_tip_announced_seqnos.clear();
+        return;
+    }
+
+    ProcessBlockAvailability(node.GetId());
+    // Fork points must be known to the peer, through blocks it announced to us
+    // or headers we sent it.
+    if (state.pindexBestKnownBlock == nullptr && state.pindexBestHeaderSent == nullptr) return;
+
+    for (const auto& announcement : m_stale_tips.GetTipsToAnnounce(m_chainman.ActiveChain(), want_blocks, peer.m_stale_tip_announced_seqnos)) {
+        // Don't announce a tip to a peer that already has it, for example
+        // because it announced the tip to us, or that it was announced to.
+        if (PeerAnnouncedStaleTip(peer, *announcement.fork.tip) || PeerHasHeader(&state, announcement.fork.tip) ||
+            std::ranges::find(peer.m_stale_tips_sent, announcement.fork.tip) != peer.m_stale_tips_sent.end()) {
+            peer.m_stale_tip_announced_seqnos.insert(announcement.seqno);
+            continue;
+        }
+        // The compressed payload reconstructs headers from the fork point, so
+        // it must be a block the peer is known to have. Prefer the highest
+        // such block on the stale branch, to send fewer headers.
+        StaleFork fork{announcement.fork};
+        if (const CBlockIndex* known_ancestor{PeerKnownStaleAncestor(peer, state, fork)}) {
+            fork.fork_point = known_ancestor;
+        } else if (!PeerHasHeader(&state, fork.fork_point)) {
+            continue;
+        }
+
+        // Only claim block data that requests from this peer would get, for
+        // every block of the branch above its fork point on the active chain:
+        // the peer may request them all, for example through normal block
+        // download if the branch has more work than its tip.
+        bool have_block{true};
+        bool missing_data{false};
+        for (const CBlockIndex* block{fork.tip}; have_block && block != nullptr && block != announcement.fork.fork_point; block = block->pprev) {
+            missing_data = (block->nStatus & BLOCK_HAVE_DATA) == 0;
+            have_block = !missing_data && BlockRequestAllowed(*block) && !BlockServingLimited(node, peer, *block);
+        }
+        // Peers preferring block data wait for that of the whole branch, unless
+        // that would substantially delay propagation.
+        if (missing_data && want_blocks && NodeClock::now() < announcement.header_time + STALETIP_BLOCK_WAIT) continue;
+        // Signet stale tips can only be validated with the block data, and
+        // peers may disconnect for announcements without it. Defer the
+        // announcement until the block data can be served.
+        if (!have_block && m_chainparams.GetChainType() == ChainType::SIGNET) continue;
+        StaleTipMessage data{fork, have_block};
+        MakeAndPushMessage(node, NetMsgType::STALETIP, data);
+        peer.m_stale_tip_announced_seqnos.insert(announcement.seqno);
+        peer.m_stale_tips_sent.push_back(fork.tip);
+        if (peer.m_stale_tips_sent.size() > MAX_STALETIPS_SENT_PER_PEER) peer.m_stale_tips_sent.pop_front();
+        LogDebug(BCLog::NET, "sending staletip with %u header(s) to peer=%d", data.m_headers.size(), node.GetId());
+    }
+    // Expire per-peer announcement state only for tips dropped from the
+    // cache, and only once some were. Tips that are merely ineligible at the
+    // moment (for example, reorged onto the active chain) keep their state,
+    // so they are not re-announced to the same peer if they become eligible
+    // again.
+    if (peer.m_stale_tip_removal_count != m_stale_tips.GetRemovalCount()) {
+        peer.m_stale_tip_removal_count = m_stale_tips.GetRemovalCount();
+        const std::set<uint32_t> tracked_seqnos{m_stale_tips.GetTrackedSeqnos()};
+        std::erase_if(peer.m_stale_tip_announced_seqnos, [&](uint32_t seqno) { return !tracked_seqnos.contains(seqno); });
+    }
+}
+
 void PeerManagerImpl::HandleStaleTip(CNode& pfrom, Peer& peer, const CBlockIndex* pindex, bool peer_has_block, bool received_new_header)
 {
     AssertLockHeld(g_msgproc_mutex);
@@ -6149,6 +6331,8 @@ void PeerManagerImpl::HandleStaleTip(CNode& pfrom, Peer& peer, const CBlockIndex
         return;
     }
 
+    RememberReceivedStaleTip(peer, *pindex);
+
     const CBlockIndex* active_tip{m_chainman.ActiveTip()};
     if (peer_has_block && active_tip != nullptr && pindex->nChainWork > active_tip->nChainWork) {
         UpdatePeerStateForReceivedHeaders(pfrom, *pindex, received_new_header, /*may_have_more_headers=*/false);
@@ -6159,7 +6343,9 @@ void PeerManagerImpl::HandleStaleTip(CNode& pfrom, Peer& peer, const CBlockIndex
     // A stale tip with more work than the active tip can only be tracked once
     // the active chain has caught up with it.
     if (pindex->nChainWork > m_chainman.ActiveTip()->nChainWork) AddPendingStaleTip(*pindex);
-    (void)m_stale_tips.AddStaleTip(m_chainman.ActiveChain(), pindex);
+    if (m_stale_tips.AddStaleTip(m_chainman.ActiveChain(), pindex)) {
+        m_connman.WakeMessageHandler();
+    }
 }
 
 bool PeerManagerImpl::RejectIncomingTxs(const CNode& peer) const
@@ -6729,6 +6915,10 @@ bool PeerManagerImpl::SendMessages(CNode& node)
         }
         if (!vInv.empty())
             MakeAndPushMessage(node, NetMsgType::INV, vInv);
+
+        // Announce stale tips after any new active tip, so that the peer
+        // learns our active tip first.
+        MaybeSendStaleTips(node, peer, state);
 
         // Detect whether we're stalling
         auto stalling_timeout = m_block_stalling_timeout.load();

@@ -175,7 +175,10 @@ void StaleTipCache::AddLongBranchTip(const CBlockIndex& tip)
     if (m_long_branch_tips.size() > MAX_RETAINED_STALETIPS) m_long_branch_tips.pop_front();
 
     for (auto& entry : m_tips) {
-        if (entry.tip != nullptr && HasAncestor(tip, *entry.tip)) entry = {};
+        if (entry.tip != nullptr && HasAncestor(tip, *entry.tip)) {
+            entry = {};
+            ++m_removal_count;
+        }
     }
 }
 
@@ -257,7 +260,9 @@ bool StaleTipCache::Add(const CChain& chain, const CBlockIndex& stale_tip)
                   evict_ineligible != nullptr ? evict_ineligible : evict};
     if (target == nullptr) return false;
 
+    if (target->tip != nullptr) ++m_removal_count;
     for (Entry* entry : replace) {
+        if (entry != target) ++m_removal_count;
         *entry = {};
     }
     target->tip = &stale_tip;
@@ -337,16 +342,16 @@ std::vector<StaleFork> StaleTipCache::GetStaleTips(const CChain& chain) const
     return tips;
 }
 
-std::vector<StaleTipAnnouncement> StaleTipCache::GetTipsToAnnounce(const CChain& chain, bool want_blocks) const
+std::vector<StaleTipAnnouncement> StaleTipCache::GetTipsToAnnounce(const CChain& chain, bool want_blocks, const std::set<uint32_t>& skip_seqnos) const
 {
     AssertLockHeld(::cs_main);
 
     std::vector<StaleTipAnnouncement> announcements;
-    announcements.reserve(m_tips.size());
     const auto now{NodeClock::now()};
 
     for (const auto& entry : m_tips) {
         if (entry.tip == nullptr) continue;
+        if (skip_seqnos.contains(entry.header_seqno) || skip_seqnos.contains(entry.block_seqno)) continue;
 
         uint32_t seqno{entry.header_seqno};
         if (want_blocks) {
@@ -362,7 +367,7 @@ std::vector<StaleTipAnnouncement> StaleTipCache::GetTipsToAnnounce(const CChain&
         const CBlockIndex* fork_point{GetEligibleForkPoint(chain, *entry.tip)};
         if (fork_point == nullptr) continue;
 
-        announcements.push_back({.fork = {.fork_point = fork_point, .tip = entry.tip}, .seqno = seqno, .header_time = entry.header_time});
+        announcements.push_back({.fork = {.fork_point = fork_point, .tip = entry.tip}, .seqno = seqno, .header_seqno = entry.header_seqno, .header_time = entry.header_time});
     }
 
     std::ranges::sort(announcements, {}, &StaleTipAnnouncement::seqno);
@@ -397,4 +402,17 @@ std::vector<StaleTipInfo> StaleTipCache::GetStaleTipInfo(const CChain& chain) co
         });
     }
     return info;
+}
+
+std::vector<StaleTipAnnouncement> GetUnadvertisedStaleTips(std::vector<StaleTipAnnouncement> known_tips, size_t max_tips)
+{
+    AssertLockHeld(::cs_main);
+    if (known_tips.size() <= max_tips) return {};
+
+    std::ranges::sort(known_tips, [](const StaleTipAnnouncement& a, const StaleTipAnnouncement& b) {
+        if (a.fork.tip->nChainWork != b.fork.tip->nChainWork) return a.fork.tip->nChainWork > b.fork.tip->nChainWork;
+        return a.seqno > b.seqno;
+    });
+    known_tips.erase(known_tips.begin(), known_tips.begin() + max_tips);
+    return known_tips;
 }
