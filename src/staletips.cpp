@@ -126,7 +126,7 @@ bool StaleTipCache::MeetsMinimumDifficulty(uint32_t bits) const
     return !negative && !overflow && target != 0 && target <= UintToArith256(TESTNET_MAX_TARGET);
 }
 
-const CBlockIndex* StaleTipCache::GetEligibleForkPoint(const CChain& chain, const CBlockIndex& stale_tip, bool allow_more_work) const
+const CBlockIndex* StaleTipCache::GetEligibleForkPoint(const CChain& chain, const CBlockIndex& stale_tip, bool require_signet_block_data, bool allow_more_work) const
 {
     const CBlockIndex* active_tip{chain.Tip()};
     if (active_tip == nullptr) return nullptr;
@@ -135,7 +135,7 @@ const CBlockIndex* StaleTipCache::GetEligibleForkPoint(const CChain& chain, cons
     if (!IsRecentHeight(chain, stale_tip.nHeight)) return nullptr;
     if (!allow_more_work && stale_tip.nChainWork > active_tip->nChainWork) return nullptr;
 
-    if (m_chain_type == ChainType::SIGNET && !(stale_tip.nStatus & BLOCK_HAVE_DATA)) return nullptr;
+    if (require_signet_block_data && m_chain_type == ChainType::SIGNET && !(stale_tip.nStatus & BLOCK_HAVE_DATA)) return nullptr;
 
     if (!MeetsMinimumDifficulty(stale_tip.nBits)) return nullptr;
 
@@ -148,6 +148,12 @@ const CBlockIndex* StaleTipCache::GetEligibleForkPoint(const CChain& chain, cons
     if (fork_length <= 0 || static_cast<size_t>(fork_length) > m_max_headers) return nullptr;
 
     return fork_point;
+}
+
+bool StaleTipCache::IsStaleTipEligible(const CChain& chain, const CBlockIndex* stale_tip, bool require_signet_block_data, bool allow_more_work) const
+{
+    AssertLockHeld(::cs_main);
+    return stale_tip != nullptr && GetEligibleForkPoint(chain, *stale_tip, require_signet_block_data, allow_more_work) != nullptr;
 }
 
 bool StaleTipCache::IsLongBranchTip(const CChain& chain, const CBlockIndex& block) const
@@ -182,7 +188,7 @@ void StaleTipCache::AddLongBranchTip(const CBlockIndex& tip)
     }
 }
 
-bool StaleTipCache::Add(const CChain& chain, const CBlockIndex& stale_tip)
+StaleTipCache::Placement StaleTipCache::GetPlacement(const CChain& chain, const CBlockIndex& stale_tip) const
 {
     AssertLockHeld(::cs_main);
 
@@ -191,56 +197,47 @@ bool StaleTipCache::Add(const CChain& chain, const CBlockIndex& stale_tip)
     const bool on_long_branch{std::ranges::any_of(m_long_branch_tips, [&](const CBlockIndex* long_tip) EXCLUSIVE_LOCKS_REQUIRED(::cs_main) {
         return HasAncestor(*long_tip, stale_tip) && IsLongBranchTip(chain, *long_tip);
     })};
-    if (on_long_branch) return false;
+    if (on_long_branch) return {};
 
-    const bool have_block{(stale_tip.nStatus & BLOCK_HAVE_DATA) != 0};
-    Entry* available{nullptr};
-    Entry* evict{nullptr};
-    Entry* evict_ineligible{nullptr};
-    std::vector<Entry*> replace;
+    Placement placement;
+    std::optional<size_t> available;
+    std::optional<size_t> evict;
+    std::optional<size_t> evict_ineligible;
 
-    auto better_evict_candidate = [](const Entry* current, const Entry& candidate) {
-        return current == nullptr || candidate.tip->nChainWork < current->tip->nChainWork ||
-               (candidate.tip->nChainWork == current->tip->nChainWork && candidate.header_seqno < current->header_seqno);
+    auto better_evict_candidate = [&](const std::optional<size_t>& current, const Entry& candidate) {
+        if (!current) return true;
+        const Entry& entry{m_tips[*current]};
+        return candidate.tip->nChainWork < entry.tip->nChainWork ||
+               (candidate.tip->nChainWork == entry.tip->nChainWork && candidate.header_seqno < entry.header_seqno);
     };
 
-    for (auto& entry : m_tips) {
+    for (size_t i{0}; i < m_tips.size(); ++i) {
+        const Entry& entry{m_tips[i]};
         if (entry.tip == nullptr) {
-            if (available == nullptr) available = &entry;
+            if (!available) available = i;
             continue;
         }
 
-        if (entry.tip == &stale_tip) {
-            if (have_block && entry.block_seqno == 0) {
-                // After STALETIP_BLOCK_WAIT, the tip may already have been
-                // announced without block data to peers that prefer block
-                // data. Reuse its sequence number so it is not announced to
-                // them again.
-                const bool waited{NodeClock::now() >= entry.header_time + STALETIP_BLOCK_WAIT};
-                entry.block_seqno = waited ? entry.header_seqno : m_next_seqno++;
-                return true;
-            }
-            return false;
-        }
+        if (entry.tip == &stale_tip) return {.index = i, .tracked = true, .replace = {}};
 
         // A tracked tip known to be invalid doesn't make its valid ancestors
         // redundant: they replace it.
         const bool invalid{(entry.tip->nStatus & (BLOCK_FAILED_VALID | BLOCK_FAILED_CHILD)) != 0};
         if (HasAncestor(stale_tip, *entry.tip)) {
-            replace.push_back(&entry);
+            placement.replace.push_back(i);
             continue;
         }
         if (HasAncestor(*entry.tip, stale_tip)) {
-            if (!invalid) return false;
-            replace.push_back(&entry);
+            if (!invalid) return {};
+            placement.replace.push_back(i);
             continue;
         }
 
         if (m_chain_type == ChainType::SIGNET) {
             const auto variant_result{CompareVariantHeaders(stale_tip, *entry.tip)};
-            if (variant_result == VariantHeaderResult::PREFER_OLD) return false;
+            if (variant_result == VariantHeaderResult::PREFER_OLD) return {};
             if (variant_result == VariantHeaderResult::PREFER_NEW) {
-                replace.push_back(&entry);
+                placement.replace.push_back(i);
                 continue;
             }
         }
@@ -249,26 +246,48 @@ bool StaleTipCache::Add(const CChain& chain, const CBlockIndex& stale_tip)
         // tips now on the active chain. `stale_tip` is the most recently
         // added, so it is preferred over tracked tips with equal chainwork.
         if (GetEligibleForkPoint(chain, *entry.tip) == nullptr) {
-            if (better_evict_candidate(evict_ineligible, entry)) evict_ineligible = &entry;
+            if (better_evict_candidate(evict_ineligible, entry)) evict_ineligible = i;
         } else if (entry.tip->nChainWork <= stale_tip.nChainWork && better_evict_candidate(evict, entry)) {
-            evict = &entry;
+            evict = i;
         }
     }
 
-    Entry* target{!replace.empty() ? replace.front() :
-                  available != nullptr ? available :
-                  evict_ineligible != nullptr ? evict_ineligible : evict};
-    if (target == nullptr) return false;
-
-    if (target->tip != nullptr) ++m_removal_count;
-    for (Entry* entry : replace) {
-        if (entry != target) ++m_removal_count;
-        *entry = {};
+    if (!placement.replace.empty()) {
+        placement.index = placement.replace.front();
+    } else {
+        placement.index = available ? available : evict_ineligible ? evict_ineligible : evict;
     }
-    target->tip = &stale_tip;
-    target->header_seqno = m_next_seqno++;
-    target->block_seqno = have_block ? target->header_seqno : 0;
-    target->header_time = NodeClock::now();
+    return placement;
+}
+
+bool StaleTipCache::Add(const CChain& chain, const CBlockIndex& stale_tip)
+{
+    AssertLockHeld(::cs_main);
+
+    const Placement placement{GetPlacement(chain, stale_tip)};
+    if (!placement.index) return false;
+    Entry& target{m_tips[*placement.index]};
+    const bool have_block{(stale_tip.nStatus & BLOCK_HAVE_DATA) != 0};
+
+    if (placement.tracked) {
+        if (!have_block || target.block_seqno != 0) return false;
+        // After STALETIP_BLOCK_WAIT, the tip may already have been announced
+        // without block data to peers that prefer block data. Reuse its
+        // sequence number so it is not announced to them again.
+        const bool waited{NodeClock::now() >= target.header_time + STALETIP_BLOCK_WAIT};
+        target.block_seqno = waited ? target.header_seqno : m_next_seqno++;
+        return true;
+    }
+
+    if (target.tip != nullptr) ++m_removal_count;
+    for (const size_t i : placement.replace) {
+        if (i != *placement.index) ++m_removal_count;
+        m_tips[i] = {};
+    }
+    target.tip = &stale_tip;
+    target.header_seqno = m_next_seqno++;
+    target.block_seqno = have_block ? target.header_seqno : 0;
+    target.header_time = NodeClock::now();
     return true;
 }
 
@@ -302,7 +321,7 @@ void StaleTipCache::Initialize(node::BlockManager& blockman, const CChain& chain
         if (IsLongBranchTip(chain, *tip)) AddLongBranchTip(*tip);
     }
     for (const CBlockIndex* tip : tips) {
-        if (GetEligibleForkPoint(chain, *tip) != nullptr) (void)Add(chain, *tip);
+        if (IsStaleTipEligible(chain, tip)) (void)Add(chain, *tip);
     }
 }
 
@@ -320,9 +339,38 @@ bool StaleTipCache::AddStaleTip(const CChain& chain, const CBlockIndex* stale_ti
         AddLongBranchTip(*stale_tip);
         return false;
     }
-    if (GetEligibleForkPoint(chain, *stale_tip, allow_more_work) == nullptr) return false;
+    if (!IsStaleTipEligible(chain, stale_tip, /*require_signet_block_data=*/true, allow_more_work)) return false;
 
     return Add(chain, *stale_tip);
+}
+
+bool StaleTipCache::CanRequestStaleTipBlock(const CChain& chain, const CBlockIndex* stale_tip, bool allow_more_work) const
+{
+    AssertLockHeld(::cs_main);
+    if (!IsStaleTipEligible(chain, stale_tip, /*require_signet_block_data=*/false, allow_more_work)) return false;
+    for (const CBlockIndex* block{stale_tip}; block != nullptr && !chain.Contains(*block); block = block->pprev) {
+        if (IsKnownVariant(chain, *block)) return false;
+    }
+    // Only request block data that could be served: that of a tip that is or
+    // would be tracked, or that is on a tracked, eligible branch.
+    return GetPlacement(chain, *stale_tip).index.has_value() ||
+           std::ranges::any_of(m_tips, [&](const Entry& entry) EXCLUSIVE_LOCKS_REQUIRED(::cs_main) {
+               return entry.tip != nullptr && HasAncestor(*entry.tip, *stale_tip) &&
+                      GetEligibleForkPoint(chain, *entry.tip, /*require_signet_block_data=*/true, allow_more_work) != nullptr;
+           });
+}
+
+bool StaleTipCache::IsKnownVariant(const CChain& chain, const CBlockIndex& block) const
+{
+    AssertLockHeld(::cs_main);
+    if (m_chain_type != ChainType::SIGNET || chain.Contains(block)) return false;
+
+    if (IsSameVariant(chain[block.nHeight], &block)) return true;
+
+    return std::ranges::any_of(m_tips, [&](const Entry& entry) {
+        return entry.tip != nullptr && !HasAncestor(*entry.tip, block) &&
+               CompareVariantHeaders(block, *entry.tip) == VariantHeaderResult::PREFER_OLD;
+    });
 }
 
 bool StaleTipCache::CanServeStaleBranchBlock(const CChain& chain, const CBlockIndex* block) const

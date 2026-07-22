@@ -18,6 +18,7 @@
 #include <cstdint>
 #include <deque>
 #include <ios>
+#include <optional>
 #include <set>
 #include <string>
 #include <vector>
@@ -254,13 +255,29 @@ private:
      *  the tip is eligible for tracking. On signet, header variants of
      *  active-chain blocks are not eligible, as they are duplicates of them.
      *
+     * @param[in] require_signet_block_data Whether to enforce the signet
+     *            requirement that the tip's block data is available.
      * @param[in] allow_more_work Permit tips with more work than the active
      *            tip. Used when a block is disconnected during a reorg, as it
      *            may temporarily have more work than the new active tip.
-     *
      * @return The fork point, or nullptr if the tip is not eligible.
      */
-    const CBlockIndex* GetEligibleForkPoint(const CChain& chain, const CBlockIndex& stale_tip, bool allow_more_work = false) const EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
+    const CBlockIndex* GetEligibleForkPoint(const CChain& chain, const CBlockIndex& stale_tip, bool require_signet_block_data = true, bool allow_more_work = false) const EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
+    /** Whether `stale_tip` is eligible for tracking. See GetEligibleForkPoint(). */
+    bool IsStaleTipEligible(const CChain& chain, const CBlockIndex* stale_tip, bool require_signet_block_data = true, bool allow_more_work = false) const EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
+    /** Where Add() would place a stale tip. */
+    struct Placement {
+        //! Index of the entry already tracking the tip, or of the entry to
+        //! overwrite with it. Unset if the tip would not be tracked.
+        std::optional<size_t> index;
+        //! Whether the tip is already tracked at `index`.
+        bool tracked{false};
+        //! Indices of the entries tracking tips that the tip would replace.
+        std::vector<size_t> replace;
+    };
+    /** Determine where Add() would place `stale_tip`, without changing the
+     *  cache. */
+    Placement GetPlacement(const CChain& chain, const CBlockIndex& stale_tip) const EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
     /** Insert `stale_tip` into the cache, dropping any tracked tips that it
      *  descends from, and any tracked descendants known to be invalid. If the
      *  cache is full, a tracked tip that is no longer eligible is evicted, or
@@ -308,7 +325,7 @@ public:
     /** Whether no stale tips are currently retained. */
     bool Empty() const EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
 
-    /** Track `stale_tip` if it is eligible (see GetEligibleForkPoint()) and can
+    /** Track `stale_tip` if it is eligible (see IsStaleTipEligible()) and can
      *  be retained under the cache's resource limits. If `stale_tip` extends a
      *  stale branch beyond the length limit, stop tracking that branch.
      *
@@ -316,11 +333,31 @@ public:
      *         data availability.
      */
     bool AddStaleTip(const CChain& chain, const CBlockIndex* stale_tip, bool allow_more_work = false) EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
+    /** Whether the block data for `stale_tip` may be requested from a peer.
+     *  Unlike AddStaleTip(), this does not require the block data to already
+     *  be available on signet, as it is exactly what would be requested.
+     *  `allow_more_work` also considers pending tips with more work than the
+     *  active tip, so their missing ancestors can be requested best-effort.
+     *
+     *  Only block data that could be served is requested: that of a tip that
+     *  is or would be tracked, or that is on a tracked, eligible branch. On
+     *  signet, a branch containing a header variant of a known block (see
+     *  IsKnownVariant()) is not requested: variants are cheap to produce, so
+     *  their block data is not downloaded, and the branch could not be served
+     *  in full without it. This goes beyond BIP 332, which only requires
+     *  variant tips to be deduplicated, as headers extending a variant are
+     *  cheap to produce on signet too. */
+    bool CanRequestStaleTipBlock(const CChain& chain, const CBlockIndex* stale_tip, bool allow_more_work = false) const EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
+    /** Whether, on signet, `block` is a header variant of a block on the
+     *  active chain or on a tracked stale branch. Such variants are cheap to
+     *  produce and would not be tracked. */
+    bool IsKnownVariant(const CChain& chain, const CBlockIndex& block) const EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
     /** Whether `block` is stored on a tracked, still-eligible stale branch and
      *  may be served to a peer that negotiated stale-tip relay. This does not
      *  require the tracked tip's block data, which may be missing when the
      *  branch was extended by a header, after `block` was announced. */
     bool CanServeStaleBranchBlock(const CChain& chain, const CBlockIndex* block) const EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
+
     /** Get the tracked tips that are still eligible, with their fork points. */
     std::vector<StaleFork> GetStaleTips(const CChain& chain) const EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
     /** Get the tracked tips that are still eligible, in the order they were

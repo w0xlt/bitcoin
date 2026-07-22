@@ -733,6 +733,7 @@ BOOST_AUTO_TEST_CASE(staletip_cache_network_policy)
     CBlockIndex* fork{active->pprev};
     CBlockIndex* headers_only{tree.Add(fork, false)};
     StaleTipCache signet_tips{ChainType::SIGNET};
+    BOOST_CHECK(signet_tips.CanRequestStaleTipBlock(tree.active_chain, headers_only));
     BOOST_CHECK(!signet_tips.AddStaleTip(tree.active_chain, headers_only));
 
     headers_only->nStatus |= BLOCK_VALID_TRANSACTIONS | BLOCK_HAVE_DATA;
@@ -792,6 +793,58 @@ BOOST_AUTO_TEST_CASE(staletip_cache_signet_variant_of_new_active_block)
     BOOST_CHECK(tips.GetStaleTipInfo(tree.active_chain).empty());
 }
 
+BOOST_AUTO_TEST_CASE(staletip_cache_signet_variant_block_not_requested)
+{
+    LOCK(::cs_main);
+
+    BlockTree tree;
+    CBlockIndex* active{tree.Add(nullptr, true, true)};
+    for (int i{0}; i < 6; ++i) active = tree.Add(active, true, true);
+
+    CBlockIndex* fork{Assert(active->GetAncestor(active->nHeight - 4))};
+    CBlockIndex* tracked_parent{tree.Add(fork, false, true, /*bits=*/0x1d00ffff, uint256{uint8_t{42}})};
+    CBlockIndex* tracked{tree.Add(tracked_parent, false, true, /*bits=*/0x1d00ffff, uint256{uint8_t{43}})};
+    CBlockIndex* tip_variant{tree.Add(tracked_parent, false, false, /*bits=*/0x1d00ffff, tracked->hashMerkleRoot)};
+    CBlockIndex* branch_variant{tree.Add(fork, false, false, /*bits=*/0x1d00ffff, tracked_parent->hashMerkleRoot)};
+    CBlockIndex* extended_variant{tree.Add(tip_variant, false, false)};
+
+    StaleTipCache tips{ChainType::SIGNET};
+    BOOST_CHECK(tips.AddStaleTip(tree.active_chain, tracked));
+
+    // Header variants of the tracked tip or of a block on its branch would not
+    // be tracked, so their block data is not requested.
+    BOOST_CHECK(!tips.CanRequestStaleTipBlock(tree.active_chain, tip_variant));
+    BOOST_CHECK(!tips.CanRequestStaleTipBlock(tree.active_chain, branch_variant));
+
+    // Nor is a branch extending a variant: variants are cheap to produce, so
+    // their block data is not downloaded, and the branch could not be served
+    // in full without it. A branch extending the tracked tip may be requested.
+    BOOST_CHECK(!tips.IsKnownVariant(tree.active_chain, *extended_variant));
+    BOOST_CHECK(!tips.CanRequestStaleTipBlock(tree.active_chain, extended_variant));
+    CBlockIndex* extended_tracked{tree.Add(tracked, false, false)};
+    BOOST_CHECK(tips.CanRequestStaleTipBlock(tree.active_chain, extended_tracked));
+
+    // Variants of tracked blocks and of active chain blocks are known.
+    BOOST_CHECK(tips.IsKnownVariant(tree.active_chain, *tip_variant));
+    BOOST_CHECK(tips.IsKnownVariant(tree.active_chain, *branch_variant));
+    CBlockIndex* active_variant{tree.Add(Assert(active->pprev), false, false, /*bits=*/0x1d00ffff, active->hashMerkleRoot)};
+    BOOST_CHECK(tips.IsKnownVariant(tree.active_chain, *active_variant));
+    BOOST_CHECK(!tips.IsKnownVariant(tree.active_chain, *active));
+    BOOST_CHECK(!tips.IsKnownVariant(tree.active_chain, *tracked));
+
+    // Blocks on the tracked branch are not variants of it, so they may be
+    // requested again, for example after being pruned.
+    tracked_parent->nStatus &= ~BLOCK_HAVE_DATA;
+    BOOST_CHECK(tips.CanRequestStaleTipBlock(tree.active_chain, tracked_parent));
+
+    // Header variants are not deduplicated on other networks.
+    StaleTipCache main_tips;
+    BOOST_CHECK(main_tips.AddStaleTip(tree.active_chain, tracked));
+    BOOST_CHECK(main_tips.CanRequestStaleTipBlock(tree.active_chain, tip_variant));
+    BOOST_CHECK(main_tips.CanRequestStaleTipBlock(tree.active_chain, extended_variant));
+    BOOST_CHECK(!main_tips.IsKnownVariant(tree.active_chain, *active_variant));
+}
+
 BOOST_AUTO_TEST_CASE(staletip_cache_recent_height)
 {
     LOCK(::cs_main);
@@ -824,6 +877,58 @@ BOOST_AUTO_TEST_CASE(staletip_cache_minimum_difficulty)
     for (const auto chain_type : {ChainType::MAIN, ChainType::SIGNET, ChainType::REGTEST}) {
         BOOST_CHECK(StaleTipCache{chain_type}.MeetsMinimumDifficulty(0x207fffff));
     }
+}
+
+BOOST_AUTO_TEST_CASE(staletip_cache_requests_only_trackable_tips)
+{
+    LOCK(::cs_main);
+
+    BlockTree tree;
+    CBlockIndex* active{tree.Add(nullptr, true, true)};
+    for (int i{0}; i < 30; ++i) active = tree.Add(active, true, true);
+
+    // Once the cache is full of tips with more work, a tip with less work
+    // would not be tracked, so its block data is not requested.
+    StaleTipCache full_tips;
+    for (int i{0}; i < static_cast<int>(MAX_RETAINED_STALETIPS); ++i) {
+        BOOST_CHECK(full_tips.AddStaleTip(tree.active_chain, tree.Add(active->GetAncestor(active->nHeight - 1 - i), false)));
+    }
+    CBlockIndex* less_work{tree.Add(active->GetAncestor(5), false)};
+    BOOST_CHECK(!full_tips.AddStaleTip(tree.active_chain, less_work));
+    BOOST_CHECK(!full_tips.CanRequestStaleTipBlock(tree.active_chain, less_work));
+
+    // The block data of a tracked tip, and of blocks on its branch, is
+    // requested.
+    StaleTipCache branch_tips;
+    CBlockIndex* parent{tree.Add(active->GetAncestor(20), false)};
+    CBlockIndex* tip{tree.Add(parent, false)};
+    BOOST_CHECK(branch_tips.AddStaleTip(tree.active_chain, tip));
+    BOOST_CHECK(branch_tips.CanRequestStaleTipBlock(tree.active_chain, tip));
+    BOOST_CHECK(branch_tips.CanRequestStaleTipBlock(tree.active_chain, parent));
+    // If the tracked tip turns out to be invalid, the parent would replace it.
+    tip->nStatus |= BLOCK_FAILED_VALID;
+    BOOST_CHECK(branch_tips.CanRequestStaleTipBlock(tree.active_chain, parent));
+
+    // A block below a tracked tip that is otherwise no longer eligible, such as
+    // one with more work than the active tip, is not requested, as that branch
+    // is not served.
+    StaleTipCache more_work_tips;
+    CBlockIndex* more_work_parent{tree.Add(Assert(active->pprev), false)};
+    CBlockIndex* more_work_tip{tree.Add(more_work_parent, false)};
+    BOOST_CHECK(!more_work_tips.CanRequestStaleTipBlock(tree.active_chain, more_work_tip));
+    BOOST_CHECK(more_work_tips.CanRequestStaleTipBlock(tree.active_chain, more_work_tip, /*allow_more_work=*/true));
+    BOOST_CHECK(more_work_tips.AddStaleTip(tree.active_chain, more_work_tip, /*allow_more_work=*/true));
+    BOOST_CHECK(!more_work_tips.CanRequestStaleTipBlock(tree.active_chain, more_work_parent));
+    BOOST_CHECK(more_work_tips.CanRequestStaleTipBlock(tree.active_chain, more_work_parent, /*allow_more_work=*/true));
+
+    // A block on a branch too long to track is not requested, even when its
+    // own fork is short enough.
+    StaleTipCache long_tips{ChainType::MAIN, /*recent_window=*/STALETIP_RECENT_WINDOW, /*max_headers=*/2};
+    CBlockIndex* long1{tree.Add(active->GetAncestor(25), false)};
+    CBlockIndex* long2{tree.Add(long1, false)};
+    CBlockIndex* long3{tree.Add(long2, false)};
+    BOOST_CHECK(!long_tips.AddStaleTip(tree.active_chain, long3));
+    BOOST_CHECK(!long_tips.CanRequestStaleTipBlock(tree.active_chain, long2));
 }
 
 BOOST_AUTO_TEST_CASE(staletip_cache_long_branch_not_tracked)
