@@ -1301,6 +1301,8 @@ void PeerManagerImpl::ApplyHighBandwidthState(CNode& node, bool high_bandwidth)
 
     MakeAndPushMessage(node, NetMsgType::SENDCMPCT, high_bandwidth, CMPCTBLOCKS_VERSION);
     node.m_bip152_highbandwidth_to = high_bandwidth;
+    LogDebug(BCLog::CMPCTBLOCK, "Set effective BIP152 high-bandwidth state to %s, %s",
+             high_bandwidth ? "true" : "false", node.LogPeer());
 }
 
 void PeerManagerImpl::ReconcileHighBandwidthState(CNode& node, const CNodeState& state)
@@ -1314,7 +1316,9 @@ void PeerManagerImpl::ReconcileHighBandwidthState(CNode& node, const CNodeState&
 
     const bool automatically_selected{
         std::ranges::find(m_automatic_high_bandwidth_peers, node.GetId()) != m_automatic_high_bandwidth_peers.end()};
-    ApplyHighBandwidthState(node, automatically_selected || state.m_bip152_hb_to_manual);
+    const bool eligible{!m_opts.ignore_incoming_txs && !node.IsPrivateBroadcastConn() &&
+                        !node.IsAddrFetchConn() && !node.IsFeelerConn()};
+    ApplyHighBandwidthState(node, eligible && (automatically_selected || state.m_bip152_hb_to_manual));
 }
 
 void PeerManagerImpl::MaybeSetPeerAsAnnouncingHeaderAndIDs(NodeId nodeid)
@@ -1652,7 +1656,11 @@ void PeerManagerImpl::InitializeNode(const CNode& node, ServiceFlags our_service
     NodeId nodeid = node.GetId();
     {
         LOCK(cs_main); // For m_node_states
-        m_node_states.try_emplace(m_node_states.end(), nodeid);
+        auto state{m_node_states.try_emplace(m_node_states.end(), nodeid)};
+        state->second.m_bip152_hb_to_manual = node.m_bip152_hb_to_configured;
+        if (node.m_bip152_hb_to_configured) {
+            LogDebug(BCLog::CMPCTBLOCK, "Seeded manual BIP152 high-bandwidth source from configuration, %s", node.LogPeer());
+        }
     }
     WITH_LOCK(m_tx_download_mutex, m_txdownloadman.CheckIsEmpty(nodeid));
 
@@ -2085,7 +2093,11 @@ util::Expected<bool, std::string> PeerManagerImpl::SetPeerHighBandwidth(NodeId p
             return true;
         }
 
-        state->m_bip152_hb_to_manual = high_bandwidth;
+        if (state->m_bip152_hb_to_manual != high_bandwidth) {
+            state->m_bip152_hb_to_manual = high_bandwidth;
+            LogDebug(BCLog::CMPCTBLOCK, "Set manual BIP152 high-bandwidth source to %s, %s",
+                     high_bandwidth ? "true" : "false", node->LogPeer());
+        }
         ReconcileHighBandwidthState(*node, *state);
         effective_state = node->m_bip152_highbandwidth_to.load();
         return true;

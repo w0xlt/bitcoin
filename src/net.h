@@ -104,7 +104,8 @@ typedef int64_t NodeId;
 
 struct AddedNodeParams {
     std::string m_added_node;
-    bool m_use_v2transport;
+    bool m_use_v2transport{false};
+    bool m_bip152_hb_to_configured{false};
 };
 
 struct AddedNodeInfo {
@@ -674,6 +675,7 @@ struct CNodeOptions
     bool prefer_evict = false;
     size_t recv_flood_size{DEFAULT_MAXRECEIVEBUFFER * 1000};
     bool use_v2transport = false;
+    bool bip152_hb_to_configured{false};
 };
 
 /** Information about a peer */
@@ -723,6 +725,8 @@ public:
     const std::string m_addr_name;
     /** The pszDest argument provided to ConnectNode(). Only used for reconnections. */
     const std::string m_dest;
+    /** Whether this connection was configured for BIP152 high-bandwidth announcements. */
+    const bool m_bip152_hb_to_configured;
     //! Whether this peer is an inbound onion, i.e. connected via our Tor onion service.
     const bool m_inbound_onion;
     std::atomic<int> nVersion{0};
@@ -1105,7 +1109,7 @@ public:
         bool bind_on_any;
         bool m_use_addrman_outgoing = true;
         std::vector<std::string> m_specified_outgoing;
-        std::vector<std::string> m_added_nodes;
+        std::vector<AddedNodeParams> m_added_nodes;
         bool m_i2p_accept_incoming;
         bool whitelist_forcerelay = DEFAULT_WHITELISTFORCERELAY;
         bool whitelist_relay = DEFAULT_WHITELISTRELAY;
@@ -1137,12 +1141,8 @@ public:
         vWhitelistedRangeOutgoing = connOptions.vWhitelistedRangeOutgoing;
         {
             LOCK(m_added_nodes_mutex);
-            // Attempt v2 connection if we support v2 - we'll reconnect with v1 if our
-            // peer doesn't support it or immediately disconnects us for another reason.
-            const bool use_v2transport(GetLocalServices() & NODE_P2P_V2);
-            for (const std::string& added_node : connOptions.m_added_nodes) {
-                m_added_node_params.push_back({added_node, use_v2transport});
-            }
+            m_added_node_params.insert(
+                m_added_node_params.end(), connOptions.m_added_nodes.begin(), connOptions.m_added_nodes.end());
         }
         m_onion_binds = connOptions.onion_binds;
         whitelist_forcerelay = connOptions.whitelist_forcerelay;
@@ -1188,6 +1188,7 @@ public:
      * @param[in] pszDest Address to resolve and connect to.
      * @param[in] conn_type Type of the connection to open, must not be `ConnectionType::INBOUND`.
      * @param[in] use_v2transport Use P2P encryption, (aka V2 transport, BIP324).
+     * @param[in] bip152_hb_to_configured Whether configuration requested BIP152 high-bandwidth announcements.
      * @param[in] proxy_override Optional proxy to use and override normal proxy selection.
      * @retval true The connection was opened successfully.
      * @retval false The connection attempt failed.
@@ -1198,6 +1199,7 @@ public:
                                const char* pszDest,
                                ConnectionType conn_type,
                                bool use_v2transport,
+                               bool bip152_hb_to_configured,
                                const std::optional<Proxy>& proxy_override)
         EXCLUSIVE_LOCKS_REQUIRED(!m_nodes_mutex, !m_unused_i2p_sessions_mutex);
 
@@ -1550,6 +1552,7 @@ private:
      * @param[in] fCountFailure Increment the number of connection attempts to this address in Addrman.
      * @param[in] conn_type Type of the connection to open, must not be `ConnectionType::INBOUND`.
      * @param[in] use_v2transport Use P2P encryption, (aka V2 transport, BIP324).
+     * @param[in] bip152_hb_to_configured Whether configuration requested BIP152 high-bandwidth announcements.
      * @param[in] proxy_override Optional proxy to use and override normal proxy selection.
      * @return Newly created CNode object or nullptr if the connection failed.
      */
@@ -1558,6 +1561,7 @@ private:
                        bool fCountFailure,
                        ConnectionType conn_type,
                        bool use_v2transport,
+                       bool bip152_hb_to_configured,
                        const std::optional<Proxy>& proxy_override)
         EXCLUSIVE_LOCKS_REQUIRED(!m_nodes_mutex, !m_unused_i2p_sessions_mutex);
 
@@ -1820,6 +1824,7 @@ private:
         std::string destination;
         ConnectionType conn_type;
         bool use_v2transport;
+        bool bip152_hb_to_configured;
     };
 
     /**

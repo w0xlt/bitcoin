@@ -251,6 +251,7 @@ FUZZ_TARGET(connman, .init = initialize_connman)
                     /*pszDest=*/fuzzed_data_provider.ConsumeBool() ? nullptr : random_string.c_str(),
                     /*conn_type=*/conn_type,
                     /*use_v2transport=*/fuzzed_data_provider.ConsumeBool(),
+                    /*bip152_hb_to_configured=*/conn_type == ConnectionType::MANUAL && fuzzed_data_provider.ConsumeBool(),
                     /*proxy_override=*/proxy_override);
             },
             [&] {

@@ -259,6 +259,7 @@ class NetTest(BitcoinTestFramework):
         added_nodes = self.nodes[0].getaddednodeinfo()
         assert_equal(len(added_nodes), 1)
         assert_equal(added_nodes[0]['addednode'], ip_port)
+        assert_equal(added_nodes[0]['bip152_hb_to_configured'], False)
         self.log.info("Check that filtering by node works")
         self.nodes[0].addnode(node="11.22.33.44", command='add')
         first_added_node = self.nodes[0].getaddednodeinfo(node=ip_port)

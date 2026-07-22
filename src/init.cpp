@@ -121,6 +121,7 @@
 #include <set>
 #include <span>
 #include <string>
+#include <string_view>
 #include <system_error>
 #include <thread>
 #include <tuple>
@@ -174,6 +175,38 @@ static constexpr bool DEFAULT_PROXYRANDOMIZE{true};
 static constexpr bool DEFAULT_REST_ENABLE{false};
 static constexpr bool DEFAULT_I2P_ACCEPT_INCOMING{true};
 static constexpr bool DEFAULT_STOPAFTERBLOCKIMPORT{false};
+static constexpr std::string_view BIP152_HIGH_BANDWIDTH_ADDNODE_TAG{"bip152-hb"};
+
+static util::Result<AddedNodeParams> ParseAddedNode(const std::string& value, bool use_v2transport)
+{
+    std::string endpoint{value};
+    bool bip152_hb_to_configured{false};
+
+    if (const size_t separator{value.find('=')}; separator != std::string::npos) {
+        endpoint = value.substr(0, separator);
+        const std::string tag{value.substr(separator + 1)};
+        if (endpoint.empty()) {
+            return util::Error{Untranslated(strprintf("Invalid -addnode value '%s': endpoint is empty", value))};
+        }
+        if (tag.empty()) {
+            return util::Error{Untranslated(strprintf("Invalid -addnode value '%s': tag is empty", value))};
+        }
+        if (tag != BIP152_HIGH_BANDWIDTH_ADDNODE_TAG) {
+            return util::Error{Untranslated(strprintf("Invalid -addnode value '%s': unknown tag '%s'", value, tag))};
+        }
+        bip152_hb_to_configured = true;
+    }
+
+    if (endpoint.empty()) {
+        return util::Error{Untranslated(strprintf("Invalid -addnode value '%s': endpoint is empty", value))};
+    }
+
+    return AddedNodeParams{
+        .m_added_node = std::move(endpoint),
+        .m_use_v2transport = use_v2transport,
+        .m_bip152_hb_to_configured = bip152_hb_to_configured,
+    };
+}
 
 #ifdef WIN32
 // Win32 LevelDB doesn't use filedescriptors, and the ones used for
@@ -563,7 +596,7 @@ void SetupServerArgs(ArgsManager& argsman, bool can_listen_ipc)
                  " If <type> is not supplied or if <type> = 1, indexes for all known types are enabled.",
                  ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
 
-    argsman.AddArg("-addnode=<ip>", strprintf("Add a node to connect to and attempt to keep the connection open (see the addnode RPC help for more info). This option can be specified multiple times to add multiple nodes; connections are limited to %u at a time and are counted separately from the -maxconnections limit.", MAX_ADDNODE_CONNECTIONS), ArgsManager::ALLOW_ANY | ArgsManager::NETWORK_ONLY, OptionsCategory::CONNECTION);
+    argsman.AddArg("-addnode=<ip>[:<port>][=bip152-hb]", strprintf("Add a node to connect to and attempt to keep the connection open (see the addnode RPC help for more info). Append =bip152-hb to request high-bandwidth compact block announcements after negotiation. Tagged entries are incompatible with -blocksonly and may increase the total above the three peers selected automatically. This option can be specified multiple times to add multiple nodes; connections are limited to %u at a time and are counted separately from the -maxconnections limit.", MAX_ADDNODE_CONNECTIONS), ArgsManager::ALLOW_ANY | ArgsManager::NETWORK_ONLY, OptionsCategory::CONNECTION);
     argsman.AddArg("-asmap=<file>", strprintf("Specify asn mapping used for bucketing of the peers. Relative paths will be prefixed by the net-specific datadir location.%s",
                 #ifdef ENABLE_EMBEDDED_ASMAP
                     " If a bool arg is given (-asmap or -asmap=1), the embedded mapping data in the binary will be used."
@@ -2133,7 +2166,31 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
     connOptions.m_msgproc = node.peerman.get();
     connOptions.nSendBufferMaxSize = 1000 * args.GetIntArg("-maxsendbuffer", DEFAULT_MAXSENDBUFFER);
     connOptions.nReceiveFloodSize = 1000 * args.GetIntArg("-maxreceivebuffer", DEFAULT_MAXRECEIVEBUFFER);
-    connOptions.m_added_nodes = args.GetArgs("-addnode");
+    // Attempt v2 connections if supported. Added nodes that do not support v2
+    // are retried with v1 while retaining their configured BIP152 policy.
+    const bool use_v2transport{static_cast<bool>(g_local_services & NODE_P2P_V2)};
+    for (const std::string& value : args.GetArgs("-addnode")) {
+        auto parsed{ParseAddedNode(value, use_v2transport)};
+        if (!parsed) return InitError(util::ErrorString(parsed));
+        if (parsed->m_bip152_hb_to_configured && args.GetBoolArg("-blocksonly", DEFAULT_BLOCKSONLY)) {
+            return InitError(Untranslated(strprintf(
+                "Invalid -addnode value '%s': the bip152-hb tag is incompatible with -blocksonly", value)));
+        }
+
+        const CService resolved{LookupNumeric(parsed->m_added_node, Params().GetDefaultPort())};
+        for (const AddedNodeParams& existing : connOptions.m_added_nodes) {
+            const bool equivalent{
+                parsed->m_added_node == existing.m_added_node ||
+                (resolved.IsValid() && resolved == LookupNumeric(existing.m_added_node, Params().GetDefaultPort()))};
+            if (equivalent && parsed->m_bip152_hb_to_configured != existing.m_bip152_hb_to_configured) {
+                const std::string existing_value{existing.m_added_node + (existing.m_bip152_hb_to_configured ? "=bip152-hb" : "")};
+                return InitError(Untranslated(strprintf(
+                    "Conflicting -addnode values '%s' and '%s': equivalent endpoints specify different BIP152 high-bandwidth policies",
+                    existing_value, value)));
+            }
+        }
+        connOptions.m_added_nodes.push_back(std::move(*parsed));
+    }
     connOptions.nMaxOutboundLimit = *opt_max_upload;
     connOptions.m_peer_connect_timeout = peer_connect_timeout;
     connOptions.whitelist_forcerelay = args.GetBoolArg("-whitelistforcerelay", DEFAULT_WHITELISTFORCERELAY);

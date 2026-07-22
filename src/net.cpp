@@ -380,6 +380,7 @@ CNode* CConnman::ConnectNode(CAddress addrConnect,
                              bool fCountFailure,
                              ConnectionType conn_type,
                              bool use_v2transport,
+                             bool bip152_hb_to_configured,
                              const std::optional<Proxy>& proxy_override)
 {
     AssertLockNotHeld(m_nodes_mutex);
@@ -547,6 +548,7 @@ CNode* CConnman::ConnectNode(CAddress addrConnect,
                                     .i2p_sam_session = std::move(i2p_transient_session),
                                     .recv_flood_size = nReceiveFloodSize,
                                     .use_v2transport = use_v2transport,
+                                    .bip152_hb_to_configured = bip152_hb_to_configured,
                                 });
         pnode->AddRef();
 
@@ -1925,6 +1927,7 @@ bool CConnman::AddConnection(const std::string& address, ConnectionType conn_typ
                           /*pszDest=*/address.c_str(),
                           /*conn_type=*/conn_type,
                           /*use_v2transport=*/use_v2transport,
+                          /*bip152_hb_to_configured=*/false,
                           /*proxy_override=*/std::nullopt);
     return true;
 }
@@ -1971,7 +1974,8 @@ void CConnman::DisconnectNodes()
                         .grant = std::move(pnode->grantOutbound),
                         .destination = pnode->m_dest,
                         .conn_type = pnode->m_conn_type,
-                        .use_v2transport = false});
+                        .use_v2transport = false,
+                        .bip152_hb_to_configured = pnode->m_bip152_hb_to_configured});
                     LogDebug(BCLog::NET, "retrying with v1 transport protocol for peer=%d\n", pnode->GetId());
                 }
 
@@ -2455,6 +2459,7 @@ void CConnman::ProcessAddrFetch()
                               /*pszDest=*/strDest.c_str(),
                               /*conn_type=*/ConnectionType::ADDR_FETCH,
                               /*use_v2transport=*/use_v2transport,
+                              /*bip152_hb_to_configured=*/false,
                               /*proxy_override=*/std::nullopt);
     }
 }
@@ -2589,6 +2594,7 @@ void CConnman::ThreadOpenConnections(const std::vector<std::string> connect, std
                                       /*pszDest=*/strAddr.c_str(),
                                       /*conn_type=*/ConnectionType::MANUAL,
                                       /*use_v2transport=*/use_v2transport,
+                                      /*bip152_hb_to_configured=*/false,
                                       /*proxy_override=*/std::nullopt);
                 for (int i = 0; i < 10 && i < nLoop; i++)
                 {
@@ -2945,6 +2951,7 @@ void CConnman::ThreadOpenConnections(const std::vector<std::string> connect, std
                                   /*pszDest=*/nullptr,
                                   /*conn_type=*/conn_type,
                                   /*use_v2transport=*/use_v2transport,
+                                  /*bip152_hb_to_configured=*/false,
                                   /*proxy_override=*/std::nullopt);
         }
     }
@@ -3050,6 +3057,7 @@ void CConnman::ThreadOpenAddedConnections()
                                   /*pszDest=*/info.m_params.m_added_node.c_str(),
                                   /*conn_type=*/ConnectionType::MANUAL,
                                   /*use_v2transport=*/info.m_params.m_use_v2transport,
+                                  /*bip152_hb_to_configured=*/info.m_params.m_bip152_hb_to_configured,
                                   /*proxy_override=*/std::nullopt);
             if (!m_interrupt_net->sleep_for(500ms)) return;
             grant = CountingSemaphoreGrant<>(*semAddnode, /*fTry=*/true);
@@ -3070,6 +3078,7 @@ bool CConnman::OpenNetworkConnection(const CAddress& addrConnect,
                                      const char* pszDest,
                                      ConnectionType conn_type,
                                      bool use_v2transport,
+                                     bool bip152_hb_to_configured,
                                      const std::optional<Proxy>& proxy_override)
 {
     AssertLockNotHeld(m_nodes_mutex);
@@ -3094,7 +3103,8 @@ bool CConnman::OpenNetworkConnection(const CAddress& addrConnect,
         return false;
     }
 
-    CNode* pnode = ConnectNode(addrConnect, pszDest, fCountFailure, conn_type, use_v2transport, proxy_override);
+    CNode* pnode = ConnectNode(
+        addrConnect, pszDest, fCountFailure, conn_type, use_v2transport, bip152_hb_to_configured, proxy_override);
 
     if (!pnode)
         return false;
@@ -3330,6 +3340,7 @@ void CConnman::ThreadPrivateBroadcast()
                                   /*pszDest=*/nullptr,
                                   ConnectionType::PRIVATE_BROADCAST,
                                   use_v2transport,
+                                  /*bip152_hb_to_configured=*/false,
                                   proxy)) {
             const size_t remaining{m_private_broadcast.NumToOpenSub(1)};
             LogDebug(BCLog::PRIVBROADCAST, "Socket connected to %s; remaining connections to open: %d", target_str, remaining);
@@ -4066,6 +4077,7 @@ CNode::CNode(NodeId idIn,
       addrBind{addrBindIn},
       m_addr_name{addrNameIn.empty() ? addr.ToStringAddrPort() : addrNameIn},
       m_dest(addrNameIn),
+      m_bip152_hb_to_configured{node_opts.bip152_hb_to_configured},
       m_inbound_onion{inbound_onion},
       m_prefer_evict{node_opts.prefer_evict},
       nKeyedNetGroup{nKeyedNetGroupIn},
@@ -4249,6 +4261,7 @@ void CConnman::PerformReconnections()
                               item.destination.empty() ? nullptr : item.destination.c_str(),
                               item.conn_type,
                               item.use_v2transport,
+                              item.bip152_hb_to_configured,
                               item.proxy_override);
     }
 }

@@ -228,6 +228,50 @@ class ConfArgsTest(BitcoinTestFramework):
                     extra_args=[f'-nowallet={value}'],
                 )
 
+    def test_bip152_high_bandwidth_addnode(self):
+        self.log.info("Test tagged addnode configuration validation")
+        node = self.nodes[0]
+
+        invalid_values = [
+            (
+                "=bip152-hb",
+                "Error: Invalid -addnode value '=bip152-hb': endpoint is empty",
+            ),
+            (
+                "127.0.0.1:18444=",
+                "Error: Invalid -addnode value '127.0.0.1:18444=': tag is empty",
+            ),
+            (
+                "127.0.0.1:18444=high-bandwidth",
+                "Error: Invalid -addnode value '127.0.0.1:18444=high-bandwidth': unknown tag 'high-bandwidth'",
+            ),
+        ]
+        for value, error in invalid_values:
+            node.assert_start_raises_init_error(
+                extra_args=[f"-addnode={value}"],
+                expected_msg=error,
+            )
+
+        node.assert_start_raises_init_error(
+            extra_args=["-blocksonly", "-addnode=127.0.0.1:18444=bip152-hb"],
+            expected_msg="Error: Invalid -addnode value '127.0.0.1:18444=bip152-hb': the bip152-hb tag is incompatible with -blocksonly",
+        )
+        node.assert_start_raises_init_error(
+            extra_args=["-addnode=127.0.0.1", "-addnode=127.1=bip152-hb"],
+            expected_msg="Error: Conflicting -addnode values '127.0.0.1' and '127.1=bip152-hb': equivalent endpoints specify different BIP152 high-bandwidth policies",
+        )
+
+        # A tagged hostname is retained for name-proxy resolution instead of
+        # being resolved merely to parse the policy tag.
+        self.start_node(0, extra_args=["-addnode=unresolved.example=bip152-hb", UNREACHABLE_PROXY_ARG])
+        util.assert_equal(node.getaddednodeinfo(), [{
+            "addednode": "unresolved.example",
+            "bip152_hb_to_configured": True,
+            "connected": False,
+            "addresses": [],
+        }])
+        self.stop_node(0)
+
     def test_log_buffer(self):
         with self.nodes[0].assert_debug_log(expected_msgs=["[warning] Parsed potentially confusing double-negative -listen=0\n"]):
             self.start_node(0, extra_args=['-nolisten=0'])
@@ -526,6 +570,7 @@ class ConfArgsTest(BitcoinTestFramework):
         self.test_config_file_parser()
         self.test_config_file_log()
         self.test_invalid_command_line_options()
+        self.test_bip152_high_bandwidth_addnode()
         self.test_ignored_conf()
         self.test_ignored_default_conf()
         self.test_acceptstalefeeestimates_arg_support()

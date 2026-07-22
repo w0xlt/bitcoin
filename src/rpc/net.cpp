@@ -323,7 +323,7 @@ static RPCMethod setpeerhighbandwidth()
     return RPCMethod{
         "setpeerhighbandwidth",
         "Manually enable or disable BIP152 high-bandwidth compact block announcements from a peer.\n"
-        "This setting applies only to the current connection and is not persisted.\n"
+        "This setting applies only to the current connection and does not edit configuration. An addnode=<endpoint>=bip152-hb configuration is reapplied on reconnect.\n"
         "Manual selection is independent of the three-peer automatic selection limit, so enabling it may result in more than three high-bandwidth peers.\n"
         "The peer must be fully connected and must have negotiated version 2 compact block support before high-bandwidth mode can be enabled.\n"
         "Disabling clears only the manual selection; a peer selected automatically may remain in effective high-bandwidth mode.",
@@ -411,6 +411,7 @@ static RPCMethod addnode()
                                       /*pszDest=*/std::string{node_arg}.c_str(),
                                       /*conn_type=*/ConnectionType::MANUAL,
                                       /*use_v2transport=*/use_v2transport,
+                                      /*bip152_hb_to_configured=*/false,
                                       /*proxy_override=*/std::nullopt);
         return UniValue::VNULL;
     }
@@ -556,7 +557,8 @@ static RPCMethod getaddednodeinfo()
                     {
                         {RPCResult::Type::OBJ, "", "",
                         {
-                            {RPCResult::Type::STR, "addednode", "The node IP address or name (as provided to addnode)"},
+                            {RPCResult::Type::STR, "addednode", "The node IP address or name, with any configuration policy tag omitted"},
+                            {RPCResult::Type::BOOL, "bip152_hb_to_configured", "Whether high-bandwidth compact block announcements are configured for this added node"},
                             {RPCResult::Type::BOOL, "connected", "If connected"},
                             {RPCResult::Type::ARR, "addresses", "Only when connected = true",
                             {
@@ -599,6 +601,7 @@ static RPCMethod getaddednodeinfo()
     for (const AddedNodeInfo& info : vInfo) {
         UniValue obj(UniValue::VOBJ);
         obj.pushKV("addednode", info.m_params.m_added_node);
+        obj.pushKV("bip152_hb_to_configured", info.m_params.m_bip152_hb_to_configured);
         obj.pushKV("connected", info.fConnected);
         UniValue addresses(UniValue::VARR);
         if (info.fConnected) {
