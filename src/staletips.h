@@ -11,12 +11,14 @@
 #include <uint256.h>
 #include <util/chaintype.h>
 #include <util/check.h>
+#include <util/time.h>
 
 #include <array>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
 #include <ios>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -32,6 +34,10 @@ static constexpr int STALETIP_RECENT_WINDOW{1000};
 /** Maximum number of stale tips retained in StaleTipCache. This is a local
  *  resource limit. */
 static constexpr size_t MAX_RETAINED_STALETIPS{20};
+/** Maximum time to defer announcing a stale tip to peers that prefer block
+ *  data while its block data is unavailable, so that propagation is not
+ *  substantially delayed. */
+static constexpr auto STALETIP_BLOCK_WAIT{1min};
 
 /** A stale branch of the block tree, described by its tip and the point where
  *  it forks off the active chain. */
@@ -54,6 +60,17 @@ struct StaleTipInfo {
     uint256 fork_point{};
     //! Number of stale blocks between the fork point and the stale tip.
     int fork_length{0};
+};
+
+/** A stale fork due to be announced to peers via a `staletip` message. */
+struct StaleTipAnnouncement {
+    //! Stale fork to announce.
+    StaleFork fork;
+    //! Sequence number assigned when the tip's headers (or block data) became
+    //! known, used to announce tips in the order they were discovered.
+    uint32_t seqno{0};
+    //! Time the tip was added to the cache.
+    NodeClock::time_point header_time{};
 };
 
 /** A block header without its previous block hash, as serialized in `staletip`
@@ -200,9 +217,14 @@ private:
     struct Entry {
         //! Tracked stale tip, or nullptr for an unused slot.
         const CBlockIndex* tip{nullptr};
-        //! Sequence number assigned when the tip was added, used as a
-        //! deterministic tie-breaker for eviction.
+        //! Sequence number assigned when the tip was added.
         uint32_t header_seqno{0};
+        //! Sequence number assigned when the tip's block data became
+        //! available, or 0 while it is unavailable. Equal to `header_seqno`
+        //! if the block data became available after STALETIP_BLOCK_WAIT.
+        uint32_t block_seqno{0};
+        //! Time the tip was added.
+        NodeClock::time_point header_time{};
     };
 
     std::array<Entry, MAX_RETAINED_STALETIPS> m_tips{};
@@ -273,15 +295,34 @@ public:
      *  again later for tips that were not eligible when learned. */
     void Initialize(node::BlockManager& blockman, const CChain& chain) EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
 
+    /** Whether no stale tips are currently retained. */
+    bool Empty() const EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
+
     /** Track `stale_tip` if it is eligible (see GetEligibleForkPoint()) and can
      *  be retained under the cache's resource limits. If `stale_tip` extends a
      *  stale branch beyond the length limit, stop tracking that branch.
      *
-     * @return Whether the cache was updated to track `stale_tip`.
+     * @return Whether the cache was updated to track `stale_tip` or its block
+     *         data availability.
      */
     bool AddStaleTip(const CChain& chain, const CBlockIndex* stale_tip, bool allow_more_work = false) EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
     /** Get the tracked tips that are still eligible, with their fork points. */
     std::vector<StaleFork> GetStaleTips(const CChain& chain) const EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
+    /** Get the tracked tips that are still eligible, in the order they were
+     *  added.
+     *
+     * @param[in] want_blocks If true, defer tips without block data for up to
+     *            STALETIP_BLOCK_WAIT after they were added, and order tips
+     *            with block data by when it was obtained. Used for peers that
+     *            prefer announcements with block data.
+     */
+    std::vector<StaleTipAnnouncement> GetTipsToAnnounce(const CChain& chain, bool want_blocks) const EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
+    /** Get the announcement sequence numbers of all retained tips, including
+     *  tips that are currently ineligible for relay. Used to expire per-peer
+     *  announcement state only when a tip is dropped from the cache, so that
+     *  a temporarily ineligible tip (for example, one reorged onto the active
+     *  chain and back) is not re-announced once it becomes eligible again. */
+    std::set<uint32_t> GetTrackedSeqnos() const EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
     /** Get a summary of the tracked tips that are still eligible. */
     std::vector<StaleTipInfo> GetStaleTipInfo(const CChain& chain) const EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
 };

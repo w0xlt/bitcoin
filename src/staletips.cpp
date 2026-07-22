@@ -190,6 +190,7 @@ bool StaleTipCache::Add(const CChain& chain, const CBlockIndex& stale_tip)
     })};
     if (on_long_branch) return false;
 
+    const bool have_block{(stale_tip.nStatus & BLOCK_HAVE_DATA) != 0};
     Entry* available{nullptr};
     Entry* evict{nullptr};
     Entry* evict_ineligible{nullptr};
@@ -206,7 +207,18 @@ bool StaleTipCache::Add(const CChain& chain, const CBlockIndex& stale_tip)
             continue;
         }
 
-        if (entry.tip == &stale_tip) return false;
+        if (entry.tip == &stale_tip) {
+            if (have_block && entry.block_seqno == 0) {
+                // After STALETIP_BLOCK_WAIT, the tip may already have been
+                // announced without block data to peers that prefer block
+                // data. Reuse its sequence number so it is not announced to
+                // them again.
+                const bool waited{NodeClock::now() >= entry.header_time + STALETIP_BLOCK_WAIT};
+                entry.block_seqno = waited ? entry.header_seqno : m_next_seqno++;
+                return true;
+            }
+            return false;
+        }
 
         // A tracked tip known to be invalid doesn't make its valid ancestors
         // redundant: they replace it.
@@ -250,6 +262,8 @@ bool StaleTipCache::Add(const CChain& chain, const CBlockIndex& stale_tip)
     }
     target->tip = &stale_tip;
     target->header_seqno = m_next_seqno++;
+    target->block_seqno = have_block ? target->header_seqno : 0;
+    target->header_time = NodeClock::now();
     return true;
 }
 
@@ -287,6 +301,12 @@ void StaleTipCache::Initialize(node::BlockManager& blockman, const CChain& chain
     }
 }
 
+bool StaleTipCache::Empty() const
+{
+    AssertLockHeld(::cs_main);
+    return std::ranges::all_of(m_tips, [](const Entry& entry) { return entry.tip == nullptr; });
+}
+
 bool StaleTipCache::AddStaleTip(const CChain& chain, const CBlockIndex* stale_tip, bool allow_more_work)
 {
     AssertLockHeld(::cs_main);
@@ -315,6 +335,51 @@ std::vector<StaleFork> StaleTipCache::GetStaleTips(const CChain& chain) const
     }
 
     return tips;
+}
+
+std::vector<StaleTipAnnouncement> StaleTipCache::GetTipsToAnnounce(const CChain& chain, bool want_blocks) const
+{
+    AssertLockHeld(::cs_main);
+
+    std::vector<StaleTipAnnouncement> announcements;
+    announcements.reserve(m_tips.size());
+    const auto now{NodeClock::now()};
+
+    for (const auto& entry : m_tips) {
+        if (entry.tip == nullptr) continue;
+
+        uint32_t seqno{entry.header_seqno};
+        if (want_blocks) {
+            // Wait for the block data, unless that would substantially delay
+            // propagation.
+            if (entry.block_seqno != 0) {
+                seqno = entry.block_seqno;
+            } else if (now < entry.header_time + STALETIP_BLOCK_WAIT) {
+                continue;
+            }
+        }
+
+        const CBlockIndex* fork_point{GetEligibleForkPoint(chain, *entry.tip)};
+        if (fork_point == nullptr) continue;
+
+        announcements.push_back({.fork = {.fork_point = fork_point, .tip = entry.tip}, .seqno = seqno, .header_time = entry.header_time});
+    }
+
+    std::ranges::sort(announcements, {}, &StaleTipAnnouncement::seqno);
+    return announcements;
+}
+
+std::set<uint32_t> StaleTipCache::GetTrackedSeqnos() const
+{
+    AssertLockHeld(::cs_main);
+
+    std::set<uint32_t> seqnos;
+    for (const auto& entry : m_tips) {
+        if (entry.tip == nullptr) continue;
+        seqnos.insert(entry.header_seqno);
+        if (entry.block_seqno != 0) seqnos.insert(entry.block_seqno);
+    }
+    return seqnos;
 }
 
 std::vector<StaleTipInfo> StaleTipCache::GetStaleTipInfo(const CChain& chain) const
