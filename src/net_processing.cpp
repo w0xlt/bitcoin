@@ -271,6 +271,8 @@ struct Peer {
     bool m_stale_tip_negotiated GUARDED_BY(NetEventsInterface::g_msgproc_mutex){false};
     /** Whether this peer prefers stale-tip announcements after block data is available. */
     bool m_stale_tip_prefers_blocks GUARDED_BY(NetEventsInterface::g_msgproc_mutex){false};
+    /** Sequence numbers of stale-tip announcements sent to this peer. */
+    std::set<uint32_t> m_stale_tip_announced_seqnos GUARDED_BY(NetEventsInterface::g_msgproc_mutex);
 
     /** Set to true once initial VERSION message was sent (only relevant for outbound peers). */
     bool m_outbound_version_message_sent GUARDED_BY(NetEventsInterface::g_msgproc_mutex){false};
@@ -768,6 +770,9 @@ private:
 
     /** Send `feefilter` message. */
     void MaybeSendFeefilter(CNode& node, Peer& peer, std::chrono::microseconds current_time) EXCLUSIVE_LOCKS_REQUIRED(g_msgproc_mutex);
+
+    /** Send `staletip` messages for any new stale tips. */
+    void MaybeSendStaleTips(CNode& node, Peer& peer, CNodeState& state) EXCLUSIVE_LOCKS_REQUIRED(g_msgproc_mutex, cs_main);
 
     /** Add a stale tip to the cache and update peer state if appropriate. */
     void HandleStaleTip(CNode& pfrom, Peer& peer, const CBlockIndex* pindex, bool peer_has_block, bool received_new_header) EXCLUSIVE_LOCKS_REQUIRED(g_msgproc_mutex, cs_main);
@@ -5754,6 +5759,48 @@ void PeerManagerImpl::MaybeSendFeefilter(CNode& pto, Peer& peer, std::chrono::mi
     }
 }
 
+void PeerManagerImpl::MaybeSendStaleTips(CNode& node, Peer& peer, CNodeState& state)
+{
+    AssertLockHeld(g_msgproc_mutex);
+    AssertLockHeld(cs_main);
+
+    if (m_opts.stale_tip_mode == StaleTipMode::NONE) return;
+    if (!peer.m_stale_tip_negotiated) return;
+    if (m_chainman.IsInitialBlockDownload()) return;
+    if (m_stale_tips.Empty()) {
+        peer.m_stale_tip_announced_seqnos.clear();
+        return;
+    }
+
+    ProcessBlockAvailability(node.GetId());
+    if (state.pindexBestKnownBlock == nullptr) return;
+
+    const bool want_blocks{m_opts.stale_tip_mode == StaleTipMode::BLOCKS && peer.m_stale_tip_prefers_blocks};
+    for (const auto& announcement : m_stale_tips.GetTipsToAnnounce(m_chainman.ActiveChain(), want_blocks)) {
+        if (peer.m_stale_tip_announced_seqnos.contains(announcement.seqno)) continue;
+        // The compressed payload reconstructs headers from the fork point, so
+        // only announce tips whose fork point the peer is known to have.
+        if (!PeerHasHeader(&state, announcement.fork.fork_point)) continue;
+
+        const CBlockIndex& stale_tip{*announcement.fork.tip};
+        const bool have_block{(stale_tip.nStatus & BLOCK_HAVE_DATA) != 0 && BlockRequestAllowed(stale_tip)};
+        // Signet stale tips can only be validated with the block data, and
+        // peers may disconnect for announcements without it. Defer the
+        // announcement until the block data can be served.
+        if (!have_block && m_chainparams.GetChainType() == ChainType::SIGNET) continue;
+        StaleTipMessage data{announcement.fork, have_block};
+        MakeAndPushMessage(node, NetMsgType::STALETIP, data);
+        peer.m_stale_tip_announced_seqnos.insert(announcement.seqno);
+        LogDebug(BCLog::NET, "sending staletip with %u header(s) to peer=%d", data.m_headers.size(), node.GetId());
+    }
+    // Expire per-peer announcement state only for tips dropped from the
+    // cache. Tips that are merely ineligible at the moment (for example,
+    // reorged onto the active chain) keep their state, so they are not
+    // re-announced to the same peer if they become eligible again.
+    const std::set<uint32_t> tracked_seqnos{m_stale_tips.GetTrackedSeqnos()};
+    std::erase_if(peer.m_stale_tip_announced_seqnos, [&](uint32_t seqno) { return !tracked_seqnos.contains(seqno); });
+}
+
 void PeerManagerImpl::HandleStaleTip(CNode& pfrom, Peer& peer, const CBlockIndex* pindex, bool peer_has_block, bool received_new_header)
 {
     AssertLockHeld(g_msgproc_mutex);
@@ -5768,7 +5815,9 @@ void PeerManagerImpl::HandleStaleTip(CNode& pfrom, Peer& peer, const CBlockIndex
     }
 
     if (m_chainman.ActiveChain().Contains(*pindex)) return;
-    (void)m_stale_tips.AddStaleTip(m_chainman.ActiveChain(), pindex);
+    if (m_stale_tips.AddStaleTip(m_chainman.ActiveChain(), pindex)) {
+        m_connman.WakeMessageHandler();
+    }
 }
 
 namespace {
@@ -6029,6 +6078,8 @@ bool PeerManagerImpl::SendMessages(CNode& node)
         if (m_chainman.m_best_header == nullptr) {
             m_chainman.m_best_header = m_chainman.ActiveChain().Tip();
         }
+
+        MaybeSendStaleTips(node, peer, state);
 
         // Determine whether we might try initial headers sync or parallel
         // block download from this peer -- this mostly affects behavior while

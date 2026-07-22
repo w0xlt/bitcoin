@@ -32,6 +32,7 @@ class StaleTipPeer(P2PInterface):
         self.features = []
         self.getdata = []
         self.invs = []
+        self.staletips = []
 
     def on_version(self, message):
         if self.send_feature and message.nVersion >= FEATURE_VERSION:
@@ -47,6 +48,16 @@ class StaleTipPeer(P2PInterface):
     def on_inv(self, message):
         self.invs.extend(message.inv)
         super().on_inv(message)
+
+    def on_staletip(self, message):
+        self.staletips.append(message)
+
+    def wait_for_staletip(self, match=None):
+        def matches(staletip):
+            return match is None or match(staletip)
+
+        self.wait_until(lambda: any(matches(staletip) for staletip in self.staletips))
+        return next(staletip for staletip in self.staletips if matches(staletip))
 
     def wait_for_getdata_hash(self, block_hash):
         self.wait_until(lambda: any(
@@ -76,9 +87,12 @@ class P2PStaleTipTest(BitcoinTestFramework):
         self.test_invalid_feature_data_ignored()
         self.test_oversized_staletip_ignored()
         self.test_reorged_out_active_tip_tracked()
-        self.test_inbound_staletip_tracked()
-        self.test_higher_work_staletip_requests_block()
+        self.test_skipped_staletip_does_not_block_later_eligible_announcement()
         self.test_active_tip_announced_to_source_peer()
+        self.test_inbound_and_outbound_relay()
+        self.test_peer_must_know_fork_point()
+        self.test_no_reannouncement_after_transient_ineligibility()
+        self.test_higher_work_staletip_requests_block()
         self.test_startup_seeding_only_when_enabled()
 
     def connect_peer(self, *, send_feature=True, feature_data=b"\x00", **kwargs):
@@ -228,15 +242,6 @@ class P2PStaleTipTest(BitcoinTestFramework):
         self.assert_staletip_not_tracked(block)
         self.nodes[0].disconnect_p2ps()
 
-    def test_inbound_staletip_tracked(self):
-        self.log.info("Test negotiated inbound staletip is tracked")
-        source_peer = self.connect_peer(feature_data=b"\x00")
-
-        block, fork_point_hash = self.stale_block()
-        source_peer.send_and_ping(self.staletip_msg(block, fork_point_hash))
-        self.assert_staletip_tracked(block)
-        self.nodes[0].disconnect_p2ps()
-
     def test_higher_work_staletip_requests_block(self):
         self.log.info("Test block data is requested for a higher-work staletip")
         headers_peer = self.connect_peer(feature_data=b"\x00")
@@ -262,6 +267,126 @@ class P2PStaleTipTest(BitcoinTestFramework):
         peer.send_and_ping(msg_inv([CInv(MSG_BLOCK, block.hash_int)]))
         assert_equal(node.submitblock(block.serialize().hex()), None)
         peer.wait_for_block_inv(block.hash_int)
+        self.nodes[0].disconnect_p2ps()
+
+    def test_skipped_staletip_does_not_block_later_eligible_announcement(self):
+        self.log.info("Test skipped stale-tip announcements do not block later eligible tips")
+        node = self.nodes[0]
+        source_peer = self.connect_peer(feature_data=b"\x00")
+        relay_peer = self.connect_peer(feature_data=b"\x00")
+
+        active_tip = node.getblock(node.getbestblockhash())
+        common_hash = node.getblock(active_tip["previousblockhash"])["previousblockhash"]
+        relay_peer.send_and_ping(msg_inv([CInv(MSG_BLOCK, int(common_hash, 16))]))
+
+        ineligible_block, ineligible_fork_point_hash = self.stale_block(fork_depth=1)
+        source_peer.send_and_ping(self.staletip_msg(ineligible_block, ineligible_fork_point_hash))
+        self.assert_staletip_tracked(ineligible_block)
+
+        eligible_block, eligible_fork_point_hash = self.stale_block(fork_depth=2)
+        source_peer.send_and_ping(self.staletip_msg(eligible_block, eligible_fork_point_hash))
+        self.assert_staletip_tracked(eligible_block)
+
+        staletip = relay_peer.wait_for_staletip(
+            lambda msg: msg.hash_fork_point == eligible_fork_point_hash
+            and len(msg.headers) == 1
+            and msg.headers[0].hashMerkleRoot == eligible_block.hashMerkleRoot
+        )
+        assert_equal(staletip.have_block, False)
+        self.nodes[0].disconnect_p2ps()
+
+    def test_inbound_and_outbound_relay(self):
+        self.log.info("Test negotiated inbound staletip is tracked and relayed")
+        source_peer = self.connect_peer(feature_data=b"\x00")
+        relay_peer = self.connect_peer(feature_data=b"\x00")
+
+        relay_peer.send_and_ping(msg_inv([CInv(MSG_BLOCK, int(self.nodes[0].getbestblockhash(), 16))]))
+
+        block, fork_point_hash = self.stale_block()
+        source_peer.send_and_ping(self.staletip_msg(block, fork_point_hash))
+        self.assert_staletip_tracked(block)
+
+        staletip = relay_peer.wait_for_staletip(
+            lambda msg: msg.hash_fork_point == fork_point_hash
+            and len(msg.headers) == 1
+            and msg.headers[0].hashMerkleRoot == block.hashMerkleRoot
+        )
+        assert_equal(staletip.have_block, False)
+        self.nodes[0].disconnect_p2ps()
+
+    def test_peer_must_know_fork_point(self):
+        self.log.info("Test staletip is not announced unless peer knows fork point")
+        node = self.nodes[0]
+        source_peer = self.connect_peer(feature_data=b"\x00")
+        relay_peer = self.connect_peer(feature_data=b"\x00")
+
+        active_tip_hash = node.getbestblockhash()
+        competing_blocks, _ = self.stale_branch(length=2, fork_depth=2)
+        for block in competing_blocks:
+            assert node.submitblock(block.serialize().hex()) in (None, "inconclusive")
+        assert_equal(node.getbestblockhash(), active_tip_hash)
+
+        # Advance the relay peer's best-known chain along a competing branch
+        # whose height passes the old check, but which does not contain the
+        # active-chain fork point below.
+        relay_peer.send_and_ping(msg_inv([CInv(MSG_BLOCK, competing_blocks[-1].hash_int)]))
+        relay_peer.sync_with_ping()
+
+        block, fork_point_hash = self.stale_block(fork_depth=1)
+        source_peer.send_and_ping(self.staletip_msg(block, fork_point_hash))
+        self.assert_staletip_tracked(block)
+
+        relay_peer.sync_with_ping()
+        assert_equal([
+            msg for msg in relay_peer.staletips
+            if msg.hash_fork_point == fork_point_hash
+            and len(msg.headers) == 1
+            and msg.headers[0].nTime == block.nTime
+            and msg.headers[0].nNonce == block.nNonce
+        ], [])
+        self.nodes[0].disconnect_p2ps()
+
+    def test_no_reannouncement_after_transient_ineligibility(self):
+        self.log.info("Test stale tip is not re-announced after transient ineligibility")
+        node = self.nodes[0]
+
+        # Prior subtests may have left same-work competing branches in the
+        # block index. Move the active tip forward so the branch created below
+        # is the best candidate when the current tip is invalidated.
+        self.generate(node, 1)
+
+        peer = self.connect_peer(feature_data=b"\x00")
+        active_tip_hash = node.getbestblockhash()
+        peer.send_and_ping(msg_inv([CInv(MSG_BLOCK, int(active_tip_hash, 16))]))
+
+        block, fork_point_hash = self.stale_block()
+
+        # Coinbase-only test blocks at the same height share a merkle root,
+        # so identify the announcement by the unique (time, nonce) instead.
+        def matches_block(msg):
+            return (msg.hash_fork_point == fork_point_hash
+                    and len(msg.headers) == 1
+                    and msg.headers[0].nTime == block.nTime
+                    and msg.headers[0].nNonce == block.nNonce)
+
+        assert node.submitblock(block.serialize().hex()) in (None, "inconclusive")
+        self.assert_staletip_tracked(block)
+        peer.wait_for_staletip(matches_block)
+
+        # Reorg onto the stale branch and back. While its branch is active the
+        # tip is temporarily not stale, but it stays in the cache throughout.
+        node.invalidateblock(active_tip_hash)
+        assert_equal(node.getbestblockhash(), block.hash_hex)
+        peer.wait_for_block_inv(block.hash_int)
+        node.reconsiderblock(active_tip_hash)
+        assert_equal(node.getbestblockhash(), active_tip_hash)
+        self.assert_staletip_tracked(block)
+
+        # The node announces its restored active tip, but must not announce
+        # the stale tip to the same peer a second time.
+        peer.wait_for_block_inv(int(active_tip_hash, 16))
+        peer.sync_with_ping()
+        assert_equal(len([msg for msg in peer.staletips if matches_block(msg)]), 1)
         self.nodes[0].disconnect_p2ps()
 
     def test_startup_seeding_only_when_enabled(self):
