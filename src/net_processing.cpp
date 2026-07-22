@@ -769,6 +769,9 @@ private:
     /** Send `feefilter` message. */
     void MaybeSendFeefilter(CNode& node, Peer& peer, std::chrono::microseconds current_time) EXCLUSIVE_LOCKS_REQUIRED(g_msgproc_mutex);
 
+    /** Add a stale tip to the cache if it is not on the active chain. */
+    void HandleStaleTip(const CBlockIndex* pindex) EXCLUSIVE_LOCKS_REQUIRED(g_msgproc_mutex, cs_main);
+
     FastRandomContext m_rng GUARDED_BY(NetEventsInterface::g_msgproc_mutex);
 
     FeeFilterRounder m_fee_filter_rounder GUARDED_BY(NetEventsInterface::g_msgproc_mutex);
@@ -4162,6 +4165,73 @@ void PeerManagerImpl::ProcessMessage(Peer& peer, CNode& pfrom, const std::string
         }
     }
 
+    if (msg_type == NetMsgType::STALETIP) {
+        if (m_opts.stale_tip_mode == StaleTipMode::NONE || !peer.m_stale_tip_negotiated) {
+            LogDebug(BCLog::NET, "ignoring unnegotiated staletip from peer=%d", pfrom.GetId());
+            return;
+        }
+
+        StaleTipMessage stale_tip_data;
+        try {
+            vRecv >> stale_tip_data;
+            if (!vRecv.empty()) throw std::ios_base::failure{"trailing staletip bytes"};
+        } catch (const StaleTipHeadersLimitExceeded& e) {
+            LogDebug(BCLog::NET, "ignoring staletip from peer=%d: %s", pfrom.GetId(), e.what());
+            return;
+        } catch (const std::exception& e) {
+            LogDebug(BCLog::NET, "malformed staletip from peer=%d: %s, %s", pfrom.GetId(), e.what(), pfrom.DisconnectMsg());
+            pfrom.fDisconnect = true;
+            return;
+        }
+
+        auto [tip_hash, headers]{stale_tip_data.DecompressHeaders()};
+        // Reconstructed headers are continuous by construction: each previous
+        // block hash is computed from the preceding header.
+        Assume(CheckHeadersAreContinuous(headers));
+
+        if (!HasValidProofOfWork(headers, m_chainparams.GetConsensus())) {
+            LogDebug(BCLog::NET, "ignoring staletip with invalid headers from peer=%d", pfrom.GetId());
+            return;
+        }
+
+        const arith_uint256 anti_dos_work_threshold{GetAntiDoSWorkThreshold()};
+        {
+            LOCK(cs_main);
+
+            const CBlockIndex* known_tip{m_chainman.m_blockman.LookupBlockIndex(tip_hash)};
+            const CBlockIndex* active_tip{m_chainman.ActiveTip()};
+            if (known_tip != nullptr) {
+                HandleStaleTip(known_tip);
+                return;
+            }
+
+            const CBlockIndex* fork_point{m_chainman.m_blockman.LookupBlockIndex(stale_tip_data.m_fork_point)};
+            if (fork_point == nullptr) {
+                LogDebug(BCLog::NET, "ignoring staletip with unknown fork point %s from peer=%d", stale_tip_data.m_fork_point.ToString(), pfrom.GetId());
+                return;
+            }
+            if (active_tip != nullptr && fork_point->nHeight + static_cast<int>(headers.size()) < active_tip->nHeight - STALETIP_RECENT_WINDOW) {
+                LogDebug(BCLog::NET, "ignoring staletip outside recency window from peer=%d", pfrom.GetId());
+                return;
+            }
+            if (fork_point->nChainWork < anti_dos_work_threshold) {
+                LogDebug(BCLog::NET, "ignoring low-work staletip fork point %s from peer=%d", stale_tip_data.m_fork_point.ToString(), pfrom.GetId());
+                return;
+            }
+        }
+
+        BlockValidationState state;
+        const CBlockIndex* pindexLast{nullptr};
+        if (!m_chainman.ProcessNewBlockHeaders(headers, /*min_pow_checked=*/true, state, &pindexLast)) {
+            LogDebug(BCLog::NET, "ignoring staletip headers from peer=%d: %s", pfrom.GetId(), state.ToString());
+            return;
+        }
+
+        LOCK(cs_main);
+        HandleStaleTip(pindexLast);
+        return;
+    }
+
     if (msg_type == NetMsgType::ADDR || msg_type == NetMsgType::ADDRV2) {
         const auto ser_params{
             msg_type == NetMsgType::ADDRV2 ?
@@ -5682,6 +5752,16 @@ void PeerManagerImpl::MaybeSendFeefilter(CNode& pto, Peer& peer, std::chrono::mi
                 (currentFilter < 3 * peer.m_fee_filter_sent / 4 || currentFilter > 4 * peer.m_fee_filter_sent / 3)) {
         peer.m_next_send_feefilter = current_time + m_rng.randrange<std::chrono::microseconds>(MAX_FEEFILTER_CHANGE_DELAY);
     }
+}
+
+void PeerManagerImpl::HandleStaleTip(const CBlockIndex* pindex)
+{
+    AssertLockHeld(g_msgproc_mutex);
+    AssertLockHeld(cs_main);
+
+    if (pindex == nullptr) return;
+    if (m_chainman.ActiveChain().Contains(*pindex)) return;
+    (void)m_stale_tips.AddStaleTip(m_chainman.ActiveChain(), pindex);
 }
 
 namespace {
