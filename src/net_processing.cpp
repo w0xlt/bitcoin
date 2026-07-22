@@ -776,7 +776,7 @@ private:
     /** Send `staletip` messages for any new stale tips. */
     void MaybeSendStaleTips(CNode& node, Peer& peer, CNodeState& state) EXCLUSIVE_LOCKS_REQUIRED(g_msgproc_mutex, cs_main);
 
-    /** Add a stale tip to the cache and update peer state if appropriate. */
+    /** Add a stale tip to the cache and request missing branch blocks if appropriate. */
     void HandleStaleTip(CNode& pfrom, Peer& peer, const CBlockIndex* pindex, bool peer_has_block, bool received_new_header) EXCLUSIVE_LOCKS_REQUIRED(g_msgproc_mutex, cs_main);
 
     FastRandomContext m_rng GUARDED_BY(NetEventsInterface::g_msgproc_mutex);
@@ -1047,7 +1047,7 @@ private:
      * about and we fully-validated them at some point.
      */
     bool BlockRequestAllowed(const CBlockIndex& block_index) EXCLUSIVE_LOCKS_REQUIRED(cs_main);
-    /** Whether this negotiated peer may fetch a tracked stale branch block. */
+    /** Whether this negotiated peer may fetch an unvalidated tracked stale-tip branch block. */
     bool StaleTipBlockRequestAllowed(const Peer& peer, const CBlockIndex& block_index) EXCLUSIVE_LOCKS_REQUIRED(g_msgproc_mutex, cs_main);
     bool AlreadyHaveBlock(const uint256& block_hash) EXCLUSIVE_LOCKS_REQUIRED(cs_main);
     void ProcessGetBlockData(CNode& pfrom, Peer& peer, const CInv& inv)
@@ -5833,8 +5833,42 @@ void PeerManagerImpl::HandleStaleTip(CNode& pfrom, Peer& peer, const CBlockIndex
     }
 
     if (m_chainman.ActiveChain().Contains(*pindex)) return;
-    if (m_stale_tips.AddStaleTip(m_chainman.ActiveChain(), pindex)) {
-        m_connman.WakeMessageHandler();
+    const bool added{m_stale_tips.AddStaleTip(m_chainman.ActiveChain(), pindex)};
+    const bool can_request{m_stale_tips.CanRequestStaleTipBlock(m_chainman.ActiveChain(), pindex)};
+    if (!added && !can_request) return;
+
+    if (!peer_has_block) return;
+    if (!can_request) return;
+    if (m_opts.stale_tip_mode != StaleTipMode::BLOCKS) return;
+    if (!CanServeBlocks(peer)) return;
+    if (!CanServeWitnesses(peer) &&
+        DeploymentActiveAt(*pindex, m_chainman, Consensus::DEPLOYMENT_SEGWIT)) return;
+    if (m_chainman.m_blockman.LoadingBlocks()) return;
+
+    CNodeState* state{State(pfrom.GetId())};
+    if (state == nullptr) return;
+
+    std::vector<CInv> getdata;
+    std::vector<const CBlockIndex*> missing_blocks;
+    const uint32_t fetch_flags{GetFetchFlags(peer)};
+
+    for (const CBlockIndex* block{pindex}; block != nullptr && !m_chainman.ActiveChain().Contains(*block); block = block->pprev) {
+        if (block->nStatus & BLOCK_HAVE_DATA) continue;
+
+        if (IsBlockRequested(block->GetBlockHash())) continue;
+
+        missing_blocks.push_back(block);
+    }
+
+    for (const CBlockIndex* block : missing_blocks | std::views::reverse) {
+        if (state->vBlocksInFlight.size() >= MAX_BLOCKS_IN_TRANSIT_PER_PEER) break;
+        getdata.emplace_back(MSG_BLOCK | fetch_flags, block->GetBlockHash());
+        BlockRequested(pfrom.GetId(), *block, /*pit=*/nullptr, /*stale_tip_request=*/true);
+        LogDebug(BCLog::NET, "requesting stale branch block %s from peer=%d", block->GetBlockHash().ToString(), pfrom.GetId());
+    }
+
+    if (!getdata.empty()) {
+        MakeAndPushMessage(pfrom, NetMsgType::GETDATA, getdata);
     }
 }
 
