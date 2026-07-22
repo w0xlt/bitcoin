@@ -458,6 +458,10 @@ struct CNodeState {
     const CBlockIndex* pindexLastCommonBlock{nullptr};
     //! The best header we have sent our peer.
     const CBlockIndex* pindexBestHeaderSent{nullptr};
+    //! The block we last announced to our peer as our tip, by header, compact
+    //! block or inv, so that each new active tip is announced to peers that
+    //! negotiated stale-tip relay, even if its header was sent before.
+    const CBlockIndex* m_active_tip_announced{nullptr};
     //! Whether we've started headers synchronization with this peer.
     bool fSyncStarted{false};
     //! Since when we're stalling block download progress (in microseconds), or 0.
@@ -2366,6 +2370,7 @@ void PeerManagerImpl::NewPoWValidBlock(const CBlockIndex *pindex, const std::sha
             const CSerializedNetMsg& ser_cmpctblock{lazy_ser.get()};
             PushMessage(*pnode, ser_cmpctblock.Copy());
             state.pindexBestHeaderSent = pindex;
+            state.m_active_tip_announced = pindex;
         }
     });
 }
@@ -6541,6 +6546,7 @@ bool PeerManagerImpl::SendMessages(CNode& node)
                         MakeAndPushMessage(node, NetMsgType::CMPCTBLOCK, cmpctblock);
                     }
                     state.pindexBestHeaderSent = pBestIndex;
+                    state.m_active_tip_announced = pBestIndex;
                 } else if (peer.m_prefers_headers) {
                     if (vHeaders.size() > 1) {
                         LogDebug(BCLog::NET, "%s: %u headers, range (%s, %s), to peer=%d\n", __func__,
@@ -6553,10 +6559,16 @@ bool PeerManagerImpl::SendMessages(CNode& node)
                     }
                     MakeAndPushMessage(node, NetMsgType::HEADERS, TX_WITH_WITNESS(vHeaders));
                     state.pindexBestHeaderSent = pBestIndex;
+                    state.m_active_tip_announced = pBestIndex;
                 } else
                     fRevertToInv = true;
             }
-            if (fRevertToInv) {
+            // Stale-tip relay relies on peers knowing our active tip, so
+            // announce it to peers that negotiated stale-tip relay even when
+            // they already appear to have the header, unless this activation
+            // was already announced to them, for example by a compact block.
+            const bool stale_tip_peer{m_opts.stale_tip_mode != StaleTipMode::NONE && peer.m_stale_tip_negotiated};
+            if (fRevertToInv || (stale_tip_peer && vHeaders.empty())) {
                 // If falling back to using an inv, just try to inv the tip.
                 // The last entry in m_blocks_for_headers_relay was our tip at some point
                 // in the past.
@@ -6573,9 +6585,11 @@ bool PeerManagerImpl::SendMessages(CNode& node)
                             hashToAnnounce.ToString(), m_chainman.ActiveChain().Tip()->GetBlockHash().ToString());
                     }
 
-                    // If the peer's chain has this block, don't inv it back.
-                    if (!PeerHasHeader(&state, pindex)) {
+                    const bool active_tip{pindex == m_chainman.ActiveChain().Tip()};
+                    const bool announce_active_tip{stale_tip_peer && active_tip && state.m_active_tip_announced != pindex};
+                    if (announce_active_tip || !PeerHasHeader(&state, pindex)) {
                         peer.m_blocks_for_inv_relay.push_back(hashToAnnounce);
+                        state.m_active_tip_announced = pindex;
                         LogDebug(BCLog::NET, "%s: sending inv peer=%d hash=%s\n", __func__,
                             node.GetId(), hashToAnnounce.ToString());
                     }
