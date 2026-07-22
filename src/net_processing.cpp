@@ -6185,7 +6185,7 @@ bool PeerManagerImpl::SendMessages(CNode& node)
                 } else
                     fRevertToInv = true;
             }
-            if (fRevertToInv) {
+            if (fRevertToInv || (m_opts.stale_tip_mode != StaleTipMode::NONE && vHeaders.empty())) {
                 // If falling back to using an inv, just try to inv the tip.
                 // The last entry in m_blocks_for_headers_relay was our tip at some point
                 // in the past.
@@ -6202,8 +6202,10 @@ bool PeerManagerImpl::SendMessages(CNode& node)
                             hashToAnnounce.ToString(), m_chainman.ActiveChain().Tip()->GetBlockHash().ToString());
                     }
 
-                    // If the peer's chain has this block, don't inv it back.
-                    if (!PeerHasHeader(&state, pindex)) {
+                    // Stale-tip relay relies on peers knowing our active tip, so announce it even when
+                    // the peer already appears to have the header.
+                    const bool announce_active_tip{m_opts.stale_tip_mode != StaleTipMode::NONE && pindex == m_chainman.ActiveChain().Tip()};
+                    if (announce_active_tip || !PeerHasHeader(&state, pindex)) {
                         peer.m_blocks_for_inv_relay.push_back(hashToAnnounce);
                         LogDebug(BCLog::NET, "%s: sending inv peer=%d hash=%s\n", __func__,
                             node.GetId(), hashToAnnounce.ToString());

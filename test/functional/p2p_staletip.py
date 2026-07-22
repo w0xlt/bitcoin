@@ -8,10 +8,12 @@
 from test_framework.blocktools import create_block
 from test_framework.messages import (
     CBlockHeader,
+    CInv,
     MSG_BLOCK,
     MSG_TYPE_MASK,
     StaleTipCompressedHeader,
     msg_feature,
+    msg_inv,
     msg_staletip,
 )
 from test_framework.p2p import P2PInterface
@@ -29,6 +31,7 @@ class StaleTipPeer(P2PInterface):
         self.feature_data = feature_data
         self.features = []
         self.getdata = []
+        self.invs = []
 
     def on_version(self, message):
         if self.send_feature and message.nVersion >= FEATURE_VERSION:
@@ -41,11 +44,18 @@ class StaleTipPeer(P2PInterface):
     def on_getdata(self, message):
         self.getdata.extend(message.inv)
 
+    def on_inv(self, message):
+        self.invs.extend(message.inv)
+        super().on_inv(message)
+
     def wait_for_getdata_hash(self, block_hash):
         self.wait_until(lambda: any(
             inv.hash == block_hash and inv.type & MSG_TYPE_MASK == MSG_BLOCK
             for inv in self.getdata
         ))
+
+    def wait_for_block_inv(self, block_hash):
+        self.wait_until(lambda: any(inv.type == MSG_BLOCK and inv.hash == block_hash for inv in self.invs))
 
 
 class P2PStaleTipTest(BitcoinTestFramework):
@@ -68,6 +78,7 @@ class P2PStaleTipTest(BitcoinTestFramework):
         self.test_reorged_out_active_tip_tracked()
         self.test_inbound_staletip_tracked()
         self.test_higher_work_staletip_requests_block()
+        self.test_active_tip_announced_to_source_peer()
         self.test_startup_seeding_only_when_enabled()
 
     def connect_peer(self, *, send_feature=True, feature_data=b"\x00", **kwargs):
@@ -240,6 +251,17 @@ class P2PStaleTipTest(BitcoinTestFramework):
         block_peer = self.connect_peer(feature_data=b"\x00")
         block_peer.send_and_ping(self.staletip_msg(block, fork_point_hash, have_block=True))
         block_peer.wait_for_getdata_hash(block.hash_int)
+        self.nodes[0].disconnect_p2ps()
+
+    def test_active_tip_announced_to_source_peer(self):
+        self.log.info("Test active tip is announced even to peers that announced it first")
+        node = self.nodes[0]
+        peer = self.connect_peer(feature_data=b"\x00")
+
+        block, _ = self.active_block()
+        peer.send_and_ping(msg_inv([CInv(MSG_BLOCK, block.hash_int)]))
+        assert_equal(node.submitblock(block.serialize().hex()), None)
+        peer.wait_for_block_inv(block.hash_int)
         self.nodes[0].disconnect_p2ps()
 
     def test_startup_seeding_only_when_enabled(self):
