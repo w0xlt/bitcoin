@@ -208,6 +208,8 @@ struct QueuedBlock {
     const CBlockIndex* pindex;
     /** Optional, used for CMPCTBLOCK downloads */
     std::unique_ptr<PartiallyDownloadedBlock> partialBlock;
+    /** Whether this request is for stale-tip branch data. */
+    bool m_stale_tip_request{false};
 };
 
 /**
@@ -932,7 +934,7 @@ private:
      * Returns false, still setting pit, if the block was already in flight from the same peer
      * pit will only be valid as long as the same cs_main lock is being held
      */
-    bool BlockRequested(NodeId nodeid, const CBlockIndex& block, std::list<QueuedBlock>::iterator** pit = nullptr) EXCLUSIVE_LOCKS_REQUIRED(cs_main);
+    bool BlockRequested(NodeId nodeid, const CBlockIndex& block, std::list<QueuedBlock>::iterator** pit = nullptr, bool stale_tip_request = false) EXCLUSIVE_LOCKS_REQUIRED(cs_main);
 
     bool TipMayBeStale() EXCLUSIVE_LOCKS_REQUIRED(cs_main);
 
@@ -1265,7 +1267,7 @@ void PeerManagerImpl::RemoveBlockRequest(const uint256& hash, std::optional<Node
     }
 }
 
-bool PeerManagerImpl::BlockRequested(NodeId nodeid, const CBlockIndex& block, std::list<QueuedBlock>::iterator** pit)
+bool PeerManagerImpl::BlockRequested(NodeId nodeid, const CBlockIndex& block, std::list<QueuedBlock>::iterator** pit, bool stale_tip_request)
 {
     const uint256& hash{block.GetBlockHash()};
 
@@ -1280,6 +1282,11 @@ bool PeerManagerImpl::BlockRequested(NodeId nodeid, const CBlockIndex& block, st
             if (pit) {
                 *pit = &range.first->second.second;
             }
+            if (!stale_tip_request) {
+                // A block that later becomes relevant to active-chain download
+                // should use normal block-download timeout handling.
+                range.first->second.second->m_stale_tip_request = false;
+            }
             return false;
         }
     }
@@ -1288,7 +1295,7 @@ bool PeerManagerImpl::BlockRequested(NodeId nodeid, const CBlockIndex& block, st
     RemoveBlockRequest(hash, nodeid);
 
     std::list<QueuedBlock>::iterator it = state->vBlocksInFlight.insert(state->vBlocksInFlight.end(),
-            {&block, std::unique_ptr<PartiallyDownloadedBlock>(pit ? new PartiallyDownloadedBlock(&m_mempool) : nullptr)});
+            {&block, std::unique_ptr<PartiallyDownloadedBlock>(pit ? new PartiallyDownloadedBlock(&m_mempool) : nullptr), stale_tip_request});
     if (state->vBlocksInFlight.size() == 1) {
         // We're starting a block download (batch) from this peer.
         state->m_downloading_since = GetTime<std::chrono::microseconds>();
@@ -6437,9 +6444,21 @@ bool PeerManagerImpl::SendMessages(CNode& node)
             QueuedBlock &queuedBlock = state.vBlocksInFlight.front();
             int nOtherPeersWithValidatedDownloads = m_peers_downloading_from - 1;
             if (current_time > state.m_downloading_since + std::chrono::seconds{consensusParams.nPowTargetSpacing} * (BLOCK_DOWNLOAD_TIMEOUT_BASE + BLOCK_DOWNLOAD_TIMEOUT_PER_PEER * nOtherPeersWithValidatedDownloads)) {
-                LogInfo("Timeout downloading block %s, %s", queuedBlock.pindex->GetBlockHash().ToString(), node.DisconnectMsg());
-                node.fDisconnect = true;
-                return true;
+                if (queuedBlock.m_stale_tip_request) {
+                    std::vector<uint256> stale_requests;
+                    for (const QueuedBlock& block : state.vBlocksInFlight) {
+                        if (block.m_stale_tip_request) stale_requests.push_back(block.pindex->GetBlockHash());
+                    }
+                    LogDebug(BCLog::NET, "Timeout downloading stale-tip branch block %s from peer=%d; clearing %u stale-tip block request(s)\n",
+                             queuedBlock.pindex->GetBlockHash().ToString(), node.GetId(), stale_requests.size());
+                    for (const uint256& hash : stale_requests) {
+                        RemoveBlockRequest(hash, node.GetId());
+                    }
+                } else {
+                    LogInfo("Timeout downloading block %s, %s", queuedBlock.pindex->GetBlockHash().ToString(), node.DisconnectMsg());
+                    node.fDisconnect = true;
+                    return true;
+                }
             }
         }
         // Check for headers sync timeouts
