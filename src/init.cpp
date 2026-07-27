@@ -1292,6 +1292,28 @@ bool CheckHostPortOptions(const ArgsManager& args) {
 }
 
 /**
+ * Return the values of `arg`, skipping (and warning about) the ones that are
+ * empty or consist only of whitespace.
+ *
+ * Such values are not valid connection targets, but would otherwise be treated
+ * as one and retried indefinitely by the connection handling threads.
+ *
+ * Call this only once per option, so that each ignored value is reported once.
+ */
+static std::vector<std::string> GetNonEmptyArgs(const ArgsManager& args, const std::string& arg)
+{
+    std::vector<std::string> values;
+    for (const std::string& value : args.GetArgs(arg)) {
+        if (TrimStringView(value).empty()) {
+            LogWarning("Ignoring empty %s value", arg);
+            continue;
+        }
+        values.push_back(value);
+    }
+    return values;
+}
+
+/**
  * @brief Checks for duplicate bindings across all binding configurations.
  *
  * @param[in] conn_options Connection options containing the binding vectors to check
@@ -2144,15 +2166,7 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
     connOptions.m_msgproc = node.peerman.get();
     connOptions.nSendBufferMaxSize = 1000 * args.GetIntArg("-maxsendbuffer", DEFAULT_MAXSENDBUFFER);
     connOptions.nReceiveFloodSize = 1000 * args.GetIntArg("-maxreceivebuffer", DEFAULT_MAXRECEIVEBUFFER);
-    for (const std::string& added_node : args.GetArgs("-addnode")) {
-        // Such a value is not a valid connection target, but would otherwise be
-        // treated as one and retried indefinitely.
-        if (TrimStringView(added_node).empty()) {
-            LogWarning("Ignoring empty -addnode value");
-            continue;
-        }
-        connOptions.m_added_nodes.push_back(added_node);
-    }
+    connOptions.m_added_nodes = GetNonEmptyArgs(args, "-addnode");
     connOptions.nMaxOutboundLimit = *opt_max_upload;
     connOptions.m_peer_connect_timeout = peer_connect_timeout;
     connOptions.whitelist_forcerelay = args.GetBoolArg("-whitelistforcerelay", DEFAULT_WHITELISTFORCERELAY);
@@ -2276,16 +2290,20 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
         }
     }
 
-    connOptions.vSeedNodes = args.GetArgs("-seednode");
+    connOptions.vSeedNodes = GetNonEmptyArgs(args, "-seednode");
 
     const auto connect = args.GetArgs("-connect");
     if (!connect.empty() || args.IsArgNegated("-connect")) {
         // Do not initiate other outgoing connections when connecting to trusted
-        // nodes, or when -noconnect is specified.
+        // nodes, or when -noconnect is specified. Note that this is keyed on
+        // -connect being set at all, so that empty values, which are ignored as
+        // connection targets below, do not silently put an otherwise isolated
+        // node back on the network.
         connOptions.m_use_addrman_outgoing = false;
 
-        if (connect.size() != 1 || connect[0] != "0") {
-            connOptions.m_specified_outgoing = connect;
+        const auto connect_to = GetNonEmptyArgs(args, "-connect");
+        if (connect_to.size() != 1 || connect_to[0] != "0") {
+            connOptions.m_specified_outgoing = connect_to;
         }
         if (!connOptions.m_specified_outgoing.empty() && !connOptions.vSeedNodes.empty()) {
             LogInfo("-seednode is ignored when -connect is used");

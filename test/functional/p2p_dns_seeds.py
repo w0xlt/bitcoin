@@ -51,6 +51,19 @@ class P2PDNSSeeds(BitcoinTestFramework):
             extra_args=["-forcednsseed=1", f"-connect={fakeaddr}"],
         )
 
+        self.log.info("Check that an empty -seednode does not delay the DNS seeds")
+        self.nodes[0].stop_node()
+        with self.nodes[0].assert_debug_log(
+                expected_msgs=["Loading addresses from DNS seed"],
+                unexpected_msgs=["-seednode enabled"],
+                timeout=12):
+            self.start_node(0, extra_args=["-dnsseed=1", "-seednode=", UNREACHABLE_PROXY_ARG])
+
+        self.log.info("Check that a non-empty -seednode is still tried before the DNS seeds")
+        self.nodes[0].stop_node()
+        with self.nodes[0].assert_debug_log(expected_msgs=["-seednode enabled"], timeout=2):
+            self.start_node(0, extra_args=["-dnsseed=1", f"-seednode={fakeaddr}", UNREACHABLE_PROXY_ARG])
+
         # Restore default bitcoind settings
         self.restart_node(0)
 
