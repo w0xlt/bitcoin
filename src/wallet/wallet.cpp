@@ -721,6 +721,22 @@ void CWallet::Close()
     GetDatabase().Close();
 }
 
+static void CopyTransactionMetadata(CWalletTx& copy_to, const CWalletTx& copy_from)
+{
+    copy_to.m_from = copy_from.m_from;
+    copy_to.m_message = copy_from.m_message;
+    copy_to.m_comment = copy_from.m_comment;
+    copy_to.m_comment_to = copy_from.m_comment_to;
+    copy_to.m_replaces_txid = copy_from.m_replaces_txid;
+    copy_to.m_replaced_by_txid = copy_from.m_replaced_by_txid;
+    copy_to.m_messages = copy_from.m_messages;
+    copy_to.m_payment_requests = copy_from.m_payment_requests;
+    // nTimeReceived not copied on purpose
+    copy_to.nTimeSmart = copy_from.nTimeSmart;
+    // nOrderPos not copied on purpose
+    // cached members not copied on purpose
+}
+
 void CWallet::SyncMetaData(std::pair<TxSpends::iterator, TxSpends::iterator> range)
 {
     // We want all the wallet transactions in range to have the same metadata as
@@ -749,18 +765,28 @@ void CWallet::SyncMetaData(std::pair<TxSpends::iterator, TxSpends::iterator> ran
         if (copyFrom == copyTo) continue;
         assert(copyFrom && "Oldest wallet transaction in range assumed to have been found.");
         if (!copyFrom->IsEquivalentTo(*copyTo)) continue;
-        copyTo->m_from = copyFrom->m_from;
-        copyTo->m_message = copyFrom->m_message;
-        copyTo->m_comment = copyFrom->m_comment;
-        copyTo->m_comment_to = copyFrom->m_comment_to;
-        copyTo->m_replaces_txid = copyFrom->m_replaces_txid;
-        copyTo->m_replaced_by_txid = copyFrom->m_replaced_by_txid;
-        copyTo->m_messages = copyFrom->m_messages;
-        copyTo->m_payment_requests = copyFrom->m_payment_requests;
-        // nTimeReceived not copied on purpose
-        copyTo->nTimeSmart = copyFrom->nTimeSmart;
-        // nOrderPos not copied on purpose
-        // cached members not copied on purpose
+        CopyTransactionMetadata(*copyTo, *copyFrom);
+    }
+}
+
+void CWallet::SyncMetaData(CWalletTx& wtx)
+{
+    // New transactions are persisted before being added to mapTxSpends. Apply
+    // the metadata they would receive from AddToSpends ahead of the write.
+    for (const CTxIn& txin : wtx.GetTx()->vin) {
+        int64_t min_order_pos{wtx.nOrderPos};
+        const CWalletTx* copy_from{&wtx};
+        auto range{mapTxSpends.equal_range(txin.prevout)};
+        for (auto it{range.first}; it != range.second; ++it) {
+            const CWalletTx& candidate{mapWallet.at(it->second)};
+            if (candidate.nOrderPos < min_order_pos) {
+                min_order_pos = candidate.nOrderPos;
+                copy_from = &candidate;
+            }
+        }
+        if (copy_from != &wtx && copy_from->IsEquivalentTo(wtx)) {
+            CopyTransactionMetadata(wtx, *copy_from);
+        }
     }
 }
 
@@ -961,18 +987,6 @@ DBErrors CWallet::ReorderTransactions()
     return DBErrors::LOAD_OK;
 }
 
-int64_t CWallet::IncOrderPosNext(WalletBatch* batch)
-{
-    AssertLockHeld(cs_wallet);
-    int64_t nRet = nOrderPosNext++;
-    if (batch) {
-        batch->WriteOrderPosNext(nOrderPosNext);
-    } else {
-        WalletBatch(GetDatabase()).WriteOrderPosNext(nOrderPosNext);
-    }
-    return nRet;
-}
-
 void CWallet::MarkDirty()
 {
     {
@@ -1050,9 +1064,16 @@ CWalletTx* CWallet::AddToWallet(CTransactionRef tx, const TxState& state, const 
 {
     LOCK(cs_wallet);
 
-    WalletBatch batch(GetDatabase());
-
     Txid hash = tx->GetHash();
+    auto wallet_it{mapWallet.find(hash)};
+    const bool fInsertedNew{wallet_it == mapWallet.end()};
+
+    // Existing transactions use this batch to retain their established update
+    // path. New transactions only need it when updating AVOID_REUSE state.
+    std::optional<WalletBatch> batch;
+    if (!fInsertedNew || IsWalletFlagSet(WALLET_FLAG_AVOID_REUSE)) {
+        batch.emplace(GetDatabase());
+    }
 
     if (IsWalletFlagSet(WALLET_FLAG_AVOID_REUSE)) {
         // Mark used destinations
@@ -1060,58 +1081,121 @@ CWalletTx* CWallet::AddToWallet(CTransactionRef tx, const TxState& state, const 
 
         for (const CTxIn& txin : tx->vin) {
             const COutPoint& op = txin.prevout;
-            SetSpentKeyState(batch, op.hash, op.n, true, tx_destinations);
+            SetSpentKeyState(*batch, op.hash, op.n, true, tx_destinations);
         }
 
         MarkDestinationsDirty(tx_destinations);
     }
 
-    // Inserts only if not already there, returns tx inserted or tx found
-    auto ret = mapWallet.emplace(std::piecewise_construct, std::forward_as_tuple(hash), std::forward_as_tuple(tx, state));
-    CWalletTx& wtx = (*ret.first).second;
-    bool fInsertedNew = ret.second;
-    bool fUpdated = update_wtx && update_wtx(wtx, fInsertedNew);
+    // Keep new transactions private until every required database write has
+    // committed. Existing transactions retain the established update path.
+    std::optional<CWalletTx> staged_wtx;
     if (fInsertedNew) {
-        wtx.nTimeReceived = GetTime();
-        wtx.nOrderPos = IncOrderPosNext(&batch);
-        wtx.m_it_wtxOrdered = wtxOrdered.insert(std::make_pair(wtx.nOrderPos, &wtx));
-        wtx.nTimeSmart = ComputeTimeSmart(wtx, rescanning_old_block);
-        AddToSpends(wtx);
+        staged_wtx.emplace(tx, state);
+    }
+    CWalletTx* wtx{fInsertedNew ? &*staged_wtx : &wallet_it->second};
 
-        // Update birth time when tx time is older than it.
-        MaybeUpdateBirthTime(wtx.GetTxTime());
+    bool fUpdated{update_wtx && update_wtx(*wtx, fInsertedNew)};
+    if (fInsertedNew) {
+        wtx->nTimeReceived = GetTime();
+        wtx->nOrderPos = nOrderPosNext;
+        wtx->nTimeSmart = ComputeTimeSmart(*wtx, rescanning_old_block);
+        SyncMetaData(*wtx);
+    } else {
+        fUpdated |= wtx->Update(tx, state);
     }
 
-    if (!fInsertedNew)
-    {
-        fUpdated |= wtx.Update(tx, state);
-    }
+    std::vector<CWalletTx*> inactive_descendants;
 
     // Mark inactive coinbase transactions and their descendants as abandoned
-    if (wtx.IsCoinBase() && wtx.isInactive()) {
-        std::vector<CWalletTx*> txs{&wtx};
-
-        TxStateInactive inactive_state = TxStateInactive{/*abandoned=*/true};
-
+    if (wtx->IsCoinBase() && wtx->isInactive()) {
+        const TxStateInactive inactive_state{/*abandoned=*/true};
+        std::vector<CWalletTx*> txs{wtx};
+        std::vector<CWalletTx*> inactive_txs;
         while (!txs.empty()) {
-            CWalletTx* desc_tx = txs.back();
+            CWalletTx* desc_tx{txs.back()};
             txs.pop_back();
-            desc_tx->m_state = inactive_state;
-            // Break caches since we have changed the state
-            desc_tx->MarkDirty();
-            batch.WriteTx(*desc_tx);
-            MarkInputsDirty(desc_tx->GetTx());
+            inactive_txs.push_back(desc_tx);
             for (unsigned int i = 0; i < desc_tx->GetTx()->vout.size(); ++i) {
-                COutPoint outpoint(desc_tx->GetHash(), i);
-                std::pair<TxSpends::const_iterator, TxSpends::const_iterator> range = mapTxSpends.equal_range(outpoint);
-                for (TxSpends::const_iterator it = range.first; it != range.second; ++it) {
-                    const auto wit = mapWallet.find(it->second);
-                    if (wit != mapWallet.end()) {
-                        txs.push_back(&wit->second);
+                auto range{mapTxSpends.equal_range(COutPoint{desc_tx->GetHash(), i})};
+                for (auto it{range.first}; it != range.second; ++it) {
+                    if (auto child{mapWallet.find(it->second)}; child != mapWallet.end()) {
+                        txs.push_back(&child->second);
                     }
                 }
             }
         }
+
+        if (fInsertedNew) {
+            wtx->m_state = inactive_state;
+            inactive_descendants.assign(inactive_txs.begin() + 1, inactive_txs.end());
+        } else {
+            for (CWalletTx* desc_tx : inactive_txs) {
+                desc_tx->m_state = inactive_state;
+                // Break caches since we have changed the state
+                desc_tx->MarkDirty();
+                batch->WriteTx(*desc_tx);
+                MarkInputsDirty(desc_tx->GetTx());
+            }
+        }
+    }
+
+    if (fInsertedNew) {
+        const int64_t next_order_pos{nOrderPosNext + 1};
+        std::map<COutPoint, bool> locked_inputs;
+        for (const CTxIn& txin : wtx->GetTx()->vin) {
+            if (auto it{m_locked_coins.find(txin.prevout)}; it != m_locked_coins.end()) {
+                locked_inputs.emplace(*it);
+            }
+        }
+        const bool persisted{RunWithinTxn(GetDatabase(), /*process_desc=*/"add wallet transaction", [&](WalletBatch& txn_batch) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet) {
+            if (!txn_batch.WriteTx(*wtx) || !txn_batch.WriteOrderPosNext(next_order_pos)) return false;
+            for (CWalletTx* desc_tx : inactive_descendants) {
+                // Serialize the final state without publishing it in memory
+                // before the database transaction commits.
+                TxState old_state{desc_tx->m_state};
+                desc_tx->m_state = TxStateInactive{/*abandoned=*/true};
+                bool written;
+                try {
+                    written = txn_batch.WriteTx(*desc_tx);
+                } catch (...) {
+                    desc_tx->m_state = std::move(old_state);
+                    throw;
+                }
+                desc_tx->m_state = std::move(old_state);
+                if (!written) return false;
+            }
+            for (const auto& [outpoint, persistent] : locked_inputs) {
+                if (persistent && !txn_batch.EraseLockedUTXO(outpoint)) return false;
+            }
+            return true;
+        })};
+        if (!persisted) {
+            WalletLogPrintf("%s: Writing transaction %s failed\n", __func__, hash.ToString());
+            return nullptr;
+        }
+
+        auto [it, inserted]{mapWallet.emplace(hash, std::move(*staged_wtx))};
+        assert(inserted);
+        wtx = &it->second;
+        nOrderPosNext = next_order_pos;
+        wtx->m_it_wtxOrdered = wtxOrdered.insert(std::make_pair(wtx->nOrderPos, wtx));
+        for (const auto& [outpoint, _] : locked_inputs) {
+            m_locked_coins.erase(outpoint);
+        }
+        AddToSpends(*wtx);
+
+        // Update birth time when tx time is older than it.
+        MaybeUpdateBirthTime(wtx->GetTxTime());
+
+        for (CWalletTx* desc_tx : inactive_descendants) {
+            desc_tx->m_state = TxStateInactive{/*abandoned=*/true};
+            desc_tx->MarkDirty();
+            MarkInputsDirty(desc_tx->GetTx());
+        }
+    } else if (fUpdated && !batch->WriteTx(*wtx)) {
+        WalletLogPrintf("%s: Writing transaction %s failed\n", __func__, hash.ToString());
+        return nullptr;
     }
 
     //// debug print
@@ -1121,16 +1205,11 @@ CWalletTx* CWallet::AddToWallet(CTransactionRef tx, const TxState& state, const 
     }
     WalletLogPrintf("AddToWallet %s %s %s", hash.ToString(), status, TxStateString(state));
 
-    // Write to disk
-    if (fInsertedNew || fUpdated)
-        if (!batch.WriteTx(wtx))
-            return nullptr;
-
     // Break debit/credit balance caches:
-    wtx.MarkDirty();
+    wtx->MarkDirty();
 
     // Cache the outputs that belong to the wallet
-    RefreshTXOsFromTx(wtx);
+    RefreshTXOsFromTx(*wtx);
 
     // Notify UI of new or updated transaction
     NotifyTransactionChanged(hash, fInsertedNew ? CT_NEW : CT_UPDATED);
@@ -1142,7 +1221,7 @@ CWalletTx* CWallet::AddToWallet(CTransactionRef tx, const TxState& state, const 
     if (!strCmd.empty())
     {
         ReplaceAll(strCmd, "%s", hash.GetHex());
-        if (auto* conf = wtx.state<TxStateConfirmed>())
+        if (auto* conf = wtx->state<TxStateConfirmed>())
         {
             ReplaceAll(strCmd, "%b", conf->confirmed_block_hash.GetHex());
             ReplaceAll(strCmd, "%h", ToString(conf->confirmed_block_height));
@@ -1163,7 +1242,7 @@ CWalletTx* CWallet::AddToWallet(CTransactionRef tx, const TxState& state, const 
     }
 #endif
 
-    return &wtx;
+    return wtx;
 }
 
 bool CWallet::LoadToWallet(CWalletTx&& wtx_in)

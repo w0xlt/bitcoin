@@ -30,6 +30,7 @@
 #include <wallet/spend.h>
 #include <wallet/test/util.h>
 #include <wallet/test/wallet_test_fixture.h>
+#include <wallet/walletdb.h>
 
 #include <boost/test/unit_test.hpp>
 #include <univalue.h>
@@ -342,6 +343,63 @@ void TestLoadWallet(const std::string& name, DatabaseFormat format, std::functio
     WITH_LOCK(wallet->cs_wallet, f(wallet));
 }
 
+BOOST_FIXTURE_TEST_CASE(AddToWalletMetadataPersistence, TestingSetup)
+{
+    CMutableTransaction original_tx;
+    original_tx.vin.emplace_back(COutPoint{Txid::FromUint256(GetRandHash()), 0}, CScript{} << OP_1);
+    original_tx.vout.emplace_back(1 * COIN, CScript{} << OP_TRUE);
+    CMutableTransaction equivalent_tx{original_tx};
+    equivalent_tx.vin[0].scriptSig = CScript{} << OP_2;
+
+    const CTransactionRef original{MakeTransactionRef(std::move(original_tx))};
+    const CTransactionRef equivalent{MakeTransactionRef(std::move(equivalent_tx))};
+    const Txid replaces_txid{Txid::FromUint256(GetRandHash())};
+    const Txid replaced_by_txid{Txid::FromUint256(GetRandHash())};
+
+    for (DatabaseFormat format : DATABASE_FORMATS) {
+        const std::string name{strprintf("add-to-wallet-metadata-%i", format)};
+        unsigned int expected_time_smart{0};
+        TestLoadWallet(name, format, [&](std::shared_ptr<CWallet> wallet) EXCLUSIVE_LOCKS_REQUIRED(wallet->cs_wallet) {
+            CWalletTx* first{wallet->AddToWallet(original, TxStateInactive{}, [&](CWalletTx& wtx, bool new_tx) {
+                BOOST_CHECK(new_tx);
+                wtx.m_from = "from";
+                wtx.m_message = "message";
+                wtx.m_comment = "comment";
+                wtx.m_comment_to = "comment_to";
+                wtx.m_replaces_txid = replaces_txid;
+                wtx.m_replaced_by_txid = replaced_by_txid;
+                wtx.m_messages = {"bip21"};
+                wtx.m_payment_requests = {"bip70"};
+                return true;
+            })};
+            BOOST_REQUIRE(first);
+            expected_time_smart = first->nTimeSmart;
+
+            CWalletTx* second{wallet->AddToWallet(equivalent, TxStateInactive{})};
+            BOOST_REQUIRE(second);
+            BOOST_CHECK(second->m_comment == first->m_comment);
+
+            // Remove the metadata source so loading cannot repair an
+            // incorrectly persisted equivalent transaction in memory.
+            std::vector<Txid> txs_to_remove{original->GetHash()};
+            BOOST_REQUIRE(wallet->RemoveTxs(txs_to_remove));
+        });
+        TestLoadWallet(name, format, [&](std::shared_ptr<CWallet> wallet) EXCLUSIVE_LOCKS_REQUIRED(wallet->cs_wallet) {
+            BOOST_REQUIRE(!wallet->mapWallet.contains(original->GetHash()));
+            const CWalletTx& loaded{wallet->mapWallet.at(equivalent->GetHash())};
+            BOOST_CHECK(loaded.m_from == "from");
+            BOOST_CHECK(loaded.m_message == "message");
+            BOOST_CHECK(loaded.m_comment == "comment");
+            BOOST_CHECK(loaded.m_comment_to == "comment_to");
+            BOOST_CHECK(loaded.m_replaces_txid == replaces_txid);
+            BOOST_CHECK(loaded.m_replaced_by_txid == replaced_by_txid);
+            BOOST_CHECK(loaded.m_messages == std::vector<std::string>{"bip21"});
+            BOOST_CHECK(loaded.m_payment_requests == std::vector<std::string>{"bip70"});
+            BOOST_CHECK_EQUAL(loaded.nTimeSmart, expected_time_smart);
+        });
+    }
+}
+
 BOOST_FIXTURE_TEST_CASE(LoadReceiveRequests, TestingSetup)
 {
     for (DatabaseFormat format : DATABASE_FORMATS) {
@@ -421,6 +479,161 @@ public:
 
     std::unique_ptr<CWallet> wallet;
 };
+
+static bool HasWalletTx(WalletDatabase& database, const Txid& txid)
+{
+    return database.MakeBatch()->Exists(std::make_pair(DBKeys::TX, txid));
+}
+
+static bool HasLockedUTXO(WalletDatabase& database, const COutPoint& outpoint)
+{
+    return database.MakeBatch()->Exists(
+        std::make_pair(DBKeys::LOCKED_UTXO, std::make_pair(outpoint.hash, outpoint.n)));
+}
+
+BOOST_FIXTURE_TEST_CASE(AddToWalletWriteFailureTest, ListCoinsTestingSetup)
+{
+    LOCK(wallet->cs_wallet);
+
+    const COutPoint source_outpoint{m_coinbase_txns[0]->GetHash(), 0};
+    BOOST_REQUIRE(wallet->mapWallet.contains(source_outpoint.hash));
+    BOOST_REQUIRE(wallet->GetTXOs().contains(source_outpoint));
+    BOOST_CHECK(!wallet->IsSpent(source_outpoint));
+
+    CMutableTransaction parent;
+    parent.vin.emplace_back(source_outpoint);
+    parent.vout.emplace_back(1 * COIN, m_coinbase_txns[0]->vout[0].scriptPubKey);
+    const CTransactionRef parent_tx{MakeTransactionRef(std::move(parent))};
+    const COutPoint parent_outpoint{parent_tx->GetHash(), 0};
+
+    const size_t wallet_size{wallet->mapWallet.size()};
+    const size_t ordered_size{wallet->wtxOrdered.size()};
+    const int64_t next_order_pos{wallet->nOrderPosNext};
+
+    MockableSQLiteDatabase& database{GetMockableDatabase(*wallet)};
+    BOOST_REQUIRE(wallet->LockCoin(source_outpoint, /*persist=*/true));
+    BOOST_REQUIRE(wallet->IsLockedCoin(source_outpoint));
+    BOOST_REQUIRE(HasLockedUTXO(database, source_outpoint));
+    const auto check_not_inserted{[&] {
+        BOOST_CHECK(!wallet->mapWallet.contains(parent_tx->GetHash()));
+        BOOST_CHECK_EQUAL(wallet->mapWallet.size(), wallet_size);
+        BOOST_CHECK_EQUAL(wallet->wtxOrdered.size(), ordered_size);
+        BOOST_CHECK_EQUAL(wallet->nOrderPosNext, next_order_pos);
+        BOOST_CHECK(!wallet->GetTXOs().contains(parent_outpoint));
+        BOOST_CHECK(!wallet->IsSpent(source_outpoint));
+        BOOST_CHECK(!HasWalletTx(database, parent_tx->GetHash()));
+        BOOST_CHECK(wallet->IsLockedCoin(source_outpoint));
+        BOOST_CHECK(HasLockedUTXO(database, source_outpoint));
+    }};
+
+    // A failed write must not leave a half-inserted wallet transaction or
+    // publish it to any secondary in-memory indexes.
+    database.SetFailWrites(true);
+    BOOST_CHECK(wallet->AddToWallet(parent_tx, TxStateInactive{}) == nullptr);
+    database.SetFailWrites(false);
+    check_not_inserted();
+
+    // A persistent input-lock erase failure must abort the transaction and
+    // retain both the in-memory and database lock.
+    database.SetFailErases(true);
+    BOOST_CHECK(wallet->AddToWallet(parent_tx, TxStateInactive{}) == nullptr);
+    database.SetFailErases(false);
+    check_not_inserted();
+
+    // A commit failure after successful writes must roll back the database and
+    // lock erase, and leave the transaction unpublished in memory.
+    database.SetFailCommit(true);
+    BOOST_CHECK(wallet->AddToWallet(parent_tx, TxStateInactive{}) == nullptr);
+    database.SetFailCommit(false);
+    check_not_inserted();
+
+    // Retrying after the transient failure must be treated as a new insert.
+    BOOST_REQUIRE(wallet->AddToWallet(parent_tx, TxStateInactive{}));
+    BOOST_CHECK(wallet->mapWallet.contains(parent_tx->GetHash()));
+    BOOST_CHECK_EQUAL(wallet->mapWallet.size(), wallet_size + 1);
+    BOOST_CHECK_EQUAL(wallet->wtxOrdered.size(), ordered_size + 1);
+    BOOST_CHECK_EQUAL(wallet->nOrderPosNext, next_order_pos + 1);
+    BOOST_CHECK(wallet->GetTXOs().contains(parent_outpoint));
+    BOOST_CHECK(wallet->IsSpent(source_outpoint));
+    BOOST_CHECK(!wallet->IsLockedCoin(source_outpoint));
+    BOOST_CHECK(!HasLockedUTXO(database, source_outpoint));
+}
+
+BOOST_FIXTURE_TEST_CASE(AddToWalletInactiveCoinbaseWriteFailureTest, ListCoinsTestingSetup)
+{
+    LOCK(wallet->cs_wallet);
+
+    CMutableTransaction coinbase;
+    coinbase.vin.emplace_back();
+    coinbase.vin[0].prevout.SetNull();
+    coinbase.vin[0].scriptSig = CScript{} << OP_0 << OP_0;
+    coinbase.vout.emplace_back(1 * COIN, m_coinbase_txns[0]->vout[0].scriptPubKey);
+    const CTransactionRef coinbase_tx{MakeTransactionRef(std::move(coinbase))};
+
+    CMutableTransaction child;
+    child.vin.emplace_back(COutPoint{coinbase_tx->GetHash(), 0});
+    child.vout.emplace_back(1 * COIN, m_coinbase_txns[0]->vout[0].scriptPubKey);
+    const CTransactionRef child_tx{MakeTransactionRef(std::move(child))};
+    CWalletTx* child_wtx{wallet->AddToWallet(child_tx, TxStateInactive{})};
+    BOOST_REQUIRE(child_wtx);
+    BOOST_CHECK(!child_wtx->isAbandoned());
+
+    const size_t wallet_size{wallet->mapWallet.size()};
+    const int64_t next_order_pos{wallet->nOrderPosNext};
+    MockableSQLiteDatabase& database{GetMockableDatabase(*wallet)};
+
+    // Writing a transaction takes two key writes, and the order position takes
+    // one. Fail the second key write for the first descendant.
+    database.SetFailWrite(5);
+    BOOST_CHECK(wallet->AddToWallet(coinbase_tx, TxStateInactive{}) == nullptr);
+    database.SetFailWrites(false);
+    BOOST_CHECK(!wallet->mapWallet.contains(coinbase_tx->GetHash()));
+    BOOST_CHECK_EQUAL(wallet->mapWallet.size(), wallet_size);
+    BOOST_CHECK_EQUAL(wallet->nOrderPosNext, next_order_pos);
+    BOOST_CHECK(!child_wtx->isAbandoned());
+    BOOST_CHECK(!HasWalletTx(database, coinbase_tx->GetHash()));
+    int64_t persisted_order_pos;
+    BOOST_REQUIRE(database.MakeBatch()->Read(DBKeys::ORDERPOSNEXT, persisted_order_pos));
+    BOOST_CHECK_EQUAL(persisted_order_pos, next_order_pos);
+
+    CWalletTx* coinbase_wtx{wallet->AddToWallet(coinbase_tx, TxStateInactive{})};
+    BOOST_REQUIRE(coinbase_wtx);
+    BOOST_CHECK(coinbase_wtx->isAbandoned());
+    BOOST_CHECK(child_wtx->isAbandoned());
+}
+
+BOOST_FIXTURE_TEST_CASE(AddToWalletAvoidReuseUpdateFailureTest, ListCoinsTestingSetup)
+{
+    LOCK(wallet->cs_wallet);
+
+    const CTxDestination source_destination{getNewDestination(*wallet, OutputType::BECH32)};
+    CMutableTransaction source;
+    source.vin.emplace_back(COutPoint{Txid::FromUint256(GetRandHash()), 0});
+    source.vout.emplace_back(1 * COIN, GetScriptForDestination(source_destination));
+    const CTransactionRef source_tx{MakeTransactionRef(std::move(source))};
+    BOOST_REQUIRE(wallet->AddToWallet(source_tx, TxStateInactive{}));
+    const COutPoint source_outpoint{source_tx->GetHash(), 0};
+
+    CMutableTransaction spend;
+    spend.vin.emplace_back(source_outpoint);
+    spend.vout.emplace_back(1 * COIN, GetScriptForDestination(source_destination));
+    const CTransactionRef spend_tx{MakeTransactionRef(std::move(spend))};
+    BOOST_REQUIRE(wallet->AddToWallet(spend_tx, TxStateInactive{}));
+    BOOST_CHECK(!wallet->IsAddressPreviouslySpent(source_destination));
+
+    wallet->SetWalletFlag(WALLET_FLAG_AVOID_REUSE);
+    MockableSQLiteDatabase& database{GetMockableDatabase(*wallet)};
+    // Let spent-key persistence succeed, then fail the transaction update.
+    database.SetFailWrite(2);
+    BOOST_CHECK(wallet->AddToWallet(spend_tx, TxStateInactive{}, [](CWalletTx&, bool new_tx) {
+        BOOST_CHECK(!new_tx);
+        return true;
+    }) == nullptr);
+    database.SetFailWrites(false);
+
+    // A transaction update failure must not bypass spent-key tracking.
+    BOOST_CHECK(wallet->IsAddressPreviouslySpent(source_destination));
+}
 
 BOOST_FIXTURE_TEST_CASE(ListCoinsTest, ListCoinsTestingSetup)
 {

@@ -341,6 +341,7 @@ private:
     TxSpends mapTxSpends GUARDED_BY(cs_wallet);
     void AddToSpends(const COutPoint& outpoint, const Txid& txid) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
     void AddToSpends(const CWalletTx& wtx) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+    void SyncMetaData(CWalletTx& wtx) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
 
     /**
      * Add a transaction to the wallet, or update it.  confirm.block_* should
@@ -608,11 +609,6 @@ public:
 
     unsigned int ComputeTimeSmart(const CWalletTx& wtx, bool rescanning_old_block) const;
 
-    /**
-     * Increment the next transaction order id
-     * @return next transaction order id
-     */
-    int64_t IncOrderPosNext(WalletBatch *batch = nullptr) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
     DBErrors ReorderTransactions();
 
     void MarkDirty();
