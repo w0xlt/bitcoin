@@ -113,6 +113,32 @@ CTxDestination getNewDestination(CWallet& w, OutputType output_type)
     return *Assert(w.GetNewDestination(output_type, ""));
 }
 
+MockableSQLiteBatch::MockableSQLiteBatch(SQLiteDatabase& database, const bool& fail_writes,
+                                         const std::optional<size_t>& fail_write, const bool& fail_erases,
+                                         const bool& fail_commit, size_t& write_count)
+    : SQLiteBatch(database), m_fail_writes(fail_writes), m_fail_write(fail_write),
+      m_fail_erases(fail_erases), m_fail_commit(fail_commit), m_write_count(write_count)
+{}
+
+bool MockableSQLiteBatch::WriteKey(DataStream&& key, DataStream&& value, bool overwrite)
+{
+    ++m_write_count;
+    if (m_fail_writes || (m_fail_write && m_write_count == *m_fail_write)) return false;
+    return SQLiteBatch::WriteKey(std::move(key), std::move(value), overwrite);
+}
+
+bool MockableSQLiteBatch::EraseKey(DataStream&& key)
+{
+    if (m_fail_erases) return false;
+    return SQLiteBatch::EraseKey(std::move(key));
+}
+
+bool MockableSQLiteBatch::TxnCommit()
+{
+    if (m_fail_commit) return false;
+    return SQLiteBatch::TxnCommit();
+}
+
 MockableSQLiteDatabase::MockableSQLiteDatabase()
     : InMemoryWalletDatabase()
 {}
@@ -120,6 +146,11 @@ MockableSQLiteDatabase::MockableSQLiteDatabase()
 std::unique_ptr<WalletDatabase> CreateMockableWalletDatabase()
 {
     return std::make_unique<MockableSQLiteDatabase>();
+}
+
+MockableSQLiteDatabase& GetMockableDatabase(CWallet& wallet)
+{
+    return *Assert(dynamic_cast<MockableSQLiteDatabase*>(&wallet.GetDatabase()));
 }
 
 wallet::DescriptorScriptPubKeyMan* CreateDescriptor(CWallet& keystore, const std::string& desc_str, const bool success)

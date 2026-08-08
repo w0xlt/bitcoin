@@ -10,7 +10,9 @@
 #include <wallet/scriptpubkeyman.h>
 #include <wallet/sqlite.h>
 
+#include <cstddef>
 #include <memory>
+#include <optional>
 
 class ArgsManager;
 class CChain;
@@ -49,15 +51,33 @@ using MockableData = std::map<SerializeData, SerializeData, std::less<>>;
 
 class MockableSQLiteBatch : public SQLiteBatch
 {
+private:
+    const bool& m_fail_writes;
+    const std::optional<size_t>& m_fail_write;
+    const bool& m_fail_erases;
+    const bool& m_fail_commit;
+    size_t& m_write_count;
+
 public:
-    using SQLiteBatch::SQLiteBatch;
-    using SQLiteBatch::WriteKey;
+    MockableSQLiteBatch(SQLiteDatabase& database, const bool& fail_writes,
+                        const std::optional<size_t>& fail_write, const bool& fail_erases,
+                        const bool& fail_commit, size_t& write_count);
+    bool WriteKey(DataStream&& key, DataStream&& value, bool overwrite = true) override;
+    bool EraseKey(DataStream&& key) override;
+    bool TxnCommit() override;
 };
 
 /** A WalletDatabase whose contents and return values can be modified as needed for testing
  **/
 class MockableSQLiteDatabase : public InMemoryWalletDatabase
 {
+private:
+    bool m_fail_writes{false};
+    std::optional<size_t> m_fail_write;
+    bool m_fail_erases{false};
+    bool m_fail_commit{false};
+    size_t m_write_count{0};
+
 public:
     MockableSQLiteDatabase();
 
@@ -65,7 +85,44 @@ public:
 
     std::string Filename() override { return "mockable"; }
     std::string Format() override { return "sqlite-mock"; }
-    std::unique_ptr<DatabaseBatch> MakeBatch() override { return std::make_unique<MockableSQLiteBatch>(*this); }
+    std::unique_ptr<DatabaseBatch> MakeBatch() override
+    {
+        return std::make_unique<MockableSQLiteBatch>(
+            *this, m_fail_writes, m_fail_write, m_fail_erases, m_fail_commit, m_write_count);
+    }
+
+    void SetFailWrites(bool fail_writes)
+    {
+        m_fail_writes = fail_writes;
+        m_fail_write.reset();
+        m_fail_erases = false;
+        m_fail_commit = false;
+        m_write_count = 0;
+    }
+    void SetFailWrite(size_t write_number)
+    {
+        m_fail_writes = false;
+        m_fail_write = write_number;
+        m_fail_erases = false;
+        m_fail_commit = false;
+        m_write_count = 0;
+    }
+    void SetFailErases(bool fail_erases)
+    {
+        m_fail_writes = false;
+        m_fail_write.reset();
+        m_fail_erases = fail_erases;
+        m_fail_commit = false;
+        m_write_count = 0;
+    }
+    void SetFailCommit(bool fail_commit)
+    {
+        m_fail_writes = false;
+        m_fail_write.reset();
+        m_fail_erases = false;
+        m_fail_commit = fail_commit;
+        m_write_count = 0;
+    }
 };
 
 std::unique_ptr<WalletDatabase> CreateMockableWalletDatabase();
