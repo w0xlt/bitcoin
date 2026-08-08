@@ -83,7 +83,10 @@ RPCMethod importprunedfunds()
 
     CTransactionRef tx_ref = MakeTransactionRef(tx);
     if (pwallet->IsMine(*tx_ref)) {
-        pwallet->AddToWallet(std::move(tx_ref), TxStateConfirmed{merkleBlock.header.GetHash(), height, static_cast<int>(txnIndex)});
+        const TxStateConfirmed tx_state{merkleBlock.header.GetHash(), height, static_cast<int>(txnIndex)};
+        if (!pwallet->AddToWallet(std::move(tx_ref), tx_state)) {
+            throw JSONRPCError(RPC_WALLET_ERROR, "Error adding transaction to wallet");
+        }
         return UniValue::VNULL;
     }
 
