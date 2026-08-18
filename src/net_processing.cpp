@@ -68,6 +68,7 @@
 #include <array>
 #include <atomic>
 #include <compare>
+#include <condition_variable>
 #include <cstddef>
 #include <deque>
 #include <exception>
@@ -85,6 +86,7 @@
 #include <ratio>
 #include <set>
 #include <span>
+#include <thread>
 #include <typeinfo>
 #include <unordered_set>
 #include <utility>
@@ -570,6 +572,7 @@ public:
     PeerManagerImpl(CConnman& connman, AddrMan& addrman,
                     BanMan* banman, ChainstateManager& chainman,
                     CTxMemPool& pool, node::Warnings& warnings, Options opts);
+    ~PeerManagerImpl() override;
 
     /** Overridden from CValidationInterface. */
     void ActiveTipChange(const CBlockIndex& new_tip, bool) override
@@ -617,6 +620,19 @@ public:
     ServiceFlags GetDesirableServiceFlags(ServiceFlags services) const override;
 
 private:
+    struct AsyncBlockJob {
+        std::shared_ptr<const CBlock> block;
+        NodeId source;
+        bool force_processing;
+        bool min_pow_checked;
+    };
+
+    struct AsyncBlockResult {
+        std::shared_ptr<const CBlock> block;
+        NodeId source;
+        bool new_block;
+    };
+
     void ProcessMessage(Peer& peer, CNode& pfrom, const std::string& msg_type, DataStream& vRecv, NodeClock::time_point time_received,
                         const std::atomic<bool>& interruptMsgProc)
         EXCLUSIVE_LOCKS_REQUIRED(!m_peer_mutex, !m_most_recent_block_mutex, !m_headers_presync_mutex, g_msgproc_mutex, !m_tx_download_mutex, !m_inv_to_send_mutex);
@@ -882,6 +898,14 @@ private:
 
     const Options m_opts;
 
+    Mutex m_async_block_mutex;
+    std::condition_variable m_async_block_cv;
+    std::optional<AsyncBlockJob> m_async_block_job GUARDED_BY(m_async_block_mutex);
+    std::optional<AsyncBlockResult> m_async_block_result GUARDED_BY(m_async_block_mutex);
+    std::optional<NodeId> m_async_block_source GUARDED_BY(m_async_block_mutex);
+    bool m_async_block_stop GUARDED_BY(m_async_block_mutex){false};
+    std::thread m_async_block_thread;
+
     bool RejectIncomingTxs(const CNode& peer) const;
 
     /** Whether we've completed initial sync yet, for determining when to turn
@@ -1052,8 +1076,27 @@ private:
         EXCLUSIVE_LOCKS_REQUIRED(!m_most_recent_block_mutex, peer.m_getdata_requests_mutex, NetEventsInterface::g_msgproc_mutex)
         LOCKS_EXCLUDED(::cs_main);
 
-    /** Process a new block. Perform any post-processing housekeeping */
-    void ProcessBlock(CNode& node, const std::shared_ptr<const CBlock>& block, bool force_processing, bool min_pow_checked);
+    /** Run the serial ProcessNewBlock job. */
+    bool ProcessBlockValidation(const std::shared_ptr<const CBlock>& block, bool force_processing, bool min_pow_checked);
+
+    /** Perform post-processing housekeeping in the message-handler domain. */
+    void ProcessBlockCompletion(NodeId source, const std::shared_ptr<const CBlock>& block, bool new_block)
+        EXCLUSIVE_LOCKS_REQUIRED(g_msgproc_mutex);
+
+    /** Process a new block synchronously. */
+    void ProcessBlock(CNode& node, const std::shared_ptr<const CBlock>& block, bool force_processing, bool min_pow_checked)
+        EXCLUSIVE_LOCKS_REQUIRED(g_msgproc_mutex);
+
+    /** Schedule one requested ordinary block on the bounded serial worker. */
+    void StartAsyncBlock(NodeId source, const std::shared_ptr<const CBlock>& block, bool force_processing, bool min_pow_checked)
+        EXCLUSIVE_LOCKS_REQUIRED(g_msgproc_mutex);
+
+    /** Apply a completed async block result, if any. */
+    void ProcessAsyncBlockCompletion() EXCLUSIVE_LOCKS_REQUIRED(g_msgproc_mutex);
+
+    bool AsyncBlockActive() EXCLUSIVE_LOCKS_REQUIRED(g_msgproc_mutex);
+    bool AsyncBlockActiveFor(NodeId source) EXCLUSIVE_LOCKS_REQUIRED(g_msgproc_mutex);
+    void AsyncBlockWorker();
 
     /** Process compact block txns  */
     void ProcessCompactBlockTxns(CNode& pfrom, Peer& peer, const BlockTransactions& block_transactions)
@@ -2147,6 +2190,49 @@ PeerManagerImpl::PeerManagerImpl(CConnman& connman, AddrMan& addrman,
     // This argument can go away after Erlay support is complete.
     if (opts.reconcile_txs) {
         m_txreconciliation = std::make_unique<TxReconciliationTracker>(TXRECONCILIATION_VERSION);
+    }
+
+    m_async_block_thread = std::thread{[this] { AsyncBlockWorker(); }};
+}
+
+PeerManagerImpl::~PeerManagerImpl()
+{
+    {
+        LOCK(m_async_block_mutex);
+        m_async_block_stop = true;
+    }
+    m_async_block_cv.notify_one();
+    if (m_async_block_thread.joinable()) m_async_block_thread.join();
+}
+
+void PeerManagerImpl::AsyncBlockWorker()
+{
+    while (true) {
+        std::optional<AsyncBlockJob> job;
+        {
+            WAIT_LOCK(m_async_block_mutex, lock);
+            m_async_block_cv.wait(lock, [this] EXCLUSIVE_LOCKS_REQUIRED(m_async_block_mutex) {
+                return m_async_block_stop || m_async_block_job.has_value();
+            });
+            if (!m_async_block_job) {
+                assert(m_async_block_stop);
+                return;
+            }
+            job = std::move(m_async_block_job);
+            m_async_block_job.reset();
+        }
+
+        const bool new_block{ProcessBlockValidation(job->block, job->force_processing, job->min_pow_checked)};
+        {
+            LOCK(m_async_block_mutex);
+            assert(!m_async_block_result);
+            m_async_block_result.emplace(AsyncBlockResult{
+                .block = std::move(job->block),
+                .source = job->source,
+                .new_block = new_block,
+            });
+        }
+        m_connman.WakeMessageHandler();
     }
 }
 
@@ -3664,7 +3750,7 @@ void PeerManagerImpl::ProcessGetCFCheckPt(CNode& node, Peer& peer, DataStream& v
               headers);
 }
 
-void PeerManagerImpl::ProcessBlock(CNode& node, const std::shared_ptr<const CBlock>& block, bool force_processing, bool min_pow_checked)
+bool PeerManagerImpl::ProcessBlockValidation(const std::shared_ptr<const CBlock>& block, bool force_processing, bool min_pow_checked)
 {
     bool new_block{false};
 
@@ -3688,8 +3774,16 @@ void PeerManagerImpl::ProcessBlock(CNode& node, const std::shared_ptr<const CBlo
             Ticks<std::chrono::nanoseconds>(bench_call_end_steady - bench_call_start_steady));
     // ASYNC_PNB_BENCH_END
 
+    return new_block;
+}
+
+void PeerManagerImpl::ProcessBlockCompletion(NodeId source, const std::shared_ptr<const CBlock>& block, bool new_block)
+{
     if (new_block) {
-        node.m_last_block_time = GetTime<std::chrono::seconds>();
+        m_connman.ForNode(source, [](CNode* node) {
+            node->m_last_block_time = GetTime<std::chrono::seconds>();
+            return true;
+        });
         // In case this block came from a different peer than we requested
         // from, we can erase the block request now anyway (as we just stored
         // this block to disk).
@@ -3699,6 +3793,63 @@ void PeerManagerImpl::ProcessBlock(CNode& node, const std::shared_ptr<const CBlo
         LOCK(cs_main);
         mapBlockSource.erase(block->GetHash());
     }
+}
+
+void PeerManagerImpl::ProcessBlock(CNode& node, const std::shared_ptr<const CBlock>& block, bool force_processing, bool min_pow_checked)
+{
+    ProcessBlockCompletion(node.GetId(), block, ProcessBlockValidation(block, force_processing, min_pow_checked));
+}
+
+void PeerManagerImpl::StartAsyncBlock(NodeId source, const std::shared_ptr<const CBlock>& block, bool force_processing, bool min_pow_checked)
+{
+    {
+        LOCK(m_async_block_mutex);
+        assert(!m_async_block_stop);
+        assert(!m_async_block_source);
+        assert(!m_async_block_job);
+        assert(!m_async_block_result);
+        m_async_block_source = source;
+        m_async_block_job.emplace(AsyncBlockJob{
+            .block = block,
+            .source = source,
+            .force_processing = force_processing,
+            .min_pow_checked = min_pow_checked,
+        });
+    }
+    m_async_block_cv.notify_one();
+}
+
+void PeerManagerImpl::ProcessAsyncBlockCompletion()
+{
+    std::optional<AsyncBlockResult> result;
+    {
+        LOCK(m_async_block_mutex);
+        if (!m_async_block_result) return;
+        result = std::move(m_async_block_result);
+        m_async_block_result.reset();
+    }
+
+    ProcessBlockCompletion(result->source, result->block, result->new_block);
+
+    {
+        LOCK(m_async_block_mutex);
+        assert(m_async_block_source == result->source);
+        assert(!m_async_block_job);
+        assert(!m_async_block_result);
+        m_async_block_source.reset();
+    }
+}
+
+bool PeerManagerImpl::AsyncBlockActive()
+{
+    LOCK(m_async_block_mutex);
+    return m_async_block_source.has_value();
+}
+
+bool PeerManagerImpl::AsyncBlockActiveFor(NodeId source)
+{
+    LOCK(m_async_block_mutex);
+    return m_async_block_source == source;
 }
 
 void PeerManagerImpl::ProcessCompactBlockTxns(CNode& pfrom, Peer& peer, const BlockTransactions& block_transactions)
@@ -5156,7 +5307,11 @@ void PeerManagerImpl::ProcessMessage(Peer& peer, CNode& pfrom, const std::string
                 min_pow_checked = true;
             }
         }
-        ProcessBlock(pfrom, pblock, forceProcessing, min_pow_checked);
+        if (forceProcessing) {
+            StartAsyncBlock(pfrom.GetId(), pblock, forceProcessing, min_pow_checked);
+        } else {
+            ProcessBlock(pfrom, pblock, forceProcessing, min_pow_checked);
+        }
         return;
     }
 
@@ -5436,6 +5591,9 @@ bool PeerManagerImpl::ProcessMessages(CNode& node, std::atomic<bool>& interruptM
     AssertLockNotHeld(m_tx_download_mutex);
     AssertLockHeld(g_msgproc_mutex);
 
+    ProcessAsyncBlockCompletion();
+    if (AsyncBlockActiveFor(node.GetId())) return false;
+
     PeerRef maybe_peer{GetPeerRef(node.GetId())};
     if (maybe_peer == nullptr) return false;
     Peer& peer{*maybe_peer};
@@ -5467,6 +5625,15 @@ bool PeerManagerImpl::ProcessMessages(CNode& node, std::atomic<bool>& interruptM
 
     // Don't bother if send buffer is too full to respond anyway
     if (node.fPauseSend) return false;
+
+    if (AsyncBlockActive()) {
+        const auto next_message_type{node.PeekMessageType()};
+        if (next_message_type && (*next_message_type == NetMsgType::BLOCK ||
+                                  *next_message_type == NetMsgType::CMPCTBLOCK ||
+                                  *next_message_type == NetMsgType::BLOCKTXN)) {
+            return false;
+        }
+    }
 
     auto poll_result{node.PollMessage()};
     if (!poll_result) {
