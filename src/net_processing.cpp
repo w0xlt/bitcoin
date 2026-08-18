@@ -3667,7 +3667,27 @@ void PeerManagerImpl::ProcessGetCFCheckPt(CNode& node, Peer& peer, DataStream& v
 void PeerManagerImpl::ProcessBlock(CNode& node, const std::shared_ptr<const CBlock>& block, bool force_processing, bool min_pow_checked)
 {
     bool new_block{false};
+
+    // ASYNC_PNB_BENCH_BEGIN: local measurement; move this entire bracket with the actual serial PNB job.
+    const auto bench_start_node{NodeClock::now()};
+    const auto bench_start_steady{SteadyClock::now()};
+    LogInfo("ASYNC_PNB_BENCH event=pnb_start hash=%s node_ns=%d steady_ns=%d\n",
+            block->GetHash().ToString(),
+            TicksSinceEpoch<std::chrono::nanoseconds>(bench_start_node),
+            TicksSinceEpoch<std::chrono::nanoseconds>(bench_start_steady));
+
+    const auto bench_call_start_steady{SteadyClock::now()};
     m_chainman.ProcessNewBlock(block, force_processing, min_pow_checked, &new_block);
+    const auto bench_call_end_steady{SteadyClock::now()};
+    const auto bench_end_node{NodeClock::now()};
+
+    LogInfo("ASYNC_PNB_BENCH event=pnb_end hash=%s node_ns=%d steady_ns=%d duration_ns=%d\n",
+            block->GetHash().ToString(),
+            TicksSinceEpoch<std::chrono::nanoseconds>(bench_end_node),
+            TicksSinceEpoch<std::chrono::nanoseconds>(bench_call_end_steady),
+            Ticks<std::chrono::nanoseconds>(bench_call_end_steady - bench_call_start_steady));
+    // ASYNC_PNB_BENCH_END
+
     if (new_block) {
         node.m_last_block_time = GetTime<std::chrono::seconds>();
         // In case this block came from a different peer than we requested
@@ -5222,6 +5242,15 @@ void PeerManagerImpl::ProcessMessage(Peer& peer, CNode& pfrom, const std::string
             // seconds to respond to each, the 5th ping the remote sends would appear to
             // return very quickly.
             MakeAndPushMessage(pfrom, NetMsgType::PONG, nonce);
+            const auto bench_queued_node{NodeClock::now()};
+            const auto bench_queued_steady{SteadyClock::now()};
+            LogInfo("ASYNC_PNB_BENCH event=pong_queued peer=%d nonce=%d recv_node_ns=%d queued_node_ns=%d queued_steady_ns=%d queue_ns=%d\n",
+                    pfrom.GetId(),
+                    nonce,
+                    TicksSinceEpoch<std::chrono::nanoseconds>(time_received),
+                    TicksSinceEpoch<std::chrono::nanoseconds>(bench_queued_node),
+                    TicksSinceEpoch<std::chrono::nanoseconds>(bench_queued_steady),
+                    Ticks<std::chrono::nanoseconds>(bench_queued_node - time_received));
         }
         return;
     }
