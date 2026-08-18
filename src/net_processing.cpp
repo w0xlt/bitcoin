@@ -6243,6 +6243,10 @@ bool PeerManagerImpl::SendMessages(CNode& node)
     AssertLockNotHeld(m_tx_download_mutex);
     AssertLockHeld(g_msgproc_mutex);
 
+    // Periodic send processing takes cs_main below. Defer it while the async
+    // block job is active so the message handler can service unrelated peers.
+    if (AsyncBlockActive()) return true;
+
     PeerRef maybe_peer{GetPeerRef(node.GetId())};
     if (!maybe_peer) return false;
     Peer& peer{*maybe_peer};
