@@ -5609,7 +5609,9 @@ bool PeerManagerImpl::ProcessMessages(CNode& node, std::atomic<bool>& interruptM
         }
     }
 
-    const bool processed_orphan = ProcessOrphanTx(peer);
+    // ProcessOrphanTx takes cs_main. Defer orphan reconsideration while the
+    // async block worker owns it so unrelated peers can still be serviced.
+    const bool processed_orphan{AsyncBlockActive() ? false : ProcessOrphanTx(peer)};
 
     if (node.fDisconnect)
         return false;
