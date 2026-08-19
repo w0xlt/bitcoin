@@ -31,24 +31,32 @@ class ReindexTest(BitcoinTestFramework):
         self.setup_clean_chain = True
         self.num_nodes = 1
 
-    def reindex(self, justchainstate=False):
-        with self.nodes[0].assert_debug_log(expected_msgs=[], unexpected_msgs=blockread_msgs(2)):
+    def reindex(self, justchainstate=False, block_fetch_threads=2, block_fetch_queue_size=4):
+        with self.nodes[0].assert_debug_log(expected_msgs=[], unexpected_msgs=blockread_msgs(1)):
             self.generatetoaddress(self.nodes[0], 3, self.nodes[0].get_deterministic_priv_key().address)
         blockcount = self.nodes[0].getblockcount()
         self.stop_nodes()
-        extra_args = [["-reindex-chainstate" if justchainstate else "-reindex"]]
+        extra_args = [[
+            "-reindex-chainstate" if justchainstate else "-reindex",
+            f"-blockfetchthreads={block_fetch_threads}",
+            f"-blockfetchqueuesize={block_fetch_queue_size}",
+        ]]
         # Reindex connects multiple blocks in one ActivateBestChain() call, exercising read-ahead.
+        read_ahead_enabled = block_fetch_threads > 0 and block_fetch_queue_size > 0
         log_start = self.nodes[0].debug_log_size(encoding='utf-8')
-        read_ahead_msgs = blockread_msgs(2) + ["Using cached block"]
-        with self.nodes[0].assert_debug_log(expected_msgs=read_ahead_msgs, unexpected_msgs=[]):
+        read_ahead_msgs = blockread_msgs(block_fetch_threads or 1) + ["Using cached block"]
+        with self.nodes[0].assert_debug_log(expected_msgs=read_ahead_msgs if read_ahead_enabled else [],
+                                            unexpected_msgs=[] if read_ahead_enabled else read_ahead_msgs):
             self.start_nodes(extra_args)
         with open(self.nodes[0].debug_log_path, encoding='utf-8', errors='replace') as debug_log:
             debug_log.seek(log_start)
-            assert_equal(debug_log.read().count('Using cached block'), blockcount if justchainstate else blockcount - 1)
-        block_hash = self.nodes[0].getblockhash(1)  # Reconnect in a second activation to check worker reuse.
-        self.nodes[0].invalidateblock(block_hash)
-        with self.nodes[0].assert_debug_log(expected_msgs=[], unexpected_msgs=blockread_msgs(2)):
-            self.nodes[0].reconsiderblock(block_hash)
+            expected_cached = (blockcount if justchainstate else blockcount - 1) if read_ahead_enabled else 0
+            assert_equal(debug_log.read().count('Using cached block'), expected_cached)
+        if read_ahead_enabled:
+            block_hash = self.nodes[0].getblockhash(1)  # Reconnect in a second activation to check worker reuse.
+            self.nodes[0].invalidateblock(block_hash)
+            with self.nodes[0].assert_debug_log(expected_msgs=[], unexpected_msgs=blockread_msgs(block_fetch_threads)):
+                self.nodes[0].reconsiderblock(block_hash)
         assert_equal(self.nodes[0].getblockcount(), blockcount)  # start_node is blocking on reindex
         self.log.info("Success")
 
@@ -139,10 +147,10 @@ class ReindexTest(BitcoinTestFramework):
         assert_equal(node.getbestblockhash(), fork_tip.hash_hex)
 
     def run_test(self):
-        self.reindex(False)
-        self.reindex(True)
-        self.reindex(False)
-        self.reindex(True)
+        self.reindex(False, block_fetch_threads=2, block_fetch_queue_size=1)
+        self.reindex(True, block_fetch_threads=1, block_fetch_queue_size=2)
+        self.reindex(False, block_fetch_threads=0, block_fetch_queue_size=2)
+        self.reindex(True, block_fetch_threads=1, block_fetch_queue_size=0)
 
         self.out_of_order()
         self.reorg()

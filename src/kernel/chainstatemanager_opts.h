@@ -22,6 +22,8 @@ class CChainParams;
 class ValidationSignals;
 
 inline constexpr auto DEFAULT_MAX_TIP_AGE{24h};
+inline constexpr int32_t DEFAULT_BLOCKFETCH_THREADS{2};
+inline constexpr uint32_t DEFAULT_BLOCKFETCH_QUEUE_SIZE{4};
 inline constexpr int32_t DEFAULT_PREVOUTFETCH_THREADS{8};
 
 namespace kernel {
@@ -47,6 +49,10 @@ struct ChainstateManagerOpts {
     ValidationSignals* signals{nullptr};
     //! Number of script check worker threads. Zero means no parallel verification.
     int worker_threads_num{0};
+    //! Number of workers used for block read-ahead. Zero disables read-ahead.
+    int32_t blockfetch_threads_num{DEFAULT_BLOCKFETCH_THREADS};
+    //! Maximum number of queued block reads. Zero disables read-ahead.
+    uint32_t blockfetch_queue_size{DEFAULT_BLOCKFETCH_QUEUE_SIZE};
     //! Number of worker threads used for prefetching block input prevouts. Zero means no parallel fetching.
     int32_t prevoutfetch_threads_num{DEFAULT_PREVOUTFETCH_THREADS};
     size_t script_execution_cache_bytes{DEFAULT_SCRIPT_EXECUTION_CACHE_BYTES};

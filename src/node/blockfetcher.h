@@ -38,9 +38,10 @@ class BlockFetcher
     bool Enqueue(const CBlockIndex& index) EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
 
 public:
-    explicit BlockFetcher(ReadBlockFn read_block, int worker_count = 2, uint32_t queue_size = 4) : m_read_block{std::move(read_block)}, m_queue_size{queue_size}
+    explicit BlockFetcher(ReadBlockFn read_block, int worker_count, uint32_t queue_size)
+        : m_read_block{std::move(read_block)}, m_queue_size{worker_count > 0 ? queue_size : 0}
     {
-        m_pool.Start(worker_count);
+        if (m_queue_size > 0) m_pool.Start(worker_count);
     }
 
     void Clear() EXCLUSIVE_LOCKS_REQUIRED(::cs_main);

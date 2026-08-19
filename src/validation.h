@@ -90,6 +90,12 @@ inline constexpr uint64_t MIN_DISK_SPACE_FOR_BLOCK_FILES{550_MiB};
 /** Maximum number of dedicated script-checking threads allowed */
 inline constexpr int MAX_SCRIPTCHECK_THREADS{15};
 
+/** Maximum number of worker threads allowed for block read-ahead */
+inline constexpr int32_t MAX_BLOCKFETCH_THREADS{16};
+
+/** Maximum number of queued blocks allowed for block read-ahead */
+inline constexpr int32_t MAX_BLOCKFETCH_QUEUE_SIZE{16};
+
 /** Maximum number of dedicated threads allowed for prefetching block input prevouts */
 inline constexpr int32_t MAX_PREVOUTFETCH_THREADS{16};
 

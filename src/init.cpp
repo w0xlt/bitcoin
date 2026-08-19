@@ -537,6 +537,8 @@ void SetupServerArgs(ArgsManager& argsman, bool can_listen_ipc)
     argsman.AddArg("-par=<n>", strprintf("Set the number of script verification threads (0 = auto, up to %d, <0 = leave that many cores free, default: %d)",
         MAX_SCRIPTCHECK_THREADS, DEFAULT_SCRIPTCHECK_THREADS), ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
     argsman.AddArg("-prevoutfetchthreads=<n>", strprintf("Set the number of threads used to prefetch block input prevouts from the chainstate database (0 disables, up to %d, default: %d). Negative values are rejected.", MAX_PREVOUTFETCH_THREADS, DEFAULT_PREVOUTFETCH_THREADS), ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
+    argsman.AddArg("-blockfetchthreads=<n>", strprintf("Set the number of threads used to read blocks ahead during chain activation (0 disables, up to %d, default: %d). Negative values are rejected.", MAX_BLOCKFETCH_THREADS, DEFAULT_BLOCKFETCH_THREADS), ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
+    argsman.AddArg("-blockfetchqueuesize=<n>", strprintf("Set the number of queued blocks used for block read-ahead (0 disables, up to %d, default: %d). Negative values are rejected.", MAX_BLOCKFETCH_QUEUE_SIZE, DEFAULT_BLOCKFETCH_QUEUE_SIZE), ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
     argsman.AddArg("-persistmempool", strprintf("Whether to save the mempool on shutdown and load on restart (default: %u)", DEFAULT_PERSIST_MEMPOOL), ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
     argsman.AddArg("-persistmempoolv1",
                    strprintf("Whether a mempool.dat file created by -persistmempool or the savemempool RPC will be written in the legacy format "

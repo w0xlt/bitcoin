@@ -1001,6 +1001,18 @@ BOOST_FIXTURE_TEST_CASE(chainstatemanager_args, BasicTestingSetup)
     BOOST_CHECK(!get_opts({"-minimumchainwork=xyz"}));                                                               // invalid hex characters
     BOOST_CHECK(!get_opts({"-minimumchainwork=01234567890123456789012345678901234567890123456789012345678901234"})); // > 64 hex chars
 
+    BOOST_CHECK_EQUAL(get_valid_opts({}).blockfetch_threads_num, DEFAULT_BLOCKFETCH_THREADS);
+    BOOST_CHECK_EQUAL(get_valid_opts({"-blockfetchthreads=0"}).blockfetch_threads_num, 0);
+    BOOST_CHECK_EQUAL(get_valid_opts({"-blockfetchthreads=3"}).blockfetch_threads_num, 3);
+    BOOST_CHECK_EQUAL(get_valid_opts({"-blockfetchthreads=100"}).blockfetch_threads_num, MAX_BLOCKFETCH_THREADS);
+    BOOST_CHECK(!get_opts({"-blockfetchthreads=-1"}));
+
+    BOOST_CHECK_EQUAL(get_valid_opts({}).blockfetch_queue_size, DEFAULT_BLOCKFETCH_QUEUE_SIZE);
+    BOOST_CHECK_EQUAL(get_valid_opts({"-blockfetchqueuesize=0"}).blockfetch_queue_size, 0);
+    BOOST_CHECK_EQUAL(get_valid_opts({"-blockfetchqueuesize=3"}).blockfetch_queue_size, 3);
+    BOOST_CHECK_EQUAL(get_valid_opts({"-blockfetchqueuesize=100"}).blockfetch_queue_size, MAX_BLOCKFETCH_QUEUE_SIZE);
+    BOOST_CHECK(!get_opts({"-blockfetchqueuesize=-1"}));
+
     BOOST_CHECK_EQUAL(get_valid_opts({}).prevoutfetch_threads_num, DEFAULT_PREVOUTFETCH_THREADS);
     BOOST_CHECK_EQUAL(get_valid_opts({"-prevoutfetchthreads=0"}).prevoutfetch_threads_num, 0);
     BOOST_CHECK_EQUAL(get_valid_opts({"-prevoutfetchthreads=3"}).prevoutfetch_threads_num, 3);
