@@ -45,9 +45,15 @@ FUZZ_TARGET(p2p_handshake, .init = ::initialize)
     FakeSteadyClock steady_clock;
     chainman.ResetIbd();
 
+    if (node.peerman) {
+        node.peerman->Interrupt();
+        node.peerman->Stop();
+        node.connman->StopNodes();
+        connman.SetMsgProc(nullptr);
+        node.peerman.reset();
+    }
     node.banman.reset();
     node.addrman.reset();
-    node.peerman.reset();
     node.addrman = std::make_unique<AddrMan>(
         *node.netgroupman, /*deterministic=*/true, /*consistency_check_ratio=*/0);
     node.peerman = PeerManager::make(connman, *node.addrman,
@@ -56,11 +62,12 @@ FUZZ_TARGET(p2p_handshake, .init = ::initialize)
                                      PeerManager::Options{
                                          .reconcile_txs = true,
                                          .deterministic_rng = true,
-                                     });
+                                     },
+                                     MakeImmediateP2PBlockValidation(chainman));
     connman.SetMsgProc(node.peerman.get());
     connman.SetAddrman(*node.addrman);
 
-    LOCK(NetEventsInterface::g_msgproc_mutex);
+    WAIT_LOCK(NetEventsInterface::g_msgproc_mutex, msgproc_lock);
 
     std::vector<CNode*> peers;
     const auto num_peers_to_add = fuzzed_data_provider.ConsumeIntegralInRange(1, 3);
@@ -112,5 +119,10 @@ FUZZ_TARGET(p2p_handshake, .init = ::initialize)
         }
     }
 
+    REVERSE_LOCK(msgproc_lock, NetEventsInterface::g_msgproc_mutex);
+    node.peerman->Interrupt();
+    node.peerman->Stop();
     node.connman->StopNodes();
+    connman.SetMsgProc(nullptr);
+    node.peerman.reset();
 }

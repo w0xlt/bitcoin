@@ -43,6 +43,7 @@
 #include <memory>
 #include <optional>
 #include <queue>
+#include <string>
 #include <string_view>
 #include <thread>
 #include <unordered_set>
@@ -766,6 +767,10 @@ public:
      * consisting of the message and a bool that indicates if the processing
      * queue has more entries. */
     std::optional<std::pair<CNetMessage, bool>> PollMessage()
+        EXCLUSIVE_LOCKS_REQUIRED(!m_msg_process_queue_mutex);
+
+    //! Return the type of the next queued message without removing it.
+    std::optional<std::string> PeekMessageType()
         EXCLUSIVE_LOCKS_REQUIRED(!m_msg_process_queue_mutex);
 
     /** Account for the total size of a sent message in the per msg type connection stats. */

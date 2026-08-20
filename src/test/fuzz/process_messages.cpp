@@ -49,6 +49,14 @@ void initialize_process_messages()
             {}),
     };
     g_setup = testing_setup.get();
+    auto& node{g_setup->m_node};
+    node.peerman->Interrupt();
+    node.peerman->Stop();
+    node.validation_signals->SyncWithValidationInterfaceQueue();
+    node.validation_signals->UnregisterValidationInterface(node.peerman.get());
+    node.connman->StopNodes();
+    static_cast<ConnmanTestMsg&>(*node.connman).SetMsgProc(nullptr);
+    node.peerman.reset();
     ResetChainmanAndMempool(*g_setup);
 }
 
@@ -69,9 +77,17 @@ FUZZ_TARGET(process_messages, .init = initialize_process_messages)
     chainman.DisableNextWrite();
 
     // Reset, so that dangling pointers can be detected by sanitizers.
+    if (node.peerman) {
+        node.peerman->Interrupt();
+        node.peerman->Stop();
+        node.validation_signals->SyncWithValidationInterfaceQueue();
+        node.validation_signals->UnregisterValidationInterface(node.peerman.get());
+        node.connman->StopNodes();
+        connman.SetMsgProc(nullptr);
+        node.peerman.reset();
+    }
     node.banman.reset();
     node.addrman.reset();
-    node.peerman.reset();
     node.addrman = std::make_unique<AddrMan>(*node.netgroupman, /*deterministic=*/true, /*consistency_check_ratio=*/0);
     node.peerman = PeerManager::make(connman, *node.addrman,
                                      /*banman=*/nullptr, chainman,
@@ -79,13 +95,14 @@ FUZZ_TARGET(process_messages, .init = initialize_process_messages)
                                      PeerManager::Options{
                                          .reconcile_txs = true,
                                          .deterministic_rng = true,
-                                     });
+                                     },
+                                     MakeImmediateP2PBlockValidation(chainman));
     connman.SetMsgProc(node.peerman.get());
     connman.SetAddrman(*node.addrman);
 
     node.validation_signals->RegisterValidationInterface(node.peerman.get());
 
-    LOCK(NetEventsInterface::g_msgproc_mutex);
+    WAIT_LOCK(NetEventsInterface::g_msgproc_mutex, msgproc_lock);
 
     std::vector<CNode*> peers;
     const auto num_peers_to_add = fuzzed_data_provider.ConsumeIntegralInRange(1, 3);
@@ -129,9 +146,14 @@ FUZZ_TARGET(process_messages, .init = initialize_process_messages)
             node.peerman->SendMessages(random_node);
         }
     }
+    REVERSE_LOCK(msgproc_lock, NetEventsInterface::g_msgproc_mutex);
+    node.peerman->Interrupt();
+    node.peerman->Stop();
     node.validation_signals->SyncWithValidationInterfaceQueue();
     node.validation_signals->UnregisterValidationInterface(node.peerman.get());
     node.connman->StopNodes();
+    connman.SetMsgProc(nullptr);
+    node.peerman.reset();
     const auto end_sequence{WITH_LOCK(node.mempool->cs, return node.mempool->GetSequence())};
     if (block_index_size != WITH_LOCK(chainman.GetMutex(), return chainman.BlockIndex().size()) || initial_sequence != end_sequence) {
         // Reuse the global chainman and mempool, but reset them when dirty.

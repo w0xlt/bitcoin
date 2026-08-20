@@ -32,6 +32,10 @@
 #include <vector>
 
 class FastRandomContext;
+class ChainstateManager;
+
+std::unique_ptr<node::P2PBlockValidation>
+MakeImmediateP2PBlockValidation(ChainstateManager& chainman);
 
 struct ConnmanTestMsg : public CConnman {
     using CConnman::CConnman;

@@ -10,15 +10,77 @@
 #include <netmessagemaker.h>
 #include <node/connection_types.h>
 #include <node/eviction.h>
+#include <node/p2p_block_validation.h>
 #include <protocol.h>
 #include <random.h>
 #include <serialize.h>
 #include <span.h>
 #include <sync.h>
+#include <util/check.h>
+#include <validation.h>
 
 #include <chrono>
 #include <optional>
+#include <utility>
 #include <vector>
+
+namespace {
+
+class ImmediateP2PBlockValidation final : public node::P2PBlockValidation
+{
+public:
+    explicit ImmediateP2PBlockValidation(ChainstateManager& chainman)
+        : m_chainman{chainman}
+    {
+    }
+
+    node::P2PBlockValidationSubmit Submit(node::P2PBlockValidationRequest request) override
+    {
+        if (m_interrupted) return node::P2PBlockValidationSubmit::INTERRUPTED;
+        if (m_result) return node::P2PBlockValidationSubmit::BUSY;
+
+        Assert(request.block != nullptr);
+        bool new_block{false};
+        (void)m_chainman.ProcessNewBlock(
+            request.block,
+            request.force_processing,
+            request.min_pow_checked,
+            &new_block);
+        request.block.reset();
+        m_result = node::P2PBlockValidationResult{new_block};
+        return node::P2PBlockValidationSubmit::ACCEPTED;
+    }
+
+    std::optional<node::P2PBlockValidationResult> TakeResult() override
+    {
+        auto result{std::move(m_result)};
+        m_result.reset();
+        return result;
+    }
+
+    void Interrupt() override
+    {
+        m_interrupted = true;
+    }
+
+    void Stop() override
+    {
+        Interrupt();
+    }
+
+private:
+    ChainstateManager& m_chainman;
+    std::optional<node::P2PBlockValidationResult> m_result;
+    bool m_interrupted{false};
+};
+
+} // namespace
+
+std::unique_ptr<node::P2PBlockValidation>
+MakeImmediateP2PBlockValidation(ChainstateManager& chainman)
+{
+    return std::make_unique<ImmediateP2PBlockValidation>(chainman);
+}
 
 void ConnmanTestMsg::Handshake(CNode& node,
                                bool successfully_connected,

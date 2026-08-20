@@ -206,6 +206,13 @@ static constexpr auto PRIVATE_BROADCAST_MAX_CONNECTION_LIFETIME{3min};
 
 // Internal stuff
 namespace {
+bool IsP2PBlockMessage(std::string_view msg_type)
+{
+    return msg_type == NetMsgType::BLOCK ||
+           msg_type == NetMsgType::CMPCTBLOCK ||
+           msg_type == NetMsgType::BLOCKTXN;
+}
+
 /** Blocks that are in flight, and that are in the queue to be downloaded. */
 struct QueuedBlock {
     /** BlockIndex. We must have this since we only request blocks when we've already validated the header. */
@@ -569,7 +576,9 @@ class PeerManagerImpl final : public PeerManager
 public:
     PeerManagerImpl(CConnman& connman, AddrMan& addrman,
                     BanMan* banman, ChainstateManager& chainman,
-                    CTxMemPool& pool, node::Warnings& warnings, Options opts);
+                    CTxMemPool& pool, node::Warnings& warnings, Options opts,
+                    std::unique_ptr<node::P2PBlockValidation> block_validation);
+    ~PeerManagerImpl() override;
 
     /** Overridden from CValidationInterface. */
     void ActiveTipChange(const CBlockIndex& new_tip, bool) override
@@ -595,6 +604,8 @@ public:
         EXCLUSIVE_LOCKS_REQUIRED(!m_peer_mutex, !m_most_recent_block_mutex, g_msgproc_mutex, !m_tx_download_mutex, !m_inv_to_send_mutex);
 
     /** Implement PeerManager */
+    void Interrupt() override;
+    void Stop() override;
     void StartScheduledTasks(CScheduler& scheduler) override;
     void CheckForStaleTipAndEvictPeers() override;
     util::Expected<void, std::string> FetchBlock(NodeId peer_id, const CBlockIndex& block_index) override
@@ -617,6 +628,18 @@ public:
     ServiceFlags GetDesirableServiceFlags(ServiceFlags services) const override;
 
 private:
+    enum class P2PBlockOrigin {
+        BLOCK,
+        BLOCKTXN,
+        CMPCTBLOCK,
+    };
+
+    struct PendingP2PBlock {
+        NodeId source;
+        uint256 hash;
+        P2PBlockOrigin origin;
+    };
+
     void ProcessMessage(Peer& peer, CNode& pfrom, const std::string& msg_type, DataStream& vRecv, NodeClock::time_point time_received,
                         const std::atomic<bool>& interruptMsgProc)
         EXCLUSIVE_LOCKS_REQUIRED(!m_peer_mutex, !m_most_recent_block_mutex, !m_headers_presync_mutex, g_msgproc_mutex, !m_tx_download_mutex, !m_inv_to_send_mutex);
@@ -855,6 +878,9 @@ private:
     BanMan* const m_banman;
     ChainstateManager& m_chainman;
     CTxMemPool& m_mempool;
+    std::unique_ptr<node::P2PBlockValidation> m_block_validation;
+    std::optional<PendingP2PBlock> m_pending_block_validation
+        GUARDED_BY(NetEventsInterface::g_msgproc_mutex);
 
     /** Synchronizes tx download including TxRequestTracker, rejection filters, and TxOrphanage.
      * Lock invariants:
@@ -1052,8 +1078,28 @@ private:
         EXCLUSIVE_LOCKS_REQUIRED(!m_most_recent_block_mutex, peer.m_getdata_requests_mutex, NetEventsInterface::g_msgproc_mutex)
         LOCKS_EXCLUDED(::cs_main);
 
-    /** Process a new block. Perform any post-processing housekeeping */
-    void ProcessBlock(CNode& node, const std::shared_ptr<const CBlock>& block, bool force_processing, bool min_pow_checked);
+    void StartP2PBlockValidation(
+        NodeId source,
+        std::shared_ptr<const CBlock> block,
+        bool force_processing,
+        bool min_pow_checked,
+        P2PBlockOrigin origin)
+        EXCLUSIVE_LOCKS_REQUIRED(NetEventsInterface::g_msgproc_mutex);
+
+    void ProcessP2PBlockValidationResult()
+        EXCLUSIVE_LOCKS_REQUIRED(NetEventsInterface::g_msgproc_mutex);
+
+    void ProcessP2PBlockCompletion(
+        NodeId source,
+        const uint256& hash,
+        bool new_block)
+        EXCLUSIVE_LOCKS_REQUIRED(NetEventsInterface::g_msgproc_mutex);
+
+    bool P2PBlockValidationActive() const
+        EXCLUSIVE_LOCKS_REQUIRED(NetEventsInterface::g_msgproc_mutex);
+
+    bool P2PBlockValidationActiveFor(NodeId source) const
+        EXCLUSIVE_LOCKS_REQUIRED(NetEventsInterface::g_msgproc_mutex);
 
     /** Process compact block txns  */
     void ProcessCompactBlockTxns(CNode& pfrom, Peer& peer, const BlockTransactions& block_transactions)
@@ -2121,14 +2167,21 @@ util::Expected<void, std::string> PeerManagerImpl::FetchBlock(NodeId peer_id, co
 
 std::unique_ptr<PeerManager> PeerManager::make(CConnman& connman, AddrMan& addrman,
                                                BanMan* banman, ChainstateManager& chainman,
-                                               CTxMemPool& pool, node::Warnings& warnings, Options opts)
+                                               CTxMemPool& pool, node::Warnings& warnings, Options opts,
+                                               std::unique_ptr<node::P2PBlockValidation> block_validation)
 {
-    return std::make_unique<PeerManagerImpl>(connman, addrman, banman, chainman, pool, warnings, opts);
+    if (!block_validation) {
+        block_validation = node::MakeP2PBlockValidation(chainman, [&connman] {
+            connman.WakeMessageHandler();
+        });
+    }
+    return std::make_unique<PeerManagerImpl>(connman, addrman, banman, chainman, pool, warnings, opts, std::move(block_validation));
 }
 
 PeerManagerImpl::PeerManagerImpl(CConnman& connman, AddrMan& addrman,
                                  BanMan* banman, ChainstateManager& chainman,
-                                 CTxMemPool& pool, node::Warnings& warnings, Options opts)
+                                 CTxMemPool& pool, node::Warnings& warnings, Options opts,
+                                 std::unique_ptr<node::P2PBlockValidation> block_validation)
     : m_rng{opts.deterministic_rng},
       m_fee_filter_rounder{CFeeRate{DEFAULT_MIN_RELAY_TX_FEE}, m_rng},
       m_chainparams(chainman.GetParams()),
@@ -2137,6 +2190,7 @@ PeerManagerImpl::PeerManagerImpl(CConnman& connman, AddrMan& addrman,
       m_banman(banman),
       m_chainman(chainman),
       m_mempool(pool),
+      m_block_validation{std::move(Assert(block_validation))},
       m_txdownloadman(node::TxDownloadOptions{pool, m_rng, opts.deterministic_rng}),
       m_warnings{warnings},
       m_opts{opts},
@@ -2147,6 +2201,28 @@ PeerManagerImpl::PeerManagerImpl(CConnman& connman, AddrMan& addrman,
     // This argument can go away after Erlay support is complete.
     if (opts.reconcile_txs) {
         m_txreconciliation = std::make_unique<TxReconciliationTracker>(TXRECONCILIATION_VERSION);
+    }
+}
+
+PeerManagerImpl::~PeerManagerImpl()
+{
+    m_block_validation->Interrupt();
+    m_block_validation->Stop();
+}
+
+void PeerManagerImpl::Interrupt()
+{
+    m_block_validation->Interrupt();
+}
+
+void PeerManagerImpl::Stop()
+{
+    m_block_validation->Interrupt();
+    m_block_validation->Stop();
+    {
+        LOCK(NetEventsInterface::g_msgproc_mutex);
+        ProcessP2PBlockValidationResult();
+        Assert(!m_pending_block_validation);
     }
 }
 
@@ -3664,21 +3740,95 @@ void PeerManagerImpl::ProcessGetCFCheckPt(CNode& node, Peer& peer, DataStream& v
               headers);
 }
 
-void PeerManagerImpl::ProcessBlock(CNode& node, const std::shared_ptr<const CBlock>& block, bool force_processing, bool min_pow_checked)
+void PeerManagerImpl::StartP2PBlockValidation(
+    NodeId source,
+    std::shared_ptr<const CBlock> block,
+    bool force_processing,
+    bool min_pow_checked,
+    P2PBlockOrigin origin)
 {
-    bool new_block{false};
-    m_chainman.ProcessNewBlock(block, force_processing, min_pow_checked, &new_block);
+    AssertLockHeld(NetEventsInterface::g_msgproc_mutex);
+    Assert(!m_pending_block_validation);
+    Assert(block != nullptr);
+
+    const uint256 hash{block->GetHash()};
+    const node::P2PBlockValidationSubmit status{m_block_validation->Submit({
+        .block = std::move(block),
+        .force_processing = force_processing,
+        .min_pow_checked = min_pow_checked,
+    })};
+
+    switch (status) {
+    case node::P2PBlockValidationSubmit::ACCEPTED:
+        m_pending_block_validation = PendingP2PBlock{source, hash, origin};
+        ProcessP2PBlockValidationResult();
+        return;
+    case node::P2PBlockValidationSubmit::BUSY:
+        Assume(false);
+        break;
+    case node::P2PBlockValidationSubmit::INTERRUPTED:
+        break;
+    }
+
+    LOCK(cs_main);
+    mapBlockSource.erase(hash);
+}
+
+void PeerManagerImpl::ProcessP2PBlockCompletion(NodeId source, const uint256& hash, bool new_block)
+{
+    AssertLockHeld(NetEventsInterface::g_msgproc_mutex);
+
     if (new_block) {
-        node.m_last_block_time = GetTime<std::chrono::seconds>();
+        m_connman.ForNode(source, [](CNode* node) {
+            node->m_last_block_time = GetTime<std::chrono::seconds>();
+            return true;
+        });
         // In case this block came from a different peer than we requested
         // from, we can erase the block request now anyway (as we just stored
         // this block to disk).
         LOCK(cs_main);
-        RemoveBlockRequest(block->GetHash(), std::nullopt);
+        RemoveBlockRequest(hash, std::nullopt);
     } else {
         LOCK(cs_main);
-        mapBlockSource.erase(block->GetHash());
+        mapBlockSource.erase(hash);
     }
+}
+
+void PeerManagerImpl::ProcessP2PBlockValidationResult()
+{
+    AssertLockHeld(NetEventsInterface::g_msgproc_mutex);
+
+    const std::optional<node::P2PBlockValidationResult> result{m_block_validation->TakeResult()};
+    if (!result) return;
+
+    Assert(m_pending_block_validation);
+    const PendingP2PBlock pending{*m_pending_block_validation};
+    ProcessP2PBlockCompletion(pending.source, pending.hash, result->new_block);
+
+    if (pending.origin == P2PBlockOrigin::CMPCTBLOCK) {
+        LOCK(cs_main);
+        const CBlockIndex* pindex{Assert(m_chainman.m_blockman.LookupBlockIndex(pending.hash))};
+        if (pindex->IsValid(BLOCK_VALID_TRANSACTIONS)) {
+            // Clear download state for this block, which is in process from
+            // some other peer. Doing this after ProcessNewBlock prevents a
+            // malleated cmpctblock announcement from interfering with relay.
+            RemoveBlockRequest(pending.hash, std::nullopt);
+        }
+    }
+
+    m_pending_block_validation.reset();
+}
+
+bool PeerManagerImpl::P2PBlockValidationActive() const
+{
+    AssertLockHeld(NetEventsInterface::g_msgproc_mutex);
+    return m_pending_block_validation.has_value();
+}
+
+bool PeerManagerImpl::P2PBlockValidationActiveFor(NodeId source) const
+{
+    AssertLockHeld(NetEventsInterface::g_msgproc_mutex);
+    return m_pending_block_validation && m_pending_block_validation->source == source;
 }
 
 void PeerManagerImpl::ProcessCompactBlockTxns(CNode& pfrom, Peer& peer, const BlockTransactions& block_transactions)
@@ -3763,7 +3913,11 @@ void PeerManagerImpl::ProcessCompactBlockTxns(CNode& pfrom, Peer& peer, const Bl
         // disk-space attacks), but this should be safe due to the
         // protections in the compact block handler -- see related comment
         // in compact block optimistic reconstruction handling.
-        ProcessBlock(pfrom, pblock, /*force_processing=*/true, /*min_pow_checked=*/true);
+        StartP2PBlockValidation(
+            pfrom.GetId(), pblock,
+            /*force_processing=*/true,
+            /*min_pow_checked=*/true,
+            P2PBlockOrigin::BLOCKTXN);
     }
     return;
 }
@@ -5025,15 +5179,11 @@ void PeerManagerImpl::ProcessMessage(Peer& peer, CNode& pfrom, const std::string
             // we have a chain with at least the minimum chain work), and we ignore
             // compact blocks with less work than our tip, it is safe to treat
             // reconstructed compact blocks as having been requested.
-            ProcessBlock(pfrom, pblock, /*force_processing=*/true, /*min_pow_checked=*/true);
-            LOCK(cs_main); // hold cs_main for CBlockIndex::IsValid()
-            if (pindex->IsValid(BLOCK_VALID_TRANSACTIONS)) {
-                // Clear download state for this block, which is in
-                // process from some other peer.  We do this after calling
-                // ProcessNewBlock so that a malleated cmpctblock announcement
-                // can't be used to interfere with block relay.
-                RemoveBlockRequest(pblock->GetHash(), std::nullopt);
-            }
+            StartP2PBlockValidation(
+                pfrom.GetId(), pblock,
+                /*force_processing=*/true,
+                /*min_pow_checked=*/true,
+                P2PBlockOrigin::CMPCTBLOCK);
         }
         return;
     }
@@ -5136,7 +5286,9 @@ void PeerManagerImpl::ProcessMessage(Peer& peer, CNode& pfrom, const std::string
                 min_pow_checked = true;
             }
         }
-        ProcessBlock(pfrom, pblock, forceProcessing, min_pow_checked);
+        StartP2PBlockValidation(
+            pfrom.GetId(), pblock, forceProcessing, min_pow_checked,
+            P2PBlockOrigin::BLOCK);
         return;
     }
 
@@ -5407,6 +5559,9 @@ bool PeerManagerImpl::ProcessMessages(CNode& node, std::atomic<bool>& interruptM
     AssertLockNotHeld(m_tx_download_mutex);
     AssertLockHeld(g_msgproc_mutex);
 
+    ProcessP2PBlockValidationResult();
+    if (P2PBlockValidationActiveFor(node.GetId())) return false;
+
     PeerRef maybe_peer{GetPeerRef(node.GetId())};
     if (maybe_peer == nullptr) return false;
     Peer& peer{*maybe_peer};
@@ -5415,14 +5570,17 @@ bool PeerManagerImpl::ProcessMessages(CNode& node, std::atomic<bool>& interruptM
     // has been sent first before processing any incoming messages
     if (!node.IsInboundConn() && !peer.m_outbound_version_message_sent) return false;
 
-    {
-        LOCK(peer.m_getdata_requests_mutex);
-        if (!peer.m_getdata_requests.empty()) {
-            ProcessGetData(node, peer, interruptMsgProc);
+    bool processed_orphan{false};
+    if (!P2PBlockValidationActive()) {
+        {
+            LOCK(peer.m_getdata_requests_mutex);
+            if (!peer.m_getdata_requests.empty()) {
+                ProcessGetData(node, peer, interruptMsgProc);
+            }
         }
-    }
 
-    const bool processed_orphan = ProcessOrphanTx(peer);
+        processed_orphan = ProcessOrphanTx(peer);
+    }
 
     if (node.fDisconnect)
         return false;
@@ -5433,11 +5591,20 @@ bool PeerManagerImpl::ProcessMessages(CNode& node, std::atomic<bool>& interruptM
     // and prevents m_getdata_requests to grow unbounded
     {
         LOCK(peer.m_getdata_requests_mutex);
-        if (!peer.m_getdata_requests.empty()) return true;
+        if (!peer.m_getdata_requests.empty()) {
+            return !P2PBlockValidationActive();
+        }
     }
 
     // Don't bother if send buffer is too full to respond anyway
     if (node.fPauseSend) return false;
+
+    if (P2PBlockValidationActive()) {
+        const std::optional<std::string> next_type{node.PeekMessageType()};
+        if (!next_type || IsP2PBlockMessage(*next_type) || *next_type == NetMsgType::GETDATA) {
+            return false;
+        }
+    }
 
     auto poll_result{node.PollMessage()};
     if (!poll_result) {
@@ -5464,17 +5631,19 @@ bool PeerManagerImpl::ProcessMessages(CNode& node, std::atomic<bool>& interruptM
     try {
         ProcessMessage(peer, node, msg.m_type, msg.m_recv, msg.m_time, interruptMsgProc);
         if (interruptMsgProc) return false;
-        {
-            LOCK(peer.m_getdata_requests_mutex);
-            if (!peer.m_getdata_requests.empty()) fMoreWork = true;
+        if (!P2PBlockValidationActive()) {
+            {
+                LOCK(peer.m_getdata_requests_mutex);
+                if (!peer.m_getdata_requests.empty()) fMoreWork = true;
+            }
+            // Does this peer have an orphan ready to reconsider?
+            // (Note: we may have provided a parent for an orphan provided
+            //  by another peer that was already processed; in that case,
+            //  the extra work may not be noticed, possibly resulting in an
+            //  unnecessary 100ms delay)
+            LOCK(m_tx_download_mutex);
+            if (m_txdownloadman.HaveMoreWork(peer.m_id)) fMoreWork = true;
         }
-        // Does this peer have an orphan ready to reconsider?
-        // (Note: we may have provided a parent for an orphan provided
-        //  by another peer that was already processed; in that case,
-        //  the extra work may not be noticed, possibly resulting in an
-        //  unnecessary 100ms delay)
-        LOCK(m_tx_download_mutex);
-        if (m_txdownloadman.HaveMoreWork(peer.m_id)) fMoreWork = true;
     } catch (const std::exception& e) {
         LogDebug(BCLog::NET, "%s(%s, %u bytes): Exception '%s' (%s) caught\n", __func__, SanitizeString(msg.m_type), msg.m_message_size, e.what(), typeid(e).name());
     } catch (...) {
@@ -6056,6 +6225,8 @@ bool PeerManagerImpl::SendMessages(CNode& node)
     // disconnect misbehaving peers even before the version handshake is complete.
     if (MaybeDiscourageAndDisconnect(node, peer)) return true;
 
+    if (P2PBlockValidationActiveFor(node.GetId())) return true;
+
     // Initiate version handshake for outbound connections
     if (!node.IsInboundConn() && !peer.m_outbound_version_message_sent) {
         PushNodeVersion(node, peer);
@@ -6093,6 +6264,8 @@ bool PeerManagerImpl::SendMessages(CNode& node)
     if (node.fDisconnect) return true;
 
     MaybeSendAddr(node, peer, current_time);
+
+    if (P2PBlockValidationActive()) return true;
 
     MaybeSendSendHeaders(node, peer);
 

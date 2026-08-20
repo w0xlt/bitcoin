@@ -302,6 +302,7 @@ void Interrupt(NodeContext& node)
         node.tor_controller->Interrupt();
     }
     InterruptMapPort();
+    if (node.peerman) node.peerman->Interrupt();
     if (node.connman)
         node.connman->Interrupt();
     for (auto* index : node.indexes) {
@@ -338,10 +339,12 @@ void Shutdown(NodeContext& node)
     }
     StopMapPort();
 
-    // Because these depend on each-other, we make sure that neither can be
-    // using the other before destroying them.
-    if (node.peerman && node.validation_signals) node.validation_signals->UnregisterValidationInterface(node.peerman.get());
-    if (node.connman) node.connman->Stop();
+    if (node.connman) node.connman->StopThreads();
+    if (node.peerman) node.peerman->Stop();
+    if (node.peerman && node.validation_signals) {
+        node.validation_signals->UnregisterValidationInterface(node.peerman.get());
+    }
+    if (node.connman) node.connman->StopNodes();
 
     if (node.tor_controller) {
         node.tor_controller->Join();
