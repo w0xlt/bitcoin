@@ -197,6 +197,7 @@ BASE_SCRIPTS = [
     'mempool_spend_coinbase.py',
     'wallet_avoid_mixing_output_types.py',
     'mempool_reorg.py',
+    'p2p_async_block_processing.py',
     'p2p_block_sync.py --v1transport',
     'p2p_block_sync.py --v2transport',
     'wallet_createwallet.py --usecli',
