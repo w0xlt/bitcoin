@@ -123,8 +123,16 @@ void initialize_cmpctblock()
     static const auto testing_setup = MakeNoLogFileContext<TestingSetup>();
     g_setup = testing_setup.get();
     g_nBits = Params().GenesisBlock().nBits;
+    auto& node{testing_setup->m_node};
+    node.peerman->Interrupt();
+    node.peerman->Stop();
+    node.validation_signals->SyncWithValidationInterfaceQueue();
+    node.validation_signals->UnregisterValidationInterface(node.peerman.get());
+    node.connman->StopNodes();
+    static_cast<ConnmanTestMsg&>(*node.connman).SetMsgProc(nullptr);
+    node.peerman.reset();
     // Replace validation_signals before creating chainman and mempool so they use it.
-    testing_setup->m_node.validation_signals = std::make_unique<ValidationSignals>(std::make_unique<ImmediateBackgroundTaskRunner>());
+    node.validation_signals = std::make_unique<ValidationSignals>(std::make_unique<ImmediateBackgroundTaskRunner>());
     g_mature_coinbase = ResetChainmanAndMempool(*g_setup, init_clock);
 }
 
@@ -150,13 +158,14 @@ FUZZ_TARGET(cmpctblock, .init = initialize_cmpctblock)
                                      mempool, *setup->m_node.warnings,
                                      PeerManager::Options{
                                          .deterministic_rng = true,
-                                     });
+                                     },
+                                     MakeImmediateP2PBlockValidation(chainman));
     connman.SetMsgProc(peerman.get());
 
     setup->m_node.validation_signals->RegisterValidationInterface(peerman.get());
     setup->m_node.validation_signals->SyncWithValidationInterfaceQueue();
 
-    LOCK(NetEventsInterface::g_msgproc_mutex);
+    WAIT_LOCK(NetEventsInterface::g_msgproc_mutex, msgproc_lock);
 
     std::vector<CNode*> peers;
     for (int i = 0; i < 4; ++i) {
@@ -470,9 +479,14 @@ FUZZ_TARGET(cmpctblock, .init = initialize_cmpctblock)
         }
     }
 
+    REVERSE_LOCK(msgproc_lock, NetEventsInterface::g_msgproc_mutex);
+    peerman->Interrupt();
+    peerman->Stop();
     setup->m_node.validation_signals->SyncWithValidationInterfaceQueue();
     setup->m_node.validation_signals->UnregisterAllValidationInterfaces();
     connman.StopNodes();
+    connman.SetMsgProc(nullptr);
+    peerman.reset();
 
     const size_t end_index_size{WITH_LOCK(chainman.GetMutex(), return chainman.BlockIndex().size())};
     const uint64_t end_sequence{WITH_LOCK(mempool.cs, return mempool.GetSequence())};

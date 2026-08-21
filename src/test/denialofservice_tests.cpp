@@ -302,7 +302,7 @@ BOOST_FIXTURE_TEST_CASE(block_relay_only_eviction, OutboundTest)
 
 BOOST_AUTO_TEST_CASE(peer_discouragement)
 {
-    LOCK(NetEventsInterface::g_msgproc_mutex);
+    WAIT_LOCK(NetEventsInterface::g_msgproc_mutex, msgproc_lock);
 
     auto banman = std::make_unique<BanMan>(m_args.GetDataDirBase() / "banlist", nullptr, DEFAULT_MISBEHAVING_BANTIME);
     auto connman = std::make_unique<ConnmanTestMsg>(0x1337, 0x1337, *m_node.addrman, *m_node.netgroupman, Params());
@@ -402,11 +402,16 @@ BOOST_AUTO_TEST_CASE(peer_discouragement)
         peerLogic->FinalizeNode(*node);
     }
     connman->ClearTestNodes();
+
+    REVERSE_LOCK(msgproc_lock, NetEventsInterface::g_msgproc_mutex);
+    peerLogic->Interrupt();
+    peerLogic->Stop();
+    peerLogic.reset();
 }
 
 BOOST_AUTO_TEST_CASE(DoS_bantime)
 {
-    LOCK(NetEventsInterface::g_msgproc_mutex);
+    WAIT_LOCK(NetEventsInterface::g_msgproc_mutex, msgproc_lock);
 
     auto banman = std::make_unique<BanMan>(m_args.GetDataDirBase() / "banlist", nullptr, DEFAULT_MISBEHAVING_BANTIME);
     auto connman = std::make_unique<CConnman>(0x1337, 0x1337, *m_node.addrman, *m_node.netgroupman, Params());
@@ -436,6 +441,11 @@ BOOST_AUTO_TEST_CASE(DoS_bantime)
     BOOST_CHECK(banman->IsDiscouraged(addr));
 
     peerLogic->FinalizeNode(dummyNode);
+
+    REVERSE_LOCK(msgproc_lock, NetEventsInterface::g_msgproc_mutex);
+    peerLogic->Interrupt();
+    peerLogic->Stop();
+    peerLogic.reset();
 }
 
 BOOST_AUTO_TEST_SUITE_END()

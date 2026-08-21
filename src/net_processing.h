@@ -8,6 +8,7 @@
 
 #include <consensus/amount.h>
 #include <net.h>
+#include <node/p2p_block_validation.h>
 #include <node/txorphanage.h>
 #include <node/types.h>
 #include <private_broadcast.h>
@@ -113,8 +114,16 @@ public:
 
     static std::unique_ptr<PeerManager> make(CConnman& connman, AddrMan& addrman,
                                              BanMan* banman, ChainstateManager& chainman,
-                                             CTxMemPool& pool, node::Warnings& warnings, Options opts);
+                                             CTxMemPool& pool, node::Warnings& warnings, Options opts,
+                                             std::unique_ptr<node::P2PBlockValidation> block_validation = {});
     virtual ~PeerManager() = default;
+
+    //! Reject new background work during node interruption.
+    virtual void Interrupt() = 0;
+
+    //! Finish accepted work, join the worker, and apply any completion.
+    //! Connection threads must already be stopped.
+    virtual void Stop() = 0;
 
     /**
      * Attempt to manually fetch block from a given peer. We must already have the header.

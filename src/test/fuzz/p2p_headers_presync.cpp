@@ -40,9 +40,15 @@ public:
         // No txs are relayed. Disable irrelevant and possibly
         // non-deterministic code paths.
         peerman_opts.ignore_incoming_txs = true;
+        m_node.peerman->Interrupt();
+        m_node.peerman->Stop();
+        m_node.connman->StopNodes();
+        static_cast<ConnmanTestMsg&>(*m_node.connman).SetMsgProc(nullptr);
+        m_node.peerman.reset();
         m_node.peerman = PeerManager::make(*m_node.connman, *m_node.addrman,
                                            m_node.banman.get(), *m_node.chainman,
-                                           *m_node.mempool, *m_node.warnings, peerman_opts);
+                                           *m_node.mempool, *m_node.warnings, peerman_opts,
+                                           MakeImmediateP2PBlockValidation(*m_node.chainman));
 
         CConnman::Options options;
         options.m_msgproc = m_node.peerman.get();

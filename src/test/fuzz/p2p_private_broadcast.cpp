@@ -61,9 +61,15 @@ FUZZ_TARGET(p2p_private_broadcast, .init = ::initialize)
     if (fuzzed_data_provider.ConsumeBool()) chainman.JumpOutOfIbd();
 
     // Reset, so that dangling pointers can be detected by sanitizers.
+    if (node.peerman) {
+        node.peerman->Interrupt();
+        node.peerman->Stop();
+        node.connman->StopNodes();
+        connman.SetMsgProc(nullptr);
+        node.peerman.reset();
+    }
     node.banman.reset();
     node.addrman.reset();
-    node.peerman.reset();
     node.addrman = std::make_unique<AddrMan>(
         *node.netgroupman, /*deterministic=*/true, /*consistency_check_ratio=*/0);
     node.peerman = PeerManager::make(connman, *node.addrman,
@@ -72,7 +78,8 @@ FUZZ_TARGET(p2p_private_broadcast, .init = ::initialize)
                                      PeerManager::Options{
                                          .reconcile_txs = true,
                                          .deterministic_rng = true,
-                                     });
+                                     },
+                                     MakeImmediateP2PBlockValidation(chainman));
     connman.SetMsgProc(node.peerman.get());
     connman.SetAddrman(*node.addrman);
 
@@ -86,7 +93,7 @@ FUZZ_TARGET(p2p_private_broadcast, .init = ::initialize)
         seeded_txs.push_back(tx);
     }
 
-    LOCK(NetEventsInterface::g_msgproc_mutex);
+    WAIT_LOCK(NetEventsInterface::g_msgproc_mutex, msgproc_lock);
 
     static NodeId node_id{0};
     // Create at least one PRIVATE_BROADCAST peer, optionally add others of random types.
@@ -254,5 +261,10 @@ FUZZ_TARGET(p2p_private_broadcast, .init = ::initialize)
     CaptureMessage = CaptureMessageOrig;
     connman.SetCaptureMessages(false);
 
+    REVERSE_LOCK(msgproc_lock, NetEventsInterface::g_msgproc_mutex);
+    node.peerman->Interrupt();
+    node.peerman->Stop();
     node.connman->StopNodes();
+    connman.SetMsgProc(nullptr);
+    node.peerman.reset();
 }
