@@ -762,10 +762,13 @@ public:
 
     /** Poll the next message from the processing queue of this connection.
      *
-     * Returns std::nullopt if the processing queue is empty, or a pair
-     * consisting of the message and a bool that indicates if the processing
-     * queue has more entries. */
-    std::optional<std::pair<CNetMessage, bool>> PollMessage()
+     * If `allowed_types` is provided, the queue's front message is returned
+     * only if its type is allowed. Returns std::nullopt if the processing queue
+     * is empty or its front message is not allowed, or a pair consisting of the
+     * message and a bool that indicates if another message is immediately
+     * pollable under the same filter. */
+    std::optional<std::pair<CNetMessage, bool>> PollMessage(
+        std::optional<std::span<const std::string_view>> allowed_types = std::nullopt)
         EXCLUSIVE_LOCKS_REQUIRED(!m_msg_process_queue_mutex);
 
     /** Account for the total size of a sent message in the per msg type connection stats. */

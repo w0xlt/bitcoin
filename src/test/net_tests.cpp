@@ -29,11 +29,13 @@
 #include <boost/test/unit_test.hpp>
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <ios>
 #include <memory>
 #include <optional>
 #include <string>
+#include <string_view>
 
 using namespace std::literals;
 using namespace util::hex_literals;
@@ -138,6 +140,121 @@ BOOST_AUTO_TEST_CASE(cnode_simple_test)
     BOOST_CHECK(pnode4->IsInboundConn() == true);
     BOOST_CHECK(pnode4->m_inbound_onion == true);
     BOOST_CHECK_EQUAL(pnode4->ConnectedThroughNetwork(), Network::NET_ONION);
+}
+
+BOOST_AUTO_TEST_CASE(cnode_poll_message)
+{
+    auto& connman{static_cast<ConnmanTestMsg&>(*m_node.connman)};
+    auto node{std::make_unique<CNode>(/*id=*/0,
+                                      /*sock=*/nullptr,
+                                      /*addrIn=*/CAddress{},
+                                      /*nKeyedNetGroupIn=*/0,
+                                      /*nLocalHostNonceIn=*/0,
+                                      /*addrBindIn=*/CService{},
+                                      /*addrNameIn=*/std::string{},
+                                      /*conn_type_in=*/ConnectionType::OUTBOUND_FULL_RELAY,
+                                      /*inbound_onion=*/false,
+                                      /*network_key=*/0)};
+    const auto queue_message{[&](const char* type) {
+        BOOST_REQUIRE(connman.ReceiveMsgFrom(*node, NetMsg::Make(type)));
+    }};
+    constexpr std::array<std::string_view, 2> ALLOWED_TYPES{NetMsgType::PING, NetMsgType::PONG};
+    const auto poll_allowed{[&] {
+        return node->PollMessage(std::span<const std::string_view>{ALLOWED_TYPES});
+    }};
+
+    BOOST_CHECK(!node->PollMessage());
+    BOOST_CHECK(!poll_allowed());
+
+    queue_message(NetMsgType::VERSION);
+    queue_message(NetMsgType::PING);
+    auto result{node->PollMessage()};
+    BOOST_REQUIRE(result);
+    BOOST_CHECK_EQUAL(result->first.m_type, NetMsgType::VERSION);
+    BOOST_CHECK(result->second);
+    result = poll_allowed();
+    BOOST_REQUIRE(result);
+    BOOST_CHECK_EQUAL(result->first.m_type, NetMsgType::PING);
+    BOOST_CHECK(!result->second);
+
+    queue_message(NetMsgType::VERSION);
+    queue_message(NetMsgType::PING);
+    BOOST_CHECK(!poll_allowed());
+    result = node->PollMessage();
+    BOOST_REQUIRE(result);
+    BOOST_CHECK_EQUAL(result->first.m_type, NetMsgType::VERSION);
+    BOOST_CHECK(result->second);
+    result = poll_allowed();
+    BOOST_REQUIRE(result);
+    BOOST_CHECK_EQUAL(result->first.m_type, NetMsgType::PING);
+    BOOST_CHECK(!result->second);
+
+    queue_message(NetMsgType::PING);
+    queue_message(NetMsgType::PONG);
+    result = poll_allowed();
+    BOOST_REQUIRE(result);
+    BOOST_CHECK_EQUAL(result->first.m_type, NetMsgType::PING);
+    BOOST_CHECK(result->second);
+    result = poll_allowed();
+    BOOST_REQUIRE(result);
+    BOOST_CHECK_EQUAL(result->first.m_type, NetMsgType::PONG);
+    BOOST_CHECK(!result->second);
+
+    queue_message(NetMsgType::PING);
+    queue_message(NetMsgType::VERSION);
+    result = poll_allowed();
+    BOOST_REQUIRE(result);
+    BOOST_CHECK_EQUAL(result->first.m_type, NetMsgType::PING);
+    BOOST_CHECK(!result->second);
+    BOOST_CHECK(!poll_allowed());
+    result = node->PollMessage();
+    BOOST_REQUIRE(result);
+    BOOST_CHECK_EQUAL(result->first.m_type, NetMsgType::VERSION);
+    BOOST_CHECK(!result->second);
+
+    BOOST_CHECK(!poll_allowed());
+    queue_message(NetMsgType::VERSION);
+    BOOST_CHECK(!poll_allowed());
+    result = node->PollMessage();
+    BOOST_REQUIRE(result);
+    BOOST_CHECK_EQUAL(result->first.m_type, NetMsgType::VERSION);
+    BOOST_CHECK(!result->second);
+}
+
+BOOST_AUTO_TEST_CASE(cnode_poll_message_preserves_backpressure)
+{
+    auto& connman{static_cast<ConnmanTestMsg&>(*m_node.connman)};
+    CNode node{/*id=*/0,
+               /*sock=*/nullptr,
+               /*addrIn=*/CAddress{},
+               /*nKeyedNetGroupIn=*/0,
+               /*nLocalHostNonceIn=*/0,
+               /*addrBindIn=*/CService{},
+               /*addrNameIn=*/std::string{},
+               /*conn_type_in=*/ConnectionType::OUTBOUND_FULL_RELAY,
+               /*inbound_onion=*/false,
+               /*network_key=*/0,
+               /*node_opts=*/CNodeOptions{.recv_flood_size = 0}};
+    BOOST_REQUIRE(connman.ReceiveMsgFrom(node, NetMsg::Make(NetMsgType::VERSION)));
+    BOOST_REQUIRE(connman.ReceiveMsgFrom(node, NetMsg::Make(NetMsgType::PING)));
+    BOOST_CHECK(node.fPauseRecv);
+
+    constexpr std::array<std::string_view, 2> ALLOWED_TYPES{NetMsgType::PING, NetMsgType::PONG};
+    const std::span<const std::string_view> allowed_types{ALLOWED_TYPES};
+    BOOST_CHECK(!node.PollMessage(allowed_types));
+    BOOST_CHECK(node.fPauseRecv);
+
+    auto result{node.PollMessage()};
+    BOOST_REQUIRE(result);
+    BOOST_CHECK_EQUAL(result->first.m_type, NetMsgType::VERSION);
+    BOOST_CHECK(result->second);
+    BOOST_CHECK(node.fPauseRecv);
+
+    result = node.PollMessage(allowed_types);
+    BOOST_REQUIRE(result);
+    BOOST_CHECK_EQUAL(result->first.m_type, NetMsgType::PING);
+    BOOST_CHECK(!result->second);
+    BOOST_CHECK(!node.fPauseRecv);
 }
 
 BOOST_AUTO_TEST_CASE(cnetaddr_basic)

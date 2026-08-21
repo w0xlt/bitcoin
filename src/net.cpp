@@ -4130,10 +4130,17 @@ void CNode::MarkReceivedMsgsForProcessing()
     fPauseRecv = m_msg_process_queue_size > m_recv_flood_size;
 }
 
-std::optional<std::pair<CNetMessage, bool>> CNode::PollMessage()
+std::optional<std::pair<CNetMessage, bool>> CNode::PollMessage(
+    std::optional<std::span<const std::string_view>> allowed_types)
 {
     LOCK(m_msg_process_queue_mutex);
     if (m_msg_process_queue.empty()) return std::nullopt;
+
+    const auto is_allowed{[&](const CNetMessage& message) {
+        return !allowed_types || std::find(allowed_types->begin(), allowed_types->end(),
+                                           std::string_view{message.m_type}) != allowed_types->end();
+    }};
+    if (!is_allowed(m_msg_process_queue.front())) return std::nullopt;
 
     std::list<CNetMessage> msgs;
     // Just take one message
@@ -4141,7 +4148,8 @@ std::optional<std::pair<CNetMessage, bool>> CNode::PollMessage()
     m_msg_process_queue_size -= msgs.front().GetMemoryUsage();
     fPauseRecv = m_msg_process_queue_size > m_recv_flood_size;
 
-    return std::make_pair(std::move(msgs.front()), !m_msg_process_queue.empty());
+    const bool more_work{!m_msg_process_queue.empty() && is_allowed(m_msg_process_queue.front())};
+    return std::make_pair(std::move(msgs.front()), more_work);
 }
 
 bool CConnman::NodeFullyConnected(const CNode* pnode)
