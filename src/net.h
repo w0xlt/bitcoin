@@ -762,10 +762,12 @@ public:
 
     /** Poll the next message from the processing queue of this connection.
      *
-     * Returns std::nullopt if the processing queue is empty, or a pair
-     * consisting of the message and a bool that indicates if the processing
-     * queue has more entries. */
-    std::optional<std::pair<CNetMessage, bool>> PollMessage()
+     * If `predicate` is non-empty and rejects the front message, returns
+     * std::nullopt without changing the queue or receive accounting. Otherwise
+     * returns the message and whether the new front also satisfies the same
+     * predicate. An empty predicate preserves ordinary polling behavior. */
+    std::optional<std::pair<CNetMessage, bool>> PollMessage(
+        const std::function<bool(const CNetMessage&)>& predicate = {})
         EXCLUSIVE_LOCKS_REQUIRED(!m_msg_process_queue_mutex);
 
     /** Account for the total size of a sent message in the per msg type connection stats. */

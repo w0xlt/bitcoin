@@ -140,6 +140,69 @@ BOOST_AUTO_TEST_CASE(cnode_simple_test)
     BOOST_CHECK_EQUAL(pnode4->ConnectedThroughNetwork(), Network::NET_ONION);
 }
 
+BOOST_AUTO_TEST_CASE(cnode_conditional_poll)
+{
+    auto& connman{static_cast<ConnmanTestMsg&>(*m_node.connman)};
+    CNode node{/*id=*/0,
+               /*sock=*/nullptr,
+               /*addrIn=*/CAddress{},
+               /*nKeyedNetGroupIn=*/0,
+               /*nLocalHostNonceIn=*/0,
+               /*addrBindIn=*/CAddress{},
+               /*addrNameIn=*/std::string{},
+               /*conn_type_in=*/ConnectionType::INBOUND,
+               /*inbound_onion=*/false,
+               /*network_key=*/0,
+               CNodeOptions{.recv_flood_size = 0}};
+
+    BOOST_REQUIRE(connman.ReceiveMsgFrom(node, NetMsg::Make(NetMsgType::BLOCK)));
+    BOOST_REQUIRE(connman.ReceiveMsgFrom(node, NetMsg::Make(NetMsgType::PING, uint64_t{42})));
+    BOOST_REQUIRE(connman.ReceiveMsgFrom(node, NetMsg::Make(NetMsgType::BLOCK)));
+    BOOST_CHECK(node.fPauseRecv);
+
+    const auto is_block{[](const CNetMessage& message) noexcept {
+        return message.m_type == NetMsgType::BLOCK;
+    }};
+    const auto deny_all{[](const CNetMessage&) noexcept { return false; }};
+
+    // Rejection leaves both queue order and receive accounting untouched.
+    BOOST_CHECK(!node.PollMessage(deny_all));
+    BOOST_CHECK(node.fPauseRecv);
+
+    auto first_block{node.PollMessage(is_block)};
+    BOOST_REQUIRE(first_block);
+    BOOST_CHECK_EQUAL(first_block->first.m_type, NetMsgType::BLOCK);
+    // The new front is a ping, so it is not more work for this predicate.
+    BOOST_CHECK(!first_block->second);
+    BOOST_CHECK(node.fPauseRecv);
+
+    // Conditional polling never scans past a rejected front.
+    BOOST_CHECK(!node.PollMessage(is_block));
+    BOOST_CHECK(node.fPauseRecv);
+
+    auto ping{node.PollMessage()};
+    BOOST_REQUIRE(ping);
+    BOOST_CHECK_EQUAL(ping->first.m_type, NetMsgType::PING);
+    BOOST_CHECK(ping->second);
+    BOOST_CHECK(node.fPauseRecv);
+
+    auto second_block{node.PollMessage(is_block)};
+    BOOST_REQUIRE(second_block);
+    BOOST_CHECK_EQUAL(second_block->first.m_type, NetMsgType::BLOCK);
+    BOOST_CHECK(!second_block->second);
+    BOOST_CHECK(!node.fPauseRecv);
+    BOOST_CHECK(!node.PollMessage());
+
+    // Empty-predicate polling keeps the ordinary pop/accounting behavior.
+    BOOST_REQUIRE(connman.ReceiveMsgFrom(node, NetMsg::Make(NetMsgType::PING, uint64_t{43})));
+    BOOST_CHECK(node.fPauseRecv);
+    auto final_ping{node.PollMessage()};
+    BOOST_REQUIRE(final_ping);
+    BOOST_CHECK_EQUAL(final_ping->first.m_type, NetMsgType::PING);
+    BOOST_CHECK(!final_ping->second);
+    BOOST_CHECK(!node.fPauseRecv);
+}
+
 BOOST_AUTO_TEST_CASE(cnetaddr_basic)
 {
     CNetAddr addr;
