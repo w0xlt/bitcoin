@@ -58,6 +58,7 @@
 #include <uint256.h>
 #include <util/check.h>
 #include <util/hasher.h>
+#include <util/signalinterrupt.h>
 #include <util/strencodings.h>
 #include <util/time.h>
 #include <util/tokenbucket.h>
@@ -85,6 +86,7 @@
 #include <ratio>
 #include <set>
 #include <span>
+#include <type_traits>
 #include <typeinfo>
 #include <unordered_set>
 #include <utility>
@@ -206,6 +208,7 @@ static constexpr auto PRIVATE_BROADCAST_MAX_CONNECTION_LIFETIME{3min};
 
 // Internal stuff
 namespace {
+
 /** Blocks that are in flight, and that are in the queue to be downloaded. */
 struct QueuedBlock {
     /** BlockIndex. We must have this since we only request blocks when we've already validated the header. */
@@ -569,7 +572,10 @@ class PeerManagerImpl final : public PeerManager
 public:
     PeerManagerImpl(CConnman& connman, AddrMan& addrman,
                     BanMan* banman, ChainstateManager& chainman,
-                    CTxMemPool& pool, node::Warnings& warnings, Options opts);
+                    CTxMemPool& pool, node::Warnings& warnings, Options opts,
+                    std::unique_ptr<node::P2PBlockProcessing> block_processing);
+    ~PeerManagerImpl() override
+        EXCLUSIVE_LOCKS_REQUIRED(!m_pending_validation_mutex, !m_async_fairness_mutex);
 
     /** Overridden from CValidationInterface. */
     void ActiveTipChange(const CBlockIndex& new_tip, bool) override
@@ -581,25 +587,30 @@ public:
     void UpdatedBlockTip(const CBlockIndex *pindexNew, const CBlockIndex *pindexFork, bool fInitialDownload) override
         EXCLUSIVE_LOCKS_REQUIRED(!m_peer_mutex);
     void BlockChecked(const std::shared_ptr<const CBlock>& block, const BlockValidationState& state) override
-        EXCLUSIVE_LOCKS_REQUIRED(!m_peer_mutex);
+        EXCLUSIVE_LOCKS_REQUIRED(!m_peer_mutex, !m_pending_validation_mutex);
     void NewPoWValidBlock(const CBlockIndex *pindex, const std::shared_ptr<const CBlock>& pblock) override
         EXCLUSIVE_LOCKS_REQUIRED(!m_most_recent_block_mutex);
 
     /** Implement NetEventsInterface */
     void InitializeNode(const CNode& node, ServiceFlags our_services) override EXCLUSIVE_LOCKS_REQUIRED(!m_peer_mutex, !m_tx_download_mutex);
-    void FinalizeNode(const CNode& node) override EXCLUSIVE_LOCKS_REQUIRED(!m_peer_mutex, !m_headers_presync_mutex, !m_tx_download_mutex);
+    void FinalizeNode(const CNode& node) override EXCLUSIVE_LOCKS_REQUIRED(!m_peer_mutex, !m_headers_presync_mutex, !m_tx_download_mutex, !m_pending_validation_mutex, !m_async_fairness_mutex);
     bool HasAllDesirableServiceFlags(ServiceFlags services) const override;
     bool ProcessMessages(CNode& node, std::atomic<bool>& interrupt) override
-        EXCLUSIVE_LOCKS_REQUIRED(!m_peer_mutex, !m_most_recent_block_mutex, !m_headers_presync_mutex, g_msgproc_mutex, !m_tx_download_mutex, !m_inv_to_send_mutex);
+        EXCLUSIVE_LOCKS_REQUIRED(!m_peer_mutex, !m_most_recent_block_mutex, !m_headers_presync_mutex, g_msgproc_mutex, !m_tx_download_mutex, !m_inv_to_send_mutex, !m_pending_validation_mutex, !m_async_fairness_mutex);
     bool SendMessages(CNode& node) override
-        EXCLUSIVE_LOCKS_REQUIRED(!m_peer_mutex, !m_most_recent_block_mutex, g_msgproc_mutex, !m_tx_download_mutex, !m_inv_to_send_mutex);
+        EXCLUSIVE_LOCKS_REQUIRED(!m_peer_mutex, !m_most_recent_block_mutex, g_msgproc_mutex, !m_tx_download_mutex, !m_inv_to_send_mutex, !m_pending_validation_mutex, !m_async_fairness_mutex);
 
     /** Implement PeerManager */
+    void InterruptAsyncBlockProcessing() override;
+    bool HasAsyncBlockProcessing() const override { return m_block_processing != nullptr; }
+    void StopAsyncBlockProcessing() override
+        EXCLUSIVE_LOCKS_REQUIRED(!m_pending_validation_mutex, !m_async_fairness_mutex);
     void StartScheduledTasks(CScheduler& scheduler) override;
-    void CheckForStaleTipAndEvictPeers() override;
+    void CheckForStaleTipAndEvictPeers() override
+        EXCLUSIVE_LOCKS_REQUIRED(!m_pending_validation_mutex);
     util::Expected<void, std::string> FetchBlock(NodeId peer_id, const CBlockIndex& block_index) override
-        EXCLUSIVE_LOCKS_REQUIRED(!m_peer_mutex);
-    bool GetNodeStateStats(NodeId nodeid, CNodeStateStats& stats) const override EXCLUSIVE_LOCKS_REQUIRED(!m_peer_mutex);
+        EXCLUSIVE_LOCKS_REQUIRED(!m_peer_mutex, !m_pending_validation_mutex);
+    bool GetNodeStateStats(NodeId nodeid, CNodeStateStats& stats) const override EXCLUSIVE_LOCKS_REQUIRED(!m_peer_mutex, !m_pending_validation_mutex);
     std::vector<node::TxOrphanage::OrphanInfo> GetOrphanTransactions() override EXCLUSIVE_LOCKS_REQUIRED(!m_tx_download_mutex);
     PeerManagerInfo GetInfo() const override EXCLUSIVE_LOCKS_REQUIRED(!m_peer_mutex, !m_inv_to_send_mutex);
     std::vector<PrivateBroadcast::TxBroadcastInfo> GetPrivateBroadcastInfo() const override EXCLUSIVE_LOCKS_REQUIRED(!m_peer_mutex);
@@ -618,8 +629,9 @@ public:
 
 private:
     void ProcessMessage(Peer& peer, CNode& pfrom, const std::string& msg_type, DataStream& vRecv, NodeClock::time_point time_received,
+                        bool async_block_admitted, uint32_t serialized_size, bool& async_block_enqueued,
                         const std::atomic<bool>& interruptMsgProc)
-        EXCLUSIVE_LOCKS_REQUIRED(!m_peer_mutex, !m_most_recent_block_mutex, !m_headers_presync_mutex, g_msgproc_mutex, !m_tx_download_mutex, !m_inv_to_send_mutex);
+        EXCLUSIVE_LOCKS_REQUIRED(!m_peer_mutex, !m_most_recent_block_mutex, !m_headers_presync_mutex, g_msgproc_mutex, !m_tx_download_mutex, !m_inv_to_send_mutex, !m_pending_validation_mutex, !m_async_fairness_mutex);
 
     /** Consider evicting an outbound peer based on the amount of time they've been behind our tip */
     void ConsiderEviction(CNode& pto, Peer& peer, std::chrono::seconds time_in_seconds) EXCLUSIVE_LOCKS_REQUIRED(cs_main, g_msgproc_mutex);
@@ -732,7 +744,7 @@ private:
     void ProcessHeadersMessage(CNode& pfrom, Peer& peer,
                                std::vector<CBlockHeader>&& headers,
                                bool via_compact_block)
-        EXCLUSIVE_LOCKS_REQUIRED(!m_peer_mutex, !m_headers_presync_mutex, g_msgproc_mutex);
+        EXCLUSIVE_LOCKS_REQUIRED(!m_peer_mutex, !m_headers_presync_mutex, g_msgproc_mutex, !m_pending_validation_mutex);
     /** Various helpers for headers processing, invoked by ProcessHeadersMessage() */
     /** Return true if headers are continuous and have valid proof-of-work (DoS points assigned on failure) */
     bool CheckHeadersPoW(const std::vector<CBlockHeader>& headers, Peer& peer);
@@ -791,7 +803,8 @@ private:
      */
     bool MaybeSendGetHeaders(CNode& pfrom, const CBlockLocator& locator, Peer& peer) EXCLUSIVE_LOCKS_REQUIRED(g_msgproc_mutex);
     /** Potentially fetch blocks from this peer upon receipt of a new headers tip */
-    void HeadersDirectFetchBlocks(CNode& pfrom, const Peer& peer, const CBlockIndex& last_header);
+    void HeadersDirectFetchBlocks(CNode& pfrom, const Peer& peer, const CBlockIndex& last_header)
+        EXCLUSIVE_LOCKS_REQUIRED(!m_pending_validation_mutex);
     /** Update peer state based on received headers message */
     void UpdatePeerStateForReceivedHeaders(CNode& pfrom, const CBlockIndex& last_header, bool received_new_header, bool may_have_more_headers)
         EXCLUSIVE_LOCKS_REQUIRED(g_msgproc_mutex);
@@ -855,6 +868,37 @@ private:
     BanMan* const m_banman;
     ChainstateManager& m_chainman;
     CTxMemPool& m_mempool;
+    std::unique_ptr<node::P2PBlockProcessing> m_block_processing;
+
+    /**
+     * Bound cumulative admissions between idle opportunities. Unsafe fronts
+     * observed during an epoch receive one ordered service opportunity before
+     * another epoch starts. This prevents continuous queue refill starvation.
+     */
+    mutable Mutex m_async_fairness_mutex;
+    size_t m_async_epoch_admissions GUARDED_BY(m_async_fairness_mutex){0};
+    bool m_async_epoch_closed GUARDED_BY(m_async_fairness_mutex){false};
+    bool m_async_drain_active GUARDED_BY(m_async_fairness_mutex){false};
+    std::set<NodeId> m_async_deferred_peers GUARDED_BY(m_async_fairness_mutex);
+
+    void BeginAsyncMessagePass(bool async_idle)
+        EXCLUSIVE_LOCKS_REQUIRED(!m_async_fairness_mutex);
+    bool CanAdmitAsyncBlockThisEpoch() const
+        EXCLUSIVE_LOCKS_REQUIRED(!m_async_fairness_mutex);
+    void AsyncBlockSubmitted()
+        EXCLUSIVE_LOCKS_REQUIRED(!m_async_fairness_mutex);
+    bool RecordAsyncDeferredPeer(NodeId source, bool expedite) noexcept
+        EXCLUSIVE_LOCKS_REQUIRED(!m_async_fairness_mutex);
+    bool CanServiceAsyncPeer(NodeId source) const
+        EXCLUSIVE_LOCKS_REQUIRED(!m_async_fairness_mutex);
+    bool IsAsyncDeferredPeer(NodeId source) const
+        EXCLUSIVE_LOCKS_REQUIRED(!m_async_fairness_mutex);
+    bool IsAsyncEpochClosed() const
+        EXCLUSIVE_LOCKS_REQUIRED(!m_async_fairness_mutex);
+    void AsyncDeferredMessageProcessed(NodeId source)
+        EXCLUSIVE_LOCKS_REQUIRED(!m_async_fairness_mutex);
+    void RemoveAsyncDeferredPeer(NodeId source) noexcept
+        EXCLUSIVE_LOCKS_REQUIRED(!m_async_fairness_mutex);
 
     /** Synchronizes tx download including TxRequestTracker, rejection filters, and TxOrphanage.
      * Lock invariants:
@@ -990,23 +1034,29 @@ private:
      * flight from that peer (to avoid one peer's network traffic from
      * affecting another's state).
      */
-    void RemoveBlockRequest(const uint256& hash, std::optional<NodeId> from_peer) EXCLUSIVE_LOCKS_REQUIRED(cs_main);
+    void RemoveBlockRequest(const uint256& hash, std::optional<NodeId> from_peer) EXCLUSIVE_LOCKS_REQUIRED(cs_main, !m_pending_validation_mutex);
+    void RemoveBlockRequestLocked(const uint256& hash, std::optional<NodeId> from_peer)
+        EXCLUSIVE_LOCKS_REQUIRED(cs_main, m_pending_validation_mutex);
+    bool RemoveUnreceivedBlockRequestLocked(const uint256& hash, NodeId source)
+        EXCLUSIVE_LOCKS_REQUIRED(m_pending_validation_mutex);
 
     /* Mark a block as in flight
      * Returns false, still setting pit, if the block was already in flight from the same peer
      * pit will only be valid as long as the same cs_main lock is being held
      */
-    bool BlockRequested(NodeId nodeid, const CBlockIndex& block, std::list<QueuedBlock>::iterator** pit = nullptr) EXCLUSIVE_LOCKS_REQUIRED(cs_main);
+    bool BlockRequested(NodeId nodeid, const CBlockIndex& block, std::list<QueuedBlock>::iterator** pit = nullptr) EXCLUSIVE_LOCKS_REQUIRED(cs_main, !m_pending_validation_mutex);
+    bool BlockRequestedLocked(NodeId nodeid, const CBlockIndex& block, std::list<QueuedBlock>::iterator** pit = nullptr)
+        EXCLUSIVE_LOCKS_REQUIRED(cs_main, m_pending_validation_mutex);
 
-    bool TipMayBeStale() EXCLUSIVE_LOCKS_REQUIRED(cs_main);
+    bool TipMayBeStale() EXCLUSIVE_LOCKS_REQUIRED(cs_main, !m_pending_validation_mutex);
 
     /** Update pindexLastCommonBlock and add not-in-flight missing successors to vBlocks, until it has
      *  at most count entries.
      */
-    void FindNextBlocksToDownload(const Peer& peer, unsigned int count, std::vector<const CBlockIndex*>& vBlocks, NodeId& nodeStaller) EXCLUSIVE_LOCKS_REQUIRED(cs_main);
+    void FindNextBlocksToDownload(const Peer& peer, unsigned int count, std::vector<const CBlockIndex*>& vBlocks, NodeId& nodeStaller) EXCLUSIVE_LOCKS_REQUIRED(cs_main, !m_pending_validation_mutex);
 
     /** Request blocks for the background chainstate, if one is in use. */
-    void TryDownloadingHistoricalBlocks(const Peer& peer, unsigned int count, std::vector<const CBlockIndex*>& vBlocks, const CBlockIndex* from_tip, const CBlockIndex* target_block) EXCLUSIVE_LOCKS_REQUIRED(cs_main);
+    void TryDownloadingHistoricalBlocks(const Peer& peer, unsigned int count, std::vector<const CBlockIndex*>& vBlocks, const CBlockIndex* from_tip, const CBlockIndex* target_block) EXCLUSIVE_LOCKS_REQUIRED(cs_main, !m_pending_validation_mutex);
 
     /**
     * \brief Find next blocks to download from a peer after a starting block.
@@ -1035,11 +1085,30 @@ private:
     *                     block in the window is in flight and no other peer is
     *                     trying to download the next block).
     */
-    void FindNextBlocks(std::vector<const CBlockIndex*>& vBlocks, const Peer& peer, CNodeState *state, const CBlockIndex *pindexWalk, unsigned int count, int nWindowEnd, const CChain* activeChain=nullptr, NodeId* nodeStaller=nullptr) EXCLUSIVE_LOCKS_REQUIRED(cs_main);
+    void FindNextBlocks(std::vector<const CBlockIndex*>& vBlocks, const Peer& peer, CNodeState *state, const CBlockIndex *pindexWalk, unsigned int count, int nWindowEnd, const CChain* activeChain=nullptr, NodeId* nodeStaller=nullptr) EXCLUSIVE_LOCKS_REQUIRED(cs_main, !m_pending_validation_mutex);
 
     /* Multimap used to preserve insertion order */
     typedef std::multimap<uint256, std::pair<NodeId, std::list<QueuedBlock>::iterator>> BlockDownloadMap;
     BlockDownloadMap mapBlocksInFlight GUARDED_BY(cs_main);
+
+    /**
+     * Received full blocks that are queued or active but not yet processed.
+     * Downloader code takes cs_main before this mutex; admission takes only
+     * this mutex, so the message handler never waits for PNB's cs_main.
+     */
+    mutable Mutex m_pending_validation_mutex ACQUIRED_AFTER(cs_main);
+    struct PendingValidationJob {
+        uint256 hash;
+        NodeId source;
+    };
+    std::array<std::optional<PendingValidationJob>, node::P2P_BLOCK_PROCESSING_MAX_JOBS> m_blocks_pending_validation GUARDED_BY(m_pending_validation_mutex);
+    /**
+     * Logical, not-yet-received request sources mirrored from
+     * mapBlocksInFlight. A receipt consumes its own source here immediately,
+     * while the physical entry remains until its worker starts.
+     */
+    std::multimap<uint256, NodeId> m_unreceived_block_requests GUARDED_BY(m_pending_validation_mutex);
+    size_t m_pending_validation_count GUARDED_BY(m_pending_validation_mutex){0};
 
     /** When our tip was last updated. */
     std::atomic<std::chrono::seconds> m_last_tip_update{0s};
@@ -1052,12 +1121,39 @@ private:
         EXCLUSIVE_LOCKS_REQUIRED(!m_most_recent_block_mutex, peer.m_getdata_requests_mutex, NetEventsInterface::g_msgproc_mutex)
         LOCKS_EXCLUDED(::cs_main);
 
-    /** Process a new block. Perform any post-processing housekeeping */
-    void ProcessBlock(CNode& node, const std::shared_ptr<const CBlock>& block, bool force_processing, bool min_pow_checked);
+    /** Process a new block synchronously. Async processing must already be idle. */
+    void ProcessBlock(CNode& node, const std::shared_ptr<const CBlock>& block, bool force_processing, bool min_pow_checked)
+        EXCLUSIVE_LOCKS_REQUIRED(!m_pending_validation_mutex);
+
+    bool IsBlockPendingValidation(const uint256& hash) const
+        EXCLUSIVE_LOCKS_REQUIRED(!m_pending_validation_mutex);
+    size_t PendingValidationCount() const
+        EXCLUSIVE_LOCKS_REQUIRED(!m_pending_validation_mutex);
+    std::pair<size_t, size_t> PendingValidationCounts(const uint256& hash) const
+        EXCLUSIVE_LOCKS_REQUIRED(!m_pending_validation_mutex);
+    /** Atomically capture receipt-time request state and mark a received job pending. */
+    bool AdmitBlockPendingValidation(const uint256& hash, NodeId source)
+        EXCLUSIVE_LOCKS_REQUIRED(!m_pending_validation_mutex);
+    /** Remove one exact pending job. */
+    void RemoveBlockPendingValidation(const uint256& hash, NodeId source)
+        EXCLUSIVE_LOCKS_REQUIRED(!m_pending_validation_mutex);
+    size_t NonPendingBlocksInFlight(const CNodeState& state) const
+        EXCLUSIVE_LOCKS_REQUIRED(cs_main, !m_pending_validation_mutex);
+    size_t NonPendingBlocksInFlightTotal() const
+        EXCLUSIVE_LOCKS_REQUIRED(cs_main, !m_pending_validation_mutex);
+    int PeersWithNonPendingDownloads() const
+        EXCLUSIVE_LOCKS_REQUIRED(cs_main, !m_pending_validation_mutex);
+    void ProcessAsyncBlock(const node::P2PBlockProcessingJob& job) noexcept
+        EXCLUSIVE_LOCKS_REQUIRED(!m_peer_mutex, !m_pending_validation_mutex)
+        LOCKS_EXCLUDED(::cs_main, NetEventsInterface::g_msgproc_mutex);
+    void CleanupCanceledAsyncBlock(const node::P2PBlockProcessingJob& job)
+        EXCLUSIVE_LOCKS_REQUIRED(cs_main, !m_pending_validation_mutex);
+    void CleanupUnsubmittedAsyncBlocks()
+        EXCLUSIVE_LOCKS_REQUIRED(cs_main, !m_pending_validation_mutex);
 
     /** Process compact block txns  */
     void ProcessCompactBlockTxns(CNode& pfrom, Peer& peer, const BlockTransactions& block_transactions)
-        EXCLUSIVE_LOCKS_REQUIRED(g_msgproc_mutex, !m_most_recent_block_mutex);
+        EXCLUSIVE_LOCKS_REQUIRED(g_msgproc_mutex, !m_most_recent_block_mutex, !m_pending_validation_mutex);
 
     /**
      * Schedule an INV for a transaction to be sent to the given peer (via `PushMessage()`).
@@ -1300,6 +1396,51 @@ bool PeerManagerImpl::IsBlockRequestedFromOutbound(const uint256& hash)
 
 void PeerManagerImpl::RemoveBlockRequest(const uint256& hash, std::optional<NodeId> from_peer)
 {
+    if (!m_block_processing) {
+        auto range = mapBlocksInFlight.equal_range(hash);
+        if (range.first == range.second) {
+            // Block was not requested from any peer
+            return;
+        }
+
+        // We should not have requested too many of this block
+        Assume(mapBlocksInFlight.count(hash) <= MAX_CMPCTBLOCKS_INFLIGHT_PER_BLOCK);
+
+        while (range.first != range.second) {
+            const auto& [node_id, list_it]{range.first->second};
+
+            if (from_peer && *from_peer != node_id) {
+                range.first++;
+                continue;
+            }
+
+            CNodeState& state = *Assert(State(node_id));
+
+            if (state.vBlocksInFlight.begin() == list_it) {
+                // First block on the queue was received, update the start download time for the next one
+                state.m_downloading_since = std::max(state.m_downloading_since, GetTime<std::chrono::microseconds>());
+            }
+            state.vBlocksInFlight.erase(list_it);
+
+            if (state.vBlocksInFlight.empty()) {
+                // Last validated block on the queue for this peer was received.
+                m_peers_downloading_from--;
+            }
+            state.m_stalling_since = 0us;
+
+            range.first = mapBlocksInFlight.erase(range.first);
+        }
+        return;
+    }
+
+    // Keep the physical request map and its cs_main-free receipt mirror one
+    // atomic state transition. Admission takes only this second mutex.
+    LOCK(m_pending_validation_mutex);
+    RemoveBlockRequestLocked(hash, from_peer);
+}
+
+void PeerManagerImpl::RemoveBlockRequestLocked(const uint256& hash, std::optional<NodeId> from_peer)
+{
     auto range = mapBlocksInFlight.equal_range(hash);
     if (range.first == range.second) {
         // Block was not requested from any peer
@@ -1331,8 +1472,22 @@ void PeerManagerImpl::RemoveBlockRequest(const uint256& hash, std::optional<Node
         }
         state.m_stalling_since = 0us;
 
+        // Receipt admission may already have consumed this exact logical
+        // request while deliberately leaving the physical entry in place.
+        (void)RemoveUnreceivedBlockRequestLocked(hash, node_id);
         range.first = mapBlocksInFlight.erase(range.first);
     }
+}
+
+bool PeerManagerImpl::RemoveUnreceivedBlockRequestLocked(const uint256& hash, NodeId source)
+{
+    auto range{m_unreceived_block_requests.equal_range(hash)};
+    const auto request{std::find_if(range.first, range.second, [&](const auto& entry) {
+        return entry.second == source;
+    })};
+    if (request == range.second) return false;
+    m_unreceived_block_requests.erase(request);
+    return true;
 }
 
 bool PeerManagerImpl::BlockRequested(NodeId nodeid, const CBlockIndex& block, std::list<QueuedBlock>::iterator** pit)
@@ -1342,6 +1497,42 @@ bool PeerManagerImpl::BlockRequested(NodeId nodeid, const CBlockIndex& block, st
     CNodeState *state = State(nodeid);
     assert(state != nullptr);
 
+    if (!m_block_processing) {
+        Assume(mapBlocksInFlight.count(hash) <= MAX_CMPCTBLOCKS_INFLIGHT_PER_BLOCK);
+
+        // Short-circuit most stuff in case it is from the same node
+        for (auto range = mapBlocksInFlight.equal_range(hash); range.first != range.second; range.first++) {
+            if (range.first->second.first == nodeid) {
+                if (pit) {
+                    *pit = &range.first->second.second;
+                }
+                return false;
+            }
+        }
+
+        // Make sure it's not being fetched already from same peer.
+        RemoveBlockRequest(hash, nodeid);
+
+        std::list<QueuedBlock>::iterator it = state->vBlocksInFlight.insert(state->vBlocksInFlight.end(),
+                {&block, std::unique_ptr<PartiallyDownloadedBlock>(pit ? new PartiallyDownloadedBlock(&m_mempool) : nullptr)});
+        if (state->vBlocksInFlight.size() == 1) {
+            // We're starting a block download (batch) from this peer.
+            state->m_downloading_since = GetTime<std::chrono::microseconds>();
+            m_peers_downloading_from++;
+        }
+        auto itInFlight = mapBlocksInFlight.insert(std::make_pair(hash, std::make_pair(nodeid, it)));
+        if (pit) {
+            *pit = &itInFlight->second.second;
+        }
+        return true;
+    }
+
+    // Admission may race this cs_main holder. Keep the pending decision,
+    // same-peer check, request replacement, and mirror publication atomic.
+    LOCK(m_pending_validation_mutex);
+    if (std::ranges::any_of(m_blocks_pending_validation, [&](const auto& job) {
+            return job && job->hash == hash;
+        })) return false;
     Assume(mapBlocksInFlight.count(hash) <= MAX_CMPCTBLOCKS_INFLIGHT_PER_BLOCK);
 
     // Short-circuit most stuff in case it is from the same node
@@ -1355,18 +1546,45 @@ bool PeerManagerImpl::BlockRequested(NodeId nodeid, const CBlockIndex& block, st
     }
 
     // Make sure it's not being fetched already from same peer.
-    RemoveBlockRequest(hash, nodeid);
+    RemoveBlockRequestLocked(hash, nodeid);
 
-    std::list<QueuedBlock>::iterator it = state->vBlocksInFlight.insert(state->vBlocksInFlight.end(),
-            {&block, std::unique_ptr<PartiallyDownloadedBlock>(pit ? new PartiallyDownloadedBlock(&m_mempool) : nullptr)});
-    if (state->vBlocksInFlight.size() == 1) {
-        // We're starting a block download (batch) from this peer.
-        state->m_downloading_since = GetTime<std::chrono::microseconds>();
-        m_peers_downloading_from++;
-    }
-    auto itInFlight = mapBlocksInFlight.insert(std::make_pair(hash, std::make_pair(nodeid, it)));
-    if (pit) {
-        *pit = &itInFlight->second.second;
+    return BlockRequestedLocked(nodeid, block, pit);
+}
+
+bool PeerManagerImpl::BlockRequestedLocked(NodeId nodeid, const CBlockIndex& block, std::list<QueuedBlock>::iterator** pit)
+{
+    const uint256& hash{block.GetBlockHash()};
+    CNodeState* state{Assert(State(nodeid))};
+    Assert(!std::ranges::any_of(m_blocks_pending_validation, [&](const auto& job) {
+        return job && job->hash == hash;
+    }));
+
+    // Publish the logical request before the physical one while holding the
+    // admission mutex. If a later allocation fails, roll it back so this
+    // operation has a strong exception guarantee.
+    auto requested_it{m_unreceived_block_requests.emplace(hash, nodeid)};
+    try {
+        const bool was_empty{state->vBlocksInFlight.empty()};
+        auto list_it{state->vBlocksInFlight.insert(
+            state->vBlocksInFlight.end(),
+            {&block, std::unique_ptr<PartiallyDownloadedBlock>(
+                         pit ? new PartiallyDownloadedBlock(&m_mempool) : nullptr)})};
+        try {
+            auto inflight_it{mapBlocksInFlight.insert(
+                std::make_pair(hash, std::make_pair(nodeid, list_it)))};
+            if (was_empty) {
+                // We're starting a block download (batch) from this peer.
+                state->m_downloading_since = GetTime<std::chrono::microseconds>();
+                m_peers_downloading_from++;
+            }
+            if (pit) *pit = &inflight_it->second.second;
+        } catch (...) {
+            state->vBlocksInFlight.erase(list_it);
+            throw;
+        }
+    } catch (...) {
+        m_unreceived_block_requests.erase(requested_it);
+        throw;
     }
     return true;
 }
@@ -1437,7 +1655,8 @@ bool PeerManagerImpl::TipMayBeStale()
     if (m_last_tip_update.load() == 0s) {
         m_last_tip_update = GetTime<std::chrono::seconds>();
     }
-    return m_last_tip_update.load() < GetTime<std::chrono::seconds>() - std::chrono::seconds{consensusParams.nPowTargetSpacing * 3} && mapBlocksInFlight.empty();
+    return m_last_tip_update.load() < GetTime<std::chrono::seconds>() - std::chrono::seconds{consensusParams.nPowTargetSpacing * 3} &&
+           mapBlocksInFlight.empty() && PendingValidationCount() == 0;
 }
 
 int64_t PeerManagerImpl::ApproximateBestBlockDepth() const
@@ -1578,6 +1797,7 @@ void PeerManagerImpl::FindNextBlocks(std::vector<const CBlockIndex*>& vBlocks, c
     int nMaxHeight = std::min<int>(state->pindexBestKnownBlock->nHeight, nWindowEnd + 1);
     bool is_limited_peer = IsLimitedPeer(peer);
     NodeId waitingfor = -1;
+    bool pending_precedes_waitingfor{false};
     while (pindexWalk->nHeight < nMaxHeight) {
         // Read up to 128 (or more, if more blocks than that are needed) successors of pindexWalk (towards
         // pindexBestKnownBlock) into vToFetch. We fetch 128, because CBlockIndex::GetAncestor may be as expensive
@@ -1612,11 +1832,21 @@ void PeerManagerImpl::FindNextBlocks(std::vector<const CBlockIndex*>& vBlocks, c
                 continue;
             }
 
+            const uint256& hash{pindex->GetBlockHash()};
+
+            // Received work is progress, not a network download or staller.
+            // Check this before mapBlocksInFlight because a legitimate request
+            // from another peer may remain until validation completes.
+            if (IsBlockPendingValidation(hash)) {
+                if (waitingfor == -1) pending_precedes_waitingfor = true;
+                continue;
+            }
+
             // Is block in-flight?
-            if (IsBlockRequested(pindex->GetBlockHash())) {
+            if (IsBlockRequested(hash)) {
                 if (waitingfor == -1) {
                     // This is the first already-in-flight block.
-                    waitingfor = mapBlocksInFlight.lower_bound(pindex->GetBlockHash())->second.first;
+                    waitingfor = mapBlocksInFlight.lower_bound(hash)->second.first;
                 }
                 continue;
             }
@@ -1624,7 +1854,11 @@ void PeerManagerImpl::FindNextBlocks(std::vector<const CBlockIndex*>& vBlocks, c
             // The block is not already downloaded, and not yet in flight.
             if (pindex->nHeight > nWindowEnd) {
                 // We reached the end of the window.
-                if (vBlocks.size() == 0 && waitingfor != peer.m_id) {
+                // Suppress blame only when local validation precedes the
+                // first network blocker. A later pending descendant does not
+                // excuse an earlier in-flight staller.
+                if (vBlocks.size() == 0 && waitingfor != peer.m_id &&
+                    !pending_precedes_waitingfor) {
                     // We aren't able to fetch anything, but we would be if the download window was one larger.
                     if (nodeStaller) *nodeStaller = waitingfor;
                 }
@@ -1778,6 +2012,7 @@ void PeerManagerImpl::ReattemptPrivateBroadcast(CScheduler& scheduler)
 void PeerManagerImpl::FinalizeNode(const CNode& node)
 {
     NodeId nodeid = node.GetId();
+    if (m_block_processing) RemoveAsyncDeferredPeer(nodeid);
     {
     LOCK(cs_main);
     {
@@ -1797,14 +2032,33 @@ void PeerManagerImpl::FinalizeNode(const CNode& node)
     if (state->fSyncStarted)
         nSyncStarted--;
 
-    for (const QueuedBlock& entry : state->vBlocksInFlight) {
-        auto range = mapBlocksInFlight.equal_range(entry.pindex->GetBlockHash());
-        while (range.first != range.second) {
-            auto [node_id, list_it] = range.first->second;
-            if (node_id != nodeid) {
-                range.first++;
-            } else {
-                range.first = mapBlocksInFlight.erase(range.first);
+    if (m_block_processing) {
+        LOCK(m_pending_validation_mutex);
+        for (const QueuedBlock& entry : state->vBlocksInFlight) {
+            const uint256& hash{entry.pindex->GetBlockHash()};
+            auto range = mapBlocksInFlight.equal_range(hash);
+            while (range.first != range.second) {
+                auto [node_id, list_it] = range.first->second;
+                if (node_id != nodeid) {
+                    range.first++;
+                } else {
+                    // A queued receipt may already have consumed this source
+                    // logically while retaining its physical request.
+                    (void)RemoveUnreceivedBlockRequestLocked(hash, nodeid);
+                    range.first = mapBlocksInFlight.erase(range.first);
+                }
+            }
+        }
+    } else {
+        for (const QueuedBlock& entry : state->vBlocksInFlight) {
+            auto range = mapBlocksInFlight.equal_range(entry.pindex->GetBlockHash());
+            while (range.first != range.second) {
+                auto [node_id, list_it] = range.first->second;
+                if (node_id != nodeid) {
+                    range.first++;
+                } else {
+                    range.first = mapBlocksInFlight.erase(range.first);
+                }
             }
         }
     }
@@ -1824,6 +2078,10 @@ void PeerManagerImpl::FinalizeNode(const CNode& node)
     if (m_node_states.empty()) {
         // Do a consistency check after the last peer is removed.
         assert(mapBlocksInFlight.empty());
+        if (m_block_processing) {
+            LOCK(m_pending_validation_mutex);
+            assert(m_unreceived_block_requests.empty());
+        }
         assert(m_num_preferred_download_peers == 0);
         assert(m_peers_downloading_from == 0);
         assert(m_outbound_peers_with_protect_from_disconnect == 0);
@@ -1908,9 +2166,21 @@ bool PeerManagerImpl::GetNodeStateStats(NodeId nodeid, CNodeStateStats& stats) c
             return false;
         stats.nSyncHeight = state->pindexBestKnownBlock ? state->pindexBestKnownBlock->nHeight : -1;
         stats.nCommonHeight = state->pindexLastCommonBlock ? state->pindexLastCommonBlock->nHeight : -1;
-        for (const QueuedBlock& queue : state->vBlocksInFlight) {
-            if (queue.pindex)
-                stats.vHeightInFlight.push_back(queue.pindex->nHeight);
+        if (m_block_processing) {
+            LOCK(m_pending_validation_mutex);
+            for (const QueuedBlock& queue : state->vBlocksInFlight) {
+                if (queue.pindex &&
+                    !std::ranges::any_of(m_blocks_pending_validation, [&](const auto& job) {
+                        return job && job->hash == queue.pindex->GetBlockHash();
+                    })) {
+                    stats.vHeightInFlight.push_back(queue.pindex->nHeight);
+                }
+            }
+        } else {
+            for (const QueuedBlock& queue : state->vBlocksInFlight) {
+                if (queue.pindex)
+                    stats.vHeightInFlight.push_back(queue.pindex->nHeight);
+            }
         }
     }
 
@@ -2096,14 +2366,29 @@ util::Expected<void, std::string> PeerManagerImpl::FetchBlock(NodeId peer_id, co
     // Ignore pre-segwit peers
     if (!CanServeWitnesses(*peer)) return util::Unexpected{"Pre-SegWit peer"};
 
-    // Forget about all prior requests
-    RemoveBlockRequest(block_index.GetBlockHash(), std::nullopt);
+    const uint256& hash{block_index.GetBlockHash()};
+    if (m_block_processing) {
+        // Receipt admission does not take cs_main. Keep the pending decision,
+        // replacement of prior requests, and mirror publication atomic with
+        // that producer so FetchBlock cannot erase fallback requests for a
+        // block that was just received.
+        LOCK(m_pending_validation_mutex);
+        if (std::ranges::any_of(m_blocks_pending_validation, [&](const auto& job) {
+                return job && job->hash == hash;
+            })) {
+            return util::Unexpected{"Block already received and pending validation"};
+        }
+        RemoveBlockRequestLocked(hash, std::nullopt);
+        Assert(BlockRequestedLocked(peer_id, block_index));
+    } else {
+        // Forget about all prior requests
+        RemoveBlockRequest(hash, std::nullopt);
 
-    // Mark block as in-flight
-    if (!BlockRequested(peer_id, block_index)) return util::Unexpected{"Already requested from this peer"};
+        // Mark block as in-flight
+        if (!BlockRequested(peer_id, block_index)) return util::Unexpected{"Already requested from this peer"};
+    }
 
     // Construct message to request the block
-    const uint256& hash{block_index.GetBlockHash()};
     std::vector<CInv> invs{CInv(MSG_BLOCK | MSG_WITNESS_FLAG, hash)};
 
     // Send block request message to the peer
@@ -2121,14 +2406,18 @@ util::Expected<void, std::string> PeerManagerImpl::FetchBlock(NodeId peer_id, co
 
 std::unique_ptr<PeerManager> PeerManager::make(CConnman& connman, AddrMan& addrman,
                                                BanMan* banman, ChainstateManager& chainman,
-                                               CTxMemPool& pool, node::Warnings& warnings, Options opts)
+                                               CTxMemPool& pool, node::Warnings& warnings, Options opts,
+                                               std::unique_ptr<node::P2PBlockProcessing> block_processing)
 {
-    return std::make_unique<PeerManagerImpl>(connman, addrman, banman, chainman, pool, warnings, opts);
+    return std::make_unique<PeerManagerImpl>(
+        connman, addrman, banman, chainman, pool, warnings, opts,
+        std::move(block_processing));
 }
 
 PeerManagerImpl::PeerManagerImpl(CConnman& connman, AddrMan& addrman,
                                  BanMan* banman, ChainstateManager& chainman,
-                                 CTxMemPool& pool, node::Warnings& warnings, Options opts)
+                                 CTxMemPool& pool, node::Warnings& warnings, Options opts,
+                                 std::unique_ptr<node::P2PBlockProcessing> block_processing)
     : m_rng{opts.deterministic_rng},
       m_fee_filter_rounder{CFeeRate{DEFAULT_MIN_RELAY_TX_FEE}, m_rng},
       m_chainparams(chainman.GetParams()),
@@ -2137,6 +2426,7 @@ PeerManagerImpl::PeerManagerImpl(CConnman& connman, AddrMan& addrman,
       m_banman(banman),
       m_chainman(chainman),
       m_mempool(pool),
+      m_block_processing{std::move(block_processing)},
       m_txdownloadman(node::TxDownloadOptions{pool, m_rng, opts.deterministic_rng}),
       m_warnings{warnings},
       m_opts{opts},
@@ -2148,6 +2438,160 @@ PeerManagerImpl::PeerManagerImpl(CConnman& connman, AddrMan& addrman,
     if (opts.reconcile_txs) {
         m_txreconciliation = std::make_unique<TxReconciliationTracker>(TXRECONCILIATION_VERSION);
     }
+    if (m_opts.async_pnb) {
+        if (!m_block_processing) {
+            m_block_processing = node::MakeP2PBlockProcessing(
+                [this](const node::P2PBlockProcessingJob& job)
+                    EXCLUSIVE_LOCKS_REQUIRED(!m_peer_mutex, !m_pending_validation_mutex) noexcept {
+                    ProcessAsyncBlock(job);
+                },
+                [this]() noexcept { m_connman.WakeMessageHandler(); });
+        }
+    } else {
+        Assert(!m_block_processing);
+    }
+}
+
+PeerManagerImpl::~PeerManagerImpl()
+{
+    StopAsyncBlockProcessing();
+}
+
+void PeerManagerImpl::InterruptAsyncBlockProcessing()
+{
+    if (m_block_processing) m_block_processing->Interrupt();
+}
+
+void PeerManagerImpl::StopAsyncBlockProcessing()
+{
+    if (!m_block_processing) return;
+    AssertLockNotHeld(NetEventsInterface::g_msgproc_mutex);
+
+    // Stop emits no wake for canceled jobs. At shutdown the message producer
+    // is already stopped, so owner bookkeeping can be cleaned after the worker
+    // has joined without exposing released capacity before pending state.
+    const auto canceled{m_block_processing->Stop()};
+    {
+        LOCK(cs_main);
+        for (const auto& job : canceled) CleanupCanceledAsyncBlock(job);
+        CleanupUnsubmittedAsyncBlocks();
+    }
+    {
+        LOCK(m_pending_validation_mutex);
+        Assert(m_pending_validation_count == 0);
+        Assert(std::ranges::none_of(m_blocks_pending_validation,
+                                    [](const auto& job) { return job.has_value(); }));
+    }
+    {
+        LOCK(m_async_fairness_mutex);
+        m_async_epoch_admissions = 0;
+        m_async_epoch_closed = false;
+        m_async_drain_active = false;
+        m_async_deferred_peers.clear();
+    }
+}
+
+void PeerManagerImpl::BeginAsyncMessagePass(bool async_idle)
+{
+    if (!async_idle) return;
+    LOCK(m_async_fairness_mutex);
+    if (m_async_drain_active) return;
+    if (!m_async_deferred_peers.empty()) {
+        // Seal the finite cohort observed while the worker was non-idle.
+        // New rejected fronts cannot extend an active drain indefinitely.
+        m_async_drain_active = true;
+        m_async_epoch_closed = true;
+        return;
+    }
+    m_async_epoch_admissions = 0;
+    m_async_epoch_closed = false;
+}
+
+bool PeerManagerImpl::CanAdmitAsyncBlockThisEpoch() const
+{
+    LOCK(m_async_fairness_mutex);
+    return !m_async_epoch_closed &&
+           m_async_epoch_admissions < node::P2P_BLOCK_PROCESSING_MAX_JOBS;
+}
+
+void PeerManagerImpl::AsyncBlockSubmitted()
+{
+    LOCK(m_async_fairness_mutex);
+    Assert(!m_async_epoch_closed);
+    Assert(m_async_epoch_admissions < node::P2P_BLOCK_PROCESSING_MAX_JOBS);
+    if (++m_async_epoch_admissions == node::P2P_BLOCK_PROCESSING_MAX_JOBS) {
+        m_async_epoch_closed = true;
+    }
+}
+
+bool PeerManagerImpl::RecordAsyncDeferredPeer(NodeId source, bool expedite) noexcept
+{
+    try {
+        LOCK(m_async_fairness_mutex);
+        if (m_async_drain_active) return false;
+        if (expedite) {
+            m_async_epoch_admissions = node::P2P_BLOCK_PROCESSING_MAX_JOBS;
+            m_async_epoch_closed = true;
+        }
+        return m_async_deferred_peers.insert(source).second;
+    } catch (...) {
+        // Fairness bookkeeping is best-effort only on allocation failure. It
+        // must never make conditional receive polling throw with the front
+        // message locked in place.
+        return false;
+    }
+}
+
+bool PeerManagerImpl::CanServiceAsyncPeer(NodeId source) const
+{
+    LOCK(m_async_fairness_mutex);
+    return !m_async_epoch_closed || m_async_deferred_peers.contains(source);
+}
+
+bool PeerManagerImpl::IsAsyncDeferredPeer(NodeId source) const
+{
+    LOCK(m_async_fairness_mutex);
+    return m_async_deferred_peers.contains(source);
+}
+
+bool PeerManagerImpl::IsAsyncEpochClosed() const
+{
+    LOCK(m_async_fairness_mutex);
+    return m_async_epoch_closed;
+}
+
+void PeerManagerImpl::AsyncDeferredMessageProcessed(NodeId source)
+{
+    bool service_complete{false};
+    {
+        LOCK(m_async_fairness_mutex);
+        m_async_deferred_peers.erase(source);
+        if (m_async_drain_active && m_async_deferred_peers.empty()) {
+            m_async_drain_active = false;
+            // Keep the epoch closed through this pass's SendMessages call.
+            // The next idle ProcessMessages pass reopens it before polling,
+            // so an untouched requested front cannot expose stale timers in
+            // between its service claim and receipt transition.
+            service_complete = true;
+        }
+    }
+    if (service_complete) m_connman.WakeMessageHandler();
+}
+
+void PeerManagerImpl::RemoveAsyncDeferredPeer(NodeId source) noexcept
+{
+    bool service_complete{false};
+    {
+        LOCK(m_async_fairness_mutex);
+        m_async_deferred_peers.erase(source);
+        if (m_async_drain_active && m_async_deferred_peers.empty()) {
+            m_async_drain_active = false;
+            // Match AsyncDeferredMessageProcessed's two-phase reopen. This
+            // also protects an untouched front when its owner disconnects.
+            service_complete = true;
+        }
+    }
+    if (service_complete) m_connman.WakeMessageHandler();
 }
 
 void PeerManagerImpl::StartScheduledTasks(CScheduler& scheduler)
@@ -2157,7 +2601,9 @@ void PeerManagerImpl::StartScheduledTasks(CScheduler& scheduler)
     // combine them in one function and schedule at the quicker (peer-eviction)
     // timer.
     static_assert(EXTRA_PEER_CHECK_INTERVAL < STALE_CHECK_INTERVAL, "peer eviction timer should be less than stale tip check timer");
-    scheduler.scheduleEvery([this] { this->CheckForStaleTipAndEvictPeers(); }, std::chrono::seconds{EXTRA_PEER_CHECK_INTERVAL});
+    scheduler.scheduleEvery([this]() EXCLUSIVE_LOCKS_REQUIRED(!m_pending_validation_mutex) {
+        this->CheckForStaleTipAndEvictPeers();
+    }, std::chrono::seconds{EXTRA_PEER_CHECK_INTERVAL});
 
     // schedule next run for 10-15 minutes in the future
     const auto delta = 10min + FastRandomContext().randrange<std::chrono::milliseconds>(5min);
@@ -2326,14 +2772,15 @@ void PeerManagerImpl::BlockChecked(const std::shared_ptr<const CBlock>& block, c
     LOCK(cs_main);
 
     const uint256 hash(block->GetHash());
-    std::map<uint256, std::pair<NodeId, bool>>::iterator it = mapBlockSource.find(hash);
+
+    auto source{mapBlockSource.find(hash)};
 
     // If the block failed validation, we know where it came from and we're still connected
     // to that peer, maybe punish.
     if (state.IsInvalid() &&
-        it != mapBlockSource.end() &&
-        State(it->second.first)) {
-            MaybePunishNodeForBlock(/*nodeid=*/ it->second.first, state, /*via_compact_block=*/ !it->second.second);
+        source != mapBlockSource.end() &&
+        State(source->second.first)) {
+        MaybePunishNodeForBlock(/*nodeid=*/source->second.first, state, /*via_compact_block=*/!source->second.second);
     }
     // Check that:
     // 1. The block is valid
@@ -2343,13 +2790,16 @@ void PeerManagerImpl::BlockChecked(const std::shared_ptr<const CBlock>& block, c
     //    just check that there are currently no other blocks in flight.
     else if (state.IsValid() &&
              !m_chainman.IsInitialBlockDownload() &&
-             mapBlocksInFlight.count(hash) == mapBlocksInFlight.size()) {
-        if (it != mapBlockSource.end()) {
-            MaybeSetPeerAsAnnouncingHeaderAndIDs(it->second.first);
+             [&]() EXCLUSIVE_LOCKS_REQUIRED(cs_main, !m_pending_validation_mutex) {
+                 const auto [pending_hash, pending_total]{PendingValidationCounts(hash)};
+                 return mapBlocksInFlight.count(hash) + pending_hash ==
+                        mapBlocksInFlight.size() + pending_total;
+             }()) {
+        if (source != mapBlockSource.end()) {
+            MaybeSetPeerAsAnnouncingHeaderAndIDs(source->second.first);
         }
     }
-    if (it != mapBlockSource.end())
-        mapBlockSource.erase(it);
+    if (source != mapBlockSource.end()) mapBlockSource.erase(source);
 }
 
 //////////////////////////////////////////////////////////////////////////////
@@ -3093,6 +3543,7 @@ void PeerManagerImpl::HeadersDirectFetchBlocks(CNode& pfrom, const Peer& peer, c
         while (pindexWalk && !m_chainman.ActiveChain().Contains(*pindexWalk) && vToFetch.size() <= MAX_BLOCKS_IN_TRANSIT_PER_PEER) {
             if (!(pindexWalk->nStatus & BLOCK_HAVE_DATA) &&
                     !IsBlockRequested(pindexWalk->GetBlockHash()) &&
+                    !IsBlockPendingValidation(pindexWalk->GetBlockHash()) &&
                     (!DeploymentActiveAt(*pindexWalk, m_chainman, Consensus::DEPLOYMENT_SEGWIT) || CanServeWitnesses(peer))) {
                 // We don't have this block, and it's not yet in flight.
                 vToFetch.push_back(pindexWalk);
@@ -3112,7 +3563,7 @@ void PeerManagerImpl::HeadersDirectFetchBlocks(CNode& pfrom, const Peer& peer, c
             std::vector<CInv> vGetData;
             // Download as much as possible, from earliest to latest.
             for (const CBlockIndex* pindex : vToFetch | std::views::reverse) {
-                if (nodestate->vBlocksInFlight.size() >= MAX_BLOCKS_IN_TRANSIT_PER_PEER) {
+                if (NonPendingBlocksInFlight(*nodestate) >= MAX_BLOCKS_IN_TRANSIT_PER_PEER) {
                     // Can't download any more from this peer
                     break;
                 }
@@ -3131,7 +3582,7 @@ void PeerManagerImpl::HeadersDirectFetchBlocks(CNode& pfrom, const Peer& peer, c
                 if (!m_opts.ignore_incoming_txs &&
                         nodestate->m_provides_cmpctblocks &&
                         vGetData.size() == 1 &&
-                        mapBlocksInFlight.size() == 1 &&
+                        NonPendingBlocksInFlightTotal() == 1 &&
                         last_header.pprev->IsValid(BLOCK_VALID_CHAIN)) {
                     // In any case, we want to download using a compact block, not a regular one
                     vGetData[0] = CInv(MSG_CMPCT_BLOCK, vGetData[0].hash);
@@ -3662,8 +4113,267 @@ void PeerManagerImpl::ProcessGetCFCheckPt(CNode& node, Peer& peer, DataStream& v
               headers);
 }
 
+bool PeerManagerImpl::IsBlockPendingValidation(const uint256& hash) const
+{
+    if (!m_block_processing) return false;
+    LOCK(m_pending_validation_mutex);
+    return std::ranges::any_of(m_blocks_pending_validation, [&](const auto& job) {
+        return job && job->hash == hash;
+    });
+}
+
+size_t PeerManagerImpl::PendingValidationCount() const
+{
+    if (!m_block_processing) return 0;
+    LOCK(m_pending_validation_mutex);
+    return m_pending_validation_count;
+}
+
+std::pair<size_t, size_t> PeerManagerImpl::PendingValidationCounts(const uint256& hash) const
+{
+    if (!m_block_processing) return {0, 0};
+    LOCK(m_pending_validation_mutex);
+    return {std::ranges::count_if(m_blocks_pending_validation, [&](const auto& job) {
+                return job && job->hash == hash;
+            }),
+            m_pending_validation_count};
+}
+
+bool PeerManagerImpl::AdmitBlockPendingValidation(const uint256& hash, NodeId source)
+{
+    LOCK(m_pending_validation_mutex);
+    const bool force_processing{m_unreceived_block_requests.contains(hash)};
+    // Match master's receive-time transition: this source's request is
+    // logically fulfilled before its PNB call, even though the physical
+    // downloader entry stays in place until the worker starts. Requests from
+    // other sources remain and continue to force later duplicate receipts.
+    (void)RemoveUnreceivedBlockRequestLocked(hash, source);
+    Assert(m_pending_validation_count < m_blocks_pending_validation.size());
+    auto slot{std::ranges::find_if(m_blocks_pending_validation,
+                                   [](const auto& job) { return !job; })};
+    Assert(slot != m_blocks_pending_validation.end());
+    static_assert(std::is_nothrow_move_constructible_v<PendingValidationJob>);
+    slot->emplace(PendingValidationJob{hash, source});
+    ++m_pending_validation_count;
+    return force_processing;
+}
+
+void PeerManagerImpl::RemoveBlockPendingValidation(const uint256& hash, NodeId source)
+{
+    LOCK(m_pending_validation_mutex);
+    auto slot{std::ranges::find_if(m_blocks_pending_validation, [&](const auto& job) {
+        return job && job->hash == hash && job->source == source;
+    })};
+    Assert(slot != m_blocks_pending_validation.end());
+    Assert(m_pending_validation_count > 0);
+    slot->reset();
+    --m_pending_validation_count;
+}
+
+size_t PeerManagerImpl::NonPendingBlocksInFlight(const CNodeState& state) const
+{
+    if (!m_block_processing) return state.vBlocksInFlight.size();
+    LOCK(m_pending_validation_mutex);
+    size_t count{0};
+    for (const QueuedBlock& queued : state.vBlocksInFlight) {
+        const uint256& hash{queued.pindex->GetBlockHash()};
+        bool pending{false};
+        for (const auto& job : m_blocks_pending_validation) {
+            if (job && job->hash == hash) {
+                pending = true;
+                break;
+            }
+        }
+        if (!pending) ++count;
+    }
+    return count;
+}
+
+size_t PeerManagerImpl::NonPendingBlocksInFlightTotal() const
+{
+    if (!m_block_processing) return mapBlocksInFlight.size();
+    LOCK(m_pending_validation_mutex);
+    size_t count{0};
+    for (const auto& entry : mapBlocksInFlight) {
+        bool pending{false};
+        for (const auto& job : m_blocks_pending_validation) {
+            if (job && job->hash == entry.first) {
+                pending = true;
+                break;
+            }
+        }
+        if (!pending) ++count;
+    }
+    return count;
+}
+
+int PeerManagerImpl::PeersWithNonPendingDownloads() const
+{
+    if (!m_block_processing) return m_peers_downloading_from;
+    LOCK(m_pending_validation_mutex);
+    int count{0};
+    for (const auto& entry : m_node_states) {
+        const CNodeState& state{entry.second};
+        for (const QueuedBlock& queued : state.vBlocksInFlight) {
+            const uint256& hash{queued.pindex->GetBlockHash()};
+            bool pending{false};
+            for (const auto& job : m_blocks_pending_validation) {
+                if (job && job->hash == hash) {
+                    pending = true;
+                    break;
+                }
+            }
+            if (!pending) {
+                ++count;
+                break;
+            }
+        }
+    }
+    return count;
+}
+
+void PeerManagerImpl::CleanupCanceledAsyncBlock(const node::P2PBlockProcessingJob& job)
+{
+    const uint256 hash{job.block->GetHash()};
+    RemoveBlockRequest(hash, NodeId{job.source});
+    RemoveBlockPendingValidation(hash, NodeId{job.source});
+}
+
+void PeerManagerImpl::CleanupUnsubmittedAsyncBlocks()
+{
+    LOCK(m_pending_validation_mutex);
+    for (auto& slot : m_blocks_pending_validation) {
+        if (!slot) continue;
+        const auto [hash, source]{*slot};
+        RemoveBlockRequestLocked(hash, source);
+        slot.reset();
+        Assert(m_pending_validation_count > 0);
+        --m_pending_validation_count;
+    }
+}
+
+void PeerManagerImpl::ProcessAsyncBlock(const node::P2PBlockProcessingJob& job) noexcept
+{
+    const NodeId source{job.source};
+    const uint256 hash{job.block->GetHash()};
+
+    // An external shutdown signal can land after the preceding job's final
+    // check but before init interrupts this queue. Treat a job promoted in
+    // that gap exactly like a canceled receipt. A signal arriving after this
+    // entry check instead finds an already-active job, which may finish.
+    if (bool{m_chainman.m_interrupt}) {
+        LOCK(cs_main);
+        CleanupCanceledAsyncBlock(job);
+        m_block_processing->Interrupt();
+        return;
+    }
+
+    bool mutated{false};
+    bool pnb_attempted{false};
+    const bool force_processing{job.force_processing};
+    bool new_block{false};
+
+    try {
+        bool min_pow_checked{false};
+        {
+            LOCK(cs_main);
+            // Move the queued receipt out of ordinary downloader state only
+            // when this worker owns the job. Pending state has already made
+            // the hash unavailable to every new download path.
+            RemoveBlockRequest(hash, source);
+
+            const CBlockIndex* prev_block{
+                m_chainman.m_blockman.LookupBlockIndex(job.block->hashPrevBlock)};
+
+            // Re-evaluate mutation when the job reaches the FIFO front because
+            // its predecessor may have become known since admission.
+            mutated = prev_block && IsBlockMutated(
+                /*block=*/*job.block,
+                /*check_witness_root=*/DeploymentActiveAfter(
+                    prev_block, m_chainman, Consensus::DEPLOYMENT_SEGWIT));
+            if (mutated) {
+                LogDebug(BCLog::NET, "Received mutated block from peer=%d\n", source);
+                if (PeerRef peer{GetPeerRef(source)}) Misbehaving(*peer, "mutated block");
+            } else {
+                if (prev_block &&
+                    prev_block->nChainWork + GetBlockProof(*job.block) >=
+                        GetAntiDoSWorkThreshold()) {
+                    min_pow_checked = true;
+                }
+
+                // Match serial BLOCK handling exactly. A retained source for
+                // an accepted non-tip block wins emplace for a later
+                // same-hash job and is consumed by the next BlockChecked.
+                mapBlockSource.emplace(hash, std::make_pair(source, true));
+            }
+        }
+
+        if (!mutated) {
+            // This is the only asynchronous P2P consumer. Independent master
+            // PNB callers are deliberately not coordinated here.
+            pnb_attempted = true;
+            (void)m_chainman.ProcessNewBlock(
+                job.block, force_processing, min_pow_checked, &new_block);
+        }
+    } catch (const std::exception& e) {
+        LogDebug(BCLog::NET, "%s: Exception '%s' (%s) caught\n",
+                 __func__, e.what(), typeid(e).name());
+    } catch (...) {
+        LogDebug(BCLog::NET, "%s: Unknown exception caught\n", __func__);
+    }
+
+    // ProcessNewBlock can set new_block before a later validation callback
+    // throws. Preserve that observed transition for request and peer cleanup.
+    if (new_block) {
+        try {
+            m_connman.ForNode(source, [](CNode* node) {
+                node->m_last_block_time = GetTime<std::chrono::seconds>();
+                return true;
+            });
+        } catch (const std::exception& e) {
+            LogDebug(BCLog::NET, "%s: Exception '%s' (%s) caught during completion\n",
+                     __func__, e.what(), typeid(e).name());
+        } catch (...) {
+            LogDebug(BCLog::NET, "%s: Unknown exception caught during completion\n", __func__);
+        }
+    }
+
+    {
+        LOCK(cs_main);
+        if (new_block) {
+            // The block is stored, so requests from every source are obsolete.
+            RemoveBlockRequest(hash, std::nullopt);
+            const CBlockIndex* index{m_chainman.m_blockman.LookupBlockIndex(hash)};
+            // Retain attribution only for an accepted non-tip block whose
+            // future ConnectBlock callback has not happened. This also avoids
+            // publishing stale attribution if an overlapping non-P2P caller
+            // completed validation while this PNB was returning.
+            if (!index || !index->IsValid(BLOCK_VALID_TRANSACTIONS) ||
+                index->IsValid(BLOCK_VALID_SCRIPTS)) {
+                mapBlockSource.erase(hash);
+            }
+        } else {
+            RemoveBlockRequest(hash, source);
+            // Serial ProcessBlock erases the hash after every attempted
+            // non-new PNB. An early mutation or pre-PNB exception must leave
+            // an older accepted block's retained attribution untouched.
+            if (pnb_attempted) mapBlockSource.erase(hash);
+        }
+        RemoveBlockPendingValidation(hash, source);
+
+        // -stopatheight and validation errors can request shutdown
+        // synchronously inside this PNB call. Set the queue interruption
+        // before publishing pending/request cleanup by releasing cs_main, so
+        // shutdown tests and other cs_main readers observe one atomic worker
+        // boundary. The worker invokes this callback without holding the FIFO
+        // mutex, and Interrupt does not join.
+        if (bool{m_chainman.m_interrupt}) m_block_processing->Interrupt();
+    }
+}
+
 void PeerManagerImpl::ProcessBlock(CNode& node, const std::shared_ptr<const CBlock>& block, bool force_processing, bool min_pow_checked)
 {
+    Assert(!m_block_processing || m_block_processing->IsIdle());
     bool new_block{false};
     m_chainman.ProcessNewBlock(block, force_processing, min_pow_checked, &new_block);
     if (new_block) {
@@ -3812,9 +4522,12 @@ void PeerManagerImpl::PushPrivateBroadcastTx(CNode& node)
 
 void PeerManagerImpl::ProcessMessage(Peer& peer, CNode& pfrom, const std::string& msg_type, DataStream& vRecv,
                                      const NodeClock::time_point time_received,
+                                     bool async_block_admitted, uint32_t serialized_size,
+                                     bool& async_block_enqueued,
                                      const std::atomic<bool>& interruptMsgProc)
 {
     AssertLockHeld(g_msgproc_mutex);
+    async_block_enqueued = false;
 
     LogDebug(BCLog::NET, "received: %s (%u bytes) peer=%d\n", SanitizeString(msg_type), vRecv.size(), pfrom.GetId());
 
@@ -4364,7 +5077,8 @@ void PeerManagerImpl::ProcessMessage(Peer& peer, CNode& pfrom, const std::string
                 LogDebug(BCLog::NET, "got inv: %s %s peer=%d", inv.ToString(), fAlreadyHave ? "have" : "new", pfrom.GetId());
 
                 UpdateBlockAvailability(pfrom.GetId(), inv.hash);
-                if (!fAlreadyHave && !m_chainman.m_blockman.LoadingBlocks() && !IsBlockRequested(inv.hash)) {
+                if (!fAlreadyHave && !m_chainman.m_blockman.LoadingBlocks() &&
+                    !IsBlockRequested(inv.hash) && !IsBlockPendingValidation(inv.hash)) {
                     // Headers-first is the primary method of announcement on
                     // the network. If a node fell back to sending blocks by
                     // inv, it may be for a re-org, or because we haven't
@@ -4859,6 +5573,8 @@ void PeerManagerImpl::ProcessMessage(Peer& peer, CNode& pfrom, const std::string
         if (pindex->nStatus & BLOCK_HAVE_DATA) // Nothing to do here
             return;
 
+        if (IsBlockPendingValidation(pindex->GetBlockHash())) return;
+
         auto range_flight = mapBlocksInFlight.equal_range(pindex->GetBlockHash());
         size_t already_in_flight = std::distance(range_flight.first, range_flight.second);
         bool requested_block_from_this_peer{false};
@@ -4899,7 +5615,7 @@ void PeerManagerImpl::ProcessMessage(Peer& peer, CNode& pfrom, const std::string
         // We want to be a bit conservative just to be extra careful about DoS
         // possibilities in compact block processing...
         if (pindex->nHeight <= m_chainman.ActiveChain().Height() + 2) {
-            if ((already_in_flight < MAX_CMPCTBLOCKS_INFLIGHT_PER_BLOCK && nodestate->vBlocksInFlight.size() < MAX_BLOCKS_IN_TRANSIT_PER_PEER) ||
+            if ((already_in_flight < MAX_CMPCTBLOCKS_INFLIGHT_PER_BLOCK && NonPendingBlocksInFlight(*nodestate) < MAX_BLOCKS_IN_TRANSIT_PER_PEER) ||
                  requested_block_from_this_peer) {
                 std::list<QueuedBlock>::iterator* queuedBlockIt = nullptr;
                 if (!BlockRequested(pfrom.GetId(), *pindex, &queuedBlockIt)) {
@@ -5102,7 +5818,38 @@ void PeerManagerImpl::ProcessMessage(Peer& peer, CNode& pfrom, const std::string
         std::shared_ptr<CBlock> pblock = std::make_shared<CBlock>();
         vRecv >> TX_WITH_WITNESS(*pblock);
 
-        LogDebug(BCLog::NET, "received block %s peer=%d\n", pblock->GetHash().ToString(), pfrom.GetId());
+        const uint256 hash{pblock->GetHash()};
+        LogDebug(BCLog::NET, "received block %s peer=%d\n", hash.ToString(), pfrom.GetId());
+
+        if (async_block_admitted) {
+            Assert(m_block_processing);
+            // Admission must not acquire cs_main: the active PNB may hold it
+            // through script validation. The request-count mirror atomically
+            // preserves receipt-time force-processing semantics while pending
+            // state immediately suppresses duplicate downloads.
+            const bool force_processing{
+                AdmitBlockPendingValidation(hash, pfrom.GetId())};
+
+            const auto status{m_block_processing->Submit({
+                .source = pfrom.GetId(),
+                .block = pblock,
+                // This serialized payload size bounds attack bandwidth;
+                // it is not an exact decoded heap-memory measurement.
+                .serialized_size = serialized_size,
+                .force_processing = force_processing,
+            })};
+            if (status == node::P2PBlockProcessingSubmit::ACCEPTED) {
+                AsyncBlockSubmitted();
+                async_block_enqueued = true;
+                return;
+            }
+
+            // Interruption can race the nonblocking CanSubmit/Submit pair.
+            // Keep the allocation-free pending slot. Shutdown joins the sole
+            // producer before StopAsyncBlockProcessing drains this exact
+            // receipt and its physical request under cs_main.
+            return;
+        }
 
         const CBlockIndex* prev_block{WITH_LOCK(m_chainman.GetMutex(), return m_chainman.m_blockman.LookupBlockIndex(pblock->hashPrevBlock))};
 
@@ -5116,7 +5863,6 @@ void PeerManagerImpl::ProcessMessage(Peer& peer, CNode& pfrom, const std::string
         }
 
         bool forceProcessing = false;
-        const uint256 hash(pblock->GetHash());
         bool min_pow_checked = false;
         {
             LOCK(cs_main);
@@ -5413,73 +6159,288 @@ bool PeerManagerImpl::ProcessMessages(CNode& node, std::atomic<bool>& interruptM
     // has been sent first before processing any incoming messages
     if (!node.IsInboundConn() && !peer.m_outbound_version_message_sent) return false;
 
-    {
-        LOCK(peer.m_getdata_requests_mutex);
-        if (!peer.m_getdata_requests.empty()) {
-            ProcessGetData(node, peer, interruptMsgProc);
+    // Validation can synchronously request shutdown (-stopatheight) before
+    // init interrupts the message thread. Never pop priority/socket work in
+    // that gap, including a synchronous-only full or compact block.
+    if (m_block_processing && bool{m_chainman.m_interrupt}) return false;
+
+    const bool async_idle{!m_block_processing || m_block_processing->IsIdle()};
+    // Close the race where the active worker raises the shutdown signal and
+    // becomes idle after the first check. An idle second snapshot means no
+    // async worker can subsequently originate that signal.
+    if (m_block_processing && bool{m_chainman.m_interrupt}) return false;
+    if (m_block_processing) BeginAsyncMessagePass(async_idle);
+    const bool async_busy{!async_idle};
+    const bool async_peer_deferred{
+        m_block_processing && IsAsyncDeferredPeer(node.GetId())};
+    if (!async_busy) {
+        bool processed_getdata{false};
+        {
+            LOCK(peer.m_getdata_requests_mutex);
+            if (!peer.m_getdata_requests.empty()) {
+                ProcessGetData(node, peer, interruptMsgProc);
+                processed_getdata = true;
+            }
+        }
+
+        // A fairness owner receives one bounded priority-work opportunity per
+        // epoch. Do not let a peer-controlled backlog or full send buffer hold
+        // the global admission gate closed indefinitely.
+        if (processed_getdata && async_peer_deferred) {
+            AsyncDeferredMessageProcessed(node.GetId());
+            return !node.fDisconnect;
+        }
+
+        if (ProcessOrphanTx(peer)) {
+            if (async_peer_deferred) AsyncDeferredMessageProcessed(node.GetId());
+            return !node.fDisconnect;
         }
     }
 
-    const bool processed_orphan = ProcessOrphanTx(peer);
-
-    if (node.fDisconnect)
+    if (node.fDisconnect) {
+        const bool consumed_deferred_opportunity{async_peer_deferred && async_idle};
+        if (consumed_deferred_opportunity) {
+            AsyncDeferredMessageProcessed(node.GetId());
+        }
         return false;
-
-    if (processed_orphan) return true;
+    }
 
     // this maintains the order of responses
     // and prevents m_getdata_requests to grow unbounded
+    bool pending_getdata{false};
     {
         LOCK(peer.m_getdata_requests_mutex);
-        if (!peer.m_getdata_requests.empty()) return true;
+        pending_getdata = !peer.m_getdata_requests.empty();
+    }
+    if (pending_getdata) {
+        // Parsed requests can take cs_main or mempool locks. Defer them
+        // without spinning while the P2P worker owns validation.
+        if (async_busy) (void)RecordAsyncDeferredPeer(node.GetId(), false);
+        return !async_busy;
+    }
+
+    if (async_busy) {
+        // Orphan reconsideration precedes socket messages in master's order.
+        // Never wait here: the worker's ActiveTipChange callback may hold this
+        // mutex while the message handler holds g_msgproc_mutex.
+        bool defer_orphan_work{false};
+        {
+            TRY_LOCK(m_tx_download_mutex, tx_download_lock);
+            defer_orphan_work = !tx_download_lock ||
+                                m_txdownloadman.HaveMoreWork(peer.m_id);
+        }
+        if (defer_orphan_work) {
+            (void)RecordAsyncDeferredPeer(node.GetId(), false);
+            return false;
+        }
     }
 
     // Don't bother if send buffer is too full to respond anyway
-    if (node.fPauseSend) return false;
-
-    auto poll_result{node.PollMessage()};
-    if (!poll_result) {
-        // No message to process
+    if (node.fPauseSend) {
+        if (async_peer_deferred && async_idle) {
+            AsyncDeferredMessageProcessed(node.GetId());
+        }
         return false;
     }
 
-    CNetMessage& msg{poll_result->first};
-    bool fMoreWork = poll_result->second;
+    const bool async_ibd_snapshot{
+        m_block_processing && m_chainman.IsInitialBlockDownload()};
+    const bool async_peer_service_allowed{
+        !m_block_processing || CanServiceAsyncPeer(node.GetId())};
+    const bool async_epoch_admission_allowed{
+        !m_block_processing || CanAdmitAsyncBlockThisEpoch()};
+    bool rejected_unsafe_front{false};
+    bool expedite_deferred_front{false};
+    const auto admission_predicate{
+        [this, &node, async_ibd_snapshot, async_idle,
+         async_peer_service_allowed, async_epoch_admission_allowed,
+         &rejected_unsafe_front, &expedite_deferred_front](const CNetMessage& front) noexcept {
+            if (front.m_type == NetMsgType::PING ||
+                front.m_type == NetMsgType::PONG) {
+                return true;
+            }
 
-    TRACEPOINT(net, inbound_message,
-        node.GetId(),
-        node.m_addr_name.c_str(),
-        node.ConnectionTypeAsString().c_str(),
-        msg.m_type.c_str(),
-        msg.m_recv.size(),
-        msg.m_recv.data()
-    );
+            if (front.m_type == NetMsgType::BLOCK) {
+                if (async_ibd_snapshot &&
+                    front.m_message_size <= node::P2P_BLOCK_PROCESSING_MAX_BYTES) {
+                    return async_peer_service_allowed &&
+                           async_epoch_admission_allowed &&
+                           m_block_processing->CanSubmit(front.m_message_size);
+                }
+                if (!async_idle || !async_peer_service_allowed) {
+                    rejected_unsafe_front = true;
+                    return false;
+                }
+                return true;
+            }
 
-    if (m_opts.capture_messages) {
-        CaptureMessage(node.addr, msg.m_type, MakeUCharSpan(msg.m_recv), /*is_incoming=*/true);
-    }
+            if (!async_idle || !async_peer_service_allowed) {
+                rejected_unsafe_front = true;
+                expedite_deferred_front =
+                    (front.m_type == NetMsgType::VERSION && node.nVersion == 0) ||
+                    (front.m_type == NetMsgType::VERACK && node.nVersion != 0 &&
+                     !node.fSuccessfullyConnected);
+                return false;
+            }
+            return true;
+        }};
 
-    try {
-        ProcessMessage(peer, node, msg.m_type, msg.m_recv, msg.m_time, interruptMsgProc);
-        if (interruptMsgProc) return false;
-        {
-            LOCK(peer.m_getdata_requests_mutex);
-            if (!peer.m_getdata_requests.empty()) fMoreWork = true;
+    auto poll_result{m_block_processing
+                         ? node.PollMessage(admission_predicate)
+                         : node.PollMessage()};
+    if (!poll_result) {
+        if (async_peer_deferred && async_idle) {
+            // Priority work owned this service opportunity but left no
+            // processable socket front (or only a normal BLOCK for the next
+            // epoch). Release the owner before installing any new claim.
+            AsyncDeferredMessageProcessed(node.GetId());
         }
-        // Does this peer have an orphan ready to reconsider?
-        // (Note: we may have provided a parent for an orphan provided
-        //  by another peer that was already processed; in that case,
-        //  the extra work may not be noticed, possibly resulting in an
-        //  unnecessary 100ms delay)
-        LOCK(m_tx_download_mutex);
-        if (m_txdownloadman.HaveMoreWork(peer.m_id)) fMoreWork = true;
-    } catch (const std::exception& e) {
-        LogDebug(BCLog::NET, "%s(%s, %u bytes): Exception '%s' (%s) caught\n", __func__, SanitizeString(msg.m_type), msg.m_message_size, e.what(), typeid(e).name());
-    } catch (...) {
-        LogDebug(BCLog::NET, "%s(%s, %u bytes): Unknown exception caught\n", __func__, SanitizeString(msg.m_type), msg.m_message_size);
+        if (rejected_unsafe_front &&
+            RecordAsyncDeferredPeer(node.GetId(), expedite_deferred_front) &&
+            async_idle) {
+            m_connman.WakeMessageHandler();
+        }
+        // The socket thread only appends and this globally serialized handler
+        // is the sole consumer. A predicate-rejected front therefore remains
+        // stable and ordered until the worker wakes a later handler pass.
+        return false;
     }
 
-    return fMoreWork;
+    size_t async_messages_processed{0};
+    uint64_t async_bytes_processed{0};
+    while (true) {
+        CNetMessage& msg{poll_result->first};
+        bool more_work{poll_result->second};
+        bool async_block_enqueued{false};
+        bool priority_work{false};
+        bool defer_priority_work{false};
+
+        TRACEPOINT(net, inbound_message,
+            node.GetId(),
+            node.m_addr_name.c_str(),
+            node.ConnectionTypeAsString().c_str(),
+            msg.m_type.c_str(),
+            msg.m_recv.size(),
+            msg.m_recv.data()
+        );
+
+        if (m_opts.capture_messages) {
+            CaptureMessage(node.addr, msg.m_type, MakeUCharSpan(msg.m_recv), /*is_incoming=*/true);
+        }
+
+        try {
+            const bool async_block_admitted{
+                m_block_processing && async_ibd_snapshot &&
+                msg.m_type == NetMsgType::BLOCK &&
+                msg.m_message_size <= node::P2P_BLOCK_PROCESSING_MAX_BYTES};
+            ProcessMessage(peer, node, msg.m_type, msg.m_recv, msg.m_time,
+                           async_block_admitted, msg.m_message_size,
+                           async_block_enqueued, interruptMsgProc);
+            if (interruptMsgProc) return false;
+            {
+                LOCK(peer.m_getdata_requests_mutex);
+                if (!peer.m_getdata_requests.empty()) {
+                    more_work = true;
+                    priority_work = true;
+                    defer_priority_work =
+                        m_block_processing && !m_block_processing->IsIdle();
+                }
+            }
+            // Does this peer have an orphan ready to reconsider?
+            // (Note: we may have provided a parent for an orphan provided
+            //  by another peer that was already processed; in that case,
+            //  the extra work may not be noticed, possibly resulting in an
+            //  unnecessary 100ms delay)
+            const bool worker_busy{
+                m_block_processing && !m_block_processing->IsIdle()};
+            if (worker_busy) {
+                TRY_LOCK(m_tx_download_mutex, tx_download_lock);
+                if (!tx_download_lock || m_txdownloadman.HaveMoreWork(peer.m_id)) {
+                    defer_priority_work = true;
+                }
+            } else {
+                LOCK(m_tx_download_mutex);
+                if (m_txdownloadman.HaveMoreWork(peer.m_id)) {
+                    more_work = true;
+                    priority_work = true;
+                }
+            }
+        } catch (const std::exception& e) {
+            LogDebug(BCLog::NET, "%s(%s, %u bytes): Exception '%s' (%s) caught\n", __func__, SanitizeString(msg.m_type), msg.m_message_size, e.what(), typeid(e).name());
+        } catch (...) {
+            LogDebug(BCLog::NET, "%s(%s, %u bytes): Unknown exception caught\n", __func__, SanitizeString(msg.m_type), msg.m_message_size);
+        }
+
+        if (async_peer_deferred && async_idle) {
+            // The exact front that established this peer's service claim was
+            // just popped and handled (including normal exception handling).
+            AsyncDeferredMessageProcessed(node.GetId());
+        }
+        if (rejected_unsafe_front) {
+            // A successful poll can classify only the new front after popping
+            // the current one. Install that claim after Submit/accounting and
+            // after clearing any claim owned by the message just processed.
+            if (RecordAsyncDeferredPeer(node.GetId(), expedite_deferred_front) &&
+                async_idle) {
+                m_connman.WakeMessageHandler();
+            }
+            rejected_unsafe_front = false;
+            expedite_deferred_front = false;
+        }
+        if (defer_priority_work) {
+            // A BLOCK can make the worker busy before this peer's newly
+            // created getdata/orphan work is probed. Preserve master's
+            // priority ordering by carrying this peer into the next epoch's
+            // bounded service phase.
+            (void)RecordAsyncDeferredPeer(node.GetId(), false);
+        }
+
+        if (!async_block_enqueued) {
+            return defer_priority_work ? false : more_work;
+        }
+
+        ++async_messages_processed;
+        async_bytes_processed += msg.m_message_size;
+        Assert(async_messages_processed <= 16);
+        Assert(async_bytes_processed <= node::P2P_BLOCK_PROCESSING_MAX_BYTES);
+
+        if (interruptMsgProc || node.fDisconnect || node.fPauseSend) return false;
+        if (bool{m_chainman.m_interrupt}) return false;
+        if (defer_priority_work) return false;
+        if (priority_work) return true;
+        if (async_messages_processed == 16 ||
+            async_bytes_processed == node::P2P_BLOCK_PROCESSING_MAX_BYTES) {
+            return true;
+        }
+
+        // IBD is latched false. A block admitted under the earlier true
+        // snapshot is final, but the next front must take a fresh snapshot.
+        // Ask for that pass immediately so ordinary work behind this block is
+        // not stranded; only a later full block will then defer until idle.
+        if (!m_chainman.IsInitialBlockDownload()) return true;
+
+        const uint32_t burst_bytes_remaining{
+            node::P2P_BLOCK_PROCESSING_MAX_BYTES -
+            static_cast<uint32_t>(async_bytes_processed)};
+        const bool epoch_admission_allowed{CanAdmitAsyncBlockThisEpoch()};
+        const auto feed_predicate{
+            [this, burst_bytes_remaining,
+             epoch_admission_allowed](const CNetMessage& front) noexcept {
+                return epoch_admission_allowed &&
+                       front.m_type == NetMsgType::BLOCK &&
+                       front.m_message_size <= burst_bytes_remaining &&
+                       m_block_processing->CanSubmit(front.m_message_size);
+            }};
+        auto next_poll{node.PollMessage(feed_predicate)};
+        // A rejected continuation can also be ordinary work (for example a
+        // PING) or a block just beyond this invocation's burst budget. Yield
+        // to SendMessages and ask for another handler pass; its authoritative
+        // front predicate will return false if this is a real capacity or
+        // compact-block barrier, without imposing the 100ms fallback delay on
+        // otherwise eligible work.
+        if (!next_poll) return true;
+        poll_result = std::move(next_poll);
+    }
 }
 
 void PeerManagerImpl::ConsiderEviction(CNode& pto, Peer& peer, std::chrono::seconds time_in_seconds)
@@ -5576,14 +6537,14 @@ void PeerManagerImpl::EvictExtraOutboundPeers(NodeClock::time_point now)
             // valid headers chain with at least as much work as our tip.
             CNodeState *node_state = State(pnode->GetId());
             if (node_state == nullptr ||
-                (now - pnode->m_connected >= MINIMUM_CONNECT_TIME && node_state->vBlocksInFlight.empty())) {
+                (now - pnode->m_connected >= MINIMUM_CONNECT_TIME && NonPendingBlocksInFlight(*node_state) == 0)) {
                 pnode->fDisconnect = true;
                 LogDebug(BCLog::NET, "disconnecting extra block-relay-only peer=%d (last block received at time %d)\n",
                          pnode->GetId(), count_seconds(pnode->m_last_block_time));
                 return true;
             } else {
                 LogDebug(BCLog::NET, "keeping block-relay-only peer=%d chosen for eviction (connect time: %d, blocks_in_flight: %d)\n",
-                         pnode->GetId(), TicksSinceEpoch<std::chrono::seconds>(pnode->m_connected), node_state->vBlocksInFlight.size());
+                         pnode->GetId(), TicksSinceEpoch<std::chrono::seconds>(pnode->m_connected), NonPendingBlocksInFlight(*node_state));
             }
             return false;
         });
@@ -5628,13 +6589,13 @@ void PeerManagerImpl::EvictExtraOutboundPeers(NodeClock::time_point now)
                 // Also don't disconnect any peer we're trying to download a
                 // block from.
                 CNodeState &state = *State(pnode->GetId());
-                if (now - pnode->m_connected > MINIMUM_CONNECT_TIME && state.vBlocksInFlight.empty()) {
+                if (now - pnode->m_connected > MINIMUM_CONNECT_TIME && NonPendingBlocksInFlight(state) == 0) {
                     LogDebug(BCLog::NET, "disconnecting extra outbound peer=%d (last block announcement received at time %d)\n", pnode->GetId(), oldest_block_announcement);
                     pnode->fDisconnect = true;
                     return true;
                 } else {
                     LogDebug(BCLog::NET, "keeping outbound peer=%d chosen for eviction (connect time: %d, blocks_in_flight: %d)\n",
-                             pnode->GetId(), TicksSinceEpoch<std::chrono::seconds>(pnode->m_connected), state.vBlocksInFlight.size());
+                             pnode->GetId(), TicksSinceEpoch<std::chrono::seconds>(pnode->m_connected), NonPendingBlocksInFlight(state));
                     return false;
                 }
             });
@@ -6050,14 +7011,47 @@ bool PeerManagerImpl::SendMessages(CNode& node)
     Peer& peer{*maybe_peer};
     const Consensus::Params& consensusParams = m_chainparams.GetConsensus();
 
-    // We must call MaybeDiscourageAndDisconnect first, to ensure that we'll
-    // disconnect misbehaving peers even before the version handshake is complete.
+    // Match ProcessMessages' stop-at-height boundary: do not enter any send
+    // path in the interval before CConnman's interrupt flag is propagated.
+    if (m_block_processing && bool{m_chainman.m_interrupt}) return true;
+
+    // The P2P worker may hold cs_main and mempool.cs through ConnectBlock.
+    // ProcessMessages still answers PING/PONG and admits bounded BLOCK work;
+    // defer every send path that could wait on validation while g_msgproc is
+    // held. NewPoWValidBlock may also hold CConnman's nodes mutex, so defer
+    // discouragement/disconnection before it can call DisconnectNode. IsIdle
+    // cannot transition true->false without this sole producer.
+    const bool async_worker_busy{
+        m_block_processing && !m_block_processing->IsIdle()};
+    // Match the receive-side double check: the worker can request shutdown
+    // while transitioning to idle between the first guard and IsIdle().
+    if (m_block_processing && bool{m_chainman.m_interrupt}) return true;
+    if (async_worker_busy) {
+        // VERSION construction and queuing are independent of worker-held
+        // validation locks. Start locally initiated handshakes even here.
+        if (!node.IsInboundConn() && !peer.m_outbound_version_message_sent) {
+            PushNodeVersion(node, peer);
+            peer.m_outbound_version_message_sent = true;
+        }
+        return true;
+    }
+
+    // We must call MaybeDiscourageAndDisconnect before the ordinary send
+    // paths, to disconnect misbehaving peers even before version completes.
     if (MaybeDiscourageAndDisconnect(node, peer)) return true;
 
-    // Initiate version handshake for outbound connections
     if (!node.IsInboundConn() && !peer.m_outbound_version_message_sent) {
         PushNodeVersion(node, peer);
         peer.m_outbound_version_message_sent = true;
+    }
+
+    // ProcessMessages may have recorded this peer while the worker was busy,
+    // then lost the race to this SendMessages call after the worker became
+    // idle. Preserve its untouched-front opportunity before any stale
+    // downloader timeout or new request work runs.
+    if (m_block_processing &&
+        (IsAsyncEpochClosed() || IsAsyncDeferredPeer(node.GetId()))) {
+        return true;
     }
 
     // Don't send anything until the version handshake is complete
@@ -6122,7 +7116,7 @@ bool PeerManagerImpl::SendMessages(CNode& node)
             // the latest blocks is from an inbound peer, we have to be sure to
             // eventually download it (and not just wait indefinitely for an
             // outbound peer to have it).
-            if (m_num_preferred_download_peers == 0 || mapBlocksInFlight.empty()) {
+            if (m_num_preferred_download_peers == 0 || NonPendingBlocksInFlightTotal() == 0) {
                 sync_blocks_and_headers_from_peer = true;
             }
         }
@@ -6423,7 +7417,15 @@ bool PeerManagerImpl::SendMessages(CNode& node)
 
         // Detect whether we're stalling
         auto stalling_timeout = m_block_stalling_timeout.load();
-        if (state.m_stalling_since.count() && state.m_stalling_since < current_time - stalling_timeout) {
+        const bool front_block_pending{
+            !state.vBlocksInFlight.empty() &&
+            IsBlockPendingValidation(
+                state.vBlocksInFlight.front().pindex->GetBlockHash())};
+        // Local validation pauses enforcement but does not rebase another
+        // peer's still-unfulfilled request timers. If validation fails, the
+        // fallback request retains the same deadline as serial processing.
+        if (!front_block_pending && state.m_stalling_since.count() &&
+            state.m_stalling_since < current_time - stalling_timeout) {
             // Stalling only triggers when the block download window cannot move. During normal steady state,
             // the download window should be much larger than the to-be-downloaded set of blocks, so disconnection
             // should only happen during initial block download.
@@ -6442,9 +7444,9 @@ bool PeerManagerImpl::SendMessages(CNode& node)
         // We compensate for other peers to prevent killing off peers due to our own downstream link
         // being saturated. We only count validated in-flight blocks so peers can't advertise non-existing block hashes
         // to unreasonably increase our timeout.
-        if (state.vBlocksInFlight.size() > 0) {
+        if (!state.vBlocksInFlight.empty() && !front_block_pending) {
             QueuedBlock &queuedBlock = state.vBlocksInFlight.front();
-            int nOtherPeersWithValidatedDownloads = m_peers_downloading_from - 1;
+            int nOtherPeersWithValidatedDownloads = PeersWithNonPendingDownloads() - 1;
             if (current_time > state.m_downloading_since + std::chrono::seconds{consensusParams.nPowTargetSpacing} * (BLOCK_DOWNLOAD_TIMEOUT_BASE + BLOCK_DOWNLOAD_TIMEOUT_PER_PEER * nOtherPeersWithValidatedDownloads)) {
                 LogInfo("Timeout downloading block %s, %s", queuedBlock.pindex->GetBlockHash().ToString(), node.DisconnectMsg());
                 node.fDisconnect = true;
@@ -6492,11 +7494,11 @@ bool PeerManagerImpl::SendMessages(CNode& node)
         // Message: getdata (blocks)
         //
         std::vector<CInv> vGetData;
-        if (CanServeBlocks(peer) && ((sync_blocks_and_headers_from_peer && !IsLimitedPeer(peer)) || !m_chainman.IsInitialBlockDownload()) && state.vBlocksInFlight.size() < MAX_BLOCKS_IN_TRANSIT_PER_PEER) {
+        if (CanServeBlocks(peer) && ((sync_blocks_and_headers_from_peer && !IsLimitedPeer(peer)) || !m_chainman.IsInitialBlockDownload()) && NonPendingBlocksInFlight(state) < MAX_BLOCKS_IN_TRANSIT_PER_PEER) {
             std::vector<const CBlockIndex*> vToDownload;
             NodeId staller = -1;
-            auto get_inflight_budget = [&state]() {
-                return std::max(0, MAX_BLOCKS_IN_TRANSIT_PER_PEER - static_cast<int>(state.vBlocksInFlight.size()));
+            auto get_inflight_budget = [this, &state]() EXCLUSIVE_LOCKS_REQUIRED(cs_main, !m_pending_validation_mutex) {
+                return std::max(0, MAX_BLOCKS_IN_TRANSIT_PER_PEER - static_cast<int>(NonPendingBlocksInFlight(state)));
             };
 
             // If there are multiple chainstates, download blocks for the
@@ -6520,7 +7522,7 @@ bool PeerManagerImpl::SendMessages(CNode& node)
                 LogDebug(BCLog::NET, "Requesting block %s (%d) peer=%d\n", pindex->GetBlockHash().ToString(),
                     pindex->nHeight, node.GetId());
             }
-            if (state.vBlocksInFlight.empty() && staller != -1) {
+            if (NonPendingBlocksInFlight(state) == 0 && staller != -1) {
                 if (State(staller)->m_stalling_since == 0us) {
                     State(staller)->m_stalling_since = current_time;
                     LogDebug(BCLog::NET, "Stall started peer=%d\n", staller);

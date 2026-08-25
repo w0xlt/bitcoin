@@ -306,6 +306,12 @@ void Interrupt(NodeContext& node)
     InterruptMapPort();
     if (node.connman)
         node.connman->Interrupt();
+    // Once the message-handler interrupt flag is visible, reject queued/next
+    // P2P block work. A racing receipt retains its fixed pending slot for the
+    // post-producer StopAsyncBlockProcessing cleanup.
+    if (node.peerman && node.peerman->HasAsyncBlockProcessing()) {
+        node.peerman->InterruptAsyncBlockProcessing();
+    }
     for (auto* index : node.indexes) {
         index->Interrupt();
     }
@@ -340,10 +346,22 @@ void Shutdown(NodeContext& node)
     }
     StopMapPort();
 
-    // Because these depend on each-other, we make sure that neither can be
-    // using the other before destroying them.
-    if (node.peerman && node.validation_signals) node.validation_signals->UnregisterValidationInterface(node.peerman.get());
-    if (node.connman) node.connman->Stop();
+    if (node.peerman && node.peerman->HasAsyncBlockProcessing()) {
+        // Stop new handler work, reject promotion/submission, then join the
+        // producer. The active job may finish while peers and validation
+        // callbacks are alive; queued jobs and racing receipts are cleaned
+        // after the producer joins.
+        if (node.connman) node.connman->Interrupt();
+        node.peerman->InterruptAsyncBlockProcessing();
+        if (node.connman) node.connman->StopThreads();
+        node.peerman->StopAsyncBlockProcessing();
+        if (node.validation_signals) node.validation_signals->UnregisterValidationInterface(node.peerman.get());
+        if (node.connman) node.connman->StopNodes();
+    } else {
+        // Preserve master's shutdown order when the feature is disabled.
+        if (node.peerman && node.validation_signals) node.validation_signals->UnregisterValidationInterface(node.peerman.get());
+        if (node.connman) node.connman->Stop();
+    }
 
     if (node.tor_controller) {
         node.tor_controller->Join();
@@ -677,6 +695,7 @@ void SetupServerArgs(ArgsManager& argsman, bool can_listen_ipc)
     argsman.AddArg("-checkblockindex", strprintf("Do a consistency check for the block tree, chainstate, and other validation data structures every <n> operations. Use 0 to disable. (default: %u, regtest: %u)", defaultChainParams->DefaultConsistencyChecks(), regtestChainParams->DefaultConsistencyChecks()), ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
     argsman.AddArg("-checkaddrman=<n>", strprintf("Run addrman consistency checks every <n> operations. Use 0 to disable. (default: %u)", DEFAULT_ADDRMAN_CONSISTENCY_CHECKS), ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
     argsman.AddArg("-checkmempool=<n>", strprintf("Run mempool consistency checks every <n> transactions. Use 0 to disable. (default: %u, regtest: %u)", defaultChainParams->DefaultConsistencyChecks(), regtestChainParams->DefaultConsistencyChecks()), ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
+    argsman.AddArg("-asyncpnb", "Use one bounded asynchronous ProcessNewBlock consumer for full blocks during initial block download (default: 0)", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
     // Checkpoints were removed. We keep `-checkpoints` as a hidden arg to display a more user friendly error when set.
     argsman.AddArg("-checkpoints", "", ArgsManager::ALLOW_ANY, OptionsCategory::HIDDEN);
     argsman.AddArg("-deprecatedrpc=<method>", "Allows deprecated RPC method(s) to be used", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);

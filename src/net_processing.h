@@ -8,6 +8,7 @@
 
 #include <consensus/amount.h>
 #include <net.h>
+#include <node/p2p_block_processing.h>
 #include <node/txorphanage.h>
 #include <node/types.h>
 #include <private_broadcast.h>
@@ -109,12 +110,25 @@ public:
         bool private_broadcast{DEFAULT_PRIVATE_BROADCAST};
         //! Maximum per-second rate for sending transaction inventory to peers.
         unsigned int tx_send_rate{DEFAULT_TX_SEND_RATE};
+        //! Whether normal full blocks received during IBD may be handed to a
+        //! bounded, single asynchronous ProcessNewBlock consumer.
+        bool async_pnb{false};
     };
 
     static std::unique_ptr<PeerManager> make(CConnman& connman, AddrMan& addrman,
                                              BanMan* banman, ChainstateManager& chainman,
-                                             CTxMemPool& pool, node::Warnings& warnings, Options opts);
+                                             CTxMemPool& pool, node::Warnings& warnings, Options opts,
+                                             std::unique_ptr<node::P2PBlockProcessing> block_processing = {});
     virtual ~PeerManager() = default;
+
+    //! Idempotently reject new asynchronous block work.
+    virtual void InterruptAsyncBlockProcessing() = 0;
+
+    //! Whether asynchronous block processing was configured for this instance.
+    virtual bool HasAsyncBlockProcessing() const = 0;
+
+    /** Finish at most the active block and cancel queued work. Idempotent. */
+    virtual void StopAsyncBlockProcessing() = 0;
 
     /**
      * Attempt to manually fetch block from a given peer. We must already have the header.
