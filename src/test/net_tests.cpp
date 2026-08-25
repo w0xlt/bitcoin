@@ -140,6 +140,56 @@ BOOST_AUTO_TEST_CASE(cnode_simple_test)
     BOOST_CHECK_EQUAL(pnode4->ConnectedThroughNetwork(), Network::NET_ONION);
 }
 
+BOOST_AUTO_TEST_CASE(cnode_filtered_poll_preserves_front)
+{
+    auto& connman{static_cast<ConnmanTestMsg&>(*m_node.connman)};
+    CNode node{/*id=*/0,
+               /*sock=*/nullptr,
+               /*addrIn=*/CAddress{},
+               /*nKeyedNetGroupIn=*/0,
+               /*nLocalHostNonceIn=*/0,
+               /*addrBindIn=*/CAddress{},
+               /*addrNameIn=*/std::string{},
+               /*conn_type_in=*/ConnectionType::INBOUND,
+               /*inbound_onion=*/false,
+               /*network_key=*/0,
+               CNodeOptions{.recv_flood_size = 0}};
+
+    BOOST_REQUIRE(connman.ReceiveMsgFrom(node, NetMsg::Make(NetMsgType::BLOCK)));
+    BOOST_REQUIRE(connman.ReceiveMsgFrom(node, NetMsg::Make(NetMsgType::PING, uint64_t{42})));
+    BOOST_REQUIRE(connman.ReceiveMsgFrom(node, NetMsg::Make(NetMsgType::BLOCK)));
+    BOOST_CHECK(node.fPauseRecv);
+
+    auto first_block{node.PollMessage(NetMsgType::BLOCK)};
+    BOOST_REQUIRE(first_block);
+    BOOST_CHECK_EQUAL(first_block->first.m_type, NetMsgType::BLOCK);
+    BOOST_CHECK(first_block->second);
+    BOOST_CHECK(node.fPauseRecv);
+
+    BOOST_CHECK(!node.PollMessage(NetMsgType::BLOCK));
+    BOOST_CHECK(node.fPauseRecv);
+
+    auto ping{node.PollMessage()};
+    BOOST_REQUIRE(ping);
+    BOOST_CHECK_EQUAL(ping->first.m_type, NetMsgType::PING);
+    BOOST_CHECK(ping->second);
+    BOOST_CHECK(node.fPauseRecv);
+
+    auto second_block{node.PollMessage(NetMsgType::BLOCK)};
+    BOOST_REQUIRE(second_block);
+    BOOST_CHECK_EQUAL(second_block->first.m_type, NetMsgType::BLOCK);
+    BOOST_CHECK(!second_block->second);
+    BOOST_CHECK(!node.fPauseRecv);
+    BOOST_CHECK(!node.PollMessage());
+
+    BOOST_REQUIRE(connman.ReceiveMsgFrom(node, NetMsg::Make(NetMsgType::PING, uint64_t{43})));
+    BOOST_CHECK(node.fPauseRecv);
+    auto final_ping{node.PollMessage()};
+    BOOST_REQUIRE(final_ping);
+    BOOST_CHECK(!final_ping->second);
+    BOOST_CHECK(!node.fPauseRecv);
+}
+
 BOOST_AUTO_TEST_CASE(cnetaddr_basic)
 {
     CNetAddr addr;

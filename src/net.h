@@ -768,6 +768,13 @@ public:
     std::optional<std::pair<CNetMessage, bool>> PollMessage()
         EXCLUSIVE_LOCKS_REQUIRED(!m_msg_process_queue_mutex);
 
+    /** Poll the next message only if its type matches `required_type`.
+     *
+     * Returns std::nullopt without modifying the processing queue when the
+     * queue is empty or the front message has a different type. */
+    std::optional<std::pair<CNetMessage, bool>> PollMessage(std::string_view required_type)
+        EXCLUSIVE_LOCKS_REQUIRED(!m_msg_process_queue_mutex);
+
     /** Account for the total size of a sent message in the per msg type connection stats. */
     void AccountForSentBytes(const std::string& msg_type, size_t sent_bytes)
         EXCLUSIVE_LOCKS_REQUIRED(cs_vSend)
@@ -1003,6 +1010,9 @@ public:
     }
 
 private:
+    std::optional<std::pair<CNetMessage, bool>> PollMessageImpl(std::optional<std::string_view> required_type)
+        EXCLUSIVE_LOCKS_REQUIRED(!m_msg_process_queue_mutex);
+
     const NodeId id;
     const uint64_t nLocalHostNonce;
     std::atomic<int> m_greatest_common_version{INIT_PROTO_VERSION};

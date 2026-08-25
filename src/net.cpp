@@ -4132,8 +4132,21 @@ void CNode::MarkReceivedMsgsForProcessing()
 
 std::optional<std::pair<CNetMessage, bool>> CNode::PollMessage()
 {
+    return PollMessageImpl(std::nullopt);
+}
+
+std::optional<std::pair<CNetMessage, bool>> CNode::PollMessage(std::string_view required_type)
+{
+    return PollMessageImpl(required_type);
+}
+
+std::optional<std::pair<CNetMessage, bool>> CNode::PollMessageImpl(std::optional<std::string_view> required_type)
+{
     LOCK(m_msg_process_queue_mutex);
-    if (m_msg_process_queue.empty()) return std::nullopt;
+    if (m_msg_process_queue.empty() ||
+        (required_type && m_msg_process_queue.front().m_type != *required_type)) {
+        return std::nullopt;
+    }
 
     std::list<CNetMessage> msgs;
     // Just take one message
