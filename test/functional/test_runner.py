@@ -107,6 +107,7 @@ BASE_SCRIPTS = [
     'mempool_ephemeral_dust.py',
     'wallet_conflicts.py',
     'p2p_opportunistic_1p1c.py',
+    'p2p_async_block_processing.py',
     'p2p_node_network_limited.py --v1transport',
     'p2p_node_network_limited.py --v2transport',
     # vv Tests less than 2m vv
