@@ -80,6 +80,7 @@ FUZZ_TARGET(process_messages, .init = initialize_process_messages)
                                      PeerManager::Options{
                                          .reconcile_txs = true,
                                          .deterministic_rng = true,
+                                         .async_pnb = true,
                                      });
     connman.SetMsgProc(node.peerman.get());
     connman.SetAddrman(*node.addrman);
@@ -130,6 +131,7 @@ FUZZ_TARGET(process_messages, .init = initialize_process_messages)
             node.peerman->SendMessages(random_node);
         }
     }
+    node.peerman->StopAsyncBlockProcessing();
     node.validation_signals->SyncWithValidationInterfaceQueue();
     node.validation_signals->UnregisterValidationInterface(node.peerman.get());
     node.connman->StopNodes();

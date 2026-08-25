@@ -59,6 +59,7 @@
 #include <util/check.h>
 #include <util/hasher.h>
 #include <util/strencodings.h>
+#include <util/thread.h>
 #include <util/time.h>
 #include <util/tokenbucket.h>
 #include <util/trace.h>
@@ -68,6 +69,7 @@
 #include <array>
 #include <atomic>
 #include <compare>
+#include <condition_variable>
 #include <cstddef>
 #include <deque>
 #include <exception>
@@ -79,12 +81,14 @@
 #include <list>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <queue>
 #include <ranges>
 #include <ratio>
 #include <set>
 #include <span>
+#include <thread>
 #include <typeinfo>
 #include <unordered_set>
 #include <utility>
@@ -570,6 +574,7 @@ public:
     PeerManagerImpl(CConnman& connman, AddrMan& addrman,
                     BanMan* banman, ChainstateManager& chainman,
                     CTxMemPool& pool, node::Warnings& warnings, Options opts);
+    ~PeerManagerImpl() override;
 
     /** Overridden from CValidationInterface. */
     void ActiveTipChange(const CBlockIndex& new_tip, bool) override
@@ -590,12 +595,13 @@ public:
     void FinalizeNode(const CNode& node) override EXCLUSIVE_LOCKS_REQUIRED(!m_peer_mutex, !m_headers_presync_mutex, !m_tx_download_mutex);
     bool HasAllDesirableServiceFlags(ServiceFlags services) const override;
     bool ProcessMessages(CNode& node, std::atomic<bool>& interrupt) override
-        EXCLUSIVE_LOCKS_REQUIRED(!m_peer_mutex, !m_most_recent_block_mutex, !m_headers_presync_mutex, g_msgproc_mutex, !m_tx_download_mutex, !m_inv_to_send_mutex);
+        EXCLUSIVE_LOCKS_REQUIRED(!m_peer_mutex, !m_most_recent_block_mutex, !m_headers_presync_mutex, g_msgproc_mutex, !m_tx_download_mutex, !m_inv_to_send_mutex, !m_async_pnb_mutex);
     bool SendMessages(CNode& node) override
         EXCLUSIVE_LOCKS_REQUIRED(!m_peer_mutex, !m_most_recent_block_mutex, g_msgproc_mutex, !m_tx_download_mutex, !m_inv_to_send_mutex);
 
     /** Implement PeerManager */
     void StartScheduledTasks(CScheduler& scheduler) override;
+    void StopAsyncBlockProcessing() override;
     void CheckForStaleTipAndEvictPeers() override;
     util::Expected<void, std::string> FetchBlock(NodeId peer_id, const CBlockIndex& block_index) override
         EXCLUSIVE_LOCKS_REQUIRED(!m_peer_mutex);
@@ -617,9 +623,52 @@ public:
     ServiceFlags GetDesirableServiceFlags(ServiceFlags services) const override;
 
 private:
+    static constexpr size_t ASYNC_PNB_CAPACITY{MAX_BLOCKS_IN_TRANSIT_PER_PEER};
+
+    struct AsyncPnbJob {
+        NodeId source{-1};
+        std::shared_ptr<const CBlock> block;
+        bool force_processing{false};
+        bool min_pow_checked{false};
+    };
+
+    class AsyncPnbReservation {
+    public:
+        AsyncPnbReservation(PeerManagerImpl& owner, const uint256& hash) noexcept
+            : m_owner{&owner}, m_hash{hash}
+        {
+        }
+        AsyncPnbReservation(const AsyncPnbReservation&) = delete;
+        AsyncPnbReservation& operator=(const AsyncPnbReservation&) = delete;
+        AsyncPnbReservation(AsyncPnbReservation&& other) noexcept
+            : m_owner{std::exchange(other.m_owner, nullptr)},
+              m_hash{std::move(other.m_hash)}
+        {
+        }
+        AsyncPnbReservation& operator=(AsyncPnbReservation&& other) noexcept
+        {
+            if (this == &other) return *this;
+            if (m_owner) m_owner->CancelAsyncPnbReservation(m_hash);
+            m_owner = std::exchange(other.m_owner, nullptr);
+            m_hash = std::move(other.m_hash);
+            return *this;
+        }
+        ~AsyncPnbReservation()
+        {
+            if (m_owner) m_owner->CancelAsyncPnbReservation(m_hash);
+        }
+
+        void MarkCommitted() noexcept { m_owner = nullptr; }
+
+    private:
+        PeerManagerImpl* m_owner;
+        uint256 m_hash;
+    };
+
     void ProcessMessage(Peer& peer, CNode& pfrom, const std::string& msg_type, DataStream& vRecv, NodeClock::time_point time_received,
+                        bool& async_pnb_enqueued,
                         const std::atomic<bool>& interruptMsgProc)
-        EXCLUSIVE_LOCKS_REQUIRED(!m_peer_mutex, !m_most_recent_block_mutex, !m_headers_presync_mutex, g_msgproc_mutex, !m_tx_download_mutex, !m_inv_to_send_mutex);
+        EXCLUSIVE_LOCKS_REQUIRED(!m_peer_mutex, !m_most_recent_block_mutex, !m_headers_presync_mutex, g_msgproc_mutex, !m_tx_download_mutex, !m_inv_to_send_mutex, !m_async_pnb_mutex);
 
     /** Consider evicting an outbound peer based on the amount of time they've been behind our tip */
     void ConsiderEviction(CNode& pto, Peer& peer, std::chrono::seconds time_in_seconds) EXCLUSIVE_LOCKS_REQUIRED(cs_main, g_msgproc_mutex);
@@ -882,6 +931,14 @@ private:
 
     const Options m_opts;
 
+    Mutex m_async_pnb_mutex;
+    std::condition_variable m_async_pnb_cv;
+    std::deque<AsyncPnbJob> m_async_pnb_jobs GUARDED_BY(m_async_pnb_mutex);
+    std::set<uint256> m_async_pnb_hashes GUARDED_BY(m_async_pnb_mutex);
+    std::thread m_async_pnb_thread;
+    std::once_flag m_async_pnb_stop_once;
+    bool m_async_pnb_stopping GUARDED_BY(m_async_pnb_mutex){false};
+
     bool RejectIncomingTxs(const CNode& peer) const;
 
     /** Whether we've completed initial sync yet, for determining when to turn
@@ -1053,11 +1110,19 @@ private:
         LOCKS_EXCLUDED(::cs_main);
 
     /** Process a new block. Perform any post-processing housekeeping */
-    void ProcessBlock(CNode& node, const std::shared_ptr<const CBlock>& block, bool force_processing, bool min_pow_checked);
+    void ProcessBlock(CNode& node, const std::shared_ptr<const CBlock>& block, bool force_processing, bool min_pow_checked)
+        EXCLUSIVE_LOCKS_REQUIRED(!m_async_pnb_mutex);
+
+    bool WaitForAsyncPnbHash(const uint256& hash) EXCLUSIVE_LOCKS_REQUIRED(!m_async_pnb_mutex);
+    std::optional<AsyncPnbReservation> ReserveAsyncPnb(const uint256& hash) EXCLUSIVE_LOCKS_REQUIRED(!m_async_pnb_mutex);
+    void CancelAsyncPnbReservation(const uint256& hash) noexcept EXCLUSIVE_LOCKS_REQUIRED(!m_async_pnb_mutex);
+    void CommitAsyncPnb(AsyncPnbReservation& reservation, AsyncPnbJob job) EXCLUSIVE_LOCKS_REQUIRED(!m_async_pnb_mutex);
+    void WaitForAsyncPnbIdle() EXCLUSIVE_LOCKS_REQUIRED(!m_async_pnb_mutex);
+    void AsyncPnbWorker() EXCLUSIVE_LOCKS_REQUIRED(!m_async_pnb_mutex);
 
     /** Process compact block txns  */
     void ProcessCompactBlockTxns(CNode& pfrom, Peer& peer, const BlockTransactions& block_transactions)
-        EXCLUSIVE_LOCKS_REQUIRED(g_msgproc_mutex, !m_most_recent_block_mutex);
+        EXCLUSIVE_LOCKS_REQUIRED(g_msgproc_mutex, !m_most_recent_block_mutex, !m_async_pnb_mutex);
 
     /**
      * Schedule an INV for a transaction to be sent to the given peer (via `PushMessage()`).
@@ -2148,6 +2213,32 @@ PeerManagerImpl::PeerManagerImpl(CConnman& connman, AddrMan& addrman,
     if (opts.reconcile_txs) {
         m_txreconciliation = std::make_unique<TxReconciliationTracker>(TXRECONCILIATION_VERSION);
     }
+    if (m_opts.async_pnb) {
+        m_async_pnb_thread = std::thread(&util::TraceThread, "pnb", [this] { AsyncPnbWorker(); });
+    }
+}
+
+PeerManagerImpl::~PeerManagerImpl()
+{
+    StopAsyncBlockProcessing();
+}
+
+void PeerManagerImpl::StopAsyncBlockProcessing()
+{
+    if (!m_opts.async_pnb) return;
+    std::call_once(m_async_pnb_stop_once, [this] {
+        {
+            LOCK(m_async_pnb_mutex);
+            m_async_pnb_stopping = true;
+        }
+        m_async_pnb_cv.notify_all();
+        if (m_async_pnb_thread.joinable()) m_async_pnb_thread.join();
+        {
+            LOCK(m_async_pnb_mutex);
+            assert(m_async_pnb_jobs.empty());
+            assert(m_async_pnb_hashes.empty());
+        }
+    });
 }
 
 void PeerManagerImpl::StartScheduledTasks(CScheduler& scheduler)
@@ -3662,8 +3753,141 @@ void PeerManagerImpl::ProcessGetCFCheckPt(CNode& node, Peer& peer, DataStream& v
               headers);
 }
 
+bool PeerManagerImpl::WaitForAsyncPnbHash(const uint256& hash)
+{
+    WAIT_LOCK(m_async_pnb_mutex, lock);
+    m_async_pnb_cv.wait(lock, [&]() EXCLUSIVE_LOCKS_REQUIRED(m_async_pnb_mutex) {
+        return m_async_pnb_stopping || !m_async_pnb_hashes.contains(hash);
+    });
+    return !m_async_pnb_stopping;
+}
+
+std::optional<PeerManagerImpl::AsyncPnbReservation> PeerManagerImpl::ReserveAsyncPnb(const uint256& hash)
+{
+    WAIT_LOCK(m_async_pnb_mutex, lock);
+    m_async_pnb_cv.wait(lock, [&]() EXCLUSIVE_LOCKS_REQUIRED(m_async_pnb_mutex) {
+        return m_async_pnb_stopping ||
+               (m_async_pnb_hashes.size() < ASYNC_PNB_CAPACITY && !m_async_pnb_hashes.contains(hash));
+    });
+    if (m_async_pnb_stopping) return std::nullopt;
+
+    const bool inserted{m_async_pnb_hashes.insert(hash).second};
+    assert(inserted);
+    return std::optional<AsyncPnbReservation>{std::in_place, *this, hash};
+}
+
+void PeerManagerImpl::CancelAsyncPnbReservation(const uint256& hash) noexcept
+{
+    {
+        LOCK(m_async_pnb_mutex);
+        assert(m_async_pnb_hashes.erase(hash) == 1);
+    }
+    m_async_pnb_cv.notify_all();
+}
+
+void PeerManagerImpl::CommitAsyncPnb(AsyncPnbReservation& reservation, AsyncPnbJob job)
+{
+    const uint256 hash{job.block->GetHash()};
+    {
+        LOCK(m_async_pnb_mutex);
+        assert(m_async_pnb_hashes.contains(hash));
+        m_async_pnb_jobs.push_back(std::move(job));
+        reservation.MarkCommitted();
+    }
+    m_async_pnb_cv.notify_all();
+}
+
+void PeerManagerImpl::WaitForAsyncPnbIdle()
+{
+    if (!m_opts.async_pnb) return;
+    WAIT_LOCK(m_async_pnb_mutex, lock);
+    m_async_pnb_cv.wait(lock, [&]() EXCLUSIVE_LOCKS_REQUIRED(m_async_pnb_mutex) { return m_async_pnb_hashes.empty(); });
+}
+
+void PeerManagerImpl::AsyncPnbWorker()
+{
+    while (true) {
+        AsyncPnbJob job;
+        {
+            WAIT_LOCK(m_async_pnb_mutex, lock);
+            if (m_async_pnb_jobs.empty() && !(m_async_pnb_stopping && m_async_pnb_hashes.empty())) {
+                m_async_pnb_cv.wait(lock, [&]() EXCLUSIVE_LOCKS_REQUIRED(m_async_pnb_mutex) {
+                    return !m_async_pnb_jobs.empty() || (m_async_pnb_stopping && m_async_pnb_hashes.empty());
+                });
+            }
+            if (m_async_pnb_jobs.empty()) {
+                assert(m_async_pnb_stopping);
+                assert(m_async_pnb_hashes.empty());
+                break;
+            }
+            job = std::move(m_async_pnb_jobs.front());
+            m_async_pnb_jobs.pop_front();
+        }
+
+        const uint256 hash{job.block->GetHash()};
+        bool new_block{false};
+        std::exception_ptr process_error;
+        std::exception_ptr completion_error;
+        try {
+            m_chainman.ProcessNewBlock(job.block, job.force_processing, job.min_pow_checked, &new_block);
+        } catch (...) {
+            process_error = std::current_exception();
+        }
+        const bool confirmed_new_block{!process_error && new_block};
+
+        if (confirmed_new_block) {
+            try {
+                m_connman.ForNode(job.source, [](CNode* node) {
+                    node->m_last_block_time = GetTime<std::chrono::seconds>();
+                    return true;
+                });
+            } catch (...) {
+                completion_error = std::current_exception();
+            }
+        }
+
+        try {
+            LOCK(cs_main);
+            if (confirmed_new_block) {
+                // In case this block came from a different peer than we requested
+                // from, erase every request now that the block is stored.
+                RemoveBlockRequest(hash, std::nullopt);
+            } else {
+                RemoveBlockRequest(hash, job.source);
+                mapBlockSource.erase(hash);
+            }
+        } catch (...) {
+            if (!completion_error) completion_error = std::current_exception();
+        }
+
+        try {
+            // Async request removal has no synchronous ProcessMessages return
+            // to prompt download scheduling.
+            m_connman.WakeMessageHandler();
+        } catch (...) {
+            if (!completion_error) completion_error = std::current_exception();
+        }
+
+        {
+            LOCK(m_async_pnb_mutex);
+            assert(m_async_pnb_hashes.erase(hash) == 1);
+        }
+        m_async_pnb_cv.notify_all();
+
+        try {
+            if (process_error) std::rethrow_exception(process_error);
+            if (completion_error) std::rethrow_exception(completion_error);
+        } catch (const std::exception& e) {
+            LogDebug(BCLog::NET, "%s: Exception '%s' (%s) caught\n", __func__, e.what(), typeid(e).name());
+        } catch (...) {
+            LogDebug(BCLog::NET, "%s: Unknown exception caught\n", __func__);
+        }
+    }
+}
+
 void PeerManagerImpl::ProcessBlock(CNode& node, const std::shared_ptr<const CBlock>& block, bool force_processing, bool min_pow_checked)
 {
+    WaitForAsyncPnbIdle();
     bool new_block{false};
     m_chainman.ProcessNewBlock(block, force_processing, min_pow_checked, &new_block);
     if (new_block) {
@@ -3681,6 +3905,7 @@ void PeerManagerImpl::ProcessBlock(CNode& node, const std::shared_ptr<const CBlo
 
 void PeerManagerImpl::ProcessCompactBlockTxns(CNode& pfrom, Peer& peer, const BlockTransactions& block_transactions)
 {
+    WaitForAsyncPnbIdle();
     std::shared_ptr<CBlock> pblock = std::make_shared<CBlock>();
     bool fBlockRead{false};
     {
@@ -3812,9 +4037,11 @@ void PeerManagerImpl::PushPrivateBroadcastTx(CNode& node)
 
 void PeerManagerImpl::ProcessMessage(Peer& peer, CNode& pfrom, const std::string& msg_type, DataStream& vRecv,
                                      const NodeClock::time_point time_received,
+                                     bool& async_pnb_enqueued,
                                      const std::atomic<bool>& interruptMsgProc)
 {
     AssertLockHeld(g_msgproc_mutex);
+    async_pnb_enqueued = false;
 
     LogDebug(BCLog::NET, "received: %s (%u bytes) peer=%d\n", SanitizeString(msg_type), vRecv.size(), pfrom.GetId());
 
@@ -4782,6 +5009,11 @@ void PeerManagerImpl::ProcessMessage(Peer& peer, CNode& pfrom, const std::string
             return;
         }
 
+        // Compact-block processing mutates per-hash request and source state
+        // before its synchronous ProcessBlock call, so it must not overtake an
+        // earlier normal block in the async FIFO.
+        WaitForAsyncPnbIdle();
+
         {
             LOCK(cs_main);
             const CNodeState *nodestate = State(pfrom.GetId());
@@ -5102,7 +5334,32 @@ void PeerManagerImpl::ProcessMessage(Peer& peer, CNode& pfrom, const std::string
         std::shared_ptr<CBlock> pblock = std::make_shared<CBlock>();
         vRecv >> TX_WITH_WITNESS(*pblock);
 
-        LogDebug(BCLog::NET, "received block %s peer=%d\n", pblock->GetHash().ToString(), pfrom.GetId());
+        const uint256 hash{pblock->GetHash()};
+        LogDebug(BCLog::NET, "received block %s peer=%d\n", hash.ToString(), pfrom.GetId());
+
+        bool async_eligible{false};
+        std::optional<AsyncPnbReservation> async_reservation;
+        if (m_opts.async_pnb) {
+            const bool header_indexed{WITH_LOCK(m_chainman.GetMutex(), return m_chainman.m_blockman.LookupBlockIndex(hash) != nullptr)};
+            async_eligible = m_chainman.IsInitialBlockDownload() && header_indexed;
+            if (async_eligible) {
+                // Mutation rejection also removes request state, so a later
+                // duplicate must first wait for an earlier same-hash job's
+                // completion cleanup. Capacity is reserved after mutation.
+                if (!WaitForAsyncPnbHash(hash)) return;
+                // IBD is latched false. If it changed while waiting on an
+                // earlier duplicate, establish the full idle barrier before
+                // mutation rejection can remove request state.
+                if (!WITH_LOCK(m_chainman.GetMutex(), return m_chainman.IsInitialBlockDownload())) {
+                    async_eligible = false;
+                    WaitForAsyncPnbIdle();
+                }
+            } else {
+                // Unknown-header and other non-eligible normal blocks must not
+                // overtake earlier FIFO work or reuse stale minimum-work data.
+                WaitForAsyncPnbIdle();
+            }
+        }
 
         const CBlockIndex* prev_block{WITH_LOCK(m_chainman.GetMutex(), return m_chainman.m_blockman.LookupBlockIndex(pblock->hashPrevBlock))};
 
@@ -5115,9 +5372,56 @@ void PeerManagerImpl::ProcessMessage(Peer& peer, CNode& pfrom, const std::string
             return;
         }
 
-        bool forceProcessing = false;
-        const uint256 hash(pblock->GetHash());
-        bool min_pow_checked = false;
+        if (async_eligible) {
+            async_reservation = ReserveAsyncPnb(hash);
+            if (!async_reservation) return;
+            // Capacity backpressure can outlive IBD as well.
+            if (!WITH_LOCK(m_chainman.GetMutex(), return m_chainman.IsInitialBlockDownload())) {
+                async_reservation.reset();
+                async_eligible = false;
+                WaitForAsyncPnbIdle();
+            }
+        }
+
+        bool forceProcessing{false};
+        bool min_pow_checked{false};
+        if (async_eligible) {
+            bool source_inserted{false};
+            try {
+                {
+                    LOCK(cs_main);
+                    // Always process the block if we requested it, since we may
+                    // need it even when it's not a candidate for new best tip.
+                    forceProcessing = IsBlockRequested(hash);
+                    source_inserted = mapBlockSource.emplace(hash, std::make_pair(pfrom.GetId(), true)).second;
+
+                    // Check claimed work on this block against our anti-dos thresholds.
+                    if (prev_block && prev_block->nChainWork + GetBlockProof(*pblock) >= GetAntiDoSWorkThreshold()) {
+                        min_pow_checked = true;
+                    }
+                }
+                CommitAsyncPnb(*async_reservation,
+                               AsyncPnbJob{
+                                   .source = pfrom.GetId(),
+                                   .block = pblock,
+                                   .force_processing = forceProcessing,
+                                   .min_pow_checked = min_pow_checked,
+                               });
+                async_pnb_enqueued = true;
+            } catch (...) {
+                LOCK(cs_main);
+                RemoveBlockRequest(hash, pfrom.GetId());
+                if (source_inserted) {
+                    auto source{mapBlockSource.find(hash)};
+                    if (source != mapBlockSource.end() && source->second.first == pfrom.GetId()) {
+                        mapBlockSource.erase(source);
+                    }
+                }
+                throw;
+            }
+            return;
+        }
+
         {
             LOCK(cs_main);
             // Always process the block if we requested it, since we may
@@ -5443,43 +5747,65 @@ bool PeerManagerImpl::ProcessMessages(CNode& node, std::atomic<bool>& interruptM
         return false;
     }
 
-    CNetMessage& msg{poll_result->first};
-    bool fMoreWork = poll_result->second;
+    size_t messages_processed{0};
+    while (true) {
+        ++messages_processed;
+        CNetMessage& msg{poll_result->first};
+        const bool queued_more{poll_result->second};
+        bool fMoreWork{queued_more};
+        bool async_pnb_enqueued{false};
+        bool priority_work{false};
 
-    TRACEPOINT(net, inbound_message,
-        node.GetId(),
-        node.m_addr_name.c_str(),
-        node.ConnectionTypeAsString().c_str(),
-        msg.m_type.c_str(),
-        msg.m_recv.size(),
-        msg.m_recv.data()
-    );
+        TRACEPOINT(net, inbound_message,
+            node.GetId(),
+            node.m_addr_name.c_str(),
+            node.ConnectionTypeAsString().c_str(),
+            msg.m_type.c_str(),
+            msg.m_recv.size(),
+            msg.m_recv.data()
+        );
 
-    if (m_opts.capture_messages) {
-        CaptureMessage(node.addr, msg.m_type, MakeUCharSpan(msg.m_recv), /*is_incoming=*/true);
-    }
-
-    try {
-        ProcessMessage(peer, node, msg.m_type, msg.m_recv, msg.m_time, interruptMsgProc);
-        if (interruptMsgProc) return false;
-        {
-            LOCK(peer.m_getdata_requests_mutex);
-            if (!peer.m_getdata_requests.empty()) fMoreWork = true;
+        if (m_opts.capture_messages) {
+            CaptureMessage(node.addr, msg.m_type, MakeUCharSpan(msg.m_recv), /*is_incoming=*/true);
         }
-        // Does this peer have an orphan ready to reconsider?
-        // (Note: we may have provided a parent for an orphan provided
-        //  by another peer that was already processed; in that case,
-        //  the extra work may not be noticed, possibly resulting in an
-        //  unnecessary 100ms delay)
-        LOCK(m_tx_download_mutex);
-        if (m_txdownloadman.HaveMoreWork(peer.m_id)) fMoreWork = true;
-    } catch (const std::exception& e) {
-        LogDebug(BCLog::NET, "%s(%s, %u bytes): Exception '%s' (%s) caught\n", __func__, SanitizeString(msg.m_type), msg.m_message_size, e.what(), typeid(e).name());
-    } catch (...) {
-        LogDebug(BCLog::NET, "%s(%s, %u bytes): Unknown exception caught\n", __func__, SanitizeString(msg.m_type), msg.m_message_size);
-    }
 
-    return fMoreWork;
+        try {
+            ProcessMessage(peer, node, msg.m_type, msg.m_recv, msg.m_time,
+                           async_pnb_enqueued, interruptMsgProc);
+            if (interruptMsgProc) return false;
+            {
+                LOCK(peer.m_getdata_requests_mutex);
+                if (!peer.m_getdata_requests.empty()) {
+                    fMoreWork = true;
+                    priority_work = true;
+                }
+            }
+            // Does this peer have an orphan ready to reconsider?
+            // (Note: we may have provided a parent for an orphan provided
+            //  by another peer that was already processed; in that case,
+            //  the extra work may not be noticed, possibly resulting in an
+            //  unnecessary 100ms delay)
+            LOCK(m_tx_download_mutex);
+            if (m_txdownloadman.HaveMoreWork(peer.m_id)) {
+                fMoreWork = true;
+                priority_work = true;
+            }
+        } catch (const std::exception& e) {
+            LogDebug(BCLog::NET, "%s(%s, %u bytes): Exception '%s' (%s) caught\n", __func__, SanitizeString(msg.m_type), msg.m_message_size, e.what(), typeid(e).name());
+        } catch (...) {
+            LogDebug(BCLog::NET, "%s(%s, %u bytes): Unknown exception caught\n", __func__, SanitizeString(msg.m_type), msg.m_message_size);
+        }
+
+        if (!async_pnb_enqueued || !queued_more || messages_processed == ASYNC_PNB_CAPACITY ||
+            interruptMsgProc ||
+            node.fDisconnect || node.fPauseSend || priority_work) {
+            return fMoreWork;
+        }
+
+        auto next_poll{node.PollMessage(NetMsgType::BLOCK)};
+        if (!next_poll) return fMoreWork;
+        poll_result = std::move(next_poll);
+    }
 }
 
 void PeerManagerImpl::ConsiderEviction(CNode& pto, Peer& peer, std::chrono::seconds time_in_seconds)

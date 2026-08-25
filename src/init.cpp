@@ -340,10 +340,12 @@ void Shutdown(NodeContext& node)
     }
     StopMapPort();
 
-    // Because these depend on each-other, we make sure that neither can be
-    // using the other before destroying them.
+    // Stop the message producer, then drain the async block consumer while its
+    // peer state and validation callbacks are still available.
+    if (node.connman) node.connman->StopThreads();
+    if (node.peerman) node.peerman->StopAsyncBlockProcessing();
     if (node.peerman && node.validation_signals) node.validation_signals->UnregisterValidationInterface(node.peerman.get());
-    if (node.connman) node.connman->Stop();
+    if (node.connman) node.connman->StopNodes();
 
     if (node.tor_controller) {
         node.tor_controller->Join();
@@ -677,6 +679,7 @@ void SetupServerArgs(ArgsManager& argsman, bool can_listen_ipc)
     argsman.AddArg("-checkblockindex", strprintf("Do a consistency check for the block tree, chainstate, and other validation data structures every <n> operations. Use 0 to disable. (default: %u, regtest: %u)", defaultChainParams->DefaultConsistencyChecks(), regtestChainParams->DefaultConsistencyChecks()), ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
     argsman.AddArg("-checkaddrman=<n>", strprintf("Run addrman consistency checks every <n> operations. Use 0 to disable. (default: %u)", DEFAULT_ADDRMAN_CONSISTENCY_CHECKS), ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
     argsman.AddArg("-checkmempool=<n>", strprintf("Run mempool consistency checks every <n> transactions. Use 0 to disable. (default: %u, regtest: %u)", defaultChainParams->DefaultConsistencyChecks(), regtestChainParams->DefaultConsistencyChecks()), ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
+    argsman.AddArg("-asyncpnb", "Use one bounded asynchronous ProcessNewBlock consumer for indexed full blocks during initial block download (default: 0)", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
     // Checkpoints were removed. We keep `-checkpoints` as a hidden arg to display a more user friendly error when set.
     argsman.AddArg("-checkpoints", "", ArgsManager::ALLOW_ANY, OptionsCategory::HIDDEN);
     argsman.AddArg("-deprecatedrpc=<method>", "Allows deprecated RPC method(s) to be used", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);

@@ -109,6 +109,9 @@ public:
         bool private_broadcast{DEFAULT_PRIVATE_BROADCAST};
         //! Maximum per-second rate for sending transaction inventory to peers.
         unsigned int tx_send_rate{DEFAULT_TX_SEND_RATE};
+        //! Whether normal full blocks received during IBD may be handed to a
+        //! single asynchronous ProcessNewBlock consumer.
+        bool async_pnb{false};
     };
 
     static std::unique_ptr<PeerManager> make(CConnman& connman, AddrMan& addrman,
@@ -126,6 +129,9 @@ public:
 
     /** Begin running background tasks, should only be called once */
     virtual void StartScheduledTasks(CScheduler& scheduler) = 0;
+
+    /** Stop and drain optional asynchronous block processing. Idempotent. */
+    virtual void StopAsyncBlockProcessing() = 0;
 
     /** Get statistics from node state */
     virtual bool GetNodeStateStats(NodeId nodeid, CNodeStateStats& stats) const = 0;

@@ -88,4 +88,16 @@ BOOST_AUTO_TEST_CASE(connections_desirable_service_flags)
     BOOST_CHECK(peerman->GetDesirableServiceFlags(peer_flags) == ServiceFlags(NODE_NETWORK | NODE_WITNESS));
 }
 
+BOOST_AUTO_TEST_CASE(async_block_processing_stop_is_idempotent)
+{
+    PeerManager::Options options;
+    options.async_pnb = true;
+    auto peerman{PeerManager::make(*m_node.connman, *m_node.addrman, nullptr, *m_node.chainman,
+                                   *m_node.mempool, *m_node.warnings, options)};
+
+    BOOST_CHECK_NO_THROW(peerman->StopAsyncBlockProcessing());
+    BOOST_CHECK_NO_THROW(peerman->StopAsyncBlockProcessing());
+    BOOST_CHECK_NO_THROW(peerman.reset());
+}
+
 BOOST_AUTO_TEST_SUITE_END()
