@@ -212,11 +212,15 @@ class ResourceSampler:
                 task_fields = task_stat[task_stat.rfind(")") + 2:].split()
                 ticks = int(task_fields[11]) + int(task_fields[12])
                 task_status = (task / "status").read_text(encoding="ascii").splitlines()
-            except FileNotFoundError:
+                task_voluntary = int(next(
+                    line.split()[1] for line in task_status if line.startswith("voluntary_ctxt_switches:")))
+                task_involuntary = int(next(
+                    line.split()[1] for line in task_status if line.startswith("nonvoluntary_ctxt_switches:")))
+            except (FileNotFoundError, StopIteration):
                 continue
             threads += 1
-            voluntary += int(next(line.split()[1] for line in task_status if line.startswith("voluntary_ctxt_switches:")))
-            involuntary += int(next(line.split()[1] for line in task_status if line.startswith("nonvoluntary_ctxt_switches:")))
+            voluntary += task_voluntary
+            involuntary += task_involuntary
             if "msghand" in name:
                 categories["handler"] += ticks
             elif "p2p-pnb" in name:
@@ -238,7 +242,7 @@ class ResourceSampler:
             try:
                 self.writer.writerow((time.perf_counter_ns() - self.start_ns, *self._sample()))
                 self.file.flush()
-            except FileNotFoundError:
+            except (FileNotFoundError, StopIteration):
                 break
             self.stop_event.wait(0.05)
 
@@ -788,6 +792,9 @@ class AsyncPNBPeerService(BitcoinTestFramework):
         p2pk_wallet = MiniWallet(node, mode=MiniWalletMode.RAW_P2PK)
         seed = self._create_funding(setup_peer, address_wallet, p2pk_wallet)
         node.disconnect_p2ps()
+        self.wait_until(
+            lambda: not node.getpeerinfo() and node.getconnectioncount() == 0,
+            timeout=PING_TIMEOUT, check_interval=MARKER_POLL)
 
         source = node.add_p2p_connection(PeerServicePeer())
         self.source_id = self._map_peer_id(source)
@@ -796,6 +803,7 @@ class AsyncPNBPeerService(BitcoinTestFramework):
         serial = 0
         for load in profile["loads"]:
             assert {entry["id"] for entry in node.getpeerinfo()} == {self.source_id}
+            assert node.getconnectioncount() == 1
             peers = [node.add_p2p_connection(PeerServicePeer()) for _ in range(load)]
             peer_ids = [self._map_peer_id(peer) for peer in peers]
             assert len(set(peer_ids + [self.source_id])) == load + 1
@@ -809,7 +817,8 @@ class AsyncPNBPeerService(BitcoinTestFramework):
                 peer.peer_disconnect()
                 peer.wait_for_disconnect()
             self.wait_until(
-                lambda: {entry["id"] for entry in node.getpeerinfo()} == {self.source_id},
+                lambda: ({entry["id"] for entry in node.getpeerinfo()} == {self.source_id}
+                         and node.getconnectioncount() == 1),
                 timeout=PING_TIMEOUT, check_interval=MARKER_POLL)
         assert source.is_connected
 
