@@ -64,6 +64,7 @@
 #include <node/mempool_persist_args.h>
 #include <node/mining_args.h>
 #include <node/mining_types.h>
+#include <node/async_pnb_peer_service_probe.h>
 #include <node/peerman_args.h>
 #include <policy/feerate.h>
 #include <policy/fees/block_policy_estimator.h>
@@ -337,6 +338,13 @@ void Shutdown(NodeContext& node)
     }
     StopMapPort();
 
+    if (node.async_pnb_peer_service_probe &&
+        node.async_pnb_peer_service_probe->TestGatesEnabled()) {
+        node.async_pnb_peer_service_probe->Record(
+            node::AsyncPNBProbeEvent::TEST_SHUTDOWN_STARTED,
+            std::chrono::steady_clock::now());
+    }
+
     if (node.peerman && node.peerman->HasAsyncPNBPeerService()) {
         // Keep nodes, chainstate, and validation callbacks alive until the
         // single accepted PNB job and its network continuation are complete.
@@ -348,6 +356,14 @@ void Shutdown(NodeContext& node)
         // Preserve master's shutdown path when the experiment is disabled.
         if (node.peerman && node.validation_signals) node.validation_signals->UnregisterValidationInterface(node.peerman.get());
         if (node.connman) node.connman->Stop();
+    }
+    if (node.async_pnb_peer_service_probe &&
+        node.async_pnb_peer_service_probe->TestGatesEnabled() && node.validation_signals) {
+        node.validation_signals->UnregisterValidationInterface(
+            node.async_pnb_peer_service_probe.get());
+        node.async_pnb_peer_service_probe->Record(
+            node::AsyncPNBProbeEvent::TEST_INTERFACE_UNREGISTERED,
+            std::chrono::steady_clock::now());
     }
 
     if (node.tor_controller) {
@@ -441,6 +457,7 @@ void Shutdown(NodeContext& node)
     node.mempool.reset();
     node.chainman.reset();
     node.validation_signals.reset();
+    node.async_pnb_peer_service_probe.reset();
     node.scheduler.reset();
     node.ecc_context.reset();
     node.kernel.reset();
@@ -679,6 +696,8 @@ void SetupServerArgs(ArgsManager& argsman, bool can_listen_ipc)
 
     argsman.AddArg("-checkblocks=<n>", strprintf("How many blocks to check at startup (default: %u, 0 = all)", DEFAULT_CHECKBLOCKS), ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
     argsman.AddArg("-asyncpnbpeerservice", "Process P2P blocks on one serial worker while unrelated peers follow ordinary message processing (default: 0)", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
+    argsman.AddArg("-asyncpnbpeerserviceprobedir=<dir>", "Write nonblocking async-PNB experiment records to a new PID-named mmap file in <dir> (default: disabled)", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
+    argsman.AddArg("-asyncpnbpeerservicetestgates", "Enable quick-test-only async-PNB lifecycle gates; requires -asyncpnbpeerserviceprobedir and regtest (default: 0)", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
     argsman.AddArg("-checklevel=<n>", strprintf("How thorough the block verification of -checkblocks is: %s (0-4, default: %u)", Join(CHECKLEVEL_DOC, ", "), DEFAULT_CHECKLEVEL), ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
     argsman.AddArg("-checkblockindex", strprintf("Do a consistency check for the block tree, chainstate, and other validation data structures every <n> operations. Use 0 to disable. (default: %u, regtest: %u)", defaultChainParams->DefaultConsistencyChecks(), regtestChainParams->DefaultConsistencyChecks()), ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
     argsman.AddArg("-checkaddrman=<n>", strprintf("Run addrman consistency checks every <n> operations. Use 0 to disable. (default: %u)", DEFAULT_ADDRMAN_CONSISTENCY_CHECKS), ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
@@ -1979,6 +1998,36 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
 
     auto& kernel_notifications{*Assert(node.notifications)};
 
+    const fs::path async_pnb_probe_dir{args.GetPathArg("-asyncpnbpeerserviceprobedir")};
+    const bool async_pnb_test_gates{args.GetBoolArg("-asyncpnbpeerservicetestgates", false)};
+    if (async_pnb_test_gates && async_pnb_probe_dir.empty()) {
+        return InitError(Untranslated(
+            "-asyncpnbpeerservicetestgates requires -asyncpnbpeerserviceprobedir"));
+    }
+    if (async_pnb_test_gates && chainparams.GetChainType() != ChainType::REGTEST) {
+        return InitError(Untranslated("-asyncpnbpeerservicetestgates requires regtest"));
+    }
+    if (!async_pnb_probe_dir.empty()) {
+        if (!async_pnb_probe_dir.is_absolute()) {
+            return InitError(Untranslated("-asyncpnbpeerserviceprobedir must be absolute"));
+        }
+        try {
+            node.async_pnb_peer_service_probe =
+                node::AsyncPNBPeerServiceProbe::Create(async_pnb_probe_dir, async_pnb_test_gates);
+        } catch (const std::exception& error) {
+            return InitError(Untranslated(strprintf(
+                "Unable to initialize async-PNB probe: %s", error.what())));
+        }
+        peerman_opts.async_pnb_probe = node.async_pnb_peer_service_probe;
+        if (async_pnb_test_gates) {
+            validation_signals.RegisterSharedValidationInterface(
+                node.async_pnb_peer_service_probe);
+            node.async_pnb_peer_service_probe->Record(
+                node::AsyncPNBProbeEvent::TEST_INTERFACE_REGISTERED,
+                std::chrono::steady_clock::now());
+        }
+    }
+
     assert(!node.peerman);
     node.peerman = PeerManager::make(*node.connman, *node.addrman,
                                      node.banman.get(), chainman,
@@ -2213,6 +2262,7 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
     connOptions.whitelist_forcerelay = args.GetBoolArg("-whitelistforcerelay", DEFAULT_WHITELISTFORCERELAY);
     connOptions.whitelist_relay = args.GetBoolArg("-whitelistrelay", DEFAULT_WHITELISTRELAY);
     connOptions.m_capture_messages = args.GetBoolArg("-capturemessages", false);
+    connOptions.m_async_pnb_probe = node.async_pnb_peer_service_probe;
 
     // Port to bind to if `-bind=addr` is provided without a `:port` suffix.
     const uint16_t default_bind_port =

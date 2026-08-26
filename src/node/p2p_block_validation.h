@@ -15,6 +15,8 @@ class ChainstateManager;
 
 namespace node {
 
+class AsyncPNBPeerServiceProbe;
+
 enum class P2PBlockValidationSubmit {
     ACCEPTED,
     FULL,
@@ -68,14 +70,25 @@ public:
 //! Called outside the component mutex after the result has been published.
 using P2PBlockValidationResultReady = std::function<void()>;
 
+//! Deterministic component phases exposed only by the unit-test factory.
+enum class P2PBlockValidationTestState {
+    QUEUED,
+    RUNNING,
+    RESULT_READY,
+};
+using P2PBlockValidationTestStateHook =
+    std::function<void(P2PBlockValidationTestState)>;
+
 std::unique_ptr<P2PBlockValidation> MakeP2PBlockValidation(
     ChainstateManager& chainman,
-    P2PBlockValidationResultReady result_ready);
+    P2PBlockValidationResultReady result_ready,
+    std::shared_ptr<AsyncPNBPeerServiceProbe> probe = {});
 
 //! Unit-test factory for deterministic state and invocation accounting.
 std::unique_ptr<P2PBlockValidation> MakeP2PBlockValidationForTest(
     P2PBlockValidationFn process_new_block,
-    P2PBlockValidationResultReady result_ready);
+    P2PBlockValidationResultReady result_ready,
+    P2PBlockValidationTestStateHook state_hook = {});
 
 } // namespace node
 

@@ -25,6 +25,7 @@
 #include <netbase.h>
 #include <node/eviction.h>
 #include <node/interface_ui.h>
+#include <node/async_pnb_peer_service_probe.h>
 #include <protocol.h>
 #include <random.h>
 #include <scheduler.h>
@@ -575,6 +576,7 @@ CNode* CConnman::ConnectNode(CAddress addrConnect,
                                     .i2p_sam_session = std::move(i2p_transient_session),
                                     .recv_flood_size = nReceiveFloodSize,
                                     .use_v2transport = use_v2transport,
+                                    .async_pnb_probe = m_async_pnb_probe,
                                 });
         pnode->AddRef();
 
@@ -1899,6 +1901,7 @@ void CConnman::CreateNodeFromAcceptedSocket(std::unique_ptr<Sock>&& sock,
                                  .prefer_evict = discouraged,
                                  .recv_flood_size = nReceiveFloodSize,
                                  .use_v2transport = use_v2transport,
+                                 .async_pnb_probe = m_async_pnb_probe,
                              });
     pnode->AddRef();
     m_msgproc->InitializeNode(*pnode, local_services);
@@ -4125,6 +4128,7 @@ CNode::CNode(NodeId idIn,
       id{idIn},
       nLocalHostNonce{nLocalHostNonceIn},
       m_recv_flood_size{node_opts.recv_flood_size},
+      m_async_pnb_probe{std::move(node_opts.async_pnb_probe)},
       m_i2p_sam_session{std::move(node_opts.i2p_sam_session)}
 {
     if (inbound_onion) assert(conn_type_in == ConnectionType::INBOUND);
@@ -4144,16 +4148,6 @@ CNode::CNode(NodeId idIn,
 void CNode::MarkReceivedMsgsForProcessing()
 {
     AssertLockNotHeld(m_msg_process_queue_mutex);
-
-    struct ReadyMarker {
-        uint64_t id;
-        std::string type;
-        SteadyClock::time_point time;
-        size_t bytes;
-        size_t depth;
-        bool paused;
-    };
-    std::vector<ReadyMarker> ready_markers;
     {
         LOCK(m_msg_process_queue_mutex);
         size_t nSizeAdded{0};
@@ -4170,22 +4164,21 @@ void CNode::MarkReceivedMsgsForProcessing()
                 msg.m_process_queue_depth_at_ready = ready_depth;
                 msg.m_process_queue_paused_at_ready =
                     msg.m_process_queue_bytes_at_ready > m_recv_flood_size;
-                ready_markers.push_back({msg.m_process_queue_id, msg.m_type,
-                                         msg.m_process_queue_ready,
-                                         msg.m_process_queue_bytes_at_ready,
-                                         msg.m_process_queue_depth_at_ready,
-                                         msg.m_process_queue_paused_at_ready});
+                if (m_async_pnb_probe) {
+                    m_async_pnb_probe->Record(
+                        node::AsyncPNBProbeEvent::COMPLETE_MESSAGE_READY,
+                        msg.m_process_queue_ready,
+                        {GetId(), static_cast<int64_t>(msg.m_process_queue_id),
+                         static_cast<int64_t>(msg.m_process_queue_bytes_at_ready),
+                         static_cast<int64_t>(msg.m_process_queue_depth_at_ready),
+                         msg.m_process_queue_paused_at_ready},
+                        msg.m_type);
+                }
             }
         }
         m_msg_process_queue.splice(m_msg_process_queue.end(), vRecvMsg);
         m_msg_process_queue_size += nSizeAdded;
         fPauseRecv = m_msg_process_queue_size > m_recv_flood_size;
-    }
-    for (const auto& marker : ready_markers) {
-        LogInfo("ASYNC_PNB_PEER_SERVICE event=complete_message_ready peer=%d msg_id=%d msg=%s steady_ns=%d queue_bytes=%d queue_depth=%d pause_recv=%d\n",
-                GetId(), marker.id, marker.type,
-                TicksSinceEpoch<std::chrono::nanoseconds>(marker.time), marker.bytes,
-                marker.depth, marker.paused);
     }
 }
 
@@ -4217,6 +4210,16 @@ std::optional<std::pair<CNetMessage, bool>> CNode::PollMessage(
     const bool more_work{!m_msg_process_queue.empty() &&
                          !is_excluded(m_msg_process_queue.front())};
     return std::make_pair(std::move(msgs.front()), more_work);
+}
+
+CNode::ProcessQueueSnapshot CNode::GetProcessQueueSnapshot()
+{
+    LOCK(m_msg_process_queue_mutex);
+    return {
+        .bytes = m_msg_process_queue_size,
+        .depth = m_msg_process_queue.size(),
+        .paused = fPauseRecv,
+    };
 }
 
 bool CConnman::NodeFullyConnected(const CNode* pnode)

@@ -55,6 +55,9 @@ class CChainParams;
 class CNode;
 class CScheduler;
 struct bilingual_str;
+namespace node {
+class AsyncPNBPeerServiceProbe;
+}
 
 /** Time after which to disconnect, after waiting for a ping response (or inactivity). */
 inline constexpr std::chrono::minutes TIMEOUT_INTERVAL{20};
@@ -697,12 +700,19 @@ struct CNodeOptions
     bool prefer_evict = false;
     size_t recv_flood_size{DEFAULT_MAXRECEIVEBUFFER * 1000};
     bool use_v2transport = false;
+    std::shared_ptr<node::AsyncPNBPeerServiceProbe> async_pnb_probe;
 };
 
 /** Information about a peer */
 class CNode
 {
 public:
+    struct ProcessQueueSnapshot {
+        size_t bytes;
+        size_t depth;
+        bool paused;
+    };
+
     /** Transport serializer/deserializer. The receive side functions are only called under cs_vRecv, while
      * the sending side functions are only called under cs_vSend. */
     const std::unique_ptr<Transport> m_transport;
@@ -788,6 +798,10 @@ public:
      * ordinary polling behavior. */
     std::optional<std::pair<CNetMessage, bool>> PollMessage(
         std::span<const std::string_view> excluded_types = {})
+        EXCLUSIVE_LOCKS_REQUIRED(!m_msg_process_queue_mutex);
+
+    //! Return an internally consistent receive-accounting snapshot.
+    ProcessQueueSnapshot GetProcessQueueSnapshot()
         EXCLUSIVE_LOCKS_REQUIRED(!m_msg_process_queue_mutex);
 
     /** Account for the total size of a sent message in the per msg type connection stats. */
@@ -1030,6 +1044,7 @@ private:
     std::atomic<int> m_greatest_common_version{INIT_PROTO_VERSION};
 
     const size_t m_recv_flood_size;
+    const std::shared_ptr<node::AsyncPNBPeerServiceProbe> m_async_pnb_probe;
     std::list<CNetMessage> vRecvMsg; // Used only by SocketHandler thread
 
     Mutex m_msg_process_queue_mutex;
@@ -1136,6 +1151,7 @@ public:
         bool whitelist_forcerelay = DEFAULT_WHITELISTFORCERELAY;
         bool whitelist_relay = DEFAULT_WHITELISTRELAY;
         bool m_capture_messages = false;
+        std::shared_ptr<node::AsyncPNBPeerServiceProbe> m_async_pnb_probe;
     };
 
     void Init(const Options& connOptions) EXCLUSIVE_LOCKS_REQUIRED(!m_added_nodes_mutex, !m_total_bytes_sent_mutex)
@@ -1175,6 +1191,7 @@ public:
         whitelist_forcerelay = connOptions.whitelist_forcerelay;
         whitelist_relay = connOptions.whitelist_relay;
         m_capture_messages = connOptions.m_capture_messages;
+        m_async_pnb_probe = connOptions.m_async_pnb_probe;
     }
 
     // test only
@@ -1837,6 +1854,7 @@ private:
      * flag for whether messages are captured
      */
     bool m_capture_messages{false};
+    std::shared_ptr<node::AsyncPNBPeerServiceProbe> m_async_pnb_probe;
 
     /**
      * Mutex protecting m_i2p_sam_sessions.

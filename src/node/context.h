@@ -43,6 +43,7 @@ class SignalInterrupt;
 }
 
 namespace node {
+class AsyncPNBPeerServiceProbe;
 class KernelNotifications;
 class Warnings;
 
@@ -72,6 +73,7 @@ struct NodeContext {
     std::unique_ptr<const NetGroupManager> netgroupman;
     std::unique_ptr<FeeRateEstimatorManager> fee_estimator_man;
     std::unique_ptr<PeerManager> peerman;
+    std::shared_ptr<AsyncPNBPeerServiceProbe> async_pnb_peer_service_probe;
     std::unique_ptr<TorController> tor_controller;
     std::unique_ptr<ChainstateManager> chainman;
     std::unique_ptr<BanMan> banman;

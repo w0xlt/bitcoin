@@ -235,6 +235,7 @@ add_library(bitcoin_node STATIC EXCLUDE_FROM_ALL
   node/mining_args.cpp
   node/mini_miner.cpp
   node/minisketchwrapper.cpp
+  node/async_pnb_peer_service_probe.cpp
   node/p2p_block_validation.cpp
   node/peerman_args.cpp
   node/psbt.cpp

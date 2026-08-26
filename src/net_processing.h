@@ -38,6 +38,7 @@ class uint256;
 
 namespace node {
 class Warnings;
+class AsyncPNBPeerServiceProbe;
 } // namespace node
 
 /** Whether transaction reconciliation protocol should be enabled by default. */
@@ -114,6 +115,8 @@ public:
         unsigned int tx_send_rate{DEFAULT_TX_SEND_RATE};
         //! Test-only same-binary peer-service experiment.
         bool async_pnb_peer_service{false};
+        //! Optional nonblocking experiment recorder; never consulted for protocol decisions.
+        std::shared_ptr<node::AsyncPNBPeerServiceProbe> async_pnb_probe;
         //! Test-only coordination for async-PNB lock-order regression tests.
         std::function<void(std::string_view)> unit_test_async_pnb_hook;
     };

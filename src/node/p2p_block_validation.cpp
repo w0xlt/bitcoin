@@ -4,7 +4,8 @@
 
 #include <node/p2p_block_validation.h>
 
-#include <logging.h>
+#include <node/async_pnb_peer_service_probe.h>
+
 #include <primitives/block.h>
 #include <sync.h>
 #include <util/check.h>
@@ -26,6 +27,8 @@ class P2PBlockValidationImpl final : public P2PBlockValidation
 private:
     P2PBlockValidationFn m_process_new_block;
     P2PBlockValidationResultReady m_result_ready;
+    const std::shared_ptr<AsyncPNBPeerServiceProbe> m_probe;
+    const P2PBlockValidationTestStateHook m_test_state_hook;
 
     // Lock boundary: the worker releases this sole component mutex before
     // entering PNB or any synchronous validation callback. Callers never hold
@@ -47,38 +50,64 @@ private:
                 .force_processing = false,
                 .min_pow_checked = false,
             };
+            uint64_t queued_job{0};
+            uint256 queued_hash;
             {
                 WAIT_LOCK(m_mutex, lock);
                 m_cv.wait(lock, [this]() EXCLUSIVE_LOCKS_REQUIRED(m_mutex) {
                     return m_stopping || m_request.has_value();
                 });
                 if (!m_request) return;
+                queued_job = m_request->job_id;
+                queued_hash = m_request->block->GetHash();
+            }
+            if (m_probe && m_probe->TestGatesEnabled()) {
+                (void)m_probe->TestGate(AsyncPNBProbeTestGate::WORKER_QUEUED,
+                                        queued_job, /*peer=*/-1, &queued_hash);
+            }
+            if (m_test_state_hook) {
+                m_test_state_hook(P2PBlockValidationTestState::QUEUED);
+            }
+            {
+                LOCK(m_mutex);
+                Assert(m_request);
 
                 request = std::move(*m_request);
                 m_request.reset();
                 Assert(!m_running);
                 m_running = true;
             }
+            if (m_test_state_hook) {
+                m_test_state_hook(P2PBlockValidationTestState::RUNNING);
+            }
 
             const uint256 hash{request.block->GetHash()};
-            LogInfo("ASYNC_PNB_PEER_SERVICE event=worker_wake job=%d hash=%s steady_ns=%d active_slot=1\n",
-                    request.job_id, hash.ToString(),
-                    TicksSinceEpoch<std::chrono::nanoseconds>(SteadyClock::now()));
+            const auto worker_wake{SteadyClock::now()};
+            if (m_probe) {
+                m_probe->Record(AsyncPNBProbeEvent::WORKER_WAKE, worker_wake,
+                                {static_cast<int64_t>(request.job_id), 1}, {}, {}, &hash);
+                if (m_probe->TestGatesEnabled()) m_probe->SetActiveJob(request.job_id);
+            }
             bool new_block{false};
             const auto pnb_start{SteadyClock::now()};
-            LogInfo("ASYNC_PNB_PEER_SERVICE event=pnb_start job=%d hash=%s steady_ns=%d active_slot=1\n",
-                    request.job_id, hash.ToString(),
-                    TicksSinceEpoch<std::chrono::nanoseconds>(pnb_start));
+            if (m_probe) {
+                m_probe->Record(AsyncPNBProbeEvent::PNB_START, pnb_start,
+                                {static_cast<int64_t>(request.job_id), 1}, {}, {}, &hash);
+            }
             (void)m_process_new_block(
                 request.block,
                 request.force_processing,
                 request.min_pow_checked,
                 &new_block);
             const auto pnb_end{SteadyClock::now()};
-            LogInfo("ASYNC_PNB_PEER_SERVICE event=pnb_end job=%d hash=%s steady_ns=%d duration_ns=%d new_block=%d active_slot=1\n",
-                    request.job_id, hash.ToString(),
-                    TicksSinceEpoch<std::chrono::nanoseconds>(pnb_end),
-                    Ticks<std::chrono::nanoseconds>(pnb_end - pnb_start), new_block);
+            if (m_probe) {
+                if (m_probe->TestGatesEnabled()) m_probe->SetActiveJob(0);
+                m_probe->Record(
+                    AsyncPNBProbeEvent::PNB_END, pnb_end,
+                    {static_cast<int64_t>(request.job_id),
+                     Ticks<std::chrono::nanoseconds>(pnb_end - pnb_start), new_block, 1},
+                    {}, {}, &hash);
+            }
             request.block.reset();
 
             SteadyClock::time_point publication_time;
@@ -90,11 +119,20 @@ private:
                 publication_time = SteadyClock::now();
                 m_result = P2PBlockValidationResult{new_block};
             }
+            if (m_test_state_hook) {
+                m_test_state_hook(P2PBlockValidationTestState::RESULT_READY);
+            }
+            if (m_probe) {
+                m_probe->Record(
+                    AsyncPNBProbeEvent::RESULT_PUBLICATION, publication_time,
+                    {static_cast<int64_t>(request.job_id), new_block, 1}, {}, {}, &hash);
+                if (m_probe->TestGatesEnabled()) {
+                    (void)m_probe->TestGate(AsyncPNBProbeTestGate::RESULT_READY,
+                                            request.job_id, /*peer=*/-1, &hash);
+                }
+            }
             // Publication precedes the wake and the callback never runs under
             // the component mutex.
-            LogInfo("ASYNC_PNB_PEER_SERVICE event=result_publication job=%d hash=%s steady_ns=%d new_block=%d active_slot=1\n",
-                    request.job_id, hash.ToString(),
-                    TicksSinceEpoch<std::chrono::nanoseconds>(publication_time), new_block);
             m_result_ready();
 
             {
@@ -107,9 +145,13 @@ private:
 public:
     P2PBlockValidationImpl(
         P2PBlockValidationFn process_new_block,
-        P2PBlockValidationResultReady result_ready)
+        P2PBlockValidationResultReady result_ready,
+        P2PBlockValidationTestStateHook state_hook,
+        std::shared_ptr<AsyncPNBPeerServiceProbe> probe)
         : m_process_new_block{std::move(process_new_block)},
-          m_result_ready{std::move(result_ready)}
+          m_result_ready{std::move(result_ready)},
+          m_probe{std::move(probe)},
+          m_test_state_hook{std::move(state_hook)}
     {
         Assert(m_process_new_block);
         Assert(m_result_ready);
@@ -165,9 +207,10 @@ public:
 
 std::unique_ptr<P2PBlockValidation> MakeP2PBlockValidation(
     ChainstateManager& chainman,
-    P2PBlockValidationResultReady result_ready)
+    P2PBlockValidationResultReady result_ready,
+    std::shared_ptr<AsyncPNBPeerServiceProbe> probe)
 {
-    return MakeP2PBlockValidationForTest(
+    return std::make_unique<P2PBlockValidationImpl>(
         [&chainman](const std::shared_ptr<const CBlock>& block,
                     bool force_processing,
                     bool min_pow_checked,
@@ -175,15 +218,19 @@ std::unique_ptr<P2PBlockValidation> MakeP2PBlockValidation(
             return chainman.ProcessNewBlock(
                 block, force_processing, min_pow_checked, new_block);
         },
-        std::move(result_ready));
+        std::move(result_ready),
+        P2PBlockValidationTestStateHook{},
+        std::move(probe));
 }
 
 std::unique_ptr<P2PBlockValidation> MakeP2PBlockValidationForTest(
     P2PBlockValidationFn process_new_block,
-    P2PBlockValidationResultReady result_ready)
+    P2PBlockValidationResultReady result_ready,
+    P2PBlockValidationTestStateHook state_hook)
 {
     return std::make_unique<P2PBlockValidationImpl>(
-        std::move(process_new_block), std::move(result_ready));
+        std::move(process_new_block), std::move(result_ready), std::move(state_hook),
+        /*probe=*/nullptr);
 }
 
 } // namespace node

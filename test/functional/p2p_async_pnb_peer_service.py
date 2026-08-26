@@ -7,10 +7,12 @@
 import csv
 import hashlib
 import json
+import mmap
 import os
 import platform
 import random
 import shutil
+import struct
 import subprocess
 import sys
 import threading
@@ -79,6 +81,113 @@ EXPECTED_BLOCK_BYTES = 974_883
 EXPECTED_LEGACY_SIGOPS = 5_802
 PING_TIMEOUT = 60
 MARKER_POLL = 0.002
+
+PROBE_MAGIC = b"APNBPRB\0"
+PROBE_SCHEMA = 2
+PROBE_HEADER_SIZE = 64
+PROBE_RECORD_SIZE = 256
+PROBE_CAPACITY = 65_536
+PROBE_ENDIAN = 0x01020304
+PROBE_STATUS_TEST_GATES = 1
+PROBE_STATUS_OVERFLOW = 2
+PROBE_HEADER = struct.Struct("<8s6IQ5Ii")
+PROBE_EVENT = struct.Struct("<QIIq16q24s24s32s")
+PROBE_EVENTS = {
+    1: "complete_message_ready",
+    2: "handler_start",
+    3: "handler_complete",
+    4: "response_queued",
+    5: "job_submit",
+    6: "slot_submit",
+    7: "worker_wake",
+    8: "pnb_start",
+    9: "pnb_end",
+    10: "result_publication",
+    11: "busy_send_prefix_summary",
+    12: "result_collection",
+    13: "continuation",
+    14: "test_gate_entered",
+    15: "test_interface_registered",
+    16: "test_interface_unregistered",
+    17: "test_shutdown_started",
+}
+PROBE_GATES = {
+    "none": 0,
+    "worker_queued": 1,
+    "validation_running": 2,
+    "result_ready": 3,
+    "handler_pre_poll": 4,
+}
+
+
+class ProbeSliceReader:
+    """Minimal fixed-ABI reader used as the base of MarkerReader below."""
+
+    def __init__(self, path, *, expect_test_gates):
+        unresolved = Path(path)
+        assert unresolved.is_file() and not unresolved.is_symlink()
+        self.path = unresolved.resolve()
+        expected_size = PROBE_HEADER_SIZE + PROBE_CAPACITY * PROBE_RECORD_SIZE
+        assert self.path.stat().st_size == expected_size
+        flags = os.O_RDWR | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+        self.fd = os.open(self.path, flags)
+        self.mapping = mmap.mmap(self.fd, 0, access=mmap.ACCESS_WRITE)
+        self.expect_test_gates = expect_test_gates
+        self.header = self.read_header()
+
+    def read_header(self):
+        header = PROBE_HEADER.unpack_from(self.mapping, 0)
+        assert header[:6] == (
+            PROBE_MAGIC, PROBE_SCHEMA, PROBE_HEADER_SIZE,
+            PROBE_RECORD_SIZE, PROBE_CAPACITY, PROBE_ENDIAN)
+        status = header[6]
+        assert status & ~(PROBE_STATUS_TEST_GATES | PROBE_STATUS_OVERFLOW) == 0
+        assert bool(status & PROBE_STATUS_TEST_GATES) == self.expect_test_gates
+        if status & PROBE_STATUS_OVERFLOW or header[8]:
+            raise AssertionError(
+                f"async-PNB probe overflow: {self.path} count={header[8]}")
+        if header[7] > PROBE_CAPACITY:
+            raise AssertionError(
+                f"async-PNB probe capacity exceeded: {self.path} "
+                f"next={header[7]} capacity={PROBE_CAPACITY}")
+        if header[12]:
+            raise AssertionError(
+                f"async-PNB test gate timeout: {self.path} generation={header[12]}")
+        self.header = header
+        self.next_sequence = header[7]
+        return header
+
+    @staticmethod
+    def checksum(record):
+        result = 1_469_598_103_934_665_603
+        for byte in record:
+            result ^= byte
+            result = (result * 1_099_511_628_211) & 0xffffffffffffffff
+        return result
+
+    def read_event(self, sequence):
+        self.read_header()
+        assert 1 <= sequence <= self.next_sequence
+        offset = PROBE_HEADER_SIZE + (sequence - 1) * PROBE_RECORD_SIZE
+        published_before = struct.unpack_from("<Q", self.mapping, offset)[0]
+        if published_before == 0:
+            return None
+        assert published_before == sequence
+        record = self.mapping[offset + 8:offset + 8 + PROBE_EVENT.size]
+        checksum = struct.unpack_from("<Q", self.mapping, offset + 240)[0]
+        published_after = struct.unpack_from("<Q", self.mapping, offset)[0]
+        if published_before != published_after:
+            raise AssertionError(
+                f"async-PNB probe unstable publication: {self.path} "
+                f"sequence={sequence} before={published_before} after={published_after}")
+        if checksum != self.checksum(record):
+            raise AssertionError(
+                f"async-PNB probe checksum mismatch: {self.path} sequence={sequence}")
+        return PROBE_EVENT.unpack(record)
+
+    def close(self):
+        self.mapping.close()
+        os.close(self.fd)
 
 PROFILES = {
     # One warmup and one retained isolated trial for every fixed class.
@@ -206,36 +315,125 @@ class PeerServicePeer(P2PInterface):
 
 
 class MarkerReader:
-    def __init__(self, path, timeout_factor):
-        self.path = Path(path)
-        self.offset = 0
+    def __init__(self, directory, timeout_factor, *, expect_test_gates):
+        unresolved = Path(directory)
+        assert unresolved.is_dir() and not unresolved.is_symlink()
+        self.directory = unresolved.resolve()
         self.events = []
+        self.files = []
+        self.file_paths = set()
         self.timeout = PING_TIMEOUT * timeout_factor
+        self.expect_test_gates = expect_test_gates
+        self.unstable_reads = 0
+        self._discover()
 
     @staticmethod
-    def parse(line):
-        marker_at = line.find(MARKER_PREFIX)
-        if marker_at < 0:
-            return None
-        values = {}
-        for item in line[marker_at + len(MARKER_PREFIX):].strip().split():
-            if "=" not in item:
+    def _decode_text(value):
+        return value.split(b"\0", 1)[0].decode("ascii", errors="strict")
+
+    def _discover(self):
+        candidates = []
+        for unresolved in self.directory.glob("async-pnb-probe-*.bin"):
+            assert unresolved.parent == self.directory and not unresolved.is_symlink()
+            path = unresolved.resolve()
+            if path in self.file_paths:
                 continue
-            key, value = item.split("=", 1)
-            if value.lstrip("-").isdigit():
-                value = int(value)
-            values[key] = value
-        return values if "event" in values else None
+            suffix = path.name.removeprefix("async-pnb-probe-").removesuffix(".bin")
+            assert suffix.isdigit(), path
+            candidates.append((path.stat().st_mtime_ns, int(suffix), path))
+        for _mtime, pid, path in sorted(candidates):
+            reader = ProbeSliceReader(path, expect_test_gates=self.expect_test_gates)
+            self.files.append({
+                "event_count": 0,
+                "expected_sequence": 1,
+                "pid": pid,
+                "reader": reader,
+            })
+            self.file_paths.add(path)
+
+    @staticmethod
+    def _decode_event(event, values, text1, text2):
+        assert event in PROBE_EVENTS, event
+        fields = {"event": PROBE_EVENTS[event]}
+        if event == 1:
+            fields.update(peer=values[0], msg_id=values[1], queue_bytes=values[2],
+                          queue_depth=values[3], pause_recv=values[4], msg=text1)
+        elif event == 2:
+            fields.update(
+                peer=values[0], msg_id=values[1], handler_turn_start_ns=values[2],
+                handler_prefix_ns=values[3], ready_ns=values[4], poll_ns=values[5],
+                ready_queue_bytes=values[6], ready_queue_depth=values[7],
+                ready_pause_recv=values[8], poll_queue_bytes=values[9],
+                poll_queue_depth=values[10], poll_pause_recv=values[11],
+                active_slot=values[12], job=values[13], msg=text1)
+        elif event == 3:
+            fields.update(peer=values[0], msg_id=values[1], active_slot=values[2],
+                          job=values[3], msg=text1)
+        elif event == 4:
+            fields.update(
+                peer=values[0], msg_id=values[1], nonce=values[2],
+                response_bytes=values[3], send_queue_bytes=values[4],
+                send_queue_depth=values[5], pause_send=values[6],
+                active_slot=values[7], job=values[8], msg=text1, response=text2)
+        elif event == 5:
+            fields.update(job=values[0], source=values[1], active_slot=values[2],
+                          mode="async" if values[2] else "sync", continuation=text1)
+        elif event == 6:
+            fields.update(job=values[0], source=values[1], status_code=values[2],
+                          active_slot=values[3], status=text1)
+        elif event in {7, 8}:
+            fields.update(job=values[0], active_slot=values[1])
+        elif event == 9:
+            fields.update(job=values[0], duration_ns=values[1], new_block=values[2],
+                          active_slot=values[3])
+        elif event == 10:
+            fields.update(job=values[0], new_block=values[1], active_slot=values[2])
+        elif event == 11:
+            fields.update(
+                job=values[0], source=values[1], count=values[2], total_ns=values[3],
+                max_ns=values[4], max_peer=values[5], max_start_ns=values[6],
+                max_end_ns=values[7], active_slot=values[8])
+        elif event == 12:
+            fields.update(job=values[0], source=values[1], new_block=values[2],
+                          active_slot=values[3], continuation=text1)
+        elif event == 13:
+            fields.update(job=values[0], source=values[1], new_block=values[2],
+                          continuation=text1)
+        elif event == 14:
+            fields.update(gate=values[0], generation=values[1], job=values[2],
+                          peer=values[3])
+        return fields
+
+    def _poll_file(self, state):
+        reader = state["reader"]
+        reader.read_header()
+        while state["expected_sequence"] <= reader.next_sequence:
+            record = reader.read_event(state["expected_sequence"])
+            if record is None:
+                # next_sequence is reserved before release publication. This
+                # is an in-flight append, not an unstable/torn slot; final
+                # parsing after node exit requires every reservation below.
+                return
+            sequence, event, flags, steady_ns = record[:4]
+            assert sequence == state["expected_sequence"]
+            values = record[4:20]
+            text1 = self._decode_text(record[20])
+            text2 = self._decode_text(record[21])
+            marker = self._decode_event(event, values, text1, text2)
+            marker.update(
+                flags=flags, probe_pid=state["pid"], probe_sequence=sequence,
+                sequence=len(self.events) + 1, steady_ns=steady_ns)
+            raw_hash = record[22]
+            if any(raw_hash):
+                marker["hash"] = raw_hash[::-1].hex()
+            self.events.append(marker)
+            state["event_count"] += 1
+            state["expected_sequence"] += 1
 
     def poll(self):
-        with self.path.open(encoding="utf-8", errors="replace") as log:
-            log.seek(self.offset)
-            for line in log:
-                marker = self.parse(line)
-                if marker is not None:
-                    marker["sequence"] = len(self.events) + 1
-                    self.events.append(marker)
-            self.offset = log.tell()
+        self._discover()
+        for state in self.files:
+            self._poll_file(state)
 
     def checkpoint(self):
         self.poll()
@@ -265,6 +463,95 @@ class MarkerReader:
         ]
         assert len(matches) == 1, (event, fields, len(matches))
         return matches[0]
+
+    def assert_absent(self, event, after=0, **fields):
+        self.poll()
+        matches = [
+            marker for marker in self.events[after:]
+            if marker.get("event") == event
+            and all(marker.get(key) == value for key, value in fields.items())
+        ]
+        assert not matches, (event, fields, matches)
+
+    def arm_gate(self, gate, *, peer=-1):
+        assert self.expect_test_gates and gate != "none"
+        self.poll()
+        state = self.files[-1]
+        reader = state["reader"]
+        header = reader.read_header()
+        generation = header[10] + 1
+        assert generation > header[11]
+        assert -(1 << 31) <= peer < (1 << 31)
+        struct.pack_into("<i", reader.mapping, 60, peer)
+        struct.pack_into("<I", reader.mapping, 44, PROBE_GATES[gate])
+        # Publish the generation after the peer and gate fields.
+        struct.pack_into("<I", reader.mapping, 48, generation)
+        return generation
+
+    def release_gate(self, generation, *, clear=True):
+        assert self.expect_test_gates
+        reader = self.files[-1]["reader"]
+        # Use the raw validated mapping so failure cleanup can still release a
+        # generation after the reader has correctly made gate_error fatal.
+        header = PROBE_HEADER.unpack_from(reader.mapping, 0)
+        assert generation <= header[10]
+        if header[11] < generation:
+            struct.pack_into("<I", reader.mapping, 52, generation)
+        if clear and generation == header[10]:
+            struct.pack_into("<I", reader.mapping, 44, PROBE_GATES["none"])
+            struct.pack_into("<i", reader.mapping, 60, -1)
+
+    def wait_gate(self, gate, generation, after=0, **fields):
+        return self.wait(
+            "test_gate_entered", after, gate=PROBE_GATES[gate],
+            generation=generation, **fields)
+
+    def finalize(self, *, require_gate_none):
+        self.poll()
+        files = []
+        for state in self.files:
+            reader = state["reader"]
+            header = reader.read_header()
+            assert state["expected_sequence"] == header[7] + 1, (
+                reader.path, state["expected_sequence"], header[7])
+            if require_gate_none:
+                assert header[9] == PROBE_GATES["none"], header
+                assert header[11] == header[10], header
+            files.append({
+                "event_count": state["event_count"],
+                "path": str(reader.path),
+                "pid": state["pid"],
+                "status": header[6],
+                "overflow_count": header[8],
+                "test_gate": header[9],
+                "test_gate_generation": header[10],
+                "test_gate_release": header[11],
+                "test_gate_error": header[12],
+            })
+        return {
+            "event_count": len(self.events),
+            "files": files,
+            "schema": PROBE_SCHEMA,
+            "unstable_reads": self.unstable_reads,
+        }
+
+    def marker_lines(self):
+        self.poll()
+        return [
+            MARKER_PREFIX + " ".join(
+                f"{key}={value}" for key, value in marker.items()
+                if key != "sequence") + "\n"
+            for marker in self.events
+        ]
+
+    def remove_files(self):
+        paths = [state["reader"].path for state in self.files]
+        for state in self.files:
+            state["reader"].close()
+        for path in paths:
+            assert path.parent == self.directory and not path.is_symlink()
+            path.unlink()
+        return [str(path) for path in paths]
 
 
 class ResourceSampler:
@@ -376,8 +663,17 @@ class AsyncPNBPeerService(BitcoinTestFramework):
 
     def setup_nodes(self):
         """Refresh the cached chain with an identical height-200 block in every arm."""
+        self.probe_dir = Path(self.options.tmpdir).resolve()
+        self.test_gates_enabled = self.options.output_dir is None
+        self.extra_args[0] += [
+            f"-asyncpnbpeerserviceprobedir={self.probe_dir}",
+            f"-asyncpnbpeerservicetestgates={int(self.test_gates_enabled)}",
+        ]
         self.add_nodes(self.num_nodes, self.extra_args)
         self.start_nodes()
+        self.markers = MarkerReader(
+            self.probe_dir, self.options.timeout_factor,
+            expect_test_gates=self.test_gates_enabled)
         assert not self.uses_wallet and len(self.nodes) == 1
         node = self.nodes[0]
         assert node.getblockcount() == 199
@@ -718,9 +1014,19 @@ class AsyncPNBPeerService(BitcoinTestFramework):
             assert submit["continuation"] == continuation
         start = self.markers.unique("pnb_start", checkpoint, hash=block_hash, job=job)
         end = self.markers.unique("pnb_end", checkpoint, hash=block_hash, job=job)
+        completed = self.markers.unique(
+            "continuation", checkpoint, hash=block_hash, job=job)
+        if continuation is not None:
+            assert completed["continuation"] == continuation
         assert submit["steady_ns"] <= start["steady_ns"] < end["steady_ns"]
         assert end["duration_ns"] == end["steady_ns"] - start["steady_ns"]
-        lifecycle = {"job_submit": submit, "pnb_start": start, "pnb_end": end}
+        assert end["steady_ns"] <= completed["steady_ns"]
+        lifecycle = {
+            "continuation": completed,
+            "job_submit": submit,
+            "pnb_start": start,
+            "pnb_end": end,
+        }
         if self.options.peer_service_mode == "candidate":
             slot = self.markers.unique(
                 "slot_submit", checkpoint, hash=block_hash, job=job, status="accepted")
@@ -733,7 +1039,8 @@ class AsyncPNBPeerService(BitcoinTestFramework):
                 "result_collection", checkpoint, hash=block_hash, job=job)
             assert (submit["steady_ns"] <= wake["steady_ns"] <= start["steady_ns"]
                     < end["steady_ns"] <= publication["steady_ns"]
-                    <= summary["steady_ns"] <= collection["steady_ns"])
+                    <= summary["steady_ns"] <= collection["steady_ns"]
+                    <= completed["steady_ns"])
             assert submit["steady_ns"] <= slot["steady_ns"] <= collection["steady_ns"]
             assert summary["total_ns"] >= summary["max_ns"] >= 0
             assert (summary["count"] == 0) == (summary["max_peer"] == -1)
@@ -1179,6 +1486,148 @@ class AsyncPNBPeerService(BitcoinTestFramework):
             peer.wait_for_disconnect()
         return transcripts
 
+    def _gated_real_pnb_overlap(self, source, p2pk_wallet, seed):
+        """Resume a pre-cleared Ping handler while BlockChecked holds real PNB."""
+        block, seed = self._build_work_block(p2pk_wallet, seed)
+        peer, peer_id = self._new_service_peer("ping")
+        fixture = {"nonce": 0xA600000000000000}
+        self._announce(source, block)
+        checkpoint = self.markers.checkpoint()
+        latest_generation = self.markers.arm_gate("handler_pre_poll", peer=peer_id)
+        try:
+            self._begin_service_request(peer, "ping", fixture)
+            ready = self.markers.wait(
+                "complete_message_ready", checkpoint, peer=peer_id, msg="ping")
+            handler_gate = self.markers.wait_gate(
+                "handler_pre_poll", latest_generation, checkpoint,
+                peer=peer_id, job=0)
+            assert ready["steady_ns"] <= handler_gate["steady_ns"]
+            self.markers.assert_absent(
+                "handler_start", checkpoint, peer=peer_id,
+                msg_id=ready["msg_id"])
+
+            handler_generation = latest_generation
+            latest_generation = self.markers.arm_gate("validation_running")
+            source.send_without_ping(msg_block(block))
+            start = self.markers.wait("pnb_start", checkpoint, hash=block.hash_hex)
+            validation_gate = self.markers.wait_gate(
+                "validation_running", latest_generation, checkpoint,
+                hash=block.hash_hex, job=start["job"], peer=-1)
+            assert start["steady_ns"] <= validation_gate["steady_ns"]
+            self.markers.assert_absent(
+                "pnb_end", checkpoint, hash=block.hash_hex, job=start["job"])
+
+            # Release only the earlier handler latch. The newer validation
+            # generation remains held inside the ProcessNewBlock stack.
+            self.markers.release_gate(handler_generation, clear=False)
+            timing = peer.finish_service_request()
+            self._validate_service_response(timing, fixture)
+            target = self._target_service(peer_id, timing, checkpoint)
+            assert start["steady_ns"] < target["handler_turn_start_ns"]
+            assert start["steady_ns"] < target["response_queued_ns"]
+            self.markers.assert_absent(
+                "pnb_end", checkpoint, hash=block.hash_hex, job=start["job"])
+        finally:
+            self.markers.release_gate(latest_generation)
+
+        pnb = self._wait_pnb_job(checkpoint, block, "standard")
+        assert target["response_queued_ns"] < pnb["end_ns"]
+        peer.peer_disconnect()
+        peer.wait_for_disconnect()
+        return seed, {
+            "block_hash": block.hash_hex,
+            "handler_start_ns": target["handler_turn_start_ns"],
+            "pnb_end_ns": pnb["end_ns"],
+            "pnb_start_ns": pnb["start_ns"],
+            "response_queued_ns": target["response_queued_ns"],
+        }
+
+    def _gated_disconnect_phase(self, phase, source, block):
+        gate = {
+            "queued": "worker_queued",
+            "running": "validation_running",
+            "result_ready": "result_ready",
+        }[phase]
+        self._announce(source, block)
+        checkpoint = self.markers.checkpoint()
+        generation = self.markers.arm_gate(gate)
+        try:
+            source.send_without_ping(msg_block(block))
+            entered = self.markers.wait(
+                "test_gate_entered", checkpoint, gate=PROBE_GATES[gate],
+                generation=generation, hash=block.hash_hex)
+            job = entered["job"]
+            if phase == "queued":
+                self.markers.assert_absent(
+                    "worker_wake", checkpoint, hash=block.hash_hex, job=job)
+                self.markers.assert_absent(
+                    "pnb_start", checkpoint, hash=block.hash_hex, job=job)
+                self.markers.assert_absent(
+                    "pnb_end", checkpoint, hash=block.hash_hex, job=job)
+            elif phase == "running":
+                self.markers.unique(
+                    "pnb_start", checkpoint, hash=block.hash_hex, job=job)
+                self.markers.assert_absent(
+                    "pnb_end", checkpoint, hash=block.hash_hex, job=job)
+                self.markers.assert_absent(
+                    "result_publication", checkpoint, hash=block.hash_hex, job=job)
+            else:
+                self.markers.unique(
+                    "pnb_end", checkpoint, hash=block.hash_hex, job=job)
+                self.markers.unique(
+                    "result_publication", checkpoint, hash=block.hash_hex, job=job)
+                self.markers.assert_absent(
+                    "result_collection", checkpoint, hash=block.hash_hex, job=job)
+                self.markers.assert_absent(
+                    "continuation", checkpoint, hash=block.hash_hex, job=job)
+            source.peer_disconnect()
+            source.wait_for_disconnect()
+        finally:
+            self.markers.release_gate(generation)
+        pnb = self._wait_pnb_job(checkpoint, block, "standard")
+        assert pnb["job"] == entered["job"]
+        return pnb
+
+    def _gated_running_shutdown(self, source, block):
+        node = self.nodes[0]
+        self._announce(source, block)
+        checkpoint = self.markers.checkpoint()
+        generation = self.markers.arm_gate("validation_running")
+        stop_errors = []
+        stop_thread = None
+        try:
+            source.send_without_ping(msg_block(block))
+            start = self.markers.wait("pnb_start", checkpoint, hash=block.hash_hex)
+            self.markers.wait_gate(
+                "validation_running", generation, checkpoint,
+                hash=block.hash_hex, job=start["job"], peer=-1)
+            self.markers.assert_absent(
+                "pnb_end", checkpoint, hash=block.hash_hex, job=start["job"])
+
+            def stop_node():
+                try:
+                    node.stop_node()
+                except Exception as error:
+                    stop_errors.append(error)
+
+            stop_thread = threading.Thread(target=stop_node, name="gated-node-stop")
+            stop_thread.start()
+            self.markers.wait("test_shutdown_started", checkpoint)
+            self.markers.assert_absent(
+                "pnb_end", checkpoint, hash=block.hash_hex, job=start["job"])
+        finally:
+            self.markers.release_gate(generation)
+        assert stop_thread is not None
+        stop_thread.join(PING_TIMEOUT * self.options.timeout_factor)
+        assert not stop_thread.is_alive() and not stop_errors, stop_errors
+        self.markers.wait(
+            "pnb_end", checkpoint, hash=block.hash_hex, job=start["job"])
+        self.markers.wait(
+            "result_collection", checkpoint, hash=block.hash_hex, job=start["job"])
+        self.markers.wait("test_interface_unregistered", checkpoint)
+        return self._pnb_lifecycle(
+            checkpoint, block.hash_hex, start["job"], "standard")
+
     def _run_quick(self):
         node = self.nodes[0]
         assert node.getblockcount() == 200
@@ -1195,8 +1644,6 @@ class AsyncPNBPeerService(BitcoinTestFramework):
             connection_type="outbound-full-relay")
         source_id = self._map_peer_id(source)
         blocker_ids = [self._map_peer_id(peer) for peer in (blocker0, blocker1, blocker2)]
-        self.markers = MarkerReader(node.debug_log_path, self.options.timeout_factor)
-
         for peer in (source, blocker0, blocker1, blocker2):
             peer.send_and_ping(msg_sendcmpct(announce=False, version=2))
 
@@ -1374,6 +1821,16 @@ class AsyncPNBPeerService(BitcoinTestFramework):
         assert refused_target["ready_inside_pnb"]
         assert refused_target["response_queued_ns"] >= end["steady_ns"]
 
+        # The mixed oracle is complete. Lifecycle gates below intentionally
+        # isolate the source and one pre-cleared target so an unrelated
+        # ordinary SendMessages cs_main wait cannot masquerade as a failure of
+        # that specific receive-boundary authority.
+        for _service, peer, _peer_id in service_entries:
+            peer.peer_disconnect()
+            peer.wait_for_disconnect()
+        refused_peer.peer_disconnect()
+        refused_peer.wait_for_disconnect()
+
         # Invalid-source punishment is applied before its later PING can run.
         invalid_source = node.add_p2p_connection(PeerServicePeer())
         invalid_block = self._invalid_quick_block()
@@ -1398,46 +1855,93 @@ class AsyncPNBPeerService(BitcoinTestFramework):
             invalid_checkpoint, invalid_block.hash_hex,
             invalid_start["job"], "standard")
 
-        # Disconnecting the source during a running job retains global cleanup.
-        disconnect_source = node.add_p2p_connection(PeerServicePeer())
-        disconnect_block = self._quick_block()
-        self._announce(disconnect_source, disconnect_block)
-        disconnect_checkpoint = self.markers.checkpoint()
-        disconnect_source.send_without_ping(msg_block(disconnect_block))
-        disconnect_start = self.markers.wait(
-            "pnb_start", disconnect_checkpoint, hash=disconnect_block.hash_hex)
-        disconnect_source.peer_disconnect()
-        disconnect_source.wait_for_disconnect()
-        self._wait_pnb_job(disconnect_checkpoint, disconnect_block, "standard")
+        overlap_outcome = None
+        if self.options.peer_service_mode == "candidate":
+            seed, overlap_outcome = self._gated_real_pnb_overlap(
+                source, p2pk_wallet, seed)
+            # Disconnect at each authoritative occupied phase. Every gate is
+            # released in a finally block so a failed quick oracle cannot
+            # leave the node unkillable.
+            for phase in ("queued", "running", "result_ready"):
+                disconnect_source = node.add_p2p_connection(PeerServicePeer())
+                self._gated_disconnect_phase(
+                    phase, disconnect_source, self._quick_block())
+        else:
+            disconnect_source = node.add_p2p_connection(PeerServicePeer())
+            disconnect_block = self._quick_block()
+            self._announce(disconnect_source, disconnect_block)
+            disconnect_checkpoint = self.markers.checkpoint()
+            disconnect_source.send_without_ping(msg_block(disconnect_block))
+            disconnect_start = self.markers.wait(
+                "pnb_start", disconnect_checkpoint, hash=disconnect_block.hash_hex)
+            disconnect_source.peer_disconnect()
+            disconnect_source.wait_for_disconnect()
+            self._wait_pnb_job(disconnect_checkpoint, disconnect_block, "standard")
 
-        # Active-job shutdown drains, collects, and restarts at the same tip.
+        # Candidate shutdown is initiated while BlockChecked authoritatively
+        # holds the worker inside the ProcessNewBlock stack. Control retains
+        # the same synchronous completion/restart oracle without a phase claim.
+        shutdown_source = node.add_p2p_connection(PeerServicePeer())
         shutdown_block, _seed = self._build_work_block(p2pk_wallet, seed)
         expected_height = node.getblockcount() + 1
-        self._announce(source, shutdown_block)
-        shutdown_checkpoint = self.markers.checkpoint()
-        source.send_without_ping(msg_block(shutdown_block))
-        shutdown_start = self.markers.wait(
-            "pnb_start", shutdown_checkpoint, hash=shutdown_block.hash_hex)
-        node.stop_node()
-        self.markers.wait(
-            "pnb_end", shutdown_checkpoint, hash=shutdown_block.hash_hex,
-            job=shutdown_start["job"])
         if self.options.peer_service_mode == "candidate":
+            self._gated_running_shutdown(shutdown_source, shutdown_block)
+        else:
+            self._announce(shutdown_source, shutdown_block)
+            shutdown_checkpoint = self.markers.checkpoint()
+            shutdown_source.send_without_ping(msg_block(shutdown_block))
+            shutdown_start = self.markers.wait(
+                "pnb_start", shutdown_checkpoint, hash=shutdown_block.hash_hex)
+            node.stop_node()
             self.markers.wait(
-                "result_collection", shutdown_checkpoint,
-                hash=shutdown_block.hash_hex, job=shutdown_start["job"])
-        self._pnb_lifecycle(
-            shutdown_checkpoint, shutdown_block.hash_hex,
-            shutdown_start["job"], "standard")
+                "pnb_end", shutdown_checkpoint, hash=shutdown_block.hash_hex,
+                job=shutdown_start["job"])
+            self._pnb_lifecycle(
+                shutdown_checkpoint, shutdown_block.hash_hex,
+                shutdown_start["job"], "standard")
+            self.markers.wait("test_interface_unregistered", shutdown_checkpoint)
+
+        first_process_end = self.markers.checkpoint()
+        assert len([
+            event for event in self.markers.events[:first_process_end]
+            if event["event"] == "test_interface_registered"
+        ]) == 1
+        assert len([
+            event for event in self.markers.events[:first_process_end]
+            if event["event"] == "test_interface_unregistered"
+        ]) == 1
+
+        restart_checkpoint = self.markers.checkpoint()
         self.start_node(0)
+        self.markers.wait("test_interface_registered", restart_checkpoint)
         assert node.getblockcount() == expected_height
         assert node.getbestblockhash() == shutdown_block.hash_hex
 
+        # Stop the restarted process explicitly so register/unregister counts
+        # and the final gate header are authoritative before quick success.
+        second_checkpoint = self.markers.checkpoint()
+        node.stop_node()
+        self.markers.wait("test_shutdown_started", second_checkpoint)
+        self.markers.wait("test_interface_unregistered", second_checkpoint)
+        probe = self.markers.finalize(require_gate_none=True)
+        assert len(probe["files"]) == 2
+        assert all(file["test_gate_error"] == 0 for file in probe["files"])
+        assert len([
+            event for event in self.markers.events
+            if event["event"] == "test_interface_registered"
+        ]) == 2
+        assert len([
+            event for event in self.markers.events
+            if event["event"] == "test_interface_unregistered"
+        ]) == 2
+        self.markers.remove_files()
+
         self.log.info(
-            "Deterministic input identity start_hash=%s end_hash=%s ordered_sha256=%s calibration=%s isolated=%s mixed=%s",
+            "Deterministic input identity start_hash=%s end_hash=%s ordered_sha256=%s calibration=%s isolated=%s overlap=%s mixed=%s",
             self.chain_start["hash"], shutdown_block.hash_hex,
             self.block_input_hasher.hexdigest(), calibration_transcripts,
             isolated_outcome,
+            overlap_outcome,
             {"outcomes": mixed_outcomes, "transcripts": mixed_transcripts})
 
     def _provenance(self, node, binary):
@@ -1559,7 +2063,6 @@ class AsyncPNBPeerService(BitcoinTestFramework):
 
         source = node.add_p2p_connection(PeerServicePeer())
         self.source_id = self._map_peer_id(source)
-        self.markers = MarkerReader(node.debug_log_path, self.options.timeout_factor)
         source.send_and_ping(msg_sendcmpct(announce=False, version=2))
         fixture = {
             "recent_block": recent_block,
@@ -1660,7 +2163,19 @@ class AsyncPNBPeerService(BitcoinTestFramework):
         prefix = "-asyncpnbpeerservice="
         mode_args = [arg for arg in args if arg.startswith(prefix)]
         assert mode_args == [f"{prefix}{int(mode == 'candidate')}"]
-        return [arg for arg in args if not arg.startswith(prefix)]
+        gate_args = [
+            arg for arg in args if arg.startswith("-asyncpnbpeerservicetestgates=")]
+        assert gate_args == ["-asyncpnbpeerservicetestgates=0"], \
+            "retained profiles must disable lifecycle gates"
+        probe_args = [
+            arg for arg in args if arg.startswith("-asyncpnbpeerserviceprobedir=")]
+        assert len(probe_args) == 1
+        assert Path(probe_args[0].split("=", 1)[1]).is_absolute()
+        return [
+            "-asyncpnbpeerserviceprobedir=<per-run-tmpdir>"
+            if arg.startswith("-asyncpnbpeerserviceprobedir=") else arg
+            for arg in args if not arg.startswith(prefix)
+        ]
 
     def _validate_reference_environment(self):
         if self.reference_run is None:
@@ -1762,12 +2277,54 @@ class AsyncPNBPeerService(BitcoinTestFramework):
         for stage, cleanup in (
             ("resource_sampler", sampler.stop),
             ("samples_file", self.samples_file.close),
-            ("target_log", lambda: shutil.copyfile(debug_log, self.output_dir / "target.log")),
         ):
             try:
                 cleanup()
             except Exception as error:
                 record_failure(stage, error)
+
+        probe_paths = [str(path) for path in sorted(self.markers.file_paths)]
+        probe = {
+            "events_artifact": "target.log",
+            "preserved_paths": probe_paths,
+            "status": "failed",
+        }
+        probe_lines = None
+        try:
+            probe = {
+                **self.markers.finalize(require_gate_none=True),
+                "events_artifact": "target.log",
+                "status": "parsed",
+            }
+            assert all(file["status"] == 0 for file in probe["files"]), probe
+            assert all(file["test_gate"] == PROBE_GATES["none"] for file in probe["files"]), probe
+            probe_lines = self.markers.marker_lines()
+        except Exception as error:
+            record_failure("probe_parse", error)
+
+        target_log_ok = False
+        try:
+            target_log = self.output_dir / "target.log"
+            shutil.copyfile(debug_log, target_log)
+            if probe_lines is not None:
+                with target_log.open("a", encoding="utf-8") as output:
+                    output.writelines(probe_lines)
+            target_log_ok = True
+        except Exception as error:
+            record_failure("target_log", error)
+
+        # A failed run keeps PID files in the per-run tmpdir as evidence. A
+        # successful parse is serialized into the four existing artifacts,
+        # after which the ephemeral mappings are removed.
+        if not failures and target_log_ok and probe_lines is not None:
+            try:
+                probe["removed_paths"] = self.markers.remove_files()
+                probe["status"] = "parsed_and_removed"
+            except Exception as error:
+                record_failure("probe_cleanup", error)
+                probe["preserved_paths"] = probe_paths
+        else:
+            probe["preserved_paths"] = probe_paths
 
         failure = "; ".join(
             f"{item['stage']}: {item['reason']}" for item in failures
@@ -1785,6 +2342,7 @@ class AsyncPNBPeerService(BitcoinTestFramework):
             "pause_metrics": {**self.pause_metrics,
                               "zero_pause_proof": self.pause_metrics["pause_observations"] == 0},
             "profile": self.options.peer_service_profile, "schema_version": 2,
+            "probe": probe,
             "provenance": provenance,
             "refresh_block": self.refresh_block,
             "framework_portseed_option": self.options.port_seed,

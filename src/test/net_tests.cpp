@@ -33,6 +33,7 @@
 #include <cstdint>
 #include <ios>
 #include <list>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <string>
@@ -145,6 +146,34 @@ BOOST_AUTO_TEST_CASE(cnode_simple_test)
 BOOST_AUTO_TEST_CASE(cnode_conditional_poll)
 {
     auto& connman{static_cast<ConnmanTestMsg&>(*m_node.connman)};
+    const auto receive_test_messages{[&](CNode& target) {
+        BOOST_REQUIRE(connman.ReceiveMsgFrom(target, NetMsg::Make(NetMsgType::BLOCK)));
+        BOOST_REQUIRE(connman.ReceiveMsgFrom(target, NetMsg::Make(NetMsgType::PING, uint64_t{42})));
+        BOOST_REQUIRE(connman.ReceiveMsgFrom(target, NetMsg::Make(NetMsgType::CMPCTBLOCK)));
+        BOOST_REQUIRE(connman.ReceiveMsgFrom(target, NetMsg::Make(NetMsgType::BLOCKTXN)));
+    }};
+
+    CNode sizing_node{/*id=*/0,
+                      /*sock=*/nullptr,
+                      /*addrIn=*/CAddress{},
+                      /*nKeyedNetGroupIn=*/0,
+                      /*nLocalHostNonceIn=*/0,
+                      /*addrBindIn=*/CAddress{},
+                      /*addrNameIn=*/std::string{},
+                      /*conn_type_in=*/ConnectionType::INBOUND,
+                      /*inbound_onion=*/false,
+                      /*network_key=*/0,
+                      CNodeOptions{.recv_flood_size = std::numeric_limits<size_t>::max(),
+                                   .async_pnb_probe = {}}};
+    receive_test_messages(sizing_node);
+    std::array<size_t, 4> message_usage{};
+    for (size_t index{0}; index < message_usage.size(); ++index) {
+        auto message{sizing_node.PollMessage()};
+        BOOST_REQUIRE(message);
+        message_usage[index] = message->first.GetMemoryUsage();
+    }
+    const size_t flood_threshold{message_usage[2] + message_usage[3]};
+
     CNode node{/*id=*/0,
                /*sock=*/nullptr,
                /*addrIn=*/CAddress{},
@@ -155,13 +184,16 @@ BOOST_AUTO_TEST_CASE(cnode_conditional_poll)
                /*conn_type_in=*/ConnectionType::INBOUND,
                /*inbound_onion=*/false,
                /*network_key=*/0,
-               CNodeOptions{.recv_flood_size = 0}};
+               CNodeOptions{.recv_flood_size = flood_threshold,
+                            .async_pnb_probe = {}}};
 
-    BOOST_REQUIRE(connman.ReceiveMsgFrom(node, NetMsg::Make(NetMsgType::BLOCK)));
-    BOOST_REQUIRE(connman.ReceiveMsgFrom(node, NetMsg::Make(NetMsgType::PING, uint64_t{42})));
-    BOOST_REQUIRE(connman.ReceiveMsgFrom(node, NetMsg::Make(NetMsgType::CMPCTBLOCK)));
-    BOOST_REQUIRE(connman.ReceiveMsgFrom(node, NetMsg::Make(NetMsgType::BLOCKTXN)));
-    BOOST_CHECK(node.fPauseRecv);
+    receive_test_messages(node);
+    const size_t initial_bytes{message_usage[0] + message_usage[1] +
+                               message_usage[2] + message_usage[3]};
+    const auto initial{node.GetProcessQueueSnapshot()};
+    BOOST_CHECK_EQUAL(initial.bytes, initial_bytes);
+    BOOST_CHECK_EQUAL(initial.depth, 4);
+    BOOST_CHECK(initial.paused);
 
     const std::array<std::string_view, 3> excluded_types{
         NetMsgType::BLOCK,
@@ -171,33 +203,59 @@ BOOST_AUTO_TEST_CASE(cnode_conditional_poll)
 
     // Rejection neither pops nor scans past the refused front.
     BOOST_CHECK(!node.PollMessage(excluded_types));
-    BOOST_CHECK(node.fPauseRecv);
+    const auto refused_block{node.GetProcessQueueSnapshot()};
+    BOOST_CHECK_EQUAL(refused_block.bytes, initial.bytes);
+    BOOST_CHECK_EQUAL(refused_block.depth, initial.depth);
+    BOOST_CHECK_EQUAL(refused_block.paused, initial.paused);
     auto block{node.PollMessage()};
     BOOST_REQUIRE(block);
     BOOST_CHECK_EQUAL(block->first.m_type, NetMsgType::BLOCK);
     BOOST_CHECK(block->second);
-    BOOST_CHECK(node.fPauseRecv);
+    const auto after_block{node.GetProcessQueueSnapshot()};
+    BOOST_CHECK_EQUAL(after_block.bytes, initial_bytes - message_usage[0]);
+    BOOST_CHECK_EQUAL(after_block.depth, 3);
+    BOOST_CHECK(after_block.paused);
 
     auto ping{node.PollMessage(excluded_types)};
     BOOST_REQUIRE(ping);
     BOOST_CHECK_EQUAL(ping->first.m_type, NetMsgType::PING);
+    BOOST_CHECK_EQUAL(ping->first.m_process_queue_bytes_at_poll, after_block.bytes);
+    BOOST_CHECK_EQUAL(ping->first.m_process_queue_depth_at_poll, after_block.depth);
+    BOOST_CHECK_EQUAL(ping->first.m_process_queue_paused_at_poll, after_block.paused);
     // The next exact-front producer remains queued and suppresses more-work.
     BOOST_CHECK(!ping->second);
-    BOOST_CHECK(node.fPauseRecv);
+    const auto after_ping{node.GetProcessQueueSnapshot()};
+    BOOST_CHECK_EQUAL(after_ping.bytes, flood_threshold);
+    BOOST_CHECK_EQUAL(after_ping.depth, 2);
+    BOOST_CHECK(!after_ping.paused);
     BOOST_CHECK(!node.PollMessage(excluded_types));
+    const auto refused_cmpctblock{node.GetProcessQueueSnapshot()};
+    BOOST_CHECK_EQUAL(refused_cmpctblock.bytes, after_ping.bytes);
+    BOOST_CHECK_EQUAL(refused_cmpctblock.depth, after_ping.depth);
+    BOOST_CHECK_EQUAL(refused_cmpctblock.paused, after_ping.paused);
 
     auto cmpctblock{node.PollMessage()};
     BOOST_REQUIRE(cmpctblock);
     BOOST_CHECK_EQUAL(cmpctblock->first.m_type, NetMsgType::CMPCTBLOCK);
     BOOST_CHECK(cmpctblock->second);
-    BOOST_CHECK(node.fPauseRecv);
+    const auto after_cmpctblock{node.GetProcessQueueSnapshot()};
+    BOOST_CHECK_EQUAL(after_cmpctblock.bytes, message_usage[3]);
+    BOOST_CHECK_EQUAL(after_cmpctblock.depth, 1);
+    BOOST_CHECK(!after_cmpctblock.paused);
     BOOST_CHECK(!node.PollMessage(excluded_types));
+    const auto refused_blocktxn{node.GetProcessQueueSnapshot()};
+    BOOST_CHECK_EQUAL(refused_blocktxn.bytes, after_cmpctblock.bytes);
+    BOOST_CHECK_EQUAL(refused_blocktxn.depth, after_cmpctblock.depth);
+    BOOST_CHECK_EQUAL(refused_blocktxn.paused, after_cmpctblock.paused);
 
     auto blocktxn{node.PollMessage()};
     BOOST_REQUIRE(blocktxn);
     BOOST_CHECK_EQUAL(blocktxn->first.m_type, NetMsgType::BLOCKTXN);
     BOOST_CHECK(!blocktxn->second);
-    BOOST_CHECK(!node.fPauseRecv);
+    const auto empty{node.GetProcessQueueSnapshot()};
+    BOOST_CHECK_EQUAL(empty.bytes, 0);
+    BOOST_CHECK_EQUAL(empty.depth, 0);
+    BOOST_CHECK(!empty.paused);
     BOOST_CHECK(!node.PollMessage());
 }
 
