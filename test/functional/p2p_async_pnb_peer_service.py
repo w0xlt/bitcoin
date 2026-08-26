@@ -278,7 +278,7 @@ class AsyncPNBPeerService(BitcoinTestFramework):
         args = [
             f"-asyncpnbpeerservice={int(mode == 'candidate')}",
             "-loglevel=info",
-            "-maxconnections=150",
+            "-maxconnections=213",
             "-nodebug",
             "-nologratelimit",
             "-persistmempool=0",
