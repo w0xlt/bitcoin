@@ -31,6 +31,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <ios>
+#include <list>
 #include <memory>
 #include <optional>
 #include <string>
@@ -178,6 +179,62 @@ BOOST_AUTO_TEST_CASE(cnode_conditional_poll)
     BOOST_CHECK(!ping->second);
     BOOST_CHECK(!node.fPauseRecv);
     BOOST_CHECK(!node.PollMessage());
+}
+
+BOOST_AUTO_TEST_CASE(cnetmessage_measurement_metadata_queue_accounting)
+{
+    CNetMessage plain{DataStream{}};
+    plain.m_type = NetMsgType::PING;
+    const size_t plain_usage{plain.GetMemoryUsage()};
+
+    CNetMessage marked{DataStream{}};
+    marked.m_type = NetMsgType::PING;
+    marked.m_process_queue_id = 42;
+    marked.m_process_queue_ready = SteadyClock::now();
+    marked.m_process_queue_poll = SteadyClock::now();
+    marked.m_process_queue_bytes_at_ready = 10'000;
+    marked.m_process_queue_depth_at_ready = 100;
+    marked.m_process_queue_paused_at_ready = true;
+    marked.m_process_queue_bytes_at_poll = 9'000;
+    marked.m_process_queue_depth_at_poll = 90;
+    marked.m_process_queue_paused_at_poll = true;
+
+    // Receive-queue accounting must ignore measurement metadata values.
+    BOOST_CHECK_EQUAL(marked.GetMemoryUsage(), plain_usage);
+    std::list<CNetMessage> queue;
+    queue.push_back(std::move(plain));
+    queue.push_back(std::move(marked));
+    size_t queue_bytes{0};
+    for (const auto& msg : queue) queue_bytes += msg.GetMemoryUsage();
+    BOOST_CHECK_EQUAL(queue_bytes, 2 * plain_usage);
+}
+
+BOOST_AUTO_TEST_CASE(send_queue_snapshot_precedes_optimistic_drain)
+{
+    auto& connman{static_cast<ConnmanTestMsg&>(*m_node.connman)};
+    CNode node{/*id=*/0,
+               /*sock=*/nullptr,
+               /*addrIn=*/CAddress{},
+               /*nKeyedNetGroupIn=*/0,
+               /*nLocalHostNonceIn=*/0,
+               /*addrBindIn=*/CAddress{},
+               /*addrNameIn=*/std::string{},
+               /*conn_type_in=*/ConnectionType::INBOUND,
+               /*inbound_onion=*/false,
+               /*network_key=*/0};
+    auto pong{NetMsg::Make(NetMsgType::PONG, uint64_t{42})};
+    const size_t expected_bytes{pong.GetMemoryUsage()};
+    const auto snapshot{connman.PushMessageWithSendQueueSnapshot(node, std::move(pong))};
+    BOOST_REQUIRE(snapshot);
+    BOOST_CHECK_EQUAL(snapshot->bytes, expected_bytes);
+    BOOST_CHECK_EQUAL(snapshot->depth, 1);
+
+    // With no socket, the optimistic write has already moved the message from
+    // vSendMsg into the transport. The returned values therefore prove that
+    // they were captured inside cs_vSend at enqueue time, not sampled later.
+    LOCK(node.cs_vSend);
+    BOOST_CHECK(node.vSendMsg.empty());
+    BOOST_CHECK_EQUAL(node.m_send_memusage, 0);
 }
 
 BOOST_AUTO_TEST_CASE(cnetaddr_basic)

@@ -41,11 +41,13 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <functional>
 #include <optional>
 #include <string_view>
+#include <type_traits>
 #include <unordered_map>
 
 TRACEPOINT_SEMAPHORE(net, closed_connection);
@@ -125,9 +127,25 @@ size_t CSerializedNetMsg::GetMemoryUsage() const noexcept
     return sizeof(*this) + memusage::DynamicUsage(m_type) + memusage::DynamicUsage(data);
 }
 
+namespace {
+/** CNetMessage's frozen-master layout before measurement-only metadata. */
+struct CNetMessageAccountedLayout {
+    DataStream recv;
+    NodeClock::time_point time;
+    uint32_t message_size;
+    uint32_t raw_message_size;
+    std::string type;
+};
+
+static_assert(std::is_standard_layout_v<CNetMessage>);
+static_assert(offsetof(CNetMessage, m_process_queue_id) == sizeof(CNetMessageAccountedLayout));
+} // namespace
+
 size_t CNetMessage::GetMemoryUsage() const noexcept
 {
-    return sizeof(*this) + memusage::DynamicUsage(m_type) + m_recv.GetMemoryUsage();
+    // Measurement-only metadata must not change receive-queue backpressure or
+    // scheduling relative to the frozen base.
+    return sizeof(CNetMessageAccountedLayout) + memusage::DynamicUsage(m_type) + m_recv.GetMemoryUsage();
 }
 
 void CConnman::AddAddrFetch(const std::string& strDest)
@@ -4134,13 +4152,14 @@ void CNode::MarkReceivedMsgsForProcessing()
             // vRecvMsg contains only completed CNetMessage; the single possible
             // partially deserialized message is held by TransportDeserializer.
             nSizeAdded += msg.GetMemoryUsage();
-            msg.m_process_queue_id = ++m_next_process_queue_id;
-            msg.m_process_queue_ready = SteadyClock::now();
-            msg.m_process_queue_bytes_at_ready = m_msg_process_queue_size + nSizeAdded;
-            msg.m_process_queue_depth_at_ready = ++ready_depth;
-            msg.m_process_queue_paused_at_ready =
-                msg.m_process_queue_bytes_at_ready > m_recv_flood_size;
+            ++ready_depth;
             if (msg.m_type == NetMsgType::PING || msg.m_type == NetMsgType::PONG) {
+                msg.m_process_queue_id = ++m_next_process_queue_id;
+                msg.m_process_queue_ready = SteadyClock::now();
+                msg.m_process_queue_bytes_at_ready = m_msg_process_queue_size + nSizeAdded;
+                msg.m_process_queue_depth_at_ready = ready_depth;
+                msg.m_process_queue_paused_at_ready =
+                    msg.m_process_queue_bytes_at_ready > m_recv_flood_size;
                 ready_markers.push_back({msg.m_process_queue_id, msg.m_type,
                                          msg.m_process_queue_ready,
                                          msg.m_process_queue_bytes_at_ready,
@@ -4170,10 +4189,12 @@ std::optional<std::pair<CNetMessage, bool>> CNode::PollMessage(
     }
 
     CNetMessage& front{m_msg_process_queue.front()};
-    front.m_process_queue_poll = SteadyClock::now();
-    front.m_process_queue_bytes_at_poll = m_msg_process_queue_size;
-    front.m_process_queue_depth_at_poll = m_msg_process_queue.size();
-    front.m_process_queue_paused_at_poll = fPauseRecv;
+    if (front.m_type == NetMsgType::PING || front.m_type == NetMsgType::PONG) {
+        front.m_process_queue_poll = SteadyClock::now();
+        front.m_process_queue_bytes_at_poll = m_msg_process_queue_size;
+        front.m_process_queue_depth_at_poll = m_msg_process_queue.size();
+        front.m_process_queue_paused_at_poll = fPauseRecv;
+    }
 
     std::list<CNetMessage> msgs;
     // Just take one message
@@ -4202,13 +4223,14 @@ static bool IsOutboundMessageAllowedInPrivateBroadcast(std::string_view type) no
            type == NetMsgType::PING;
 }
 
-void CConnman::PushMessage(CNode* pnode, CSerializedNetMsg&& msg)
+std::optional<CNetMsgSendQueueSnapshot> CConnman::PushMessage(
+    CNode* pnode, CSerializedNetMsg&& msg, bool capture_send_queue)
 {
     AssertLockNotHeld(m_total_bytes_sent_mutex);
 
     if (pnode->IsPrivateBroadcastConn() && !IsOutboundMessageAllowedInPrivateBroadcast(msg.m_type)) {
         LogDebug(BCLog::PRIVBROADCAST, "Omitting send of message '%s', %s", msg.m_type, pnode->LogPeer());
-        return;
+        return std::nullopt;
     }
 
     if (!m_private_broadcast.m_outbound_tor_ok_at_least_once.load() && !pnode->IsInboundConn() &&
@@ -4234,6 +4256,7 @@ void CConnman::PushMessage(CNode* pnode, CSerializedNetMsg&& msg)
     );
 
     size_t nBytesSent = 0;
+    std::optional<CNetMsgSendQueueSnapshot> send_queue;
     {
         LOCK(pnode->cs_vSend);
         // Check if the transport still has unsent bytes, and indicate to it that we're about to
@@ -4247,6 +4270,14 @@ void CConnman::PushMessage(CNode* pnode, CSerializedNetMsg&& msg)
         if (pnode->m_send_memusage + pnode->m_transport->GetSendMemoryUsage() > nSendBufferMaxSize) pnode->fPauseSend = true;
         // Move message to vSendMsg queue.
         pnode->vSendMsg.push_back(std::move(msg));
+        if (capture_send_queue) {
+            send_queue.emplace(CNetMsgSendQueueSnapshot{
+                .time = SteadyClock::now(),
+                .bytes = pnode->m_send_memusage,
+                .depth = pnode->vSendMsg.size(),
+                .paused = pnode->fPauseSend.load(),
+            });
+        }
 
         // If there was nothing to send before, and there is now (predicted by the "more" value
         // returned by the GetBytesToSend call above), attempt "optimistic write":
@@ -4260,6 +4291,7 @@ void CConnman::PushMessage(CNode* pnode, CSerializedNetMsg&& msg)
         }
     }
     if (nBytesSent) RecordBytesSent(nBytesSent);
+    return send_queue;
 }
 
 bool CConnman::ForNode(NodeId id, std::function<bool(CNode* pnode)> func)

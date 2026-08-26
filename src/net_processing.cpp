@@ -629,6 +629,12 @@ private:
         std::shared_ptr<const CBlock> unsubmitted_block;
         bool force_processing;
         bool min_pow_checked;
+        uint64_t busy_send_prefix_count{0};
+        int64_t busy_send_prefix_total_ns{0};
+        int64_t busy_send_prefix_max_ns{0};
+        NodeId busy_send_prefix_max_peer{-1};
+        int64_t busy_send_prefix_max_start_ns{0};
+        int64_t busy_send_prefix_max_end_ns{0};
     };
 
     void ProcessMessage(Peer& peer, CNode& pfrom, const CNetMessage& net_message,
@@ -2244,6 +2250,13 @@ void PeerManagerImpl::StopAsyncPNBPeerService()
                 TicksSinceEpoch<std::chrono::nanoseconds>(pnb_end),
                 Ticks<std::chrono::nanoseconds>(pnb_end - pnb_start), new_block);
         LOCK(NetEventsInterface::g_msgproc_mutex);
+        const auto summary_time{SteadyClock::now()};
+        LogInfo("ASYNC_PNB_PEER_SERVICE event=busy_send_prefix_summary job=%d source=%d hash=%s mode=fallback steady_ns=%d count=%d total_ns=%d max_ns=%d max_peer=%d max_start_ns=%d max_end_ns=%d\n",
+                unsubmitted->job_id, unsubmitted->source, unsubmitted->hash.ToString(),
+                TicksSinceEpoch<std::chrono::nanoseconds>(summary_time),
+                unsubmitted->busy_send_prefix_count, unsubmitted->busy_send_prefix_total_ns,
+                unsubmitted->busy_send_prefix_max_ns, unsubmitted->busy_send_prefix_max_peer,
+                unsubmitted->busy_send_prefix_max_start_ns, unsubmitted->busy_send_prefix_max_end_ns);
         LogInfo("ASYNC_PNB_PEER_SERVICE event=result_collection job=%d source=%d hash=%s mode=fallback steady_ns=%d new_block=%d active_slot=1\n",
                 unsubmitted->job_id, unsubmitted->source, unsubmitted->hash.ToString(),
                 TicksSinceEpoch<std::chrono::nanoseconds>(SteadyClock::now()), new_block);
@@ -2278,6 +2291,9 @@ void PeerManagerImpl::ActiveTipChange(const CBlockIndex& new_tip, bool is_ibd)
 
     if (!is_ibd) {
         LOCK(m_tx_download_mutex);
+        if (m_opts.unit_test_async_pnb_hook) {
+            m_opts.unit_test_async_pnb_hook("tx_download_locked");
+        }
         // If the chain tip has changed, previously rejected transactions might now be valid, e.g. due
         // to a timelock. Reset the rejection filters to give those transactions another chance if we
         // see them again.
@@ -3882,6 +3898,13 @@ bool PeerManagerImpl::ProcessAsyncP2PBlockResult()
     if (!result) return false;
 
     const PendingP2PBlock pending{*m_pending_block_validation};
+    const auto summary_time{SteadyClock::now()};
+    LogInfo("ASYNC_PNB_PEER_SERVICE event=busy_send_prefix_summary job=%d source=%d hash=%s mode=async steady_ns=%d count=%d total_ns=%d max_ns=%d max_peer=%d max_start_ns=%d max_end_ns=%d\n",
+            pending.job_id, pending.source, pending.hash.ToString(),
+            TicksSinceEpoch<std::chrono::nanoseconds>(summary_time),
+            pending.busy_send_prefix_count, pending.busy_send_prefix_total_ns,
+            pending.busy_send_prefix_max_ns, pending.busy_send_prefix_max_peer,
+            pending.busy_send_prefix_max_start_ns, pending.busy_send_prefix_max_end_ns);
     LogInfo("ASYNC_PNB_PEER_SERVICE event=result_collection job=%d source=%d hash=%s mode=async steady_ns=%d new_block=%d active_slot=1\n",
             pending.job_id, pending.source, pending.hash.ToString(),
             TicksSinceEpoch<std::chrono::nanoseconds>(SteadyClock::now()), result->new_block);
@@ -5449,22 +5472,16 @@ void PeerManagerImpl::ProcessMessage(Peer& peer, CNode& pfrom, const CNetMessage
             // it, if the remote node sends a ping once per second and this node takes 5
             // seconds to respond to each, the 5th ping the remote sends would appear to
             // return very quickly.
-            MakeAndPushMessage(pfrom, NetMsgType::PONG, nonce);
-            const auto response_queued{SteadyClock::now()};
-            size_t send_queue_bytes;
-            size_t send_queue_depth;
-            {
-                LOCK(pfrom.cs_vSend);
-                send_queue_bytes = pfrom.m_send_memusage;
-                send_queue_depth = pfrom.vSendMsg.size();
-            }
+            const auto response_queued{m_connman.PushMessage(
+                &pfrom, NetMsg::Make(NetMsgType::PONG, nonce), /*capture_send_queue=*/true)};
+            if (!response_queued) return;
             const uint64_t active_job{m_pending_block_validation
                                           ? m_pending_block_validation->job_id
                                           : 0};
             LogInfo("ASYNC_PNB_PEER_SERVICE event=response_queued peer=%d msg_id=%d msg=ping response=pong nonce=%d steady_ns=%d send_queue_bytes=%d send_queue_depth=%d pause_send=%d active_slot=%d job=%d\n",
                     pfrom.GetId(), net_message.m_process_queue_id, nonce,
-                    TicksSinceEpoch<std::chrono::nanoseconds>(response_queued),
-                    send_queue_bytes, send_queue_depth, pfrom.fPauseSend.load(),
+                    TicksSinceEpoch<std::chrono::nanoseconds>(response_queued->time),
+                    response_queued->bytes, response_queued->depth, response_queued->paused,
                     m_pending_block_validation.has_value(), active_job);
         }
         return;
@@ -5660,6 +5677,7 @@ bool PeerManagerImpl::ProcessMessages(CNode& node, std::atomic<bool>& interruptM
         if (AsyncP2PBlockActiveFor(node.GetId())) return false;
     }
 
+    const auto handler_turn_start{SteadyClock::now()};
     const bool async_busy{m_block_validation && AsyncP2PBlockActive()};
 
     PeerRef maybe_peer{GetPeerRef(node.GetId())};
@@ -5698,6 +5716,10 @@ bool PeerManagerImpl::ProcessMessages(CNode& node, std::atomic<bool>& interruptM
     if (node.fPauseSend) return false;
 
     if (async_busy && !node.fSuccessfullyConnected) return false;
+    // NewPoWValidBlock may synchronously enqueue a compact block from the PNB
+    // worker to peers that selected us for high-bandwidth relay. Do not let the
+    // message handler wait on the same peer's send lock while the slot is busy.
+    if (async_busy && node.m_bip152_highbandwidth_from) return false;
 
     auto poll_result{async_busy
                          ? node.PollMessage([](const CNetMessage& message) {
@@ -5714,12 +5736,15 @@ bool PeerManagerImpl::ProcessMessages(CNode& node, std::atomic<bool>& interruptM
     const bool measured_ping_pong{msg.m_type == NetMsgType::PING ||
                                   msg.m_type == NetMsgType::PONG};
     if (measured_ping_pong) {
+        const auto handler_start{SteadyClock::now()};
         const uint64_t active_job{m_pending_block_validation
                                       ? m_pending_block_validation->job_id
                                       : 0};
-        LogInfo("ASYNC_PNB_PEER_SERVICE event=handler_start peer=%d msg_id=%d msg=%s steady_ns=%d ready_ns=%d poll_ns=%d ready_queue_bytes=%d ready_queue_depth=%d ready_pause_recv=%d poll_queue_bytes=%d poll_queue_depth=%d poll_pause_recv=%d active_slot=%d job=%d\n",
+        LogInfo("ASYNC_PNB_PEER_SERVICE event=handler_start peer=%d msg_id=%d msg=%s steady_ns=%d handler_turn_start_ns=%d handler_prefix_ns=%d ready_ns=%d poll_ns=%d ready_queue_bytes=%d ready_queue_depth=%d ready_pause_recv=%d poll_queue_bytes=%d poll_queue_depth=%d poll_pause_recv=%d active_slot=%d job=%d\n",
                 node.GetId(), msg.m_process_queue_id, msg.m_type,
-                TicksSinceEpoch<std::chrono::nanoseconds>(SteadyClock::now()),
+                TicksSinceEpoch<std::chrono::nanoseconds>(handler_start),
+                TicksSinceEpoch<std::chrono::nanoseconds>(handler_turn_start),
+                Ticks<std::chrono::nanoseconds>(handler_start - handler_turn_start),
                 TicksSinceEpoch<std::chrono::nanoseconds>(msg.m_process_queue_ready),
                 TicksSinceEpoch<std::chrono::nanoseconds>(msg.m_process_queue_poll),
                 msg.m_process_queue_bytes_at_ready, msg.m_process_queue_depth_at_ready,
@@ -5745,7 +5770,13 @@ bool PeerManagerImpl::ProcessMessages(CNode& node, std::atomic<bool>& interruptM
     try {
         ProcessMessage(peer, node, msg, msg.m_type, msg.m_recv, msg.m_time, interruptMsgProc);
         interrupted = interruptMsgProc;
-        if (!async_busy) {
+        if (msg.m_type == NetMsgType::BLOCK && m_opts.unit_test_async_pnb_hook) {
+            m_opts.unit_test_async_pnb_hook("post_block_handler");
+        }
+        // Processing an ordinary BLOCK may have started the worker during this
+        // call. Do not enter post-handler transaction bookkeeping while PNB is
+        // now active; validation callbacks can hold m_tx_download_mutex.
+        if (!interrupted && (!m_block_validation || !AsyncP2PBlockActive())) {
             {
                 LOCK(peer.m_getdata_requests_mutex);
                 if (!peer.m_getdata_requests.empty()) fMoreWork = true;
@@ -6341,16 +6372,38 @@ bool PeerManagerImpl::SendMessages(CNode& node)
     AssertLockNotHeld(m_tx_download_mutex);
     AssertLockHeld(g_msgproc_mutex);
 
+    const bool async_busy{m_block_validation && AsyncP2PBlockActive()};
+    const auto busy_prefix_start{async_busy ? SteadyClock::now() : SteadyClock::time_point{}};
+    const auto record_busy_prefix{[&](SteadyClock::time_point end) {
+        Assert(async_busy);
+        PendingP2PBlock& pending{*Assert(m_pending_block_validation)};
+        const int64_t start_ns{TicksSinceEpoch<std::chrono::nanoseconds>(busy_prefix_start)};
+        const int64_t end_ns{TicksSinceEpoch<std::chrono::nanoseconds>(end)};
+        const int64_t duration_ns{end_ns - start_ns};
+        ++pending.busy_send_prefix_count;
+        pending.busy_send_prefix_total_ns += duration_ns;
+        if (pending.busy_send_prefix_count == 1 || duration_ns > pending.busy_send_prefix_max_ns) {
+            pending.busy_send_prefix_max_ns = duration_ns;
+            pending.busy_send_prefix_max_peer = node.GetId();
+            pending.busy_send_prefix_max_start_ns = start_ns;
+            pending.busy_send_prefix_max_end_ns = end_ns;
+        }
+    }};
     PeerRef maybe_peer{GetPeerRef(node.GetId())};
-    if (!maybe_peer) return false;
+    if (!maybe_peer) {
+        if (async_busy) record_busy_prefix(SteadyClock::now());
+        return false;
+    }
     Peer& peer{*maybe_peer};
     const Consensus::Params& consensusParams = m_chainparams.GetConsensus();
 
     // We must call MaybeDiscourageAndDisconnect first, to ensure that we'll
     // disconnect misbehaving peers even before the version handshake is complete.
-    if (MaybeDiscourageAndDisconnect(node, peer)) return true;
+    const bool disconnected{MaybeDiscourageAndDisconnect(node, peer)};
+    if (async_busy) record_busy_prefix(SteadyClock::now());
+    if (disconnected) return true;
 
-    if (m_block_validation && AsyncP2PBlockActive()) return true;
+    if (async_busy) return true;
 
     // Initiate version handshake for outbound connections
     if (!node.IsInboundConn() && !peer.m_outbound_version_message_sent) {

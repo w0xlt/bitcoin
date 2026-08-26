@@ -80,18 +80,20 @@ private:
                     Ticks<std::chrono::nanoseconds>(pnb_end - pnb_start), new_block);
             request.block.reset();
 
+            SteadyClock::time_point publication_time;
             {
                 LOCK(m_mutex);
                 Assert(m_running);
                 Assert(!m_result);
                 m_running = false;
+                publication_time = SteadyClock::now();
                 m_result = P2PBlockValidationResult{new_block};
             }
             // Publication precedes the wake and the callback never runs under
             // the component mutex.
             LogInfo("ASYNC_PNB_PEER_SERVICE event=result_publication job=%d hash=%s steady_ns=%d new_block=%d active_slot=1\n",
                     request.job_id, hash.ToString(),
-                    TicksSinceEpoch<std::chrono::nanoseconds>(SteadyClock::now()), new_block);
+                    TicksSinceEpoch<std::chrono::nanoseconds>(publication_time), new_block);
             m_result_ready();
 
             {
