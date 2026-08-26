@@ -140,6 +140,46 @@ BOOST_AUTO_TEST_CASE(cnode_simple_test)
     BOOST_CHECK_EQUAL(pnode4->ConnectedThroughNetwork(), Network::NET_ONION);
 }
 
+BOOST_AUTO_TEST_CASE(cnode_conditional_poll)
+{
+    auto& connman{static_cast<ConnmanTestMsg&>(*m_node.connman)};
+    CNode node{/*id=*/0,
+               /*sock=*/nullptr,
+               /*addrIn=*/CAddress{},
+               /*nKeyedNetGroupIn=*/0,
+               /*nLocalHostNonceIn=*/0,
+               /*addrBindIn=*/CAddress{},
+               /*addrNameIn=*/std::string{},
+               /*conn_type_in=*/ConnectionType::INBOUND,
+               /*inbound_onion=*/false,
+               /*network_key=*/0,
+               CNodeOptions{.recv_flood_size = 0}};
+
+    BOOST_REQUIRE(connman.ReceiveMsgFrom(node, NetMsg::Make(NetMsgType::INV)));
+    BOOST_REQUIRE(connman.ReceiveMsgFrom(node, NetMsg::Make(NetMsgType::PING, uint64_t{42})));
+    BOOST_CHECK(node.fPauseRecv);
+
+    const auto is_ping{[](const CNetMessage& message) noexcept {
+        return message.m_type == NetMsgType::PING;
+    }};
+
+    // Rejection neither pops nor scans past the refused front.
+    BOOST_CHECK(!node.PollMessage(is_ping));
+    BOOST_CHECK(node.fPauseRecv);
+    auto inv{node.PollMessage()};
+    BOOST_REQUIRE(inv);
+    BOOST_CHECK_EQUAL(inv->first.m_type, NetMsgType::INV);
+    BOOST_CHECK(inv->second);
+    BOOST_CHECK(node.fPauseRecv);
+
+    auto ping{node.PollMessage(is_ping)};
+    BOOST_REQUIRE(ping);
+    BOOST_CHECK_EQUAL(ping->first.m_type, NetMsgType::PING);
+    BOOST_CHECK(!ping->second);
+    BOOST_CHECK(!node.fPauseRecv);
+    BOOST_CHECK(!node.PollMessage());
+}
+
 BOOST_AUTO_TEST_CASE(cnetaddr_basic)
 {
     CNetAddr addr;
