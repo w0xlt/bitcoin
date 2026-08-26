@@ -29,6 +29,7 @@
 #include <boost/test/unit_test.hpp>
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <ios>
 #include <list>
@@ -156,27 +157,46 @@ BOOST_AUTO_TEST_CASE(cnode_conditional_poll)
                /*network_key=*/0,
                CNodeOptions{.recv_flood_size = 0}};
 
-    BOOST_REQUIRE(connman.ReceiveMsgFrom(node, NetMsg::Make(NetMsgType::INV)));
+    BOOST_REQUIRE(connman.ReceiveMsgFrom(node, NetMsg::Make(NetMsgType::BLOCK)));
     BOOST_REQUIRE(connman.ReceiveMsgFrom(node, NetMsg::Make(NetMsgType::PING, uint64_t{42})));
+    BOOST_REQUIRE(connman.ReceiveMsgFrom(node, NetMsg::Make(NetMsgType::CMPCTBLOCK)));
+    BOOST_REQUIRE(connman.ReceiveMsgFrom(node, NetMsg::Make(NetMsgType::BLOCKTXN)));
     BOOST_CHECK(node.fPauseRecv);
 
-    const auto is_ping{[](const CNetMessage& message) noexcept {
-        return message.m_type == NetMsgType::PING;
-    }};
+    const std::array<std::string_view, 3> excluded_types{
+        NetMsgType::BLOCK,
+        NetMsgType::CMPCTBLOCK,
+        NetMsgType::BLOCKTXN,
+    };
 
     // Rejection neither pops nor scans past the refused front.
-    BOOST_CHECK(!node.PollMessage(is_ping));
+    BOOST_CHECK(!node.PollMessage(excluded_types));
     BOOST_CHECK(node.fPauseRecv);
-    auto inv{node.PollMessage()};
-    BOOST_REQUIRE(inv);
-    BOOST_CHECK_EQUAL(inv->first.m_type, NetMsgType::INV);
-    BOOST_CHECK(inv->second);
+    auto block{node.PollMessage()};
+    BOOST_REQUIRE(block);
+    BOOST_CHECK_EQUAL(block->first.m_type, NetMsgType::BLOCK);
+    BOOST_CHECK(block->second);
     BOOST_CHECK(node.fPauseRecv);
 
-    auto ping{node.PollMessage(is_ping)};
+    auto ping{node.PollMessage(excluded_types)};
     BOOST_REQUIRE(ping);
     BOOST_CHECK_EQUAL(ping->first.m_type, NetMsgType::PING);
+    // The next exact-front producer remains queued and suppresses more-work.
     BOOST_CHECK(!ping->second);
+    BOOST_CHECK(node.fPauseRecv);
+    BOOST_CHECK(!node.PollMessage(excluded_types));
+
+    auto cmpctblock{node.PollMessage()};
+    BOOST_REQUIRE(cmpctblock);
+    BOOST_CHECK_EQUAL(cmpctblock->first.m_type, NetMsgType::CMPCTBLOCK);
+    BOOST_CHECK(cmpctblock->second);
+    BOOST_CHECK(node.fPauseRecv);
+    BOOST_CHECK(!node.PollMessage(excluded_types));
+
+    auto blocktxn{node.PollMessage()};
+    BOOST_REQUIRE(blocktxn);
+    BOOST_CHECK_EQUAL(blocktxn->first.m_type, NetMsgType::BLOCKTXN);
+    BOOST_CHECK(!blocktxn->second);
     BOOST_CHECK(!node.fPauseRecv);
     BOOST_CHECK(!node.PollMessage());
 }

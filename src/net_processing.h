@@ -124,7 +124,6 @@ public:
                                              std::unique_ptr<node::P2PBlockValidation> block_validation = {});
     virtual ~PeerManager() = default;
 
-    virtual void InterruptAsyncPNBPeerService() = 0;
     virtual void StopAsyncPNBPeerService() = 0;
     virtual bool HasAsyncPNBPeerService() const = 0;
 

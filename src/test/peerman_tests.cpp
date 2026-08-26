@@ -110,6 +110,60 @@ private:
     int m_released GUARDED_BY(m_mutex){0};
 };
 
+class BlockingPNBSequence
+{
+public:
+    bool WaitForCount(int count) EXCLUSIVE_LOCKS_REQUIRED(!m_mutex)
+    {
+        WAIT_LOCK(m_mutex, lock);
+        return m_cv.wait_for(lock, ASYNC_TEST_TIMEOUT, [this, count]() EXCLUSIVE_LOCKS_REQUIRED(m_mutex) {
+            return m_entered >= count;
+        });
+    }
+
+    void ReleaseOne() EXCLUSIVE_LOCKS_REQUIRED(!m_mutex)
+    {
+        {
+            LOCK(m_mutex);
+            ++m_released;
+        }
+        m_cv.notify_all();
+    }
+
+    void ReleaseAll() EXCLUSIVE_LOCKS_REQUIRED(!m_mutex)
+    {
+        {
+            LOCK(m_mutex);
+            m_released = std::numeric_limits<int>::max();
+        }
+        m_cv.notify_all();
+    }
+
+    bool Process(ChainstateManager& chainman,
+                 const std::shared_ptr<const CBlock>& block,
+                 bool force_processing,
+                 bool min_pow_checked,
+                 bool* new_block) EXCLUSIVE_LOCKS_REQUIRED(!m_mutex)
+    {
+        {
+            WAIT_LOCK(m_mutex, lock);
+            const int sequence{++m_entered};
+            m_cv.notify_all();
+            (void)m_cv.wait_for(lock, ASYNC_TEST_TIMEOUT, [this, sequence]() EXCLUSIVE_LOCKS_REQUIRED(m_mutex) {
+                return m_released >= sequence;
+            });
+        }
+        return chainman.ProcessNewBlock(
+            block, force_processing, min_pow_checked, new_block);
+    }
+
+private:
+    Mutex m_mutex;
+    std::condition_variable m_cv;
+    int m_entered GUARDED_BY(m_mutex){0};
+    int m_released GUARDED_BY(m_mutex){0};
+};
+
 class AsyncPNBLockOrderGate
 {
 public:
@@ -160,7 +214,7 @@ private:
 struct AsyncPNBPeerServiceSetup : RegTestingSetup {
     AsyncPNBPeerServiceSetup()
         : m_connman{static_cast<ConnmanTestMsg&>(*m_node.connman)},
-          m_blocker{std::make_shared<BlockingBlockCheckedSequence>()}
+          m_worker_gate{std::make_shared<BlockingPNBSequence>()}
     {
         m_connman.SetMsgProc(nullptr);
         m_node.peerman.reset();
@@ -171,27 +225,32 @@ struct AsyncPNBPeerServiceSetup : RegTestingSetup {
         options.unit_test_async_pnb_hook = [this](std::string_view event) {
             m_lock_order_gate.Hook(event);
         };
-        auto validation{node::MakeP2PBlockValidation(*m_node.chainman, [this] {
-            m_results.Notify();
-            m_connman.WakeMessageHandler();
-        })};
+        auto validation{node::MakeP2PBlockValidationForTest(
+            [this](const std::shared_ptr<const CBlock>& block,
+                   bool force_processing,
+                   bool min_pow_checked,
+                   bool* new_block) {
+                return m_worker_gate->Process(
+                    *m_node.chainman, block, force_processing, min_pow_checked, new_block);
+            },
+            [this] {
+                m_results.Notify();
+                m_connman.WakeMessageHandler();
+            })};
         m_node.peerman = PeerManager::make(
             m_connman, *m_node.addrman, m_node.banman.get(), *m_node.chainman,
             *m_node.mempool, *m_node.warnings, options, std::move(validation));
         m_connman.SetMsgProc(m_node.peerman.get());
         m_node.validation_signals->RegisterValidationInterface(m_node.peerman.get());
-        m_node.validation_signals->RegisterSharedValidationInterface(m_blocker);
     }
 
     ~AsyncPNBPeerServiceSetup()
     {
         if (!m_node.peerman) return;
         m_lock_order_gate.Release();
-        m_node.peerman->InterruptAsyncPNBPeerService();
-        m_blocker->ReleaseAll();
+        m_worker_gate->ReleaseAll();
         m_node.peerman->StopAsyncPNBPeerService();
         m_node.validation_signals->UnregisterValidationInterface(m_node.peerman.get());
-        m_node.validation_signals->UnregisterSharedValidationInterface(m_blocker);
         m_connman.StopNodes();
         m_connman.SetMsgProc(nullptr);
         m_node.peerman.reset();
@@ -255,7 +314,7 @@ struct AsyncPNBPeerServiceSetup : RegTestingSetup {
 
     ConnmanTestMsg& m_connman;
     AsyncResultWaiter m_results;
-    std::shared_ptr<BlockingBlockCheckedSequence> m_blocker;
+    std::shared_ptr<BlockingPNBSequence> m_worker_gate;
     AsyncPNBLockOrderGate m_lock_order_gate;
     NodeId m_next_node_id{0};
 };
@@ -350,7 +409,7 @@ BOOST_FIXTURE_TEST_CASE(async_pnb_peer_service_fencing_and_fifo, AsyncPNBPeerSer
 
     ReceiveMsgFrom(source, NetMsg::Make(NetMsgType::BLOCK, TX_WITH_WITNESS(first_block)));
     (void)ProcessMessagesOnce(source);
-    BOOST_REQUIRE(m_blocker->WaitForCount(1));
+    BOOST_REQUIRE(m_worker_gate->WaitForCount(1));
 
     ReceiveMsgFrom(source, NetMsg::Make(NetMsgType::PING, uint64_t{1}));
     ReceiveMsgFrom(unrelated, NetMsg::Make(NetMsgType::PING, uint64_t{2}));
@@ -358,35 +417,52 @@ BOOST_FIXTURE_TEST_CASE(async_pnb_peer_service_fencing_and_fifo, AsyncPNBPeerSer
     ReceiveMsgFrom(refused_front, NetMsg::Make(NetMsgType::SENDHEADERS));
     ReceiveMsgFrom(refused_front, NetMsg::Make(NetMsgType::PING, uint64_t{3}));
     ReceiveMsgFrom(second_source, NetMsg::Make(NetMsgType::BLOCK, TX_WITH_WITNESS(second_block)));
+    ReceiveMsgFrom(second_source, NetMsg::Make(NetMsgType::PING, uint64_t{4}));
 
     BOOST_CHECK(!ProcessMessagesOnce(source));
     BOOST_CHECK(!HasSendMessage(source, NetMsgType::PONG));
     BOOST_CHECK(!ProcessMessagesOnce(unrelated));
-    BOOST_CHECK(!HasSendMessage(unrelated, NetMsgType::PONG));
-    unrelated.m_bip152_highbandwidth_from = false;
-    BOOST_CHECK(!ProcessMessagesOnce(unrelated));
     BOOST_CHECK(HasSendMessage(unrelated, NetMsgType::PONG));
-    BOOST_CHECK(!ProcessMessagesOnce(refused_front));
+    // Unrelated ordinary FIFO work is no longer restricted to PING or by
+    // high-bandwidth compact-relay state.
+    BOOST_CHECK(ProcessMessagesOnce(refused_front));
     BOOST_CHECK(!HasSendMessage(refused_front, NetMsgType::PONG));
+    BOOST_CHECK(!ProcessMessagesOnce(refused_front));
+    BOOST_CHECK(HasSendMessage(refused_front, NetMsgType::PONG));
     BOOST_CHECK(!ProcessMessagesOnce(second_source));
+    BOOST_CHECK(!HasSendMessage(second_source, NetMsgType::PONG));
 
+    m_node.peerman->SendPings();
+    BOOST_CHECK(SendMessagesOnce(source));
+    BOOST_CHECK(!HasSendMessage(source, NetMsgType::PING));
+    BOOST_CHECK(SendMessagesOnce(unrelated));
+    BOOST_CHECK(HasSendMessage(unrelated, NetMsgType::PING));
+
+    // Model BlockChecked marking the live source while worker PNB is active.
+    // Result-ready collection must not let an unrelated shuffled turn clear
+    // the source fence before its mandatory send/disconnect pass.
+    m_node.peerman->UnitTestMisbehaving(source.GetId());
     m_node.peerman->UnitTestMisbehaving(discouraged.GetId());
     BOOST_CHECK(SendMessagesOnce(discouraged));
     BOOST_CHECK(discouraged.fDisconnect);
 
-    m_blocker->ReleaseOne();
+    m_worker_gate->ReleaseOne();
     BOOST_REQUIRE(m_results.WaitForCount(1));
-    BOOST_CHECK(ProcessMessagesOnce(unrelated)); // Collect, then yield a service window.
+    BOOST_CHECK(!ProcessMessagesOnce(unrelated));
+    BOOST_CHECK(ProcessMessagesOnce(source)); // Collect on the live source's turn.
+    BOOST_CHECK(!HasSendMessage(source, NetMsgType::PONG));
+    BOOST_CHECK(SendMessagesOnce(source));
+    BOOST_CHECK(source.fDisconnect);
+    BOOST_CHECK(!ProcessMessagesOnce(source));
+    BOOST_CHECK(!HasSendMessage(source, NetMsgType::PONG));
 
     // The refused BLOCK remained at the exact front while the slot was busy.
     auto queued_block{second_source.PollMessage()};
     BOOST_REQUIRE(queued_block);
     BOOST_CHECK_EQUAL(queued_block->first.m_type, NetMsgType::BLOCK);
 
-    BOOST_CHECK(ProcessMessagesOnce(refused_front));
-    BOOST_CHECK(!HasSendMessage(refused_front, NetMsgType::PONG));
-    BOOST_CHECK(!ProcessMessagesOnce(refused_front));
-    BOOST_CHECK(HasSendMessage(refused_front, NetMsgType::PONG));
+    BOOST_CHECK(!ProcessMessagesOnce(second_source));
+    BOOST_CHECK(HasSendMessage(second_source, NetMsgType::PONG));
 }
 
 BOOST_FIXTURE_TEST_CASE(async_pnb_peer_service_disconnect_and_active_stop, AsyncPNBPeerServiceSetup)
@@ -395,14 +471,14 @@ BOOST_FIXTURE_TEST_CASE(async_pnb_peer_service_disconnect_and_active_stop, Async
     const CBlock block{NextBlock(/*variant=*/3)};
     ReceiveMsgFrom(source, NetMsg::Make(NetMsgType::BLOCK, TX_WITH_WITNESS(block)));
     (void)ProcessMessagesOnce(source);
-    BOOST_REQUIRE(m_blocker->WaitForCount(1));
+    BOOST_REQUIRE(m_worker_gate->WaitForCount(1));
     source.fDisconnect = true;
 
     auto stop{std::async(std::launch::async, [this] {
         m_node.peerman->StopAsyncPNBPeerService();
     })};
     BOOST_CHECK(stop.wait_for(std::chrono::milliseconds{20}) == std::future_status::timeout);
-    m_blocker->ReleaseOne();
+    m_worker_gate->ReleaseOne();
     BOOST_REQUIRE(m_results.WaitForCount(1));
     BOOST_REQUIRE(stop.wait_for(ASYNC_TEST_TIMEOUT) == std::future_status::ready);
     stop.get();
@@ -415,7 +491,7 @@ BOOST_FIXTURE_TEST_CASE(async_pnb_post_block_tail_skips_tx_download_mutex, Async
     m_lock_order_gate.Arm();
     // Let BlockChecked pass so the worker reaches the later ActiveTipChange
     // callback where the tx-download mutex is held.
-    m_blocker->ReleaseOne();
+    m_worker_gate->ReleaseOne();
     ReceiveMsgFrom(source, NetMsg::Make(NetMsgType::BLOCK, TX_WITH_WITNESS(block)));
 
     auto process{std::async(std::launch::async, [this, &source] {
@@ -429,7 +505,7 @@ BOOST_FIXTURE_TEST_CASE(async_pnb_post_block_tail_skips_tx_download_mutex, Async
     BOOST_CHECK(!process.get());
 
     m_lock_order_gate.Release();
-    BOOST_REQUIRE(m_blocker->WaitForCount(1));
+    BOOST_REQUIRE(m_worker_gate->WaitForCount(1));
     BOOST_REQUIRE(m_results.WaitForCount(1));
     BOOST_CHECK(ProcessMessagesOnce(source));
 }

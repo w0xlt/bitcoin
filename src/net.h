@@ -783,11 +783,11 @@ public:
 
     /** Poll the next message from the processing queue of this connection.
      *
-     * If `predicate` rejects the front message, return std::nullopt without
-     * changing queue order or receive accounting. An empty predicate preserves
+     * If the front message type is excluded, return std::nullopt without
+     * changing queue order or receive accounting. An empty span preserves
      * ordinary polling behavior. */
     std::optional<std::pair<CNetMessage, bool>> PollMessage(
-        const std::function<bool(const CNetMessage&)>& predicate = {})
+        std::span<const std::string_view> excluded_types = {})
         EXCLUSIVE_LOCKS_REQUIRED(!m_msg_process_queue_mutex);
 
     /** Account for the total size of a sent message in the per msg type connection stats. */

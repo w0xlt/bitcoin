@@ -18,7 +18,7 @@ namespace node {
 enum class P2PBlockValidationSubmit {
     ACCEPTED,
     FULL,
-    INTERRUPTED,
+    STOPPING,
 };
 
 //! Immutable inputs retained for one asynchronous ProcessNewBlock call.
@@ -34,6 +34,12 @@ struct P2PBlockValidationResult {
     bool new_block;
 };
 
+using P2PBlockValidationFn = std::function<bool(
+    const std::shared_ptr<const CBlock>& block,
+    bool force_processing,
+    bool min_pow_checked,
+    bool* new_block)>;
+
 /**
  * One-slot adapter for serial asynchronous P2P block validation.
  *
@@ -46,17 +52,17 @@ class P2PBlockValidation
 public:
     virtual ~P2PBlockValidation() = default;
 
+    //! Start the sole worker after its owner is fully constructed.
+    virtual void Start() = 0;
+
     [[nodiscard]] virtual P2PBlockValidationSubmit
     Submit(P2PBlockValidationRequest request) = 0;
 
     [[nodiscard]] virtual std::optional<P2PBlockValidationResult>
     TakeResult() = 0;
 
-    //! Idempotently reject new work without canceling an accepted request.
-    virtual void Interrupt() = 0;
-
-    //! Idempotently interrupt and join after at most the accepted request.
-    virtual void Stop() = 0;
+    //! Idempotently reject new work, drain accepted work, and join.
+    virtual void StopAndJoin() = 0;
 };
 
 //! Called outside the component mutex after the result has been published.
@@ -64,6 +70,11 @@ using P2PBlockValidationResultReady = std::function<void()>;
 
 std::unique_ptr<P2PBlockValidation> MakeP2PBlockValidation(
     ChainstateManager& chainman,
+    P2PBlockValidationResultReady result_ready);
+
+//! Unit-test factory for deterministic state and invocation accounting.
+std::unique_ptr<P2PBlockValidation> MakeP2PBlockValidationForTest(
+    P2PBlockValidationFn process_new_block,
     P2PBlockValidationResultReady result_ready);
 
 } // namespace node

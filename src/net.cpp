@@ -139,6 +139,16 @@ struct CNetMessageAccountedLayout {
 
 static_assert(std::is_standard_layout_v<CNetMessage>);
 static_assert(offsetof(CNetMessage, m_process_queue_id) == sizeof(CNetMessageAccountedLayout));
+
+bool IsMeasuredPeerServiceRequest(std::string_view type)
+{
+    return type == NetMsgType::PING ||
+           type == NetMsgType::VERSION ||
+           type == NetMsgType::GETADDR ||
+           type == NetMsgType::GETBLOCKTXN ||
+           type == NetMsgType::GETHEADERS ||
+           type == NetMsgType::GETDATA;
+}
 } // namespace
 
 size_t CNetMessage::GetMemoryUsage() const noexcept
@@ -4153,7 +4163,7 @@ void CNode::MarkReceivedMsgsForProcessing()
             // partially deserialized message is held by TransportDeserializer.
             nSizeAdded += msg.GetMemoryUsage();
             ++ready_depth;
-            if (msg.m_type == NetMsgType::PING || msg.m_type == NetMsgType::PONG) {
+            if (IsMeasuredPeerServiceRequest(msg.m_type)) {
                 msg.m_process_queue_id = ++m_next_process_queue_id;
                 msg.m_process_queue_ready = SteadyClock::now();
                 msg.m_process_queue_bytes_at_ready = m_msg_process_queue_size + nSizeAdded;
@@ -4180,16 +4190,18 @@ void CNode::MarkReceivedMsgsForProcessing()
 }
 
 std::optional<std::pair<CNetMessage, bool>> CNode::PollMessage(
-    const std::function<bool(const CNetMessage&)>& predicate)
+    std::span<const std::string_view> excluded_types)
 {
     LOCK(m_msg_process_queue_mutex);
-    if (m_msg_process_queue.empty() ||
-        (predicate && !predicate(m_msg_process_queue.front()))) {
+    const auto is_excluded{[&](const CNetMessage& message) {
+        return std::find(excluded_types.begin(), excluded_types.end(), message.m_type) != excluded_types.end();
+    }};
+    if (m_msg_process_queue.empty() || is_excluded(m_msg_process_queue.front())) {
         return std::nullopt;
     }
 
     CNetMessage& front{m_msg_process_queue.front()};
-    if (front.m_type == NetMsgType::PING || front.m_type == NetMsgType::PONG) {
+    if (front.m_process_queue_id != 0) {
         front.m_process_queue_poll = SteadyClock::now();
         front.m_process_queue_bytes_at_poll = m_msg_process_queue_size;
         front.m_process_queue_depth_at_poll = m_msg_process_queue.size();
@@ -4203,7 +4215,7 @@ std::optional<std::pair<CNetMessage, bool>> CNode::PollMessage(
     fPauseRecv = m_msg_process_queue_size > m_recv_flood_size;
 
     const bool more_work{!m_msg_process_queue.empty() &&
-                         (!predicate || predicate(m_msg_process_queue.front()))};
+                         !is_excluded(m_msg_process_queue.front())};
     return std::make_pair(std::move(msgs.front()), more_work);
 }
 

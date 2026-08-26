@@ -30,15 +30,41 @@ from test_framework.messages import (
     MAX_BLOCK_SIGOPS_COST,
     MAX_BLOCK_WEIGHT,
     MSG_BLOCK,
+    MSG_CMPCT_BLOCK,
+    MSG_TX,
     MSG_TYPE_MASK,
     WITNESS_SCALE_FACTOR,
+    BlockTransactions,
+    BlockTransactionsRequest,
     CBlockHeader,
+    CBlockLocator,
+    CInv,
+    HeaderAndShortIDs,
+    calculate_shortid,
     msg_block,
+    msg_blocktxn,
+    msg_cmpctblock,
     msg_getaddr,
+    msg_getblocktxn,
+    msg_getdata,
+    msg_getheaders,
+    msg_generic,
     msg_headers,
     msg_ping,
+    msg_sendaddrv2,
+    msg_sendcmpct,
+    msg_verack,
+    msg_version,
+    msg_wtxidrelay,
 )
-from test_framework.p2p import P2PInterface, P2P_SUBVERSION, p2p_lock
+from test_framework.p2p import (
+    MIN_P2P_VERSION_SUPPORTED,
+    P2PInterface,
+    P2P_SERVICES,
+    P2P_SUBVERSION,
+    P2P_VERSION,
+    p2p_lock,
+)
 from test_framework.script import CScript
 from test_framework.test_framework import BitcoinTestFramework
 from test_framework.wallet import MiniWallet, MiniWalletMode
@@ -55,66 +81,128 @@ PING_TIMEOUT = 60
 MARKER_POLL = 0.002
 
 PROFILES = {
-    "curve": {"loads": [1, 10, 25, 50, 100], "warmups": 2, "trials": 20},
-    "smoke": {"loads": [1, 10], "warmups": 0, "trials": 2},
-    "mixed": {"loads": [25], "warmups": 2, "trials": 20},
-    "default": {"loads": [50], "warmups": 2, "trials": 20},
+    # One warmup and one retained isolated trial for every fixed class.
+    "smoke": {"isolated_warmups": 1, "isolated_trials": 1, "mixed_trials": 0},
+    # The paired AB/BA screening count from the fast plan.
+    "curve": {"isolated_warmups": 0, "isolated_trials": 3, "mixed_trials": 0},
+    # Six retained fixed-class mixed FIFO trials per arm.
+    "mixed": {"isolated_warmups": 0, "isolated_trials": 0, "mixed_trials": 6},
+    # The optional broad confirmation plus its fixed mixed screen.
+    "default": {"isolated_warmups": 2, "isolated_trials": 20, "mixed_trials": 6},
 }
+
+SERVICE_CLASSES = ("ping", "version", "getaddr", "getblocktxn", "getheaders", "getdata")
 
 
 class PeerServicePeer(P2PInterface):
     def __init__(self):
         super().__init__()
         self.block_requests = []
-        self.ping = None
+        self.block_request_types = []
+        self.blocktxn_requests = []
+        self.pong_nonces = []
+        self.service_request = None
 
     def on_getdata(self, message):
         for inv in message.inv:
-            if (inv.type & MSG_TYPE_MASK) == MSG_BLOCK:
+            if (inv.type & MSG_TYPE_MASK) in {MSG_BLOCK, MSG_CMPCT_BLOCK}:
                 self.block_requests.append(inv.hash)
+                self.block_request_types.append((inv.hash, inv.type & MSG_TYPE_MASK))
 
     def on_inv(self, message):
         pass
 
-    def on_pong(self, message):
-        if self.ping is None or message.nonce != self.ping["nonce"]:
+    def on_getblocktxn(self, message):
+        self.blocktxn_requests.append(message.block_txn_request)
+
+    def _record_service_response(self, response_type, message):
+        request = self.service_request
+        if request is None or response_type not in request["expected_types"]:
             return
-        self.ping["responses"].append(time.perf_counter_ns())
-        self.ping["event"].set()
+        if response_type == "pong" and message.nonce != request.get("nonce"):
+            return
+        serialized = message.serialize()
+        request["responses"].append({
+            "message": message,
+            "received_ns": time.perf_counter_ns(),
+            "response_bytes": len(serialized),
+            "response_sha256": hashlib.sha256(serialized).hexdigest(),
+            "type": response_type,
+        })
+        received_types = {entry["type"] for entry in request["responses"]}
+        if set(request["expected_types"]).issubset(received_types):
+            request["event"].set()
 
-    def begin_ping(self, nonce):
-        with p2p_lock:
-            assert self.is_connected
-            assert self.ping is None
-            self.ping = {
-                "nonce": nonce,
-                "sent_ns": time.perf_counter_ns(),
-                "responses": [],
-                "event": threading.Event(),
-            }
-            self.send_without_ping(msg_ping(nonce))
+    def on_version(self, message):
+        self._record_service_response("version", message)
+        assert message.nVersion >= MIN_P2P_VERSION_SUPPORTED
+        if not self.p2p_connected_to_node:
+            self.send_version()
+            self.reconnect = False
+        if message.nVersion >= 70016 and self.wtxidrelay:
+            self.send_without_ping(msg_wtxidrelay())
+        if self.support_addrv2:
+            self.send_without_ping(msg_sendaddrv2())
+        self.send_without_ping(msg_verack())
+        self.nServices = message.nServices
+        self.relay = message.relay
 
-    def finish_ping(self, timeout):
-        with p2p_lock:
-            ping = self.ping
-            assert ping is not None
-        completed = ping["event"].wait(max(0, timeout) * self.timeout_factor)
-        with p2p_lock:
-            responses = list(ping["responses"])
-            connected = self.is_connected
-            self.ping = None
-        return {
-            "completed": completed and len(responses) == 1,
-            "connected": connected,
-            "nonce": ping["nonce"],
-            "request_sent_ns": ping["sent_ns"],
-            "response_received_ns": responses[0] if responses else None,
-            "response_count": len(responses),
-        }
+    def on_verack(self, message):
+        self._record_service_response("verack", message)
+
+    def on_addr(self, message):
+        self._record_service_response("addr", message)
+
+    def on_addrv2(self, message):
+        self._record_service_response("addrv2", message)
+
+    def on_blocktxn(self, message):
+        self._record_service_response("blocktxn", message)
+
+    def on_headers(self, message):
+        self._record_service_response("headers", message)
+
+    def on_notfound(self, message):
+        self._record_service_response("notfound", message)
+
+    def on_pong(self, message):
+        self.pong_nonces.append(message.nonce)
+        self._record_service_response("pong", message)
 
     def wait_for_block_request(self, block_hash):
         self.wait_until(lambda: self.block_requests.count(block_hash) >= 1, timeout=PING_TIMEOUT)
         assert self.block_requests.count(block_hash) == 1
+
+    def begin_service_request(self, service, message, expected_types, nonce=None):
+        with p2p_lock:
+            assert self.is_connected
+            assert self.service_request is None
+            self.service_request = {
+                "event": threading.Event(),
+                "expected_types": tuple(expected_types),
+                "nonce": nonce,
+                "request_sent_ns": time.perf_counter_ns(),
+                "responses": [],
+                "service": service,
+            }
+            self.send_without_ping(message)
+
+    def finish_service_request(self, timeout=PING_TIMEOUT):
+        with p2p_lock:
+            request = self.service_request
+            assert request is not None
+        completed = request["event"].wait(max(0, timeout) * self.timeout_factor)
+        with p2p_lock:
+            responses = list(request["responses"])
+            connected = self.is_connected
+            self.service_request = None
+        return {
+            "completed": completed,
+            "connected": connected,
+            "request_sent_ns": request["request_sent_ns"],
+            "responses": responses,
+            "service": request["service"],
+        }
 
 
 class MarkerReader:
@@ -274,7 +362,6 @@ class AsyncPNBPeerService(BitcoinTestFramework):
         if self.options.output_dir is not None:
             assert portseed_explicit, "measurement runs require an explicit fixed --portseed"
         mode = self.options.peer_service_mode
-        profile = self.options.peer_service_profile
         args = [
             f"-asyncpnbpeerservice={int(mode == 'candidate')}",
             "-loglevel=info",
@@ -284,8 +371,7 @@ class AsyncPNBPeerService(BitcoinTestFramework):
             "-persistmempool=0",
             "-v2transport=0",
         ]
-        if profile != "default":
-            args += ["-par=1", "-prevoutfetchthreads=0"]
+        args += ["-par=1", "-prevoutfetchthreads=0"]
         self.extra_args = [args]
 
     def setup_nodes(self):
@@ -336,12 +422,31 @@ class AsyncPNBPeerService(BitcoinTestFramework):
         self.samples_file.write(json.dumps(sample, sort_keys=True, separators=(",", ":"), allow_nan=False) + "\n")
         self.samples_file.flush()
 
-    def _map_peer_id(self, peer):
+    @staticmethod
+    def _empty_campaign_aggregate():
+        fields = {
+            "completed": 0,
+            "correlation_failed": 0,
+            "disconnected": 0,
+            "eligible": 0,
+            "failed": 0,
+            "offered": 0,
+            "ready_inside_pnb": 0,
+            "response_inside_pnb": 0,
+            "timed_out": 0,
+        }
+        return {
+            **fields,
+            "by_service": {service: dict(fields) for service in SERVICE_CLASSES},
+        }
+
+    def _map_peer_id(self, peer, *, require_subversion=True):
         sock = peer._transport.get_extra_info("socket")
         local = sock.getsockname()
         addr = f"{local[0]}:{local[1]}"
         matches = [entry for entry in self.nodes[0].getpeerinfo()
-                   if entry["addr"] == addr and entry["subver"] == P2P_SUBVERSION]
+                   if entry["addr"] == addr
+                   and (not require_subversion or entry["subver"] == P2P_SUBVERSION)]
         assert len(matches) == 1
         return matches[0]["id"]
 
@@ -395,6 +500,16 @@ class AsyncPNBPeerService(BitcoinTestFramework):
         self._record_block_input(block, "quick", template["height"])
         return block
 
+    def _invalid_quick_block(self):
+        self._advance_block_mocktime()
+        template = self.nodes[0].getblocktemplate(NORMAL_GBT_REQUEST_PARAMS)
+        block = create_block(tmpl=template, coinbase=create_coinbase(template["height"]))
+        block.vtx[0].vout[0].nValue += COIN
+        block.hashMerkleRoot = block.calc_merkle_root()
+        block.solve()
+        self._record_block_input(block, "invalid-coinbase", template["height"])
+        return block
+
     def _create_funding(self, setup_peer, address_wallet, p2pk_wallet):
         self._advance_block_mocktime()
         utxo = min(address_wallet.get_utxos(mark_as_spent=False, confirmed_only=True),
@@ -416,7 +531,7 @@ class AsyncPNBPeerService(BitcoinTestFramework):
         self._announce(setup_peer, block)
         setup_peer.send_without_ping(msg_block(block))
         self._wait_tip(block)
-        return seed
+        return seed, block
 
     def _build_work_block(self, wallet, seed):
         self._advance_block_mocktime()
@@ -452,20 +567,108 @@ class AsyncPNBPeerService(BitcoinTestFramework):
         self._record_block_input(block, "work", template["height"])
         return block, included[-1]["new_utxo"]
 
-    def _target_ping(self, peer_id, timing, checkpoint, pnb=None):
-        if not timing["completed"]:
-            return None
-        response = self.markers.wait("response_queued", checkpoint,
-                                     peer=peer_id, nonce=timing["nonce"])
-        msg_id = response["msg_id"]
-        ready = self.markers.wait("complete_message_ready", checkpoint,
-                                  peer=peer_id, msg_id=msg_id)
-        start = self.markers.wait("handler_start", checkpoint, peer=peer_id, msg_id=msg_id)
-        complete = self.markers.wait("handler_complete", checkpoint, peer=peer_id, msg_id=msg_id)
-        for event in ("complete_message_ready", "handler_start", "response_queued", "handler_complete"):
-            self.markers.unique(event, checkpoint, peer=peer_id, msg_id=msg_id)
+    def _begin_service_request(self, peer, service, fixture):
+        if service == "ping":
+            nonce = fixture["nonce"]
+            peer.begin_service_request(
+                service, msg_ping(nonce), ("pong",), nonce=nonce)
+        elif service == "version":
+            version = msg_version()
+            version.nVersion = P2P_VERSION
+            version.strSubVer = P2P_SUBVERSION
+            version.nServices = P2P_SERVICES
+            version.relay = 1
+            peer.begin_service_request(
+                service, version, ("version", "verack"))
+        elif service == "getaddr":
+            peer.begin_service_request(
+                service, msg_getaddr(),
+                (("addrv2",) if peer.support_addrv2 else ("addr",)))
+        elif service == "getblocktxn":
+            request = msg_getblocktxn()
+            request.block_txn_request = BlockTransactionsRequest(
+                blockhash=fixture["recent_block"].hash_int)
+            request.block_txn_request.from_absolute([0])
+            peer.begin_service_request(
+                service, request, ("blocktxn",))
+        elif service == "getheaders":
+            request = msg_getheaders()
+            request.locator = CBlockLocator()
+            request.locator.vHave = [fixture["recent_block"].hashPrevBlock]
+            request.hashstop = fixture["recent_block"].hash_int
+            peer.begin_service_request(
+                service, request, ("headers",))
+        elif service == "getdata":
+            peer.begin_service_request(
+                service,
+                msg_getdata([CInv(MSG_TX, fixture["unknown_tx_hash"])]),
+                ("notfound",))
+        else:
+            raise AssertionError(service)
+
+    @staticmethod
+    def _validate_service_response(timing, fixture):
+        assert timing["completed"] and timing["connected"]
+        service = timing["service"]
+        responses = timing["responses"]
+        response_types = [entry["type"] for entry in responses]
+        if service == "ping":
+            assert response_types == ["pong"]
+            assert responses[0]["message"].nonce == fixture["nonce"]
+        elif service == "version":
+            assert response_types.count("version") == 1
+            assert response_types.count("verack") == 1
+            version = next(entry["message"] for entry in responses if entry["type"] == "version")
+            assert version.nVersion >= MIN_P2P_VERSION_SUPPORTED
+            assert version.nServices & P2P_SERVICES == P2P_SERVICES
+        elif service == "getaddr":
+            assert len(responses) == 1 and response_types[0] in {"addr", "addrv2"}
+            assert responses[0]["message"].addrs
+            assert any(addr.ip in fixture["seed_addresses"]
+                       for addr in responses[0]["message"].addrs)
+        elif service == "getblocktxn":
+            assert response_types == ["blocktxn"]
+            response = responses[0]["message"].block_transactions
+            assert response.blockhash == fixture["recent_block"].hash_int
+            assert len(response.transactions) == 1
+            assert response.transactions[0].txid_int == fixture["recent_block"].vtx[0].txid_int
+        elif service == "getheaders":
+            assert response_types == ["headers"]
+            headers = responses[0]["message"].headers
+            assert len(headers) == 1
+            assert headers[0].hash_int == fixture["recent_block"].hash_int
+        elif service == "getdata":
+            assert response_types == ["notfound"]
+            inv = responses[0]["message"].vec
+            assert len(inv) == 1
+            assert inv[0].type == MSG_TX and inv[0].hash == fixture["unknown_tx_hash"]
+        else:
+            raise AssertionError(service)
+
+    def _target_service(self, peer_id, timing, checkpoint, pnb=None):
+        service = timing["service"]
+        response_markers = []
+        for response in timing["responses"]:
+            marker = self.markers.wait(
+                "response_queued", checkpoint, peer=peer_id,
+                msg=service, response=response["type"])
+            assert marker["response_bytes"] == response["response_bytes"]
+            response_markers.append(marker)
+        msg_ids = {marker["msg_id"] for marker in response_markers}
+        assert len(msg_ids) == 1
+        msg_id = msg_ids.pop()
+        ready = self.markers.wait(
+            "complete_message_ready", checkpoint, peer=peer_id, msg_id=msg_id)
+        start = self.markers.wait(
+            "handler_start", checkpoint, peer=peer_id, msg_id=msg_id)
+        complete = self.markers.wait(
+            "handler_complete", checkpoint, peer=peer_id, msg_id=msg_id)
+        assert ready["msg"] == start["msg"] == complete["msg"] == service
+        for response in response_markers:
+            assert ready["steady_ns"] <= start["steady_ns"] <= response["steady_ns"]
+        final_response = max(response_markers, key=lambda marker: marker["steady_ns"])
         target = {
-            "active_job": response["job"],
+            "active_job": final_response["job"],
             "handler_complete_ns": complete["steady_ns"],
             "handler_processing_ns": complete["steady_ns"] - start["steady_ns"],
             "handler_queue_delay_ns": start["steady_ns"] - ready["steady_ns"],
@@ -473,7 +676,7 @@ class AsyncPNBPeerService(BitcoinTestFramework):
             "handler_scheduling_delay_ns": start["handler_turn_start_ns"] - ready["steady_ns"],
             "handler_turn_start_ns": start["handler_turn_start_ns"],
             "message_id": msg_id,
-            "node_service_latency_ns": response["steady_ns"] - ready["steady_ns"],
+            "node_service_latency_ns": final_response["steady_ns"] - ready["steady_ns"],
             "poll_ns": start["poll_ns"],
             "poll_pause_recv": start["poll_pause_recv"],
             "poll_queue_bytes": start["poll_queue_bytes"],
@@ -482,30 +685,37 @@ class AsyncPNBPeerService(BitcoinTestFramework):
             "ready_pause_recv": ready["pause_recv"],
             "ready_queue_bytes": ready["queue_bytes"],
             "ready_queue_depth": ready["queue_depth"],
-            "response_queued_ns": response["steady_ns"],
-            "send_pause": response["pause_send"],
-            "send_queue_bytes": response["send_queue_bytes"],
-            "send_queue_depth": response["send_queue_depth"],
+            "response_markers": response_markers,
+            "response_queued_ns": final_response["steady_ns"],
+            "response_transcript": [
+                {key: response[key] for key in ("response_bytes", "response_sha256", "type")}
+                for response in timing["responses"]
+            ],
+            "send_pause": final_response["pause_send"],
+            "send_queue_bytes": final_response["send_queue_bytes"],
+            "send_queue_depth": final_response["send_queue_depth"],
+            "service": service,
         }
-        assert target["handler_prefix_ns"] == start["steady_ns"] - target["handler_turn_start_ns"]
-        assert (target["handler_turn_start_ns"] <= target["poll_ns"]
-                <= start["steady_ns"] <= target["response_queued_ns"]
-                <= target["handler_complete_ns"])
-        assert target["ready_ns"] <= target["poll_ns"]
-        assert (target["handler_queue_delay_ns"]
-                == target["handler_scheduling_delay_ns"] + target["handler_prefix_ns"])
-        assert target["node_service_latency_ns"] == target["response_queued_ns"] - target["ready_ns"]
-        pause_values = (target["ready_pause_recv"], target["poll_pause_recv"], target["send_pause"])
+        assert target["handler_prefix_ns"] == start["steady_ns"] - start["handler_turn_start_ns"]
+        assert ready["steady_ns"] <= start["poll_ns"] <= start["steady_ns"] <= complete["steady_ns"]
+        pause_values = (
+            target["ready_pause_recv"], target["poll_pause_recv"], target["send_pause"])
         self.pause_metrics["snapshots_checked"] += len(pause_values)
         self.pause_metrics["pause_observations"] += sum(bool(value) for value in pause_values)
         assert not any(pause_values), "measured receive/send queue pause invalidates campaign"
         if pnb is not None:
             target["ready_inside_pnb"] = pnb["start_ns"] < target["ready_ns"] < pnb["end_ns"]
-            target["response_inside_pnb"] = pnb["start_ns"] < target["response_queued_ns"] < pnb["end_ns"]
+            target["response_inside_pnb"] = (
+                pnb["start_ns"] < target["response_queued_ns"] < pnb["end_ns"])
+            target["residual_pnb_ns_at_ready"] = max(0, pnb["end_ns"] - target["ready_ns"])
+            target["residual_delay_removed_ns"] = max(
+                0, target["node_service_latency_ns"] - target["residual_pnb_ns_at_ready"])
         return target
 
-    def _pnb_lifecycle(self, checkpoint, block_hash, job):
+    def _pnb_lifecycle(self, checkpoint, block_hash, job, continuation=None):
         submit = self.markers.unique("job_submit", checkpoint, hash=block_hash, job=job)
+        if continuation is not None:
+            assert submit["continuation"] == continuation
         start = self.markers.unique("pnb_start", checkpoint, hash=block_hash, job=job)
         end = self.markers.unique("pnb_end", checkpoint, hash=block_hash, job=job)
         assert submit["steady_ns"] <= start["steady_ns"] < end["steady_ns"]
@@ -536,153 +746,699 @@ class AsyncPNBPeerService(BitcoinTestFramework):
             })
         return lifecycle
 
-    def _calibrate(self, peer, peer_id, load, phase, trial, peer_index, nonce):
-        checkpoint = self.markers.checkpoint()
-        peer.begin_ping(nonce)
-        timing = peer.finish_ping(PING_TIMEOUT)
-        assert timing["completed"] and timing["connected"]
-        target = self._target_ping(peer_id, timing, checkpoint)
-        self._write_sample({
-            "kind": "calibration", "load": load, "mode": self.options.peer_service_mode,
-            "peer_id": peer_id, "peer_index": peer_index, "phase": phase, "trial": trial,
-            "nonce": nonce, "request_sent_ns": timing["request_sent_ns"],
-            "response_received_ns": timing["response_received_ns"],
-            "peer_rtt_ns": timing["response_received_ns"] - timing["request_sent_ns"],
-            "target": target,
-        })
+    @staticmethod
+    def _missing_coinbase_compact(block):
+        compact = HeaderAndShortIDs()
+        compact.header = CBlockHeader(block)
+        compact.nonce = 0
+        compact.use_witness = True
+        key0, key1 = compact.get_siphash_keys()
+        compact.shortids = [calculate_shortid(key0, key1, block.vtx[0].wtxid_int)]
+        return compact
 
-    def _measure_trial(self, source, peers, peer_ids, block, load, phase, trial, serial, mixed):
-        target_peer_ids = {entry["id"] for entry in self.nodes[0].getpeerinfo()}
-        expected_peer_ids = {self.source_id, *peer_ids}
-        assert target_peer_ids == expected_peer_ids
-        for index, (peer, peer_id) in enumerate(zip(peers, peer_ids)):
-            nonce = 0xC000000000000000 | (serial << 12) | index
-            self._calibrate(peer, peer_id, load, phase, trial, index, nonce)
+    @staticmethod
+    def _missing_all_compact(block):
+        compact = HeaderAndShortIDs()
+        compact.initialize_from_block(block, prefill_list=[], use_witness=True)
+        return compact
 
+    def _wait_pnb_job(self, checkpoint, block, continuation):
+        start = self.markers.wait("pnb_start", checkpoint, hash=block.hash_hex)
+        end = self.markers.wait(
+            "pnb_end", checkpoint, hash=block.hash_hex, job=start["job"])
+        self._wait_tip(block)
+        if self.options.peer_service_mode == "candidate":
+            self.markers.wait(
+                "result_publication", checkpoint, hash=block.hash_hex, job=start["job"])
+            self.markers.wait(
+                "result_collection", checkpoint, hash=block.hash_hex, job=start["job"])
+        lifecycle = self._pnb_lifecycle(
+            checkpoint, block.hash_hex, start["job"], continuation)
+        return {
+            "duration_ns": end["duration_ns"],
+            "end_ns": end["steady_ns"],
+            "job": start["job"],
+            "lifecycle": lifecycle,
+            "start_ns": start["steady_ns"],
+        }
+
+    def _deliver_full_block(self, source, block):
         self._announce(source, block)
         checkpoint = self.markers.checkpoint()
         source.send_without_ping(msg_block(block))
-        pnb_start = self.markers.wait("pnb_start", checkpoint, hash=block.hash_hex)
-        job = pnb_start["job"]
+        return self._wait_pnb_job(checkpoint, block, "standard")
 
-        order = list(range(load))
-        random.Random(self.options.peer_service_seed + serial).shuffle(order)
-        refused = set(order[:load // 2]) if mixed else set()
-        nonce_by_index = {
-            index: 0xD000000000000000 | (serial << 12) | index for index in range(load)
-        }
-        send_order = [
-            {"front_refused": index in refused, "nonce": nonce_by_index[index], "peer_index": index}
-            for index in order
-        ]
-        trial_input = {
+    def _deliver_blocktxn_block(self, source, block):
+        self._announce(source, block)
+        assert source.block_request_types[-1] == (block.hash_int, MSG_CMPCT_BLOCK)
+        source.blocktxn_requests.clear()
+        source.send_without_ping(
+            msg_cmpctblock(self._missing_coinbase_compact(block).to_p2p()))
+        source.wait_until(
+            lambda: any(request.blockhash == block.hash_int
+                        for request in source.blocktxn_requests),
+            timeout=PING_TIMEOUT)
+        request = next(request for request in source.blocktxn_requests
+                       if request.blockhash == block.hash_int)
+        assert request.to_absolute() == [0]
+        response = msg_blocktxn()
+        response.block_transactions = BlockTransactions(
+            block.hash_int, [block.vtx[0]])
+        checkpoint = self.markers.checkpoint()
+        source.send_without_ping(response)
+        return self._wait_pnb_job(checkpoint, block, "standard")
+
+    def _deliver_optimistic_compact_block(self, source, blockers, block):
+        assert len(blockers) == 3
+        self._announce(blockers[0], block)
+        assert blockers[0].block_request_types[-1] == (block.hash_int, MSG_CMPCT_BLOCK)
+        missing = msg_cmpctblock(self._missing_coinbase_compact(block).to_p2p())
+        for blocker in blockers:
+            blocker.blocktxn_requests.clear()
+            blocker.send_without_ping(missing)
+            blocker.wait_until(
+                lambda blocker=blocker: any(
+                    request.blockhash == block.hash_int
+                    for request in blocker.blocktxn_requests),
+                timeout=PING_TIMEOUT)
+        complete = HeaderAndShortIDs()
+        complete.initialize_from_block(
+            block, prefill_list=[0], use_witness=True)
+        checkpoint = self.markers.checkpoint()
+        source.send_without_ping(msg_cmpctblock(complete.to_p2p()))
+        return self._wait_pnb_job(checkpoint, block, "optimistic_compact")
+
+    def _calibrate_service_fixtures(self, fixture):
+        """Prove every fixed request is eligible outside PNB before timing it."""
+        transcripts = {}
+        for index, service in enumerate(SERVICE_CLASSES):
+            peer, peer_id = self._new_service_peer(service)
+            service_fixture = {**fixture, "nonce": 0xC000000000000000 | index}
+            checkpoint = self.markers.checkpoint()
+            self._begin_service_request(peer, service, service_fixture)
+            timing = peer.finish_service_request()
+            self._validate_service_response(timing, service_fixture)
+            target = self._target_service(peer_id, timing, checkpoint)
+            transcripts[service] = target["response_transcript"]
+            response_received_ns = max(
+                response["received_ns"] for response in timing["responses"])
+            self._write_sample({
+                "completed": True,
+                "connected": timing["connected"],
+                "eligible": True,
+                "kind": "calibration",
+                "mode": self.options.peer_service_mode,
+                "peer_id": peer_id,
+                "peer_rtt_ns": response_received_ns - timing["request_sent_ns"],
+                "request_sent_ns": timing["request_sent_ns"],
+                "response_received_ns": response_received_ns,
+                "response_transcript": target["response_transcript"],
+                "service": service,
+                "target": target,
+                "workload": "outside_pnb",
+            })
+            peer.peer_disconnect()
+            peer.wait_for_disconnect()
+        return transcripts
+
+    def _start_producer_form(self, source, block, producer_form, blockers=()):
+        """Submit the final wire message for one of the three audited P2P routes."""
+        if producer_form == "full_block":
+            self._announce(source, block)
+            checkpoint = self.markers.checkpoint()
+            source.send_without_ping(msg_block(block))
+            continuation = "standard"
+        elif producer_form == "blocktxn":
+            self._announce(source, block)
+            source.blocktxn_requests.clear()
+            source.send_without_ping(
+                msg_cmpctblock(self._missing_all_compact(block).to_p2p()))
+            source.wait_until(
+                lambda: any(request.blockhash == block.hash_int
+                            for request in source.blocktxn_requests),
+                timeout=PING_TIMEOUT)
+            request = next(request for request in source.blocktxn_requests
+                           if request.blockhash == block.hash_int)
+            indexes = request.to_absolute()
+            assert indexes and indexes == sorted(set(indexes))
+            response = msg_blocktxn()
+            response.block_transactions = BlockTransactions(
+                block.hash_int, [block.vtx[index] for index in indexes])
+            checkpoint = self.markers.checkpoint()
+            source.send_without_ping(response)
+            continuation = "standard"
+        elif producer_form == "optimistic_compact":
+            assert len(blockers) == 3
+            self._announce(blockers[0], block)
+            missing = msg_cmpctblock(self._missing_all_compact(block).to_p2p())
+            for blocker in blockers:
+                blocker.blocktxn_requests.clear()
+                blocker.send_without_ping(missing)
+                blocker.wait_until(
+                    lambda blocker=blocker: any(
+                        request.blockhash == block.hash_int
+                        for request in blocker.blocktxn_requests),
+                    timeout=PING_TIMEOUT)
+            complete = HeaderAndShortIDs()
+            complete.initialize_from_block(
+                block, prefill_list=list(range(len(block.vtx))), use_witness=True)
+            checkpoint = self.markers.checkpoint()
+            source.send_without_ping(msg_cmpctblock(complete.to_p2p()))
+            continuation = "optimistic_compact"
+        else:
+            raise AssertionError(producer_form)
+
+        start = self.markers.wait("pnb_start", checkpoint, hash=block.hash_hex)
+        return checkpoint, start, continuation
+
+    def _finish_measured_pnb(self, block, checkpoint, start, continuation):
+        end = self.markers.wait(
+            "pnb_end", checkpoint, hash=block.hash_hex, job=start["job"])
+        self._wait_tip(block)
+        if self.options.peer_service_mode == "candidate":
+            self.markers.wait(
+                "result_collection", checkpoint,
+                hash=block.hash_hex, job=start["job"])
+        lifecycle = self._pnb_lifecycle(
+            checkpoint, block.hash_hex, start["job"], continuation)
+        assert lifecycle["job_submit"]["source"] == self.source_id
+        return {
+            "duration_ns": end["duration_ns"],
+            "end_ns": end["steady_ns"],
+            "job": start["job"],
+            "start_ns": start["steady_ns"],
+        }, lifecycle
+
+    def _record_request_sample(self, *, block, fixture, front_refused, lifecycle,
+                               peer_id, phase, pnb, producer_form, send_position,
+                               serial, service, target, timing, trial, workload):
+        response_received_ns = max(
+            response["received_ns"] for response in timing["responses"])
+        sample = {
             "block_hash": block.hash_hex,
-            "expected_target_peer_count": load + 1,
-            "load": load,
+            "completed": timing["completed"],
+            "connected": timing["connected"],
+            "correlation_failed": False,
+            "disconnected": not timing["connected"],
+            "eligible": True,
+            "front_refused": front_refused,
+            "kind": "request",
+            "lifecycle": lifecycle,
+            "mode": self.options.peer_service_mode,
+            "peer_id": peer_id,
+            "peer_rtt_ns": response_received_ns - timing["request_sent_ns"],
             "phase": phase,
-            "refused_peer_indices": sorted(refused),
+            "pnb": pnb,
+            "producer_form": producer_form,
+            "request_sent_ns": timing["request_sent_ns"],
+            "response_count": len(timing["responses"]),
+            "response_received_ns": response_received_ns,
+            "response_transcript": target["response_transcript"],
+            "send_position": send_position,
+            "serial": serial,
+            "service": service,
+            "target": target,
+            "timed_out": not timing["completed"],
+            "trial": trial,
+            "workload": workload,
+        }
+        if service == "ping": sample["nonce"] = fixture["nonce"]
+        if service in {"getblocktxn", "getheaders"}:
+            sample["fixture_block_hash"] = fixture["recent_block"].hash_hex
+        if service == "getdata":
+            sample["fixture_tx_hash"] = f"{fixture['unknown_tx_hash']:064x}"
+        self._write_sample(sample)
+        return sample
+
+    def _measure_isolated_trial(self, source, block, fixture, service, phase,
+                                trial, serial, producer_form="full_block", blockers=()):
+        peer, peer_id = self._new_service_peer(service)
+        service_fixture = {**fixture, "nonce": 0xD000000000000000 | serial}
+        checkpoint, start, continuation = self._start_producer_form(
+            source, block, producer_form, blockers)
+        self._begin_service_request(peer, service, service_fixture)
+        timing = peer.finish_service_request()
+        pnb, lifecycle = self._finish_measured_pnb(
+            block, checkpoint, start, continuation)
+        self._validate_service_response(timing, service_fixture)
+        target = self._target_service(peer_id, timing, checkpoint, pnb)
+        assert target["ready_inside_pnb"]
+        self.trial_inputs.append({
+            "block_hash": block.hash_hex,
+            "phase": phase,
+            "producer_form": producer_form,
+            "fixture_block_hash": fixture["recent_block"].hash_hex,
+            "serial": serial,
+            "service": service,
+            "trial": trial,
+            "workload": "isolated" if phase != "source_form" else "source_form",
+        })
+        sample = self._record_request_sample(
+            block=block, fixture=service_fixture, front_refused=False,
+            lifecycle=lifecycle, peer_id=peer_id, phase=phase, pnb=pnb,
+            producer_form=producer_form, send_position=0, serial=serial,
+            service=service, target=target, timing=timing, trial=trial,
+            workload="isolated" if phase != "source_form" else "source_form")
+        self._write_sample({
+            "block_hash": block.hash_hex,
+            "busy_send_prefix_summary": lifecycle.get("busy_send_prefix_summary"),
+            "completed": 1,
+            "failed": 0,
+            "kind": "trial",
+            "mode": self.options.peer_service_mode,
+            "offered": 1,
+            "phase": phase,
+            "pnb": pnb,
+            "producer_form": producer_form,
+            "ready_inside_pnb": int(target["ready_inside_pnb"]),
+            "response_inside_pnb": int(target["response_inside_pnb"]),
+            "serial": serial,
+            "service": service,
+            "timed_out": 0,
+            "trial": trial,
+            "workload": sample["workload"],
+        })
+        if phase in {"trial", "warmup"}:
+            aggregate = self.aggregate if phase == "trial" else self.warmup_aggregate
+            for values in (aggregate, aggregate["by_service"][service]):
+                values["offered"] += 1
+                values["eligible"] += 1
+                values["completed"] += 1
+                values["ready_inside_pnb"] += int(target["ready_inside_pnb"])
+                values["response_inside_pnb"] += int(target["response_inside_pnb"])
+        peer.peer_disconnect()
+        peer.wait_for_disconnect()
+        return target
+
+    def _measure_mixed_trial(self, source, block, fixture, trial, serial):
+        entries = []
+        for service in SERVICE_CLASSES:
+            peer, peer_id = self._new_service_peer(service)
+            entries.append((service, peer, peer_id))
+        refused_peer, refused_peer_id = self._new_service_peer("ping")
+        checkpoint, start, continuation = self._start_producer_form(
+            source, block, "full_block")
+
+        order = list(range(len(entries)))
+        random.Random(self.options.peer_service_seed + serial).shuffle(order)
+        fixtures = {}
+        for position, index in enumerate(order):
+            service, peer, _peer_id = entries[index]
+            service_fixture = {
+                **fixture, "nonce": 0xE000000000000000 | (serial << 8) | index}
+            fixtures[service] = service_fixture
+            self._begin_service_request(peer, service, service_fixture)
+        refused_fixture = {
+            **fixture, "nonce": 0xE100000000000000 | serial}
+        refused_peer.send_without_ping(msg_generic(b"block", b""))
+        self._begin_service_request(refused_peer, "ping", refused_fixture)
+
+        deadline = time.monotonic() + PING_TIMEOUT * self.options.timeout_factor
+        timings = {}
+        for service, peer, _peer_id in entries:
+            timings[service] = peer.finish_service_request(
+                deadline - time.monotonic())
+        refused_timing = refused_peer.finish_service_request(
+            deadline - time.monotonic())
+        pnb, lifecycle = self._finish_measured_pnb(
+            block, checkpoint, start, continuation)
+
+        send_position = {index: position for position, index in enumerate(order)}
+        samples = []
+        for index, (service, _peer, peer_id) in enumerate(entries):
+            timing = timings[service]
+            self._validate_service_response(timing, fixtures[service])
+            target = self._target_service(peer_id, timing, checkpoint, pnb)
+            assert target["ready_inside_pnb"]
+            samples.append(self._record_request_sample(
+                block=block, fixture=fixtures[service], front_refused=False,
+                lifecycle=lifecycle, peer_id=peer_id, phase="trial", pnb=pnb,
+                producer_form="full_block", send_position=send_position[index],
+                serial=serial, service=service, target=target, timing=timing,
+                trial=trial, workload="mixed_fifo"))
+        self._validate_service_response(refused_timing, refused_fixture)
+        refused_target = self._target_service(
+            refused_peer_id, refused_timing, checkpoint, pnb)
+        assert refused_target["ready_inside_pnb"]
+        assert refused_target["response_queued_ns"] >= pnb["end_ns"]
+        samples.append(self._record_request_sample(
+            block=block, fixture=refused_fixture, front_refused=True,
+            lifecycle=lifecycle, peer_id=refused_peer_id, phase="trial", pnb=pnb,
+            producer_form="full_block", send_position=len(entries), serial=serial,
+            service="ping", target=refused_target, timing=refused_timing,
+            trial=trial, workload="mixed_fifo"))
+
+        send_order = [SERVICE_CLASSES[index] for index in order]
+        self.trial_inputs.append({
+            "block_hash": block.hash_hex,
+            "blocked_cohort": ["ping"],
+            "phase": "trial",
+            "producer_form": "full_block",
+            "fixture_block_hash": fixture["recent_block"].hash_hex,
             "send_order": send_order,
             "serial": serial,
             "trial": trial,
-        }
-        self.trial_inputs.append(trial_input)
-        send_position = {index: position for position, index in enumerate(order)}
-        timings = {}
-        for index in order:
-            if index in refused:
-                peers[index].send_without_ping(msg_getaddr())
-            peers[index].begin_ping(nonce_by_index[index])
-        deadline = time.monotonic() + PING_TIMEOUT * self.options.timeout_factor
-        for index in order:
-            timings[index] = peers[index].finish_ping(deadline - time.monotonic())
-
-        pnb_end = self.markers.wait("pnb_end", checkpoint, hash=block.hash_hex, job=job)
-        pnb = {
-            "duration_ns": pnb_end["duration_ns"], "end_ns": pnb_end["steady_ns"],
-            "job": job, "start_ns": pnb_start["steady_ns"],
-        }
-        self._wait_tip(block)
-        submit = self.markers.wait("job_submit", checkpoint, hash=block.hash_hex, job=job)
-        assert submit["source"] == self.source_id
-        if self.options.peer_service_mode == "candidate":
-            self.markers.wait("worker_wake", checkpoint, hash=block.hash_hex, job=job)
-            self.markers.wait("result_publication", checkpoint, hash=block.hash_hex, job=job)
-            self.markers.wait("result_collection", checkpoint, hash=block.hash_hex, job=job)
-        lifecycle = self._pnb_lifecycle(checkpoint, block.hash_hex, job)
-        busy_send_prefix = lifecycle.get("busy_send_prefix_summary")
-
-        completed = 0
-        ready_inside = 0
-        response_inside = 0
-        for index in range(load):
-            timing = timings[index]
-            target = self._target_ping(peer_ids[index], timing, checkpoint, pnb)
-            completed += int(timing["completed"])
-            ready_inside += int(target is not None and target["ready_inside_pnb"])
-            response_inside += int(target is not None and target["response_inside_pnb"])
-            self._write_sample({
-                "kind": "request", "block_hash": block.hash_hex, "front_refused": index in refused,
-                "load": load, "mode": self.options.peer_service_mode, "peer_id": peer_ids[index],
-                "peer_index": index, "phase": phase, "trial": trial, "nonce": timing["nonce"],
-                "send_position": send_position[index],
-                "completed": timing["completed"], "connected": timing["connected"],
-                "response_count": timing["response_count"], "request_sent_ns": timing["request_sent_ns"],
-                "response_received_ns": timing["response_received_ns"],
-                "peer_rtt_ns": (timing["response_received_ns"] - timing["request_sent_ns"]
-                                if timing["response_received_ns"] is not None else None),
-                "target": target, "pnb": pnb,
-            })
-        assert ready_inside > 0, "no request overlapped real PNB"
-        if self.options.peer_service_profile == "smoke":
-            assert completed == load
-            if self.options.peer_service_mode == "candidate":
-                assert response_inside > 0
-            else:
-                assert response_inside == 0
-        self._write_sample({
-            "kind": "trial", "block_hash": block.hash_hex, "completed": completed,
-            "failed": load - completed, "load": load, "mode": self.options.peer_service_mode,
-            "offered": load, "phase": phase, "pnb": pnb, "ready_inside_pnb": ready_inside,
-            "refused_peer_indices": sorted(refused), "send_order": send_order,
-            "source_peer_id": self.source_id, "service_peer_ids": peer_ids,
-            "target_peer_count": len(target_peer_ids),
-            "busy_send_prefix_summary": busy_send_prefix,
-            "response_inside_pnb": response_inside, "timed_out": sum(not value["completed"] for value in timings.values()),
-            "trial": trial,
+            "workload": "mixed_fifo",
         })
-        aggregate = self.aggregate if phase == "trial" else self.warmup_aggregate
-        aggregate["offered"] += load
-        aggregate["completed"] += completed
-        aggregate["failed"] += load - completed
-        aggregate["response_inside_pnb"] += response_inside
+        response_inside = sum(
+            int(sample["target"]["response_inside_pnb"]) for sample in samples)
+        completion_order = [
+            {"front_refused": sample["front_refused"],
+             "peer_id": sample["peer_id"], "service": sample["service"]}
+            for sample in sorted(
+                samples, key=lambda value: value["target"]["response_queued_ns"])
+        ]
+        response_times = sorted(
+            sample["target"]["response_queued_ns"] for sample in samples)
+        maximum_service_gap_ns = max(
+            (later - earlier for earlier, later in zip(response_times, response_times[1:])),
+            default=0)
+        self._write_sample({
+            "block_hash": block.hash_hex,
+            "blocked_cohort": ["ping"],
+            "busy_send_prefix_summary": lifecycle.get("busy_send_prefix_summary"),
+            "completed": len(samples),
+            "completion_order": completion_order,
+            "failed": 0,
+            "kind": "trial",
+            "mode": self.options.peer_service_mode,
+            "offered": len(samples),
+            "phase": "trial",
+            "pnb": pnb,
+            "producer_form": "full_block",
+            "ready_inside_pnb": len(samples),
+            "response_inside_pnb": response_inside,
+            "responses_per_pnb": len(samples),
+            "send_order": send_order,
+            "serial": serial,
+            "maximum_service_gap_ns": maximum_service_gap_ns,
+            "timed_out": 0,
+            "trial": trial,
+            "workload": "mixed_fifo",
+        })
+        for sample in samples:
+            for values in (
+                    self.aggregate,
+                    self.aggregate["by_service"][sample["service"]]):
+                values["offered"] += 1
+                values["eligible"] += 1
+                values["completed"] += 1
+                values["ready_inside_pnb"] += int(
+                    sample["target"]["ready_inside_pnb"])
+                values["response_inside_pnb"] += int(
+                    sample["target"]["response_inside_pnb"])
+        for _service, peer, _peer_id in entries:
+            peer.peer_disconnect()
+            peer.wait_for_disconnect()
+        refused_peer.peer_disconnect()
+        refused_peer.wait_for_disconnect()
+
+    def _new_service_peer(self, service):
+        peer = PeerServicePeer()
+        if service == "version":
+            self.nodes[0].add_p2p_connection(
+                peer, send_version=False, wait_for_verack=False)
+            peer_id = self._map_peer_id(peer, require_subversion=False)
+        else:
+            self.nodes[0].add_p2p_connection(peer)
+            peer_id = self._map_peer_id(peer)
+        return peer, peer_id
+
+    def _prove_service_fixtures(self, fixture):
+        transcripts = {}
+        for index, service in enumerate(SERVICE_CLASSES):
+            peer, peer_id = self._new_service_peer(service)
+            service_fixture = {**fixture, "nonce": 0xA100000000000000 | index}
+            checkpoint = self.markers.checkpoint()
+            self._begin_service_request(peer, service, service_fixture)
+            timing = peer.finish_service_request()
+            self._validate_service_response(timing, service_fixture)
+            target = self._target_service(peer_id, timing, checkpoint)
+            transcripts[service] = target["response_transcript"]
+            peer.peer_disconnect()
+            peer.wait_for_disconnect()
+        return transcripts
 
     def _run_quick(self):
         node = self.nodes[0]
         assert node.getblockcount() == 200
         self._initialize_block_inputs()
+        seed_addresses = {f"1.2.3.{index}" for index in range(1, 17)}
+        for address in sorted(seed_addresses):
+            node.addpeeraddress(address, 18444)
+
         source = node.add_p2p_connection(PeerServicePeer())
-        service = node.add_p2p_connection(PeerServicePeer())
-        service_id = self._map_peer_id(service)
+        blocker0 = node.add_p2p_connection(PeerServicePeer())
+        blocker1 = node.add_p2p_connection(PeerServicePeer())
+        blocker2 = node.add_outbound_p2p_connection(
+            PeerServicePeer(), p2p_idx=0,
+            connection_type="outbound-full-relay")
+        source_id = self._map_peer_id(source)
+        blocker_ids = [self._map_peer_id(peer) for peer in (blocker0, blocker1, blocker2)]
         self.markers = MarkerReader(node.debug_log_path, self.options.timeout_factor)
-        block = self._quick_block()
-        self._announce(source, block)
-        checkpoint = self.markers.checkpoint()
-        source.send_without_ping(msg_block(block))
-        start = self.markers.wait("pnb_start", checkpoint, hash=block.hash_hex)
-        service.begin_ping(0xA5A5A5A5A5A5A5A5)
-        timing = service.finish_ping(PING_TIMEOUT)
-        assert timing["completed"]
-        self._target_ping(service_id, timing, checkpoint)
-        self.markers.wait("pnb_end", checkpoint, hash=block.hash_hex, job=start["job"])
-        self._wait_tip(block)
+
+        for peer in (source, blocker0, blocker1, blocker2):
+            peer.send_and_ping(msg_sendcmpct(announce=False, version=2))
+
+        # Prove the three P2P producer forms and their exact continuation kinds.
+        full_block = self._quick_block()
+        self._deliver_full_block(source, full_block)
+        for peer in (blocker1, blocker2):
+            setup_block = self._quick_block()
+            self._deliver_full_block(peer, setup_block)
+        self.wait_until(
+            lambda: all(
+                next(info for info in node.getpeerinfo() if info["id"] == peer_id)["bip152_hb_to"]
+                for peer_id in (source_id, blocker_ids[1], blocker_ids[2])),
+            timeout=PING_TIMEOUT, check_interval=MARKER_POLL)
+
+        blocktxn_block = self._quick_block()
+        self._deliver_blocktxn_block(source, blocktxn_block)
+        optimistic_block = self._quick_block()
+        self._deliver_optimistic_compact_block(
+            source, (blocker0, blocker1, blocker2), optimistic_block)
+
+        # The service positive control below must contain only the producer and
+        # one target peer. In particular, do not let an unrelated producer-proof
+        # peer's ordinary SendMessages pass obscure the service mechanism under
+        # test.
+        for peer in (blocker0, blocker1, blocker2):
+            peer.peer_disconnect()
+            peer.wait_for_disconnect()
+        self.wait_until(
+            lambda: ({entry["id"] for entry in node.getpeerinfo()} == {source_id}
+                     and node.getconnectioncount() == 1),
+            timeout=PING_TIMEOUT, check_interval=MARKER_POLL)
+
+        unknown_tx_hash = int.from_bytes(
+            hashlib.sha256(b"async-pnb-peer-service-notfound").digest(), "big")
+        base_fixture = {
+            "recent_block": optimistic_block,
+            "seed_addresses": seed_addresses,
+            "unknown_tx_hash": unknown_tx_hash,
+        }
+        calibration_transcripts = self._prove_service_fixtures(base_fixture)
+
+        # Use one real near-full PNB to prove all fixed services, source fencing,
+        # and exact-front producer head-of-line blocking in a single mixed turn.
+        address_wallet = MiniWallet(node)
+        p2pk_wallet = MiniWallet(node, mode=MiniWalletMode.RAW_P2PK)
+        seed, recent_block = self._create_funding(source, address_wallet, p2pk_wallet)
+        isolated_block, seed = self._build_work_block(p2pk_wallet, seed)
+
+        isolated_peer, isolated_peer_id = self._new_service_peer("ping")
+        isolated_fixture = {
+            "nonce": 0xA000000000000000,
+            "recent_block": recent_block,
+            "seed_addresses": seed_addresses,
+            "unknown_tx_hash": unknown_tx_hash,
+        }
+        self._announce(source, isolated_block)
+        isolated_checkpoint = self.markers.checkpoint()
+        source.send_without_ping(msg_block(isolated_block))
+        isolated_start = self.markers.wait(
+            "pnb_start", isolated_checkpoint, hash=isolated_block.hash_hex)
+        self._begin_service_request(isolated_peer, "ping", isolated_fixture)
+        isolated_timing = isolated_peer.finish_service_request()
+        isolated_end = self.markers.wait(
+            "pnb_end", isolated_checkpoint, hash=isolated_block.hash_hex,
+            job=isolated_start["job"])
+        self._wait_tip(isolated_block)
         if self.options.peer_service_mode == "candidate":
-            self.markers.wait("result_publication", checkpoint,
-                              hash=block.hash_hex, job=start["job"])
-            self.markers.wait("result_collection", checkpoint, hash=block.hash_hex, job=start["job"])
-        self._pnb_lifecycle(checkpoint, block.hash_hex, start["job"])
+            self.markers.wait(
+                "result_collection", isolated_checkpoint,
+                hash=isolated_block.hash_hex, job=isolated_start["job"])
+        self._validate_service_response(isolated_timing, isolated_fixture)
+        isolated_target = self._target_service(
+            isolated_peer_id, isolated_timing, isolated_checkpoint, {
+                "start_ns": isolated_start["steady_ns"],
+                "end_ns": isolated_end["steady_ns"],
+            })
+        assert isolated_target["ready_inside_pnb"]
+        # Keep the timing outcome observational. The ordinary prefix may wait
+        # on ProcessOrphanTx(cs_main), and this functional oracle must not tune
+        # topology or scheduling until a response happens inside PNB.
+        isolated_outcome = {
+            "handler_turn_started_inside_pnb": (
+                isolated_start["steady_ns"]
+                < isolated_target["handler_turn_start_ns"]
+                < isolated_end["steady_ns"]),
+            "ready_inside_pnb": isolated_target["ready_inside_pnb"],
+            "response_inside_pnb": isolated_target["response_inside_pnb"],
+        }
+        self._pnb_lifecycle(
+            isolated_checkpoint, isolated_block.hash_hex,
+            isolated_start["job"], "standard")
+        isolated_peer.peer_disconnect()
+        isolated_peer.wait_for_disconnect()
+
+        work_block, seed = self._build_work_block(p2pk_wallet, seed)
+        service_entries = []
+        for service in SERVICE_CLASSES:
+            peer, peer_id = self._new_service_peer(service)
+            service_entries.append((service, peer, peer_id))
+        refused_peer, refused_peer_id = self._new_service_peer("ping")
+
+        mixed_fixture = {
+            "recent_block": recent_block,
+            "seed_addresses": seed_addresses,
+            "unknown_tx_hash": unknown_tx_hash,
+        }
+        self._announce(source, work_block)
+        checkpoint = self.markers.checkpoint()
+        source.send_without_ping(msg_block(work_block))
+        start = self.markers.wait("pnb_start", checkpoint, hash=work_block.hash_hex)
+
+        source_fixture = {**mixed_fixture, "nonce": 0xA200000000000000}
+        self._begin_service_request(source, "ping", source_fixture)
+        refused_peer.send_without_ping(msg_generic(b"block", b""))
+        refused_fixture = {**mixed_fixture, "nonce": 0xA300000000000000}
+        self._begin_service_request(refused_peer, "ping", refused_fixture)
+        order = list(range(len(service_entries)))
+        random.Random(self.options.peer_service_seed).shuffle(order)
+        fixtures = {}
+        for index in order:
+            service, peer, _peer_id = service_entries[index]
+            fixture = {**mixed_fixture, "nonce": 0xA400000000000000 | index}
+            fixtures[service] = fixture
+            self._begin_service_request(peer, service, fixture)
+
+        deadline = time.monotonic() + PING_TIMEOUT * self.options.timeout_factor
+        timings = {}
+        for service, peer, _peer_id in service_entries:
+            timings[service] = peer.finish_service_request(deadline - time.monotonic())
+        source_timing = source.finish_service_request(deadline - time.monotonic())
+        refused_timing = refused_peer.finish_service_request(deadline - time.monotonic())
+
+        end = self.markers.wait(
+            "pnb_end", checkpoint, hash=work_block.hash_hex, job=start["job"])
+        self._wait_tip(work_block)
+        if self.options.peer_service_mode == "candidate":
+            self.markers.wait(
+                "result_publication", checkpoint,
+                hash=work_block.hash_hex, job=start["job"])
+            collection = self.markers.wait(
+                "result_collection", checkpoint,
+                hash=work_block.hash_hex, job=start["job"])
+        else:
+            collection = {"steady_ns": end["steady_ns"]}
+        self._pnb_lifecycle(
+            checkpoint, work_block.hash_hex, start["job"], "standard")
+        pnb = {
+            "duration_ns": end["duration_ns"],
+            "end_ns": end["steady_ns"],
+            "job": start["job"],
+            "start_ns": start["steady_ns"],
+        }
+
+        mixed_transcripts = {}
+        mixed_outcomes = {}
+        for service, _peer, peer_id in service_entries:
+            timing = timings[service]
+            self._validate_service_response(timing, fixtures[service])
+            target = self._target_service(peer_id, timing, checkpoint, pnb)
+            assert target["ready_inside_pnb"]
+            mixed_transcripts[service] = target["response_transcript"]
+            mixed_outcomes[service] = {
+                "ready_inside_pnb": target["ready_inside_pnb"],
+                "response_inside_pnb": target["response_inside_pnb"],
+            }
+
+        self._validate_service_response(source_timing, source_fixture)
+        source_target = self._target_service(source_id, source_timing, checkpoint, pnb)
+        assert source_target["ready_inside_pnb"]
+        assert source_target["response_queued_ns"] >= collection["steady_ns"]
+        self._validate_service_response(refused_timing, refused_fixture)
+        refused_target = self._target_service(
+            refused_peer_id, refused_timing, checkpoint, pnb)
+        assert refused_target["ready_inside_pnb"]
+        assert refused_target["response_queued_ns"] >= end["steady_ns"]
+
+        # Invalid-source punishment is applied before its later PING can run.
+        invalid_source = node.add_p2p_connection(PeerServicePeer())
+        invalid_block = self._invalid_quick_block()
+        self._announce(invalid_source, invalid_block)
+        invalid_checkpoint = self.markers.checkpoint()
+        invalid_source.send_without_ping(msg_block(invalid_block))
+        invalid_start = self.markers.wait(
+            "pnb_start", invalid_checkpoint, hash=invalid_block.hash_hex)
+        invalid_nonce = 0xA500000000000000
+        invalid_source.send_without_ping(msg_ping(invalid_nonce))
+        self.markers.wait(
+            "pnb_end", invalid_checkpoint, hash=invalid_block.hash_hex,
+            job=invalid_start["job"])
+        if self.options.peer_service_mode == "candidate":
+            self.markers.wait(
+                "result_collection", invalid_checkpoint,
+                hash=invalid_block.hash_hex, job=invalid_start["job"])
+        invalid_source.wait_for_disconnect(timeout=PING_TIMEOUT)
+        assert node.getbestblockhash() == work_block.hash_hex
+        assert invalid_nonce not in invalid_source.pong_nonces
+        self._pnb_lifecycle(
+            invalid_checkpoint, invalid_block.hash_hex,
+            invalid_start["job"], "standard")
+
+        # Disconnecting the source during a running job retains global cleanup.
+        disconnect_source = node.add_p2p_connection(PeerServicePeer())
+        disconnect_block = self._quick_block()
+        self._announce(disconnect_source, disconnect_block)
+        disconnect_checkpoint = self.markers.checkpoint()
+        disconnect_source.send_without_ping(msg_block(disconnect_block))
+        disconnect_start = self.markers.wait(
+            "pnb_start", disconnect_checkpoint, hash=disconnect_block.hash_hex)
+        disconnect_source.peer_disconnect()
+        disconnect_source.wait_for_disconnect()
+        self._wait_pnb_job(disconnect_checkpoint, disconnect_block, "standard")
+
+        # Active-job shutdown drains, collects, and restarts at the same tip.
+        shutdown_block, _seed = self._build_work_block(p2pk_wallet, seed)
+        expected_height = node.getblockcount() + 1
+        self._announce(source, shutdown_block)
+        shutdown_checkpoint = self.markers.checkpoint()
+        source.send_without_ping(msg_block(shutdown_block))
+        shutdown_start = self.markers.wait(
+            "pnb_start", shutdown_checkpoint, hash=shutdown_block.hash_hex)
+        node.stop_node()
+        self.markers.wait(
+            "pnb_end", shutdown_checkpoint, hash=shutdown_block.hash_hex,
+            job=shutdown_start["job"])
+        if self.options.peer_service_mode == "candidate":
+            self.markers.wait(
+                "result_collection", shutdown_checkpoint,
+                hash=shutdown_block.hash_hex, job=shutdown_start["job"])
+        self._pnb_lifecycle(
+            shutdown_checkpoint, shutdown_block.hash_hex,
+            shutdown_start["job"], "standard")
+        self.start_node(0)
+        assert node.getblockcount() == expected_height
+        assert node.getbestblockhash() == shutdown_block.hash_hex
+
         self.log.info(
-            "Deterministic input identity start_hash=%s block_hash=%s ordered_sha256=%s",
-            self.chain_start["hash"], block.hash_hex, self.block_input_hasher.hexdigest())
+            "Deterministic input identity start_hash=%s end_hash=%s ordered_sha256=%s calibration=%s isolated=%s mixed=%s",
+            self.chain_start["hash"], shutdown_block.hash_hex,
+            self.block_input_hasher.hexdigest(), calibration_transcripts,
+            isolated_outcome,
+            {"outcomes": mixed_outcomes, "transcripts": mixed_transcripts})
 
     def _provenance(self, node, binary):
         source_dir = Path(self.config["environment"]["SRCDIR"])
@@ -787,10 +1543,15 @@ class AsyncPNBPeerService(BitcoinTestFramework):
         node = self.nodes[0]
         assert node.getblockcount() == 200 and not node.getblockchaininfo()["initialblockdownload"]
         self._initialize_block_inputs()
+        seed_addresses = {f"1.2.3.{index}" for index in range(1, 17)}
+        for address in sorted(seed_addresses):
+            node.addpeeraddress(address, 18444)
+
         setup_peer = node.add_p2p_connection(PeerServicePeer())
         address_wallet = MiniWallet(node)
         p2pk_wallet = MiniWallet(node, mode=MiniWalletMode.RAW_P2PK)
-        seed = self._create_funding(setup_peer, address_wallet, p2pk_wallet)
+        seed, recent_block = self._create_funding(
+            setup_peer, address_wallet, p2pk_wallet)
         node.disconnect_p2ps()
         self.wait_until(
             lambda: not node.getpeerinfo() and node.getconnectioncount() == 0,
@@ -799,27 +1560,92 @@ class AsyncPNBPeerService(BitcoinTestFramework):
         source = node.add_p2p_connection(PeerServicePeer())
         self.source_id = self._map_peer_id(source)
         self.markers = MarkerReader(node.debug_log_path, self.options.timeout_factor)
-        profile = PROFILES[self.options.peer_service_profile]
+        source.send_and_ping(msg_sendcmpct(announce=False, version=2))
+        fixture = {
+            "recent_block": recent_block,
+            "seed_addresses": seed_addresses,
+            "unknown_tx_hash": int.from_bytes(
+                hashlib.sha256(b"async-pnb-peer-service-notfound").digest(), "big"),
+        }
+        calibration_transcripts = self._calibrate_service_fixtures(fixture)
+        self._write_sample({
+            "kind": "calibration_summary",
+            "mode": self.options.peer_service_mode,
+            "services": list(SERVICE_CLASSES),
+            "transcripts": calibration_transcripts,
+        })
+
+        # One real near-full service trial for each audited producer route.
+        # These are route probes, not part of the retained class aggregates.
         serial = 0
-        for load in profile["loads"]:
-            assert {entry["id"] for entry in node.getpeerinfo()} == {self.source_id}
-            assert node.getconnectioncount() == 1
-            peers = [node.add_p2p_connection(PeerServicePeer()) for _ in range(load)]
-            peer_ids = [self._map_peer_id(peer) for peer in peers]
-            assert len(set(peer_ids + [self.source_id])) == load + 1
-            for phase, count in (("warmup", profile["warmups"]), ("trial", profile["trials"])):
-                for trial in range(count):
+        block, seed = self._build_work_block(p2pk_wallet, seed)
+        serial += 1
+        self._measure_isolated_trial(
+            source, block, fixture, "ping", "source_form", 0, serial,
+            producer_form="full_block")
+        fixture["recent_block"] = block
+        self.wait_until(
+            lambda: next(info for info in node.getpeerinfo()
+                         if info["id"] == self.source_id)["bip152_hb_to"],
+            timeout=PING_TIMEOUT, check_interval=MARKER_POLL)
+
+        block, seed = self._build_work_block(p2pk_wallet, seed)
+        serial += 1
+        self._measure_isolated_trial(
+            source, block, fixture, "ping", "source_form", 1, serial,
+            producer_form="blocktxn")
+        fixture["recent_block"] = block
+
+        blocker0 = node.add_p2p_connection(PeerServicePeer())
+        blocker1 = node.add_p2p_connection(PeerServicePeer())
+        blocker2 = node.add_outbound_p2p_connection(
+            PeerServicePeer(), p2p_idx=0,
+            connection_type="outbound-full-relay")
+        blocker_ids = [self._map_peer_id(peer)
+                       for peer in (blocker0, blocker1, blocker2)]
+        for peer in (blocker0, blocker1, blocker2):
+            peer.send_and_ping(msg_sendcmpct(announce=False, version=2))
+        for peer in (blocker1, blocker2):
+            self._deliver_full_block(peer, self._quick_block())
+        self.wait_until(
+            lambda: all(
+                next(info for info in node.getpeerinfo()
+                     if info["id"] == peer_id)["bip152_hb_to"]
+                for peer_id in blocker_ids[1:]),
+            timeout=PING_TIMEOUT, check_interval=MARKER_POLL)
+        block, seed = self._build_work_block(p2pk_wallet, seed)
+        serial += 1
+        self._measure_isolated_trial(
+            source, block, fixture, "ping", "source_form", 2, serial,
+            producer_form="optimistic_compact",
+            blockers=(blocker0, blocker1, blocker2))
+        fixture["recent_block"] = block
+        for peer in (blocker0, blocker1, blocker2):
+            peer.peer_disconnect()
+            peer.wait_for_disconnect()
+        self.wait_until(
+            lambda: ({entry["id"] for entry in node.getpeerinfo()} == {self.source_id}
+                     and node.getconnectioncount() == 1),
+            timeout=PING_TIMEOUT, check_interval=MARKER_POLL)
+
+        profile = PROFILES[self.options.peer_service_profile]
+        for phase, count in (("warmup", profile["isolated_warmups"]),
+                             ("trial", profile["isolated_trials"])):
+            for trial in range(count):
+                for service in SERVICE_CLASSES:
                     block, seed = self._build_work_block(p2pk_wallet, seed)
                     serial += 1
-                    self._measure_trial(source, peers, peer_ids, block, load, phase, trial,
-                                        serial, self.options.peer_service_profile == "mixed")
-            for peer in peers:
-                peer.peer_disconnect()
-                peer.wait_for_disconnect()
-            self.wait_until(
-                lambda: ({entry["id"] for entry in node.getpeerinfo()} == {self.source_id}
-                         and node.getconnectioncount() == 1),
-                timeout=PING_TIMEOUT, check_interval=MARKER_POLL)
+                    self._measure_isolated_trial(
+                        source, block, fixture, service, phase, trial, serial)
+                    fixture["recent_block"] = block
+        for trial in range(profile["mixed_trials"]):
+            block, seed = self._build_work_block(p2pk_wallet, seed)
+            serial += 1
+            self._measure_mixed_trial(
+                source, block, fixture, trial, serial)
+            fixture["recent_block"] = block
+        assert {entry["id"] for entry in node.getpeerinfo()} == {self.source_id}
+        assert node.getconnectioncount() == 1
         assert source.is_connected
 
     def _block_identity(self):
@@ -901,8 +1727,8 @@ class AsyncPNBPeerService(BitcoinTestFramework):
         provenance = self._provenance(node, binary)
         self.provenance = provenance
         sampler = ResourceSampler(pid, self.output_dir / "resource.csv")
-        self.aggregate = {"offered": 0, "completed": 0, "failed": 0, "response_inside_pnb": 0}
-        self.warmup_aggregate = {"offered": 0, "completed": 0, "failed": 0, "response_inside_pnb": 0}
+        self.aggregate = self._empty_campaign_aggregate()
+        self.warmup_aggregate = self._empty_campaign_aggregate()
         self.block_inputs = []
         self.block_input_hasher = hashlib.sha256()
         self.chain_start = None
@@ -958,7 +1784,7 @@ class AsyncPNBPeerService(BitcoinTestFramework):
             "mode": self.options.peer_service_mode, "node_args": self.extra_args[0],
             "pause_metrics": {**self.pause_metrics,
                               "zero_pause_proof": self.pause_metrics["pause_observations"] == 0},
-            "profile": self.options.peer_service_profile, "schema_version": 1,
+            "profile": self.options.peer_service_profile, "schema_version": 2,
             "provenance": provenance,
             "refresh_block": self.refresh_block,
             "framework_portseed_option": self.options.port_seed,
