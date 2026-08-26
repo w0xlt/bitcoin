@@ -20,9 +20,11 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 class AddrMan;
@@ -112,6 +114,8 @@ public:
         unsigned int tx_send_rate{DEFAULT_TX_SEND_RATE};
         //! Test-only same-binary peer-service experiment.
         bool async_pnb_peer_service{false};
+        //! Test-only coordination for async-PNB lock-order regression tests.
+        std::function<void(std::string_view)> unit_test_async_pnb_hook;
     };
 
     static std::unique_ptr<PeerManager> make(CConnman& connman, AddrMan& addrman,

@@ -110,6 +110,53 @@ private:
     int m_released GUARDED_BY(m_mutex){0};
 };
 
+class AsyncPNBLockOrderGate
+{
+public:
+    void Arm() EXCLUSIVE_LOCKS_REQUIRED(!m_mutex)
+    {
+        LOCK(m_mutex);
+        m_armed = true;
+    }
+
+    void Hook(std::string_view event) EXCLUSIVE_LOCKS_REQUIRED(!m_mutex)
+    {
+        WAIT_LOCK(m_mutex, lock);
+        if (!m_armed) return;
+        if (event == "tx_download_locked") {
+            m_tx_download_locked = true;
+            m_cv.notify_all();
+            m_cv.wait(lock, [this]() EXCLUSIVE_LOCKS_REQUIRED(m_mutex) { return m_released; });
+        } else if (event == "post_block_handler") {
+            m_cv.wait(lock, [this]() EXCLUSIVE_LOCKS_REQUIRED(m_mutex) { return m_tx_download_locked; });
+        }
+    }
+
+    bool WaitForTxDownloadLocked() EXCLUSIVE_LOCKS_REQUIRED(!m_mutex)
+    {
+        WAIT_LOCK(m_mutex, lock);
+        return m_cv.wait_for(lock, ASYNC_TEST_TIMEOUT, [this]() EXCLUSIVE_LOCKS_REQUIRED(m_mutex) {
+            return m_tx_download_locked;
+        });
+    }
+
+    void Release() EXCLUSIVE_LOCKS_REQUIRED(!m_mutex)
+    {
+        {
+            LOCK(m_mutex);
+            m_released = true;
+        }
+        m_cv.notify_all();
+    }
+
+private:
+    Mutex m_mutex;
+    std::condition_variable m_cv;
+    bool m_armed GUARDED_BY(m_mutex){false};
+    bool m_tx_download_locked GUARDED_BY(m_mutex){false};
+    bool m_released GUARDED_BY(m_mutex){false};
+};
+
 struct AsyncPNBPeerServiceSetup : RegTestingSetup {
     AsyncPNBPeerServiceSetup()
         : m_connman{static_cast<ConnmanTestMsg&>(*m_node.connman)},
@@ -121,6 +168,9 @@ struct AsyncPNBPeerServiceSetup : RegTestingSetup {
         PeerManager::Options options;
         options.deterministic_rng = true;
         options.async_pnb_peer_service = true;
+        options.unit_test_async_pnb_hook = [this](std::string_view event) {
+            m_lock_order_gate.Hook(event);
+        };
         auto validation{node::MakeP2PBlockValidation(*m_node.chainman, [this] {
             m_results.Notify();
             m_connman.WakeMessageHandler();
@@ -136,6 +186,7 @@ struct AsyncPNBPeerServiceSetup : RegTestingSetup {
     ~AsyncPNBPeerServiceSetup()
     {
         if (!m_node.peerman) return;
+        m_lock_order_gate.Release();
         m_node.peerman->InterruptAsyncPNBPeerService();
         m_blocker->ReleaseAll();
         m_node.peerman->StopAsyncPNBPeerService();
@@ -205,6 +256,7 @@ struct AsyncPNBPeerServiceSetup : RegTestingSetup {
     ConnmanTestMsg& m_connman;
     AsyncResultWaiter m_results;
     std::shared_ptr<BlockingBlockCheckedSequence> m_blocker;
+    AsyncPNBLockOrderGate m_lock_order_gate;
     NodeId m_next_node_id{0};
 };
 
@@ -302,12 +354,16 @@ BOOST_FIXTURE_TEST_CASE(async_pnb_peer_service_fencing_and_fifo, AsyncPNBPeerSer
 
     ReceiveMsgFrom(source, NetMsg::Make(NetMsgType::PING, uint64_t{1}));
     ReceiveMsgFrom(unrelated, NetMsg::Make(NetMsgType::PING, uint64_t{2}));
+    unrelated.m_bip152_highbandwidth_from = true;
     ReceiveMsgFrom(refused_front, NetMsg::Make(NetMsgType::SENDHEADERS));
     ReceiveMsgFrom(refused_front, NetMsg::Make(NetMsgType::PING, uint64_t{3}));
     ReceiveMsgFrom(second_source, NetMsg::Make(NetMsgType::BLOCK, TX_WITH_WITNESS(second_block)));
 
     BOOST_CHECK(!ProcessMessagesOnce(source));
     BOOST_CHECK(!HasSendMessage(source, NetMsgType::PONG));
+    BOOST_CHECK(!ProcessMessagesOnce(unrelated));
+    BOOST_CHECK(!HasSendMessage(unrelated, NetMsgType::PONG));
+    unrelated.m_bip152_highbandwidth_from = false;
     BOOST_CHECK(!ProcessMessagesOnce(unrelated));
     BOOST_CHECK(HasSendMessage(unrelated, NetMsgType::PONG));
     BOOST_CHECK(!ProcessMessagesOnce(refused_front));
@@ -350,6 +406,32 @@ BOOST_FIXTURE_TEST_CASE(async_pnb_peer_service_disconnect_and_active_stop, Async
     BOOST_REQUIRE(m_results.WaitForCount(1));
     BOOST_REQUIRE(stop.wait_for(ASYNC_TEST_TIMEOUT) == std::future_status::ready);
     stop.get();
+}
+
+BOOST_FIXTURE_TEST_CASE(async_pnb_post_block_tail_skips_tx_download_mutex, AsyncPNBPeerServiceSetup)
+{
+    CNode& source{AddNode()};
+    const CBlock block{NextBlock(/*variant=*/4)};
+    m_lock_order_gate.Arm();
+    // Let BlockChecked pass so the worker reaches the later ActiveTipChange
+    // callback where the tx-download mutex is held.
+    m_blocker->ReleaseOne();
+    ReceiveMsgFrom(source, NetMsg::Make(NetMsgType::BLOCK, TX_WITH_WITNESS(block)));
+
+    auto process{std::async(std::launch::async, [this, &source] {
+        return ProcessMessagesOnce(source);
+    })};
+    // The worker's ActiveTipChange callback is blocked while holding the real
+    // tx-download mutex. The initiating BLOCK handler must return without
+    // entering its ordinary post-message transaction tail.
+    BOOST_REQUIRE(m_lock_order_gate.WaitForTxDownloadLocked());
+    BOOST_REQUIRE(process.wait_for(ASYNC_TEST_TIMEOUT) == std::future_status::ready);
+    BOOST_CHECK(!process.get());
+
+    m_lock_order_gate.Release();
+    BOOST_REQUIRE(m_blocker->WaitForCount(1));
+    BOOST_REQUIRE(m_results.WaitForCount(1));
+    BOOST_CHECK(ProcessMessagesOnce(source));
 }
 
 BOOST_AUTO_TEST_CASE(async_pnb_peer_service_default_off)

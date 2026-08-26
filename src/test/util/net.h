@@ -112,6 +112,12 @@ struct ConnmanTestMsg : public CConnman {
     bool ReceiveMsgFrom(CNode& node, CSerializedNetMsg&& ser_msg) const;
     void FlushSendBuffer(CNode& node) const;
 
+    std::optional<CNetMsgSendQueueSnapshot> PushMessageWithSendQueueSnapshot(
+        CNode& node, CSerializedNetMsg&& msg)
+    {
+        return PushMessage(&node, std::move(msg), /*capture_send_queue=*/true);
+    }
+
     bool AlreadyConnectedToAddressPublic(const CNetAddr& addr) { return AlreadyConnectedToAddress(addr); };
 
     CNode* ConnectNodePublic(PeerManager& peerman, const char* pszDest, ConnectionType conn_type)

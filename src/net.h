@@ -143,6 +143,14 @@ struct CSerializedNetMsg {
     size_t GetMemoryUsage() const noexcept;
 };
 
+/** Send-queue state captured atomically when a message is enqueued. */
+struct CNetMsgSendQueueSnapshot {
+    SteadyClock::time_point time;
+    size_t bytes;
+    size_t depth;
+    bool paused;
+};
+
 /**
  * Look up IP addresses from all interfaces on the machine and add them to the
  * list of local addresses to self-advertise.
@@ -1294,7 +1302,9 @@ public:
 
     bool ForNode(NodeId id, std::function<bool(CNode* pnode)> func) EXCLUSIVE_LOCKS_REQUIRED(!m_nodes_mutex);
 
-    void PushMessage(CNode* pnode, CSerializedNetMsg&& msg) EXCLUSIVE_LOCKS_REQUIRED(!m_total_bytes_sent_mutex);
+    std::optional<CNetMsgSendQueueSnapshot> PushMessage(
+        CNode* pnode, CSerializedNetMsg&& msg, bool capture_send_queue = false)
+        EXCLUSIVE_LOCKS_REQUIRED(!m_total_bytes_sent_mutex);
 
     using NodeFn = std::function<void(CNode*)>;
     void ForEachNode(const NodeFn& func) EXCLUSIVE_LOCKS_REQUIRED(!m_nodes_mutex)
