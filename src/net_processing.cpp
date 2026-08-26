@@ -623,6 +623,7 @@ public:
 
 private:
     struct PendingP2PBlock {
+        uint64_t job_id;
         NodeId source;
         uint256 hash;
         std::shared_ptr<const CBlock> unsubmitted_block;
@@ -630,7 +631,8 @@ private:
         bool min_pow_checked;
     };
 
-    void ProcessMessage(Peer& peer, CNode& pfrom, const std::string& msg_type, DataStream& vRecv, NodeClock::time_point time_received,
+    void ProcessMessage(Peer& peer, CNode& pfrom, const CNetMessage& net_message,
+                        const std::string& msg_type, DataStream& vRecv, NodeClock::time_point time_received,
                         const std::atomic<bool>& interruptMsgProc)
         EXCLUSIVE_LOCKS_REQUIRED(!m_peer_mutex, !m_most_recent_block_mutex, !m_headers_presync_mutex, g_msgproc_mutex, !m_tx_download_mutex, !m_inv_to_send_mutex);
 
@@ -871,6 +873,7 @@ private:
     std::unique_ptr<node::P2PBlockValidation> m_block_validation;
     std::optional<PendingP2PBlock> m_pending_block_validation
         GUARDED_BY(NetEventsInterface::g_msgproc_mutex);
+    uint64_t m_next_pnb_job_id GUARDED_BY(NetEventsInterface::g_msgproc_mutex){0};
 
     /** Synchronizes tx download including TxRequestTracker, rejection filters, and TxOrphanage.
      * Lock invariants:
@@ -2226,12 +2229,24 @@ void PeerManagerImpl::StopAsyncPNBPeerService()
     // held. Validation callbacks and nodes are still alive at this point.
     if (unsubmitted) {
         bool new_block{false};
+        const auto pnb_start{SteadyClock::now()};
+        LogInfo("ASYNC_PNB_PEER_SERVICE event=pnb_start job=%d source=%d hash=%s mode=fallback steady_ns=%d active_slot=1\n",
+                unsubmitted->job_id, unsubmitted->source, unsubmitted->hash.ToString(),
+                TicksSinceEpoch<std::chrono::nanoseconds>(pnb_start));
         (void)m_chainman.ProcessNewBlock(
             unsubmitted->unsubmitted_block,
             unsubmitted->force_processing,
             unsubmitted->min_pow_checked,
             &new_block);
+        const auto pnb_end{SteadyClock::now()};
+        LogInfo("ASYNC_PNB_PEER_SERVICE event=pnb_end job=%d source=%d hash=%s mode=fallback steady_ns=%d duration_ns=%d new_block=%d active_slot=1\n",
+                unsubmitted->job_id, unsubmitted->source, unsubmitted->hash.ToString(),
+                TicksSinceEpoch<std::chrono::nanoseconds>(pnb_end),
+                Ticks<std::chrono::nanoseconds>(pnb_end - pnb_start), new_block);
         LOCK(NetEventsInterface::g_msgproc_mutex);
+        LogInfo("ASYNC_PNB_PEER_SERVICE event=result_collection job=%d source=%d hash=%s mode=fallback steady_ns=%d new_block=%d active_slot=1\n",
+                unsubmitted->job_id, unsubmitted->source, unsubmitted->hash.ToString(),
+                TicksSinceEpoch<std::chrono::nanoseconds>(SteadyClock::now()), new_block);
         ProcessP2PBlockCompletion(unsubmitted->source, unsubmitted->hash, new_block);
     }
 }
@@ -3750,8 +3765,23 @@ void PeerManagerImpl::ProcessGetCFCheckPt(CNode& node, Peer& peer, DataStream& v
 
 void PeerManagerImpl::ProcessBlock(CNode& node, const std::shared_ptr<const CBlock>& block, bool force_processing, bool min_pow_checked)
 {
+    AssertLockHeld(NetEventsInterface::g_msgproc_mutex);
+    const uint64_t job_id{++m_next_pnb_job_id};
+    const uint256 hash{block->GetHash()};
+    LogInfo("ASYNC_PNB_PEER_SERVICE event=job_submit job=%d source=%d hash=%s mode=sync steady_ns=%d active_slot=0\n",
+            job_id, node.GetId(), hash.ToString(),
+            TicksSinceEpoch<std::chrono::nanoseconds>(SteadyClock::now()));
     bool new_block{false};
+    const auto pnb_start{SteadyClock::now()};
+    LogInfo("ASYNC_PNB_PEER_SERVICE event=pnb_start job=%d source=%d hash=%s mode=sync steady_ns=%d active_slot=0\n",
+            job_id, node.GetId(), hash.ToString(),
+            TicksSinceEpoch<std::chrono::nanoseconds>(pnb_start));
     m_chainman.ProcessNewBlock(block, force_processing, min_pow_checked, &new_block);
+    const auto pnb_end{SteadyClock::now()};
+    LogInfo("ASYNC_PNB_PEER_SERVICE event=pnb_end job=%d source=%d hash=%s mode=sync steady_ns=%d duration_ns=%d new_block=%d active_slot=0\n",
+            job_id, node.GetId(), hash.ToString(),
+            TicksSinceEpoch<std::chrono::nanoseconds>(pnb_end),
+            Ticks<std::chrono::nanoseconds>(pnb_end - pnb_start), new_block);
     if (new_block) {
         node.m_last_block_time = GetTime<std::chrono::seconds>();
         // In case this block came from a different peer than we requested
@@ -3797,12 +3827,17 @@ void PeerManagerImpl::StartAsyncP2PBlockValidation(
     Assert(block != nullptr);
 
     m_pending_block_validation = PendingP2PBlock{
+        .job_id = ++m_next_pnb_job_id,
         .source = source,
         .hash = block->GetHash(),
         .unsubmitted_block = std::move(block),
         .force_processing = force_processing,
         .min_pow_checked = min_pow_checked,
     };
+    LogInfo("ASYNC_PNB_PEER_SERVICE event=job_submit job=%d source=%d hash=%s mode=async steady_ns=%d active_slot=1\n",
+            m_pending_block_validation->job_id, source,
+            m_pending_block_validation->hash.ToString(),
+            TicksSinceEpoch<std::chrono::nanoseconds>(SteadyClock::now()));
     TrySubmitPendingP2PBlock();
     (void)ProcessAsyncP2PBlockResult();
 }
@@ -3820,7 +3855,14 @@ void PeerManagerImpl::TrySubmitPendingP2PBlock()
         .block = pending.unsubmitted_block,
         .force_processing = pending.force_processing,
         .min_pow_checked = pending.min_pow_checked,
+        .job_id = pending.job_id,
     })};
+    const char* status_name{status == node::P2PBlockValidationSubmit::ACCEPTED
+                                ? "accepted"
+                                : status == node::P2PBlockValidationSubmit::FULL ? "full" : "interrupted"};
+    LogInfo("ASYNC_PNB_PEER_SERVICE event=slot_submit job=%d source=%d hash=%s status=%s steady_ns=%d active_slot=1\n",
+            pending.job_id, pending.source, pending.hash.ToString(), status_name,
+            TicksSinceEpoch<std::chrono::nanoseconds>(SteadyClock::now()));
     if (status == node::P2PBlockValidationSubmit::ACCEPTED) {
         pending.unsubmitted_block.reset();
     }
@@ -3840,6 +3882,9 @@ bool PeerManagerImpl::ProcessAsyncP2PBlockResult()
     if (!result) return false;
 
     const PendingP2PBlock pending{*m_pending_block_validation};
+    LogInfo("ASYNC_PNB_PEER_SERVICE event=result_collection job=%d source=%d hash=%s mode=async steady_ns=%d new_block=%d active_slot=1\n",
+            pending.job_id, pending.source, pending.hash.ToString(),
+            TicksSinceEpoch<std::chrono::nanoseconds>(SteadyClock::now()), result->new_block);
     ProcessP2PBlockCompletion(pending.source, pending.hash, result->new_block);
     m_pending_block_validation.reset();
     return true;
@@ -3989,7 +4034,8 @@ void PeerManagerImpl::PushPrivateBroadcastTx(CNode& node)
     MakeAndPushMessage(node, NetMsgType::INV, std::vector<CInv>{{CInv{MSG_TX, tx->GetHash().ToUint256()}}});
 }
 
-void PeerManagerImpl::ProcessMessage(Peer& peer, CNode& pfrom, const std::string& msg_type, DataStream& vRecv,
+void PeerManagerImpl::ProcessMessage(Peer& peer, CNode& pfrom, const CNetMessage& net_message,
+                                     const std::string& msg_type, DataStream& vRecv,
                                      const NodeClock::time_point time_received,
                                      const std::atomic<bool>& interruptMsgProc)
 {
@@ -5404,6 +5450,22 @@ void PeerManagerImpl::ProcessMessage(Peer& peer, CNode& pfrom, const std::string
             // seconds to respond to each, the 5th ping the remote sends would appear to
             // return very quickly.
             MakeAndPushMessage(pfrom, NetMsgType::PONG, nonce);
+            const auto response_queued{SteadyClock::now()};
+            size_t send_queue_bytes;
+            size_t send_queue_depth;
+            {
+                LOCK(pfrom.cs_vSend);
+                send_queue_bytes = pfrom.m_send_memusage;
+                send_queue_depth = pfrom.vSendMsg.size();
+            }
+            const uint64_t active_job{m_pending_block_validation
+                                          ? m_pending_block_validation->job_id
+                                          : 0};
+            LogInfo("ASYNC_PNB_PEER_SERVICE event=response_queued peer=%d msg_id=%d msg=ping response=pong nonce=%d steady_ns=%d send_queue_bytes=%d send_queue_depth=%d pause_send=%d active_slot=%d job=%d\n",
+                    pfrom.GetId(), net_message.m_process_queue_id, nonce,
+                    TicksSinceEpoch<std::chrono::nanoseconds>(response_queued),
+                    send_queue_bytes, send_queue_depth, pfrom.fPauseSend.load(),
+                    m_pending_block_validation.has_value(), active_job);
         }
         return;
     }
@@ -5649,6 +5711,22 @@ bool PeerManagerImpl::ProcessMessages(CNode& node, std::atomic<bool>& interruptM
 
     CNetMessage& msg{poll_result->first};
     bool fMoreWork = poll_result->second;
+    const bool measured_ping_pong{msg.m_type == NetMsgType::PING ||
+                                  msg.m_type == NetMsgType::PONG};
+    if (measured_ping_pong) {
+        const uint64_t active_job{m_pending_block_validation
+                                      ? m_pending_block_validation->job_id
+                                      : 0};
+        LogInfo("ASYNC_PNB_PEER_SERVICE event=handler_start peer=%d msg_id=%d msg=%s steady_ns=%d ready_ns=%d poll_ns=%d ready_queue_bytes=%d ready_queue_depth=%d ready_pause_recv=%d poll_queue_bytes=%d poll_queue_depth=%d poll_pause_recv=%d active_slot=%d job=%d\n",
+                node.GetId(), msg.m_process_queue_id, msg.m_type,
+                TicksSinceEpoch<std::chrono::nanoseconds>(SteadyClock::now()),
+                TicksSinceEpoch<std::chrono::nanoseconds>(msg.m_process_queue_ready),
+                TicksSinceEpoch<std::chrono::nanoseconds>(msg.m_process_queue_poll),
+                msg.m_process_queue_bytes_at_ready, msg.m_process_queue_depth_at_ready,
+                msg.m_process_queue_paused_at_ready, msg.m_process_queue_bytes_at_poll,
+                msg.m_process_queue_depth_at_poll, msg.m_process_queue_paused_at_poll,
+                m_pending_block_validation.has_value(), active_job);
+    }
 
     TRACEPOINT(net, inbound_message,
         node.GetId(),
@@ -5663,9 +5741,10 @@ bool PeerManagerImpl::ProcessMessages(CNode& node, std::atomic<bool>& interruptM
         CaptureMessage(node.addr, msg.m_type, MakeUCharSpan(msg.m_recv), /*is_incoming=*/true);
     }
 
+    bool interrupted{false};
     try {
-        ProcessMessage(peer, node, msg.m_type, msg.m_recv, msg.m_time, interruptMsgProc);
-        if (interruptMsgProc) return false;
+        ProcessMessage(peer, node, msg, msg.m_type, msg.m_recv, msg.m_time, interruptMsgProc);
+        interrupted = interruptMsgProc;
         if (!async_busy) {
             {
                 LOCK(peer.m_getdata_requests_mutex);
@@ -5684,6 +5763,17 @@ bool PeerManagerImpl::ProcessMessages(CNode& node, std::atomic<bool>& interruptM
     } catch (...) {
         LogDebug(BCLog::NET, "%s(%s, %u bytes): Unknown exception caught\n", __func__, SanitizeString(msg.m_type), msg.m_message_size);
     }
+
+    if (measured_ping_pong) {
+        const uint64_t active_job{m_pending_block_validation
+                                      ? m_pending_block_validation->job_id
+                                      : 0};
+        LogInfo("ASYNC_PNB_PEER_SERVICE event=handler_complete peer=%d msg_id=%d msg=%s steady_ns=%d active_slot=%d job=%d\n",
+                node.GetId(), msg.m_process_queue_id, msg.m_type,
+                TicksSinceEpoch<std::chrono::nanoseconds>(SteadyClock::now()),
+                m_pending_block_validation.has_value(), active_job);
+    }
+    if (interrupted) return false;
 
     return fMoreWork;
 }
