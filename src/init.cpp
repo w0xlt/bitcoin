@@ -306,6 +306,9 @@ void Interrupt(NodeContext& node)
     InterruptMapPort();
     if (node.connman)
         node.connman->Interrupt();
+    if (node.peerman && node.peerman->HasAsyncPNBPeerService()) {
+        node.peerman->InterruptAsyncPNBPeerService();
+    }
     for (auto* index : node.indexes) {
         index->Interrupt();
     }
@@ -340,10 +343,18 @@ void Shutdown(NodeContext& node)
     }
     StopMapPort();
 
-    // Because these depend on each-other, we make sure that neither can be
-    // using the other before destroying them.
-    if (node.peerman && node.validation_signals) node.validation_signals->UnregisterValidationInterface(node.peerman.get());
-    if (node.connman) node.connman->Stop();
+    if (node.peerman && node.peerman->HasAsyncPNBPeerService()) {
+        // Keep nodes, chainstate, and validation callbacks alive until the
+        // single accepted PNB job and its network continuation are complete.
+        if (node.connman) node.connman->StopThreads();
+        node.peerman->StopAsyncPNBPeerService();
+        if (node.validation_signals) node.validation_signals->UnregisterValidationInterface(node.peerman.get());
+        if (node.connman) node.connman->StopNodes();
+    } else {
+        // Preserve master's shutdown path when the experiment is disabled.
+        if (node.peerman && node.validation_signals) node.validation_signals->UnregisterValidationInterface(node.peerman.get());
+        if (node.connman) node.connman->Stop();
+    }
 
     if (node.tor_controller) {
         node.tor_controller->Join();
@@ -673,6 +684,7 @@ void SetupServerArgs(ArgsManager& argsman, bool can_listen_ipc)
 #endif
 
     argsman.AddArg("-checkblocks=<n>", strprintf("How many blocks to check at startup (default: %u, 0 = all)", DEFAULT_CHECKBLOCKS), ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
+    argsman.AddArg("-asyncpnbpeerservice", "Process ordinary P2P blocks on one serial worker while servicing unrelated front PING messages (default: 0)", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
     argsman.AddArg("-checklevel=<n>", strprintf("How thorough the block verification of -checkblocks is: %s (0-4, default: %u)", Join(CHECKLEVEL_DOC, ", "), DEFAULT_CHECKLEVEL), ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
     argsman.AddArg("-checkblockindex", strprintf("Do a consistency check for the block tree, chainstate, and other validation data structures every <n> operations. Use 0 to disable. (default: %u, regtest: %u)", defaultChainParams->DefaultConsistencyChecks(), regtestChainParams->DefaultConsistencyChecks()), ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
     argsman.AddArg("-checkaddrman=<n>", strprintf("Run addrman consistency checks every <n> operations. Use 0 to disable. (default: %u)", DEFAULT_ADDRMAN_CONSISTENCY_CHECKS), ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);

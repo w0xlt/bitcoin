@@ -8,6 +8,7 @@
 
 #include <consensus/amount.h>
 #include <net.h>
+#include <node/p2p_block_validation.h>
 #include <node/txorphanage.h>
 #include <node/types.h>
 #include <private_broadcast.h>
@@ -109,12 +110,19 @@ public:
         bool private_broadcast{DEFAULT_PRIVATE_BROADCAST};
         //! Maximum per-second rate for sending transaction inventory to peers.
         unsigned int tx_send_rate{DEFAULT_TX_SEND_RATE};
+        //! Test-only same-binary peer-service experiment.
+        bool async_pnb_peer_service{false};
     };
 
     static std::unique_ptr<PeerManager> make(CConnman& connman, AddrMan& addrman,
                                              BanMan* banman, ChainstateManager& chainman,
-                                             CTxMemPool& pool, node::Warnings& warnings, Options opts);
+                                             CTxMemPool& pool, node::Warnings& warnings, Options opts,
+                                             std::unique_ptr<node::P2PBlockValidation> block_validation = {});
     virtual ~PeerManager() = default;
+
+    virtual void InterruptAsyncPNBPeerService() = 0;
+    virtual void StopAsyncPNBPeerService() = 0;
+    virtual bool HasAsyncPNBPeerService() const = 0;
 
     /**
      * Attempt to manually fetch block from a given peer. We must already have the header.
