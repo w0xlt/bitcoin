@@ -4117,17 +4117,47 @@ void CNode::MarkReceivedMsgsForProcessing()
 {
     AssertLockNotHeld(m_msg_process_queue_mutex);
 
-    size_t nSizeAdded = 0;
-    for (const auto& msg : vRecvMsg) {
-        // vRecvMsg contains only completed CNetMessage
-        // the single possible partially deserialized message are held by TransportDeserializer
-        nSizeAdded += msg.GetMemoryUsage();
+    struct ReadyMarker {
+        uint64_t id;
+        std::string type;
+        SteadyClock::time_point time;
+        size_t bytes;
+        size_t depth;
+        bool paused;
+    };
+    std::vector<ReadyMarker> ready_markers;
+    {
+        LOCK(m_msg_process_queue_mutex);
+        size_t nSizeAdded{0};
+        size_t ready_depth{m_msg_process_queue.size()};
+        for (auto& msg : vRecvMsg) {
+            // vRecvMsg contains only completed CNetMessage; the single possible
+            // partially deserialized message is held by TransportDeserializer.
+            nSizeAdded += msg.GetMemoryUsage();
+            msg.m_process_queue_id = ++m_next_process_queue_id;
+            msg.m_process_queue_ready = SteadyClock::now();
+            msg.m_process_queue_bytes_at_ready = m_msg_process_queue_size + nSizeAdded;
+            msg.m_process_queue_depth_at_ready = ++ready_depth;
+            msg.m_process_queue_paused_at_ready =
+                msg.m_process_queue_bytes_at_ready > m_recv_flood_size;
+            if (msg.m_type == NetMsgType::PING || msg.m_type == NetMsgType::PONG) {
+                ready_markers.push_back({msg.m_process_queue_id, msg.m_type,
+                                         msg.m_process_queue_ready,
+                                         msg.m_process_queue_bytes_at_ready,
+                                         msg.m_process_queue_depth_at_ready,
+                                         msg.m_process_queue_paused_at_ready});
+            }
+        }
+        m_msg_process_queue.splice(m_msg_process_queue.end(), vRecvMsg);
+        m_msg_process_queue_size += nSizeAdded;
+        fPauseRecv = m_msg_process_queue_size > m_recv_flood_size;
     }
-
-    LOCK(m_msg_process_queue_mutex);
-    m_msg_process_queue.splice(m_msg_process_queue.end(), vRecvMsg);
-    m_msg_process_queue_size += nSizeAdded;
-    fPauseRecv = m_msg_process_queue_size > m_recv_flood_size;
+    for (const auto& marker : ready_markers) {
+        LogInfo("ASYNC_PNB_PEER_SERVICE event=complete_message_ready peer=%d msg_id=%d msg=%s steady_ns=%d queue_bytes=%d queue_depth=%d pause_recv=%d\n",
+                GetId(), marker.id, marker.type,
+                TicksSinceEpoch<std::chrono::nanoseconds>(marker.time), marker.bytes,
+                marker.depth, marker.paused);
+    }
 }
 
 std::optional<std::pair<CNetMessage, bool>> CNode::PollMessage(
@@ -4138,6 +4168,12 @@ std::optional<std::pair<CNetMessage, bool>> CNode::PollMessage(
         (predicate && !predicate(m_msg_process_queue.front()))) {
         return std::nullopt;
     }
+
+    CNetMessage& front{m_msg_process_queue.front()};
+    front.m_process_queue_poll = SteadyClock::now();
+    front.m_process_queue_bytes_at_poll = m_msg_process_queue_size;
+    front.m_process_queue_depth_at_poll = m_msg_process_queue.size();
+    front.m_process_queue_paused_at_poll = fPauseRecv;
 
     std::list<CNetMessage> msgs;
     // Just take one message

@@ -5,6 +5,7 @@
 #ifndef BITCOIN_NODE_P2P_BLOCK_VALIDATION_H
 #define BITCOIN_NODE_P2P_BLOCK_VALIDATION_H
 
+#include <cstdint>
 #include <functional>
 #include <memory>
 #include <optional>
@@ -25,6 +26,7 @@ struct P2PBlockValidationRequest {
     std::shared_ptr<const CBlock> block;
     bool force_processing;
     bool min_pow_checked;
+    uint64_t job_id{0}; //!< Inert measurement correlation only.
 };
 
 //! Minimal result needed by the existing P2P continuation.

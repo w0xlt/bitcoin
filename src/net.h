@@ -32,6 +32,7 @@
 #include <util/check.h>
 #include <util/sock.h>
 #include <util/threadinterrupt.h>
+#include <util/time.h>
 
 #include <atomic>
 #include <condition_variable>
@@ -244,6 +245,18 @@ public:
     uint32_t m_message_size{0};          //!< size of the payload
     uint32_t m_raw_message_size{0};      //!< used wire size of the message (including header/checksum)
     std::string m_type;
+
+    // Inert correlation data for peer-service measurements. The payload is
+    // intentionally not inspected while the socket thread fills these fields.
+    uint64_t m_process_queue_id{0};
+    SteadyClock::time_point m_process_queue_ready{};
+    SteadyClock::time_point m_process_queue_poll{};
+    size_t m_process_queue_bytes_at_ready{0};
+    size_t m_process_queue_depth_at_ready{0};
+    bool m_process_queue_paused_at_ready{false};
+    size_t m_process_queue_bytes_at_poll{0};
+    size_t m_process_queue_depth_at_poll{0};
+    bool m_process_queue_paused_at_poll{false};
 
     explicit CNetMessage(DataStream&& recv_in) : m_recv(std::move(recv_in)) {}
     // Only one CNetMessage object will exist for the same message on either
@@ -1014,6 +1027,7 @@ private:
     Mutex m_msg_process_queue_mutex;
     std::list<CNetMessage> m_msg_process_queue GUARDED_BY(m_msg_process_queue_mutex);
     size_t m_msg_process_queue_size GUARDED_BY(m_msg_process_queue_mutex){0};
+    uint64_t m_next_process_queue_id GUARDED_BY(m_msg_process_queue_mutex){0};
 
     // Our address, as reported by the peer
     CService m_addr_local GUARDED_BY(m_addr_local_mutex);

@@ -4,9 +4,12 @@
 
 #include <node/p2p_block_validation.h>
 
+#include <logging.h>
+#include <primitives/block.h>
 #include <sync.h>
 #include <util/check.h>
 #include <util/thread.h>
+#include <util/time.h>
 #include <validation.h>
 
 #include <condition_variable>
@@ -56,12 +59,25 @@ private:
                 m_running = true;
             }
 
+            const uint256 hash{request.block->GetHash()};
+            LogInfo("ASYNC_PNB_PEER_SERVICE event=worker_wake job=%d hash=%s steady_ns=%d active_slot=1\n",
+                    request.job_id, hash.ToString(),
+                    TicksSinceEpoch<std::chrono::nanoseconds>(SteadyClock::now()));
             bool new_block{false};
+            const auto pnb_start{SteadyClock::now()};
+            LogInfo("ASYNC_PNB_PEER_SERVICE event=pnb_start job=%d hash=%s steady_ns=%d active_slot=1\n",
+                    request.job_id, hash.ToString(),
+                    TicksSinceEpoch<std::chrono::nanoseconds>(pnb_start));
             (void)m_chainman.ProcessNewBlock(
                 request.block,
                 request.force_processing,
                 request.min_pow_checked,
                 &new_block);
+            const auto pnb_end{SteadyClock::now()};
+            LogInfo("ASYNC_PNB_PEER_SERVICE event=pnb_end job=%d hash=%s steady_ns=%d duration_ns=%d new_block=%d active_slot=1\n",
+                    request.job_id, hash.ToString(),
+                    TicksSinceEpoch<std::chrono::nanoseconds>(pnb_end),
+                    Ticks<std::chrono::nanoseconds>(pnb_end - pnb_start), new_block);
             request.block.reset();
 
             {
@@ -73,6 +89,9 @@ private:
             }
             // Publication precedes the wake and the callback never runs under
             // the component mutex.
+            LogInfo("ASYNC_PNB_PEER_SERVICE event=result_publication job=%d hash=%s steady_ns=%d new_block=%d active_slot=1\n",
+                    request.job_id, hash.ToString(),
+                    TicksSinceEpoch<std::chrono::nanoseconds>(SteadyClock::now()), new_block);
             m_result_ready();
 
             {
