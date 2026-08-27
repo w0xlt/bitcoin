@@ -24,6 +24,7 @@ from pathlib import Path
 
 MAGIC = b"APNBPRB\0"
 SCHEMA = 4
+COLLECTOR_SCHEMA = 2
 HEADER_SIZE = 128
 RECORD_SIZE = 256
 CAPACITY = 65_536
@@ -75,7 +76,8 @@ BLOCK_HASH_EVENTS = set(range(5, 21)) | {32, 33, 34}
 OUTPUT_NAMES = (
     "manifest.json", "events.jsonl", "resources.csv", "rpc.jsonl", "summary.json")
 RESOURCE_FIELDS = (
-    "monotonic_ns", "wall_ns", "process_user_seconds", "process_system_seconds",
+    "monotonic_ns", "wall_ns", "clock_capture_uncertainty_ns",
+    "process_user_seconds", "process_system_seconds",
     "thread_msghand_seconds", "thread_pnb_seconds", "thread_network_seconds",
     "thread_validation_seconds", "thread_other_seconds", "rss_bytes", "thread_count",
     "voluntary_ctxt_switches", "nonvoluntary_ctxt_switches", "rchar", "wchar",
@@ -311,6 +313,28 @@ def thread_category(name):
     return "other"
 
 
+def capture_clock_pair(monotonic_clock=time.monotonic_ns, wall_clock=time.time_ns):
+    """Capture wall time with a conservative representative monotonic interval.
+
+    The wall read occurs between the two monotonic reads. The persisted
+    monotonic midpoint M and uncertainty U=ceil((after-before)/2) therefore
+    guarantee that the corresponding monotonic instant is in [M-U, M+U].
+    """
+    monotonic_before = monotonic_clock()
+    wall = wall_clock()
+    monotonic_after = monotonic_clock()
+    if (type(monotonic_before) is not int or type(monotonic_after) is not int or
+            type(wall) is not int or monotonic_before <= 0 or wall <= 0 or
+            monotonic_after < monotonic_before):
+        raise CollectionError("invalid bracketed collector clock capture")
+    span = monotonic_after - monotonic_before
+    return {
+        "monotonic_ns": monotonic_before + span // 2,
+        "wall_ns": wall,
+        "clock_capture_uncertainty_ns": (span + 1) // 2,
+    }
+
+
 def sample_resources(pid, clock_ticks, page_size):
     stat = read_proc_stat(pid)
     status = read_key_values(f"/proc/{pid}/status")
@@ -326,8 +350,7 @@ def sample_resources(pid, clock_ticks, page_size):
             continue
         thread_ticks[thread_category(thread["comm"])] += thread["utime"] + thread["stime"]
     return {
-        "monotonic_ns": time.monotonic_ns(),
-        "wall_ns": time.time_ns(),
+        **capture_clock_pair(),
         "process_user_seconds": stat["utime"] / clock_ticks,
         "process_system_seconds": stat["stime"] / clock_ticks,
         "thread_msghand_seconds": thread_ticks["msghand"] / clock_ticks,
@@ -363,9 +386,10 @@ def filtered_peer(peer):
     return result
 
 
-def run_rpc(cli, cli_args, expected_chain):
+def run_rpc(cli, cli_args, expected_chain, *, runner=subprocess.run,
+            clock_capture=capture_clock_pair):
     def call(method):
-        completed = subprocess.run(
+        completed = runner(
             [cli, *cli_args, method], check=True, capture_output=True,
             text=True, timeout=30)
         return json.loads(completed.stdout)
@@ -378,8 +402,7 @@ def run_rpc(cli, cli_args, expected_chain):
         raise CollectionError(
             f"RPC chain mismatch: expected {expected_chain}, got {chain.get('chain')}")
     return {
-        "monotonic_ns": time.monotonic_ns(),
-        "wall_ns": time.time_ns(),
+        **clock_capture(),
         "chain": {
             key: chain[key] for key in
             ("chain", "blocks", "headers", "verificationprogress", "initialblockdownload")
@@ -397,6 +420,10 @@ def run_rpc(cli, cli_args, expected_chain):
         },
         "peers": [filtered_peer(peer) for peer in peers if isinstance(peer, dict)],
     }
+
+
+def rpc_failure_row(error, *, clock_capture=capture_clock_pair):
+    return {**clock_capture(), "error": type(error).__name__}
 
 
 def sha256_file(path):
@@ -610,6 +637,47 @@ def run_self_tests():
     assert mapping["origin_residual_ns"] == 9_000_000_000
     assert mapping["mapping_uncertainty_ns"] == 9_000_000_017
     assert mapping["compatibility"] == "wall_offset_bridge_with_reported_uncertainty"
+
+    monotonic_reads = iter((100, 142))
+    captured = capture_clock_pair(
+        monotonic_clock=lambda: next(monotonic_reads), wall_clock=lambda: 1_000)
+    assert captured == {
+        "monotonic_ns": 121,
+        "wall_ns": 1_000,
+        "clock_capture_uncertainty_ns": 21,
+    }
+
+    rpc_results = {
+        "getblockchaininfo": {
+            "chain": "regtest", "blocks": 1, "headers": 1,
+            "verificationprogress": 1.0, "initialblockdownload": False},
+        "getnettotals": {
+            "totalbytesrecv": 2, "totalbytessent": 3, "timemillis": 4},
+        "getnetworkinfo": {
+            "networkactive": True, "connections": 0,
+            "connections_in": 0, "connections_out": 0},
+        "getpeerinfo": [],
+    }
+
+    class Completed:
+        def __init__(self, value):
+            self.stdout = json.dumps(value)
+
+    def fake_runner(arguments, **_kwargs):
+        return Completed(rpc_results[arguments[-1]])
+
+    rpc_success = run_rpc(
+        "bitcoin-cli", [], "regtest", runner=fake_runner,
+        clock_capture=lambda: captured)
+    assert set(rpc_success) == {
+        "monotonic_ns", "wall_ns", "clock_capture_uncertainty_ns", "chain",
+        "warnings_present", "network_totals", "network", "peers"}
+    rpc_failure = rpc_failure_row(
+        subprocess.TimeoutExpired("bitcoin-cli", 30),
+        clock_capture=lambda: captured)
+    assert set(rpc_failure) == {
+        "monotonic_ns", "wall_ns", "clock_capture_uncertainty_ns", "error"}
+    assert rpc_failure["error"] == "TimeoutExpired"
     print("async_pnb_collector self-test: PASS")
 
 
@@ -655,7 +723,7 @@ def collect(args):
     measured_sequence_first = start_boundary["producer_sequence"] + 1
     env = environment_identity()
     manifest = {
-        "collector_schema": 1,
+        "collector_schema": COLLECTOR_SCHEMA,
         "probe_schema": SCHEMA,
         "process_epochs": [stream.epoch],
         "pid": pid,
@@ -684,6 +752,11 @@ def collect(args):
         "environment": env,
         "clock_origin": {"monotonic_ns": start_mono, "wall_ns": start_wall},
         "clock_mapping": mapping,
+        "sample_clock_capture": {
+            "method": "wall read bracketed by monotonic reads",
+            "representative_monotonic": "midpoint=floor((before+after)/2)",
+            "uncertainty": "ceil((monotonic_after-monotonic_before)/2)",
+        },
         "collection_window": {
             "start": start_boundary,
             "sequence_first": measured_sequence_first,
@@ -708,10 +781,12 @@ def collect(args):
     last_resource = None
     first_resource_wall = None
     last_resource_wall = None
+    maximum_resource_clock_uncertainty = 0
     first_rpc = None
     last_rpc = None
     first_rpc_wall = None
     last_rpc_wall = None
+    maximum_rpc_clock_uncertainty = 0
     process_exit_state = "running_at_collection_end"
     stop_reason = "duration_complete"
     signal_seen = {"number": None}
@@ -853,6 +928,9 @@ def collect(args):
                             sample["wall_ns"] if first_resource_wall is None
                             else first_resource_wall)
                         last_resource_wall = sample["wall_ns"]
+                        maximum_resource_clock_uncertainty = max(
+                            maximum_resource_clock_uncertainty,
+                            sample["clock_capture_uncertainty_ns"])
                         if args.max_rss_mib is not None and sample["rss_bytes"] > args.max_rss_mib * 1024 * 1024:
                             raise CollectionError(
                                 f"RSS abort threshold exceeded: {sample['rss_bytes']} bytes")
@@ -880,13 +958,12 @@ def collect(args):
                             snapshot["wall_ns"] if first_rpc_wall is None
                             else first_rpc_wall)
                         last_rpc_wall = snapshot["wall_ns"]
+                        maximum_rpc_clock_uncertainty = max(
+                            maximum_rpc_clock_uncertainty,
+                            snapshot["clock_capture_uncertainty_ns"])
                     except (OSError, subprocess.SubprocessError, json.JSONDecodeError) as error:
                         rpc_failures += 1
-                        failure = {
-                            "monotonic_ns": time.monotonic_ns(),
-                            "wall_ns": time.time_ns(),
-                            "error": type(error).__name__,
-                        }
+                        failure = rpc_failure_row(error)
                         rpc_file.write(json.dumps(
                             failure, sort_keys=True, separators=(",", ":")) + "\n")
                         rpc_file.flush()
@@ -897,6 +974,9 @@ def collect(args):
                             failure["wall_ns"] if first_rpc_wall is None
                             else first_rpc_wall)
                         last_rpc_wall = failure["wall_ns"]
+                        maximum_rpc_clock_uncertainty = max(
+                            maximum_rpc_clock_uncertainty,
+                            failure["clock_capture_uncertainty_ns"])
                     next_rpc = time.monotonic_ns() + int(
                         args.rpc_interval * 1_000_000_000)
 
@@ -1049,10 +1129,13 @@ def collect(args):
             "resource_samples": resource_samples,
             "resource_monotonic_bounds_ns": [first_resource, last_resource],
             "resource_wall_bounds_ns": [first_resource_wall, last_resource_wall],
+            "resource_clock_capture_uncertainty_max_ns":
+                maximum_resource_clock_uncertainty,
             "rpc_samples": rpc_samples,
             "rpc_rows": rpc_rows,
             "rpc_monotonic_bounds_ns": [first_rpc, last_rpc],
             "rpc_wall_bounds_ns": [first_rpc_wall, last_rpc_wall],
+            "rpc_clock_capture_uncertainty_max_ns": maximum_rpc_clock_uncertainty,
             "rpc_failures": rpc_failures,
             "artifact_integrity": data_artifacts,
             "unavailable": [
@@ -1073,6 +1156,13 @@ def collect(args):
             "clock_mapping": mapping,
             "cutoff_clock_mapping": end_mapping,
             "collection_window": collection_window,
+            "sample_clock_capture": {
+                **manifest["sample_clock_capture"],
+                "max_uncertainty_ns": {
+                    "resources.csv": maximum_resource_clock_uncertainty,
+                    "rpc.jsonl": maximum_rpc_clock_uncertainty,
+                },
+            },
             "artifacts": manifest_artifacts,
             "event_stream": {
                 "process_epoch": stream.epoch,

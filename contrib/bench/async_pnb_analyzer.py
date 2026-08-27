@@ -12,12 +12,14 @@ import json
 import math
 import os
 import sys
+import tempfile
 from collections import Counter, defaultdict, deque
 from pathlib import Path
 
 
 COLLECTOR_FILES = {
     "manifest.json", "events.jsonl", "resources.csv", "rpc.jsonl", "summary.json"}
+COLLECTOR_SCHEMA = 2
 CONNECTION_ROLES = {
     0: "inbound", 1: "outbound-full-relay", 2: "manual", 3: "feeler",
     4: "block-relay-only", 5: "addr-fetch", 6: "private-broadcast"}
@@ -39,7 +41,8 @@ EVENT_NAMES = {
     32: "block_requested", 33: "block_request_removed", 34: "block_timeout",
 }
 RESOURCE_FIELDS = (
-    "monotonic_ns", "wall_ns", "process_user_seconds", "process_system_seconds",
+    "monotonic_ns", "wall_ns", "clock_capture_uncertainty_ns",
+    "process_user_seconds", "process_system_seconds",
     "thread_msghand_seconds", "thread_pnb_seconds", "thread_network_seconds",
     "thread_validation_seconds", "thread_other_seconds", "rss_bytes", "thread_count",
     "voluntary_ctxt_switches", "nonvoluntary_ctxt_switches", "rchar", "wchar",
@@ -175,6 +178,11 @@ def prepare_rpc_states(rpc, max_age_ns):
     transition_assigned = False
     for snapshot in sorted((item for item in rpc if "error" not in item),
                            key=lambda item: item["monotonic_ns"]):
+        uncertainty = snapshot.get("clock_capture_uncertainty_ns", 0)
+        if type(uncertainty) is not int or uncertainty < 0:
+            # Structural validation rejects this row. Keeping zero here makes
+            # downstream reporting deterministic without granting extra slack.
+            uncertainty = 0
         chain = snapshot.get("chain", {})
         ibd = chain.get("initialblockdownload")
         if not isinstance(ibd, bool):
@@ -187,17 +195,34 @@ def prepare_rpc_states(rpc, max_age_ns):
             transition_assigned = True
         else:
             phase = "post_ibd"
-        states.append((snapshot["monotonic_ns"], phase, snapshot))
-    times = [state[0] for state in states]
+        states.append((snapshot["monotonic_ns"], uncertainty, phase, snapshot))
+    lower_bounds = [sample - uncertainty for sample, uncertainty, _phase, _snapshot
+                    in states]
+    upper_bounds = [sample + uncertainty for sample, uncertainty, _phase, _snapshot
+                    in states]
+    ordered_bounds = (
+        all(left <= right for left, right in zip(lower_bounds, lower_bounds[1:])) and
+        all(left <= right for left, right in zip(upper_bounds, upper_bounds[1:])))
 
     def join(steady_ns):
-        index = bisect.bisect_right(times, steady_ns) - 1
+        # A bracketed RPC sample at representative M with uncertainty U may
+        # have occurred anywhere in [M-U, M+U]. It is certainly preceding only
+        # when M+U <= event time. If a later row might already precede the
+        # event, nearest-preceding identity is ambiguous and classification is
+        # withheld. Maximum join age uses the earliest possible sample M-U.
+        if not ordered_bounds:
+            return "unclassified", None
+        index = bisect.bisect_right(upper_bounds, steady_ns) - 1
         if index < 0:
             return "unclassified", None
-        age = steady_ns - states[index][0]
-        if age < 0 or age > max_age_ns:
-            return "unclassified", age
-        return states[index][1], age
+        possibly_preceding = bisect.bisect_right(lower_bounds, steady_ns) - 1
+        if possibly_preceding != index:
+            return "unclassified", None
+        sample, uncertainty, phase, _snapshot = states[index]
+        maximum_age = steady_ns - (sample - uncertainty)
+        if maximum_age > max_age_ns:
+            return "unclassified", maximum_age
+        return phase, maximum_age
 
     return join
 
@@ -212,7 +237,13 @@ def phase_observation_intervals(rpc, start_ns, end_ns, max_age_ns,
         if "error" in row or not isinstance(row.get("monotonic_ns"), int):
             continue
         sample = row["monotonic_ns"]
-        for boundary in (sample, sample + max_age_ns):
+        uncertainty = row.get("clock_capture_uncertainty_ns", 0)
+        if type(uncertainty) is not int or uncertainty < 0:
+            uncertainty = 0
+        # Raw join classification can change when a sample first possibly
+        # precedes, certainly precedes, or reaches its conservative max age.
+        for boundary in (sample - uncertainty, sample + uncertainty,
+                         sample - uncertainty + max_age_ns):
             for point in (boundary - mapping_uncertainty_ns,
                           boundary + mapping_uncertainty_ns):
                 if start_ns < point < end_ns:
@@ -253,13 +284,19 @@ def annotate(events, rpc, max_age_seconds, mapping_uncertainty_ns=0):
     ages = []
     for event in events:
         mapped = event.get("mapped_monotonic_ns", event["steady_ns"])
-        low_phase, _low_age = join(mapped - mapping_uncertainty_ns)
-        high_phase, _high_age = join(mapped + mapping_uncertainty_ns)
-        midpoint_phase, age = join(mapped)
+        low_phase, low_age = join(mapped - mapping_uncertainty_ns)
+        high_phase, high_age = join(mapped + mapping_uncertainty_ns)
+        midpoint_phase, midpoint_age = join(mapped)
         phase = (midpoint_phase if low_phase == high_phase == midpoint_phase and
                  midpoint_phase != "unclassified" else "unclassified")
         if phase == "unclassified":
             age = None
+        else:
+            # Each join age is already measured from the RPC sample's earliest
+            # possible instant. Retain the maximum across the event's mapped
+            # uncertainty interval, not the midpoint's understated age.
+            age = max(value for value in (low_age, midpoint_age, high_age)
+                      if value is not None)
         event["_phase"] = phase
         event["_rpc_join_age_ns"] = age
         if age is not None:
@@ -774,6 +811,8 @@ def subset_summary(events, context_events=None, *, observation_seconds,
 
 def reconcile_collector(manifest, summary, events, resources, rpc, artifacts, errors):
     """Cross-check all retained rows, bounds, clocks, and finalized metadata."""
+    if manifest.get("collector_schema") != COLLECTOR_SCHEMA:
+        errors.append("collector schema mismatch")
     actual_count = len(events)
     actual_first = events[0]["sequence"] if events else None
     actual_last = events[-1]["sequence"] if events else None
@@ -1039,27 +1078,46 @@ def reconcile_collector(manifest, summary, events, resources, rpc, artifacts, er
 
     def validate_sample_rows(rows, name):
         previous_mono = None
-        mono_values, wall_values = [], []
+        previous_lower = previous_upper = None
+        mono_values, wall_values, uncertainties = [], [], []
         for index, row in enumerate(rows):
             mono, wall = row.get("monotonic_ns"), row.get("wall_ns")
-            if not isinstance(mono, int) or not isinstance(wall, int) or mono <= 0 or wall <= 0:
+            uncertainty = row.get("clock_capture_uncertainty_ns")
+            if (type(mono) is not int or type(wall) is not int or mono <= 0 or
+                    wall <= 0):
                 errors.append(f"malformed {name} clock row {index}")
+                continue
+            if (type(uncertainty) is not int or uncertainty < 0 or
+                    uncertainty >= mono):
+                errors.append(f"malformed {name} clock capture uncertainty row {index}")
                 continue
             if previous_mono is not None and mono <= previous_mono:
                 errors.append(f"non-increasing {name} monotonic clock")
             previous_mono = mono
+            lower, upper = mono - uncertainty, mono + uncertainty
+            if ((previous_lower is not None and lower < previous_lower) or
+                    (previous_upper is not None and upper < previous_upper)):
+                errors.append(f"non-monotonic {name} clock capture bounds")
+            previous_lower, previous_upper = lower, upper
             mono_values.append(mono)
             wall_values.append(wall)
+            uncertainties.append(uncertainty)
+            # The helper guarantees that the wall read's monotonic instant is
+            # within [M-U, M+U]. Since samples are taken strictly inside the
+            # collection window, that entire interval must remain in bounds.
             if start_ok and end_ok and not (
-                    start_boundary["collector_monotonic_before_ns"] <= mono <=
+                    start_boundary["collector_monotonic_before_ns"] <=
+                    lower and upper <=
                     end_boundary["collector_monotonic_after_ns"]):
-                errors.append(f"{name} row outside collection monotonic bounds")
+                errors.append(f"{name} row capture outside collection monotonic bounds")
             wall_uncertainty = (
                 mapping.get("mapping_uncertainty_ns", 0)
-                if isinstance(mapping.get("mapping_uncertainty_ns", 0), int) else 0)
+                if type(mapping.get("mapping_uncertainty_ns", 0)) is int and
+                mapping.get("mapping_uncertainty_ns", 0) >= 0 else 0)
+            row_tolerance = wall_uncertainty + uncertainty
             if start_ok and end_ok and not (
-                    start_boundary["collector_wall_before_ns"] - wall_uncertainty <= wall <=
-                    end_boundary["collector_wall_after_ns"] + wall_uncertainty):
+                    start_boundary["collector_wall_before_ns"] - row_tolerance <= wall <=
+                    end_boundary["collector_wall_after_ns"] + row_tolerance):
                 errors.append(f"{name} row outside collection wall bounds")
             if start_ok and end_ok:
                 start_delta = (
@@ -1068,13 +1126,17 @@ def reconcile_collector(manifest, summary, events, resources, rpc, artifacts, er
                 end_delta = (
                     end_boundary["collector_wall_midpoint_ns"] -
                     end_boundary["collector_monotonic_midpoint_ns"])
-                if not (min(start_delta, end_delta) - wall_uncertainty <= wall - mono <=
-                        max(start_delta, end_delta) + wall_uncertainty):
+                # Global tolerance covers the independently measured mapping
+                # and drift. U covers only this row's bracket residual.
+                if not (min(start_delta, end_delta) - row_tolerance <= wall - mono <=
+                        max(start_delta, end_delta) + row_tolerance):
                     errors.append(f"{name} row clock-domain residual mismatch")
         return ([min(mono_values), max(mono_values)] if mono_values else [None, None],
-                [min(wall_values), max(wall_values)] if wall_values else [None, None])
+                [min(wall_values), max(wall_values)] if wall_values else [None, None],
+                max(uncertainties, default=0))
 
-    resource_mono, resource_wall = validate_sample_rows(resources, "resource")
+    resource_mono, resource_wall, resource_uncertainty = validate_sample_rows(
+        resources, "resource")
     for row in resources:
         if any(not math.isfinite(row[field]) for field in RESOURCE_FLOAT_FIELDS):
             errors.append("nonfinite resource counter")
@@ -1087,6 +1149,8 @@ def reconcile_collector(manifest, summary, events, resources, rpc, artifacts, er
         errors.append("resource monotonic bounds mismatch")
     if summary.get("resource_wall_bounds_ns") != resource_wall:
         errors.append("resource wall bounds mismatch")
+    if summary.get("resource_clock_capture_uncertainty_max_ns") != resource_uncertainty:
+        errors.append("resource clock capture uncertainty maximum mismatch")
 
     valid_rpc = 0
     failed_rpc = 0
@@ -1097,20 +1161,22 @@ def reconcile_collector(manifest, summary, events, resources, rpc, artifacts, er
             errors.append(f"RPC row {index} failure/success shape mismatch")
         if has_error:
             failed_rpc += 1
-            if (set(row) != {"monotonic_ns", "wall_ns", "error"} or
+            if (set(row) != {"monotonic_ns", "wall_ns",
+                             "clock_capture_uncertainty_ns", "error"} or
                     not isinstance(row["error"], str) or not row["error"]):
                 errors.append(f"RPC row {index} malformed error")
         else:
             valid_rpc += 1
             chain = row.get("chain", {})
-            if (set(row) != {"monotonic_ns", "wall_ns", "chain", "warnings_present",
-                             "network_totals", "network", "peers"} or
+            if (set(row) != {"monotonic_ns", "wall_ns",
+                             "clock_capture_uncertainty_ns", "chain",
+                             "warnings_present", "network_totals", "network", "peers"} or
                     chain.get("chain") != manifest.get("expected_chain") or
                     not isinstance(chain.get("initialblockdownload"), bool) or
                     not isinstance(chain.get("blocks"), int) or
                     not isinstance(chain.get("headers"), int)):
                 errors.append(f"RPC row {index} malformed chain snapshot")
-    rpc_mono, rpc_wall = validate_sample_rows(rpc, "RPC")
+    rpc_mono, rpc_wall, rpc_uncertainty = validate_sample_rows(rpc, "RPC")
     if summary.get("rpc_rows") != len(rpc):
         errors.append("RPC retained row count mismatch")
     if summary.get("rpc_samples") != valid_rpc:
@@ -1121,6 +1187,20 @@ def reconcile_collector(manifest, summary, events, resources, rpc, artifacts, er
         errors.append("RPC monotonic bounds mismatch")
     if summary.get("rpc_wall_bounds_ns") != rpc_wall:
         errors.append("RPC wall bounds mismatch")
+    if summary.get("rpc_clock_capture_uncertainty_max_ns") != rpc_uncertainty:
+        errors.append("RPC clock capture uncertainty maximum mismatch")
+
+    capture_metadata = {
+        "method": "wall read bracketed by monotonic reads",
+        "representative_monotonic": "midpoint=floor((before+after)/2)",
+        "uncertainty": "ceil((monotonic_after-monotonic_before)/2)",
+        "max_uncertainty_ns": {
+            "resources.csv": resource_uncertainty,
+            "rpc.jsonl": rpc_uncertainty,
+        },
+    }
+    if manifest.get("sample_clock_capture") != capture_metadata:
+        errors.append("collector sample clock capture metadata mismatch")
 
 
 def analyze(manifest, summary, events, resources, rpc, max_join_age, artifacts=None):
@@ -2195,6 +2275,10 @@ def run_self_tests():
                     max((row["monotonic_ns"] for row in rpc_rows), default=None)]
         rpc_wall = [min((row["wall_ns"] for row in rpc_rows), default=None),
                     max((row["wall_ns"] for row in rpc_rows), default=None)]
+        resource_clock_uncertainty = max(
+            (row["clock_capture_uncertainty_ns"] for row in resources), default=0)
+        rpc_clock_uncertainty = max(
+            (row["clock_capture_uncertainty_ns"] for row in rpc_rows), default=0)
         preliminary_artifacts = {
             "events.jsonl": fixture_fact(events, len(events)),
             "resources.csv": fixture_fact(
@@ -2230,16 +2314,18 @@ def run_self_tests():
             "resource_samples": len(resources),
             "resource_monotonic_bounds_ns": resource_mono,
             "resource_wall_bounds_ns": resource_wall,
+            "resource_clock_capture_uncertainty_max_ns": resource_clock_uncertainty,
             "rpc_rows": len(rpc_rows),
             "rpc_samples": sum("error" not in row for row in rpc_rows),
             "rpc_failures": sum("error" in row for row in rpc_rows),
             "rpc_monotonic_bounds_ns": rpc_mono,
             "rpc_wall_bounds_ns": rpc_wall,
+            "rpc_clock_capture_uncertainty_max_ns": rpc_clock_uncertainty,
             "artifact_integrity": preliminary_artifacts,
         }
         artifacts = fixture_artifacts(events, resources, rpc_rows, summary)
         manifest = {
-            "collector_schema": 1,
+            "collector_schema": COLLECTOR_SCHEMA,
             "probe_schema": 4,
             "mode": mode,
             "expected_chain": "regtest",
@@ -2249,6 +2335,15 @@ def run_self_tests():
                            "wall_ns": end_mono + wall_offset},
             "clock_mapping": mapping,
             "cutoff_clock_mapping": cutoff_mapping,
+            "sample_clock_capture": {
+                "method": "wall read bracketed by monotonic reads",
+                "representative_monotonic": "midpoint=floor((before+after)/2)",
+                "uncertainty": "ceil((monotonic_after-monotonic_before)/2)",
+                "max_uncertainty_ns": {
+                    "resources.csv": resource_clock_uncertainty,
+                    "rpc.jsonl": rpc_clock_uncertainty,
+                },
+            },
             "collection_window": window,
             "artifacts": artifacts,
             "complete": True,
@@ -2269,6 +2364,7 @@ def run_self_tests():
     rpc_fixture = [{
         "monotonic_ns": 100_000_000,
         "wall_ns": 1_000_100_000_000,
+        "clock_capture_uncertainty_ns": 0,
         "chain": {"chain": "regtest", "blocks": 100, "headers": 100,
                   "initialblockdownload": False},
         "warnings_present": False,
@@ -2782,6 +2878,22 @@ def run_self_tests():
     assert math.isclose(sum(uncertain_phase_gap.values()), 100 / 1e9)
     assert math.isclose(uncertain_phase_gap["ibd"], 10 / 1e9)
     assert math.isclose(uncertain_phase_gap["unclassified"], 90 / 1e9)
+    bracketed_phase_gap = phase_observation_seconds(
+        [{"monotonic_ns": 10, "clock_capture_uncertainty_ns": 5,
+          "chain": {"initialblockdownload": True}}],
+        1, 101, 20)
+    assert math.isclose(bracketed_phase_gap["ibd"], 10 / 1e9)
+    assert math.isclose(bracketed_phase_gap["unclassified"], 90 / 1e9)
+    bracketed_join_event = [{
+        "event_code": 30, "values": [7], "process_epoch": epoch,
+        "steady_ns": 20, "mapped_monotonic_ns": 20}]
+    annotate(
+        bracketed_join_event,
+        [{"monotonic_ns": 10, "clock_capture_uncertainty_ns": 5,
+          "chain": {"initialblockdownload": True}}],
+        20 / 1e9, mapping_uncertainty_ns=2)
+    assert bracketed_join_event[0]["_phase"] == "ibd"
+    assert bracketed_join_event[0]["_rpc_join_age_ns"] == 17
     uncertainty_events = [
         {"event_code": 30, "values": [7], "process_epoch": epoch,
          "steady_ns": 12, "mapped_monotonic_ns": 12},
@@ -2883,6 +2995,45 @@ def run_self_tests():
                         wall_ns=1_000_200_000_000,
                         rss_bytes=1024, thread_count=1)
     assert fixture_report(valid, resources=[resource_row])["integrity"]["valid"]
+    with tempfile.TemporaryDirectory() as directory:
+        resource_path = Path(directory) / "resources.csv"
+        with resource_path.open("w", encoding="utf-8", newline="") as output:
+            writer = csv.DictWriter(output, fieldnames=RESOURCE_FIELDS)
+            writer.writeheader()
+            writer.writerow(resource_row)
+        parsed_resources = read_resources(resource_path)
+        assert parsed_resources == [resource_row]
+
+    # A wall read delayed beyond the independent global tolerance remains
+    # valid only through its measured row bracket. One nanosecond beyond the
+    # global-plus-row bound is still rejected.
+    bracketed_resource = dict(resource_row)
+    bracketed_resource.update(
+        monotonic_ns=200_000_000,
+        wall_ns=1_000_200_020_743,
+        clock_capture_uncertainty_ns=20_743)
+    bracketed_report = fixture_report(valid, resources=[bracketed_resource])
+    assert bracketed_report["integrity"]["valid"], bracketed_report[
+        "integrity"]["analysis_errors"]
+    outside_bracket = dict(bracketed_resource)
+    outside_bracket["wall_ns"] += 1
+    outside_report = fixture_report(valid, resources=[outside_bracket])
+    assert any("clock-domain residual mismatch" in error for error in
+               outside_report["integrity"]["analysis_errors"])
+
+    rpc_failure = {
+        "monotonic_ns": 200_000_000,
+        "wall_ns": 1_000_200_000_000,
+        "clock_capture_uncertainty_ns": 0,
+        "error": "TimeoutExpired",
+    }
+    assert fixture_report(valid, rpc_rows=[rpc_failure])["integrity"]["valid"]
+    for malformed in (-1, True, float("nan")):
+        malformed_report = fixture_report(
+            valid, mutate_rows=lambda _events, _resources, rows, value=malformed:
+            rows[0].__setitem__("clock_capture_uncertainty_ns", value))
+        assert any("clock capture uncertainty" in error for error in
+                   malformed_report["integrity"]["analysis_errors"]), malformed
     deleted_resource = fixture_report(
         valid, resources=[resource_row],
         mutate_rows=lambda _events, rows, _rpc: rows.clear())
