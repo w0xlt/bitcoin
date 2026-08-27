@@ -33,6 +33,7 @@ struct P2PBlockValidationRequest {
 
 //! Minimal result needed by the existing P2P continuation.
 struct P2PBlockValidationResult {
+    bool process_new_block;
     bool new_block;
 };
 

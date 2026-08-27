@@ -83,7 +83,7 @@ PING_TIMEOUT = 60
 MARKER_POLL = 0.002
 
 PROBE_MAGIC = b"APNBPRB\0"
-PROBE_SCHEMA = 2
+PROBE_SCHEMA = 3
 PROBE_HEADER_SIZE = 64
 PROBE_RECORD_SIZE = 256
 PROBE_CAPACITY = 65_536
@@ -110,13 +110,16 @@ PROBE_EVENTS = {
     15: "test_interface_registered",
     16: "test_interface_unregistered",
     17: "test_shutdown_started",
+    18: "handler_prefix_complete",
+    19: "handler_tail_complete",
+    20: "test_target_disconnected",
 }
 PROBE_GATES = {
     "none": 0,
     "worker_queued": 1,
     "validation_running": 2,
     "result_ready": 3,
-    "handler_pre_poll": 4,
+    "pnb_header_tip": 4,
 }
 
 
@@ -384,24 +387,39 @@ class MarkerReader:
         elif event in {7, 8}:
             fields.update(job=values[0], active_slot=values[1])
         elif event == 9:
-            fields.update(job=values[0], duration_ns=values[1], new_block=values[2],
-                          active_slot=values[3])
+            fields.update(job=values[0], duration_ns=values[1],
+                          process_new_block=values[2], new_block=values[3],
+                          active_slot=values[4])
         elif event == 10:
-            fields.update(job=values[0], new_block=values[1], active_slot=values[2])
+            fields.update(job=values[0], process_new_block=values[1],
+                          new_block=values[2], active_slot=values[3])
         elif event == 11:
             fields.update(
                 job=values[0], source=values[1], count=values[2], total_ns=values[3],
                 max_ns=values[4], max_peer=values[5], max_start_ns=values[6],
                 max_end_ns=values[7], active_slot=values[8])
         elif event == 12:
-            fields.update(job=values[0], source=values[1], new_block=values[2],
-                          active_slot=values[3], continuation=text1)
-        elif event == 13:
-            fields.update(job=values[0], source=values[1], new_block=values[2],
+            fields.update(job=values[0], source=values[1],
+                          process_new_block=values[2], new_block=values[3],
+                          active_slot=values[4], source_live=values[5],
                           continuation=text1)
+        elif event == 13:
+            fields.update(job=values[0], source=values[1],
+                          process_new_block=values[2], new_block=values[3],
+                          source_live=values[4], continuation=text1)
         elif event == 14:
             fields.update(gate=values[0], generation=values[1], job=values[2],
-                          peer=values[3])
+                          peer=values[3], detail1=values[4], detail2=values[5])
+        elif event == 18:
+            fields.update(peer=values[0], handler_turn_start_ns=values[1],
+                          active_slot=values[2], job=values[3])
+        elif event == 19:
+            fields.update(peer=values[0], msg_id=values[1],
+                          handler_turn_start_ns=values[2], active_slot=values[3],
+                          job=values[4], msg=text1)
+        elif event == 20:
+            fields.update(peer=values[0], gate=values[1], generation=values[2],
+                          job=values[3])
         return fields
 
     def _poll_file(self, state):
@@ -969,6 +987,7 @@ class AsyncPNBPeerService(BitcoinTestFramework):
             "handler_processing_ns": complete["steady_ns"] - start["steady_ns"],
             "handler_queue_delay_ns": start["steady_ns"] - ready["steady_ns"],
             "handler_prefix_ns": start["handler_prefix_ns"],
+            "handler_start_ns": start["steady_ns"],
             "handler_scheduling_delay_ns": start["handler_turn_start_ns"] - ready["steady_ns"],
             "handler_turn_start_ns": start["handler_turn_start_ns"],
             "message_id": msg_id,
@@ -1021,6 +1040,8 @@ class AsyncPNBPeerService(BitcoinTestFramework):
         assert submit["steady_ns"] <= start["steady_ns"] < end["steady_ns"]
         assert end["duration_ns"] == end["steady_ns"] - start["steady_ns"]
         assert end["steady_ns"] <= completed["steady_ns"]
+        assert end["process_new_block"] == completed["process_new_block"]
+        assert end["new_block"] == completed["new_block"]
         lifecycle = {
             "continuation": completed,
             "job_submit": submit,
@@ -1042,6 +1063,9 @@ class AsyncPNBPeerService(BitcoinTestFramework):
                     <= summary["steady_ns"] <= collection["steady_ns"]
                     <= completed["steady_ns"])
             assert submit["steady_ns"] <= slot["steady_ns"] <= collection["steady_ns"]
+            assert (end["process_new_block"] == publication["process_new_block"]
+                    == collection["process_new_block"])
+            assert end["new_block"] == publication["new_block"] == collection["new_block"]
             assert summary["total_ns"] >= summary["max_ns"] >= 0
             assert (summary["count"] == 0) == (summary["max_peer"] == -1)
             lifecycle.update({
@@ -1487,56 +1511,74 @@ class AsyncPNBPeerService(BitcoinTestFramework):
         return transcripts
 
     def _gated_real_pnb_overlap(self, source, p2pk_wallet, seed):
-        """Resume a pre-cleared Ping handler while BlockChecked holds real PNB."""
+        """Run one untouched Ping turn during PNB's kernel header-tip phase."""
         block, seed = self._build_work_block(p2pk_wallet, seed)
         peer, peer_id = self._new_service_peer("ping")
         fixture = {"nonce": 0xA600000000000000}
-        self._announce(source, block)
+        expected_height = self.nodes[0].getblockcount() + 1
         checkpoint = self.markers.checkpoint()
-        latest_generation = self.markers.arm_gate("handler_pre_poll", peer=peer_id)
+        generation = self.markers.arm_gate("pnb_header_tip")
         try:
-            self._begin_service_request(peer, "ping", fixture)
-            ready = self.markers.wait(
-                "complete_message_ready", checkpoint, peer=peer_id, msg="ping")
-            handler_gate = self.markers.wait_gate(
-                "handler_pre_poll", latest_generation, checkpoint,
-                peer=peer_id, job=0)
-            assert ready["steady_ns"] <= handler_gate["steady_ns"]
-            self.markers.assert_absent(
-                "handler_start", checkpoint, peer=peer_id,
-                msg_id=ready["msg_id"])
-
-            handler_generation = latest_generation
-            latest_generation = self.markers.arm_gate("validation_running")
+            # Source submission comes first. This full block is intentionally
+            # unannounced so AcceptBlock advances the best header and reaches
+            # the existing kernel header-tip notification in this PNB call.
             source.send_without_ping(msg_block(block))
             start = self.markers.wait("pnb_start", checkpoint, hash=block.hash_hex)
-            validation_gate = self.markers.wait_gate(
-                "validation_running", latest_generation, checkpoint,
-                hash=block.hash_hex, job=start["job"], peer=-1)
-            assert start["steady_ns"] <= validation_gate["steady_ns"]
+            header_gate = self.markers.wait_gate(
+                "pnb_header_tip", generation, checkpoint,
+                job=start["job"], peer=-1)
+            assert header_gate["detail1"] == expected_height
+            assert header_gate["detail2"] == block.nTime
+            assert start["steady_ns"] < header_gate["steady_ns"]
             self.markers.assert_absent(
                 "pnb_end", checkpoint, hash=block.hash_hex, job=start["job"])
 
-            # Release only the earlier handler latch. The newer validation
-            # generation remains held inside the ProcessNewBlock stack.
-            self.markers.release_gate(handler_generation, clear=False)
+            self._begin_service_request(peer, "ping", fixture)
             timing = peer.finish_service_request()
             self._validate_service_response(timing, fixture)
             target = self._target_service(peer_id, timing, checkpoint)
-            assert start["steady_ns"] < target["handler_turn_start_ns"]
-            assert start["steady_ns"] < target["response_queued_ns"]
+            prefix = self.markers.unique(
+                "handler_prefix_complete", checkpoint, peer=peer_id,
+                handler_turn_start_ns=target["handler_turn_start_ns"],
+                active_slot=1, job=start["job"])
+            tail = self.markers.unique(
+                "handler_tail_complete", checkpoint, peer=peer_id,
+                msg_id=target["message_id"],
+                handler_turn_start_ns=target["handler_turn_start_ns"],
+                active_slot=1, job=start["job"], msg="ping")
+            self.markers.unique(
+                "complete_message_ready", checkpoint, peer=peer_id,
+                msg_id=target["message_id"], msg="ping")
+            self.markers.unique(
+                "handler_start", checkpoint, peer=peer_id,
+                msg_id=target["message_id"], msg="ping")
+            self.markers.unique(
+                "handler_complete", checkpoint, peer=peer_id,
+                msg_id=target["message_id"], msg="ping")
+            self.markers.unique(
+                "response_queued", checkpoint, peer=peer_id,
+                msg_id=target["message_id"], msg="ping", response="pong")
+            assert (header_gate["steady_ns"] < target["ready_ns"]
+                    <= prefix["steady_ns"] <= target["poll_ns"]
+                    <= target["response_queued_ns"] <= tail["steady_ns"]
+                    <= target["handler_complete_ns"])
+            assert start["steady_ns"] < target["handler_start_ns"]
             self.markers.assert_absent(
                 "pnb_end", checkpoint, hash=block.hash_hex, job=start["job"])
         finally:
-            self.markers.release_gate(latest_generation)
+            self.markers.release_gate(generation)
 
         pnb = self._wait_pnb_job(checkpoint, block, "standard")
-        assert target["response_queued_ns"] < pnb["end_ns"]
+        assert (pnb["start_ns"] < target["handler_start_ns"]
+                < target["response_queued_ns"] <= tail["steady_ns"]
+                < pnb["end_ns"])
         peer.peer_disconnect()
         peer.wait_for_disconnect()
         return seed, {
             "block_hash": block.hash_hex,
-            "handler_start_ns": target["handler_turn_start_ns"],
+            "handler_start_ns": target["handler_start_ns"],
+            "handler_tail_ns": tail["steady_ns"],
+            "kernel_header_tip_ns": header_gate["steady_ns"],
             "pnb_end_ns": pnb["end_ns"],
             "pnb_start_ns": pnb["start_ns"],
             "response_queued_ns": target["response_queued_ns"],
@@ -1548,6 +1590,7 @@ class AsyncPNBPeerService(BitcoinTestFramework):
             "running": "validation_running",
             "result_ready": "result_ready",
         }[phase]
+        source_id = self._map_peer_id(source)
         self._announce(source, block)
         checkpoint = self.markers.checkpoint()
         generation = self.markers.arm_gate(gate)
@@ -1582,10 +1625,19 @@ class AsyncPNBPeerService(BitcoinTestFramework):
                     "continuation", checkpoint, hash=block.hash_hex, job=job)
             source.peer_disconnect()
             source.wait_for_disconnect()
+            target_disconnect = self.markers.wait(
+                "test_target_disconnected", checkpoint, peer=source_id,
+                gate=PROBE_GATES[gate], generation=generation)
+            assert entered["steady_ns"] <= target_disconnect["steady_ns"]
         finally:
             self.markers.release_gate(generation)
         pnb = self._wait_pnb_job(checkpoint, block, "standard")
         assert pnb["job"] == entered["job"]
+        lifecycle = pnb["lifecycle"]
+        assert lifecycle["job_submit"]["source"] == source_id
+        assert lifecycle["result_collection"]["source_live"] == 0
+        assert lifecycle["continuation"]["source_live"] == 0
+        assert target_disconnect["steady_ns"] < lifecycle["result_collection"]["steady_ns"]
         return pnb
 
     def _gated_running_shutdown(self, source, block):
@@ -1822,9 +1874,8 @@ class AsyncPNBPeerService(BitcoinTestFramework):
         assert refused_target["response_queued_ns"] >= end["steady_ns"]
 
         # The mixed oracle is complete. Lifecycle gates below intentionally
-        # isolate the source and one pre-cleared target so an unrelated
-        # ordinary SendMessages cs_main wait cannot masquerade as a failure of
-        # that specific receive-boundary authority.
+        # isolate the source and lifecycle fixtures so unrelated ordinary
+        # SendMessages cs_main waits cannot masquerade as a lifecycle failure.
         for _service, peer, _peer_id in service_entries:
             peer.peer_disconnect()
             peer.wait_for_disconnect()

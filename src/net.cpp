@@ -1995,6 +1995,9 @@ void CConnman::DisconnectNodes()
         {
             if (pnode->fDisconnect)
             {
+                if (m_async_pnb_probe && m_async_pnb_probe->TestGatesEnabled()) {
+                    m_async_pnb_probe->RecordTargetDisconnect(pnode->GetId());
+                }
                 // remove from m_nodes
                 m_nodes.erase(remove(m_nodes.begin(), m_nodes.end(), pnode), m_nodes.end());
 
@@ -4157,23 +4160,21 @@ void CNode::MarkReceivedMsgsForProcessing()
             // partially deserialized message is held by TransportDeserializer.
             nSizeAdded += msg.GetMemoryUsage();
             ++ready_depth;
-            if (IsMeasuredPeerServiceRequest(msg.m_type)) {
+            if (m_async_pnb_probe && IsMeasuredPeerServiceRequest(msg.m_type)) {
                 msg.m_process_queue_id = ++m_next_process_queue_id;
                 msg.m_process_queue_ready = SteadyClock::now();
                 msg.m_process_queue_bytes_at_ready = m_msg_process_queue_size + nSizeAdded;
                 msg.m_process_queue_depth_at_ready = ready_depth;
                 msg.m_process_queue_paused_at_ready =
                     msg.m_process_queue_bytes_at_ready > m_recv_flood_size;
-                if (m_async_pnb_probe) {
-                    m_async_pnb_probe->Record(
-                        node::AsyncPNBProbeEvent::COMPLETE_MESSAGE_READY,
-                        msg.m_process_queue_ready,
-                        {GetId(), static_cast<int64_t>(msg.m_process_queue_id),
-                         static_cast<int64_t>(msg.m_process_queue_bytes_at_ready),
-                         static_cast<int64_t>(msg.m_process_queue_depth_at_ready),
-                         msg.m_process_queue_paused_at_ready},
-                        msg.m_type);
-                }
+                m_async_pnb_probe->Record(
+                    node::AsyncPNBProbeEvent::COMPLETE_MESSAGE_READY,
+                    msg.m_process_queue_ready,
+                    {GetId(), static_cast<int64_t>(msg.m_process_queue_id),
+                     static_cast<int64_t>(msg.m_process_queue_bytes_at_ready),
+                     static_cast<int64_t>(msg.m_process_queue_depth_at_ready),
+                     msg.m_process_queue_paused_at_ready},
+                    msg.m_type);
             }
         }
         m_msg_process_queue.splice(m_msg_process_queue.end(), vRecvMsg);

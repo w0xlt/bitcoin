@@ -51,19 +51,21 @@ private:
                 .min_pow_checked = false,
             };
             uint64_t queued_job{0};
-            uint256 queued_hash;
+            std::optional<uint256> queued_hash;
             {
                 WAIT_LOCK(m_mutex, lock);
                 m_cv.wait(lock, [this]() EXCLUSIVE_LOCKS_REQUIRED(m_mutex) {
                     return m_stopping || m_request.has_value();
                 });
                 if (!m_request) return;
-                queued_job = m_request->job_id;
-                queued_hash = m_request->block->GetHash();
+                if (m_probe && m_probe->TestGatesEnabled()) {
+                    queued_job = m_request->job_id;
+                    queued_hash = m_request->block->GetHash();
+                }
             }
-            if (m_probe && m_probe->TestGatesEnabled()) {
+            if (queued_hash) {
                 (void)m_probe->TestGate(AsyncPNBProbeTestGate::WORKER_QUEUED,
-                                        queued_job, /*peer=*/-1, &queued_hash);
+                                        queued_job, /*peer=*/-1, &*queued_hash);
             }
             if (m_test_state_hook) {
                 m_test_state_hook(P2PBlockValidationTestState::QUEUED);
@@ -81,32 +83,35 @@ private:
                 m_test_state_hook(P2PBlockValidationTestState::RUNNING);
             }
 
-            const uint256 hash{request.block->GetHash()};
-            const auto worker_wake{SteadyClock::now()};
+            std::optional<uint256> probe_hash;
             if (m_probe) {
+                probe_hash = request.block->GetHash();
+                const auto worker_wake{SteadyClock::now()};
                 m_probe->Record(AsyncPNBProbeEvent::WORKER_WAKE, worker_wake,
-                                {static_cast<int64_t>(request.job_id), 1}, {}, {}, &hash);
+                                {static_cast<int64_t>(request.job_id), 1}, {}, {}, &*probe_hash);
                 if (m_probe->TestGatesEnabled()) m_probe->SetActiveJob(request.job_id);
             }
             bool new_block{false};
-            const auto pnb_start{SteadyClock::now()};
+            SteadyClock::time_point pnb_start;
             if (m_probe) {
+                pnb_start = SteadyClock::now();
                 m_probe->Record(AsyncPNBProbeEvent::PNB_START, pnb_start,
-                                {static_cast<int64_t>(request.job_id), 1}, {}, {}, &hash);
+                                {static_cast<int64_t>(request.job_id), 1}, {}, {}, &*probe_hash);
             }
-            (void)m_process_new_block(
+            const bool process_new_block{m_process_new_block(
                 request.block,
                 request.force_processing,
                 request.min_pow_checked,
-                &new_block);
-            const auto pnb_end{SteadyClock::now()};
+                &new_block)};
             if (m_probe) {
+                const auto pnb_end{SteadyClock::now()};
                 if (m_probe->TestGatesEnabled()) m_probe->SetActiveJob(0);
                 m_probe->Record(
                     AsyncPNBProbeEvent::PNB_END, pnb_end,
                     {static_cast<int64_t>(request.job_id),
-                     Ticks<std::chrono::nanoseconds>(pnb_end - pnb_start), new_block, 1},
-                    {}, {}, &hash);
+                     Ticks<std::chrono::nanoseconds>(pnb_end - pnb_start),
+                     process_new_block, new_block, 1},
+                    {}, {}, &*probe_hash);
             }
             request.block.reset();
 
@@ -116,8 +121,8 @@ private:
                 Assert(m_running);
                 Assert(!m_result);
                 m_running = false;
-                publication_time = SteadyClock::now();
-                m_result = P2PBlockValidationResult{new_block};
+                if (m_probe) publication_time = SteadyClock::now();
+                m_result = P2PBlockValidationResult{process_new_block, new_block};
             }
             if (m_test_state_hook) {
                 m_test_state_hook(P2PBlockValidationTestState::RESULT_READY);
@@ -125,10 +130,11 @@ private:
             if (m_probe) {
                 m_probe->Record(
                     AsyncPNBProbeEvent::RESULT_PUBLICATION, publication_time,
-                    {static_cast<int64_t>(request.job_id), new_block, 1}, {}, {}, &hash);
+                    {static_cast<int64_t>(request.job_id), process_new_block,
+                     new_block, 1}, {}, {}, &*probe_hash);
                 if (m_probe->TestGatesEnabled()) {
                     (void)m_probe->TestGate(AsyncPNBProbeTestGate::RESULT_READY,
-                                            request.job_id, /*peer=*/-1, &hash);
+                                            request.job_id, /*peer=*/-1, &*probe_hash);
                 }
             }
             // Publication precedes the wake and the callback never runs under

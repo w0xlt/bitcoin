@@ -2014,6 +2014,8 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
         try {
             node.async_pnb_peer_service_probe =
                 node::AsyncPNBPeerServiceProbe::Create(async_pnb_probe_dir, async_pnb_test_gates);
+            kernel_notifications.SetAsyncPNBPeerServiceProbe(
+                node.async_pnb_peer_service_probe);
         } catch (const std::exception& error) {
             return InitError(Untranslated(strprintf(
                 "Unable to initialize async-PNB probe: %s", error.what())));

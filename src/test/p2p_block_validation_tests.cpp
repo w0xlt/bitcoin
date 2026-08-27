@@ -164,6 +164,7 @@ BOOST_AUTO_TEST_CASE(single_slot_lifetime_and_publication)
     m_node.validation_signals->UnregisterSharedValidationInterface(blocker);
 
     BOOST_REQUIRE(result_from_wake);
+    BOOST_CHECK(!result_from_wake->process_new_block);
     BOOST_CHECK(!result_from_wake->new_block);
     BOOST_CHECK(!validation->TakeResult());
     BOOST_CHECK(weak_block.expired());
@@ -226,6 +227,8 @@ BOOST_AUTO_TEST_CASE(result_ready_occupies_slot_and_is_taken_once)
     validation->StopAndJoin();
     auto result{validation->TakeResult()};
     BOOST_REQUIRE(result);
+    // Preserve the ProcessNewBlock return independently from new_block.
+    BOOST_CHECK(!result->process_new_block);
     BOOST_CHECK(result->new_block);
     BOOST_CHECK(!validation->TakeResult());
     BOOST_CHECK(validation->Submit(InvalidRequest(std::make_shared<const CBlock>())) ==
@@ -279,6 +282,7 @@ BOOST_AUTO_TEST_CASE(process_and_wake_run_outside_component_mutex)
     BOOST_CHECK_EQUAL(calls.load(), 1);
     BOOST_CHECK_EQUAL(wakes.load(), 1);
     BOOST_REQUIRE(result_from_wake);
+    BOOST_CHECK(result_from_wake->process_new_block);
     BOOST_CHECK(!result_from_wake->new_block);
     BOOST_CHECK(!validation->TakeResult());
 }
@@ -351,6 +355,7 @@ BOOST_AUTO_TEST_CASE(stop_drains_each_occupied_state_once)
         BOOST_CHECK(weak_block.expired());
         auto result{validation->TakeResult()};
         BOOST_REQUIRE(result);
+        BOOST_CHECK(result->process_new_block);
         BOOST_CHECK(result->new_block);
         BOOST_CHECK(!validation->TakeResult());
         BOOST_CHECK(validation->Submit(InvalidRequest(std::make_shared<const CBlock>())) ==
@@ -358,9 +363,47 @@ BOOST_AUTO_TEST_CASE(stop_drains_each_occupied_state_once)
     }
 }
 
-BOOST_AUTO_TEST_CASE(handler_gate_wait_release_is_consumed_once)
+BOOST_AUTO_TEST_CASE(probe_gate_disabled_and_overflow_authority)
 {
 #ifndef WIN32
+    const fs::path disabled_dir{m_path_root / "disabled"};
+    BOOST_REQUIRE(fs::create_directory(disabled_dir));
+    auto disabled_probe{node::AsyncPNBPeerServiceProbe::Create(
+        disabled_dir, /*test_gates=*/false)};
+    std::vector<fs::path> disabled_files;
+    for (const auto& entry : fs::directory_iterator{disabled_dir}) {
+        if (fs::PathToString(entry.path().filename()).starts_with("async-pnb-probe-")) {
+            disabled_files.push_back(entry.path());
+        }
+    }
+    BOOST_REQUIRE_EQUAL(disabled_files.size(), 1U);
+    const int disabled_fd{open(fs::PathToString(disabled_files[0]).c_str(), O_RDWR | O_CLOEXEC)};
+    BOOST_REQUIRE(disabled_fd >= 0);
+    constexpr size_t mapping_size{
+        sizeof(node::AsyncPNBProbeFileHeader) +
+        node::ASYNC_PNB_PROBE_CAPACITY * sizeof(node::AsyncPNBProbeSlot)};
+    void* disabled_mapping{mmap(nullptr, mapping_size, PROT_READ | PROT_WRITE,
+                                MAP_SHARED, disabled_fd, 0)};
+    BOOST_REQUIRE(disabled_mapping != MAP_FAILED);
+    auto* disabled_header{
+        static_cast<node::AsyncPNBProbeFileHeader*>(disabled_mapping)};
+    disabled_header->test_gate.store(
+        static_cast<uint32_t>(node::AsyncPNBProbeTestGate::PNB_HEADER_TIP),
+        std::memory_order_relaxed);
+    disabled_header->test_gate_generation.store(1, std::memory_order_release);
+    disabled_probe->SetActiveJob(8);
+    // All disabled test-gate entry points return before recording or waiting.
+    BOOST_CHECK(!disabled_probe->TestGate(
+        node::AsyncPNBProbeTestGate::WORKER_QUEUED,
+        /*job=*/8, /*peer=*/-1, /*hash=*/nullptr));
+    BOOST_CHECK(!disabled_probe->TestHeaderTipGate(/*height=*/1, /*timestamp=*/2));
+    disabled_probe->RecordTargetDisconnect(/*peer=*/7);
+    BOOST_CHECK(!disabled_probe->ResultReadyCollectionDeferred());
+    BOOST_CHECK_EQUAL(disabled_header->next_sequence.load(std::memory_order_acquire), 0U);
+    BOOST_CHECK_EQUAL(disabled_header->status.load(std::memory_order_acquire), 0U);
+    BOOST_CHECK_EQUAL(munmap(disabled_mapping, mapping_size), 0);
+    BOOST_CHECK_EQUAL(close(disabled_fd), 0);
+
     auto probe{node::AsyncPNBPeerServiceProbe::Create(m_path_root, /*test_gates=*/true)};
     std::vector<fs::path> probe_files;
     for (const auto& entry : fs::directory_iterator{m_path_root}) {
@@ -371,50 +414,27 @@ BOOST_AUTO_TEST_CASE(handler_gate_wait_release_is_consumed_once)
     BOOST_REQUIRE_EQUAL(probe_files.size(), 1U);
     const int fd{open(fs::PathToString(probe_files[0]).c_str(), O_RDWR | O_CLOEXEC)};
     BOOST_REQUIRE(fd >= 0);
-    constexpr size_t mapping_size{
-        sizeof(node::AsyncPNBProbeFileHeader) +
-        node::ASYNC_PNB_PROBE_CAPACITY * sizeof(node::AsyncPNBProbeSlot)};
     void* mapping{mmap(nullptr, mapping_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0)};
     BOOST_REQUIRE(mapping != MAP_FAILED);
     auto* header{static_cast<node::AsyncPNBProbeFileHeader*>(mapping)};
-    header->test_gate_peer.store(7, std::memory_order_relaxed);
-    header->test_gate.store(
-        static_cast<uint32_t>(node::AsyncPNBProbeTestGate::HANDLER_PRE_POLL),
-        std::memory_order_relaxed);
-    header->test_gate_generation.store(1, std::memory_order_release);
-
-    BOOST_CHECK(probe->TestGate(
-        node::AsyncPNBProbeTestGate::HANDLER_PRE_POLL,
-        /*job=*/0, /*peer=*/7, /*hash=*/nullptr));
-    BOOST_CHECK(probe->HandlerPrePollDeferred(7));
-    BOOST_CHECK(!probe->ResumeHandlerPrePoll(7));
-
-    header->test_gate_release.store(1, std::memory_order_release);
-    // RELEASED remains deferred from SendMessages until ProcessMessages
-    // consumes the exact post-prefix resume once.
-    BOOST_CHECK(probe->HandlerPrePollDeferred(7));
-    BOOST_CHECK(probe->ResumeHandlerPrePoll(7));
-    BOOST_CHECK(!probe->HandlerPrePollDeferred(7));
-    BOOST_CHECK(!probe->ResumeHandlerPrePoll(7));
-
     header->test_gate.store(
         static_cast<uint32_t>(node::AsyncPNBProbeTestGate::RESULT_READY),
         std::memory_order_relaxed);
-    header->test_gate_generation.store(2, std::memory_order_release);
+    header->test_gate_generation.store(1, std::memory_order_release);
     BOOST_CHECK(probe->ResultReadyCollectionDeferred());
-    header->test_gate_release.store(2, std::memory_order_release);
+    header->test_gate_release.store(1, std::memory_order_release);
     BOOST_CHECK(!probe->ResultReadyCollectionDeferred());
 
     // Reservations beyond the fixed capacity are hard-invalid and never
     // modulo-wrap onto a published slot.
     auto* slots{reinterpret_cast<node::AsyncPNBProbeSlot*>(
         static_cast<unsigned char*>(mapping) + sizeof(node::AsyncPNBProbeFileHeader))};
-    BOOST_REQUIRE_EQUAL(header->next_sequence.load(std::memory_order_acquire), 1U);
-    const uint64_t first_checksum{slots[0].checksum};
-    for (uint32_t index{1}; index < node::ASYNC_PNB_PROBE_CAPACITY; ++index) {
+    BOOST_REQUIRE_EQUAL(header->next_sequence.load(std::memory_order_acquire), 0U);
+    for (uint32_t index{0}; index < node::ASYNC_PNB_PROBE_CAPACITY; ++index) {
         probe->Record(node::AsyncPNBProbeEvent::TEST_INTERFACE_REGISTERED,
                       std::chrono::steady_clock::time_point{});
     }
+    const uint64_t first_checksum{slots[0].checksum};
     BOOST_CHECK_EQUAL(header->next_sequence.load(std::memory_order_acquire),
                       node::ASYNC_PNB_PROBE_CAPACITY);
     BOOST_CHECK_EQUAL(slots[node::ASYNC_PNB_PROBE_CAPACITY - 1]
@@ -431,7 +451,7 @@ BOOST_AUTO_TEST_CASE(handler_gate_wait_release_is_consumed_once)
     BOOST_CHECK_EQUAL(slots[0].published_sequence.load(std::memory_order_acquire), 1U);
     BOOST_CHECK_EQUAL(slots[0].record.sequence, 1U);
     BOOST_CHECK_EQUAL(slots[0].record.event,
-                      static_cast<uint32_t>(node::AsyncPNBProbeEvent::TEST_GATE_ENTERED));
+                      static_cast<uint32_t>(node::AsyncPNBProbeEvent::TEST_INTERFACE_REGISTERED));
     BOOST_CHECK_EQUAL(slots[0].checksum, first_checksum);
 
     BOOST_CHECK_EQUAL(munmap(mapping, mapping_size), 0);

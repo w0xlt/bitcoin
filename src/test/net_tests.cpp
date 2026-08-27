@@ -210,6 +210,9 @@ BOOST_AUTO_TEST_CASE(cnode_conditional_poll)
     auto block{node.PollMessage()};
     BOOST_REQUIRE(block);
     BOOST_CHECK_EQUAL(block->first.m_type, NetMsgType::BLOCK);
+    BOOST_CHECK_EQUAL(block->first.m_process_queue_id, 0U);
+    BOOST_CHECK(block->first.m_process_queue_ready == SteadyClock::time_point{});
+    BOOST_CHECK(block->first.m_process_queue_poll == SteadyClock::time_point{});
     BOOST_CHECK(block->second);
     const auto after_block{node.GetProcessQueueSnapshot()};
     BOOST_CHECK_EQUAL(after_block.bytes, initial_bytes - message_usage[0]);
@@ -219,9 +222,17 @@ BOOST_AUTO_TEST_CASE(cnode_conditional_poll)
     auto ping{node.PollMessage(excluded_types)};
     BOOST_REQUIRE(ping);
     BOOST_CHECK_EQUAL(ping->first.m_type, NetMsgType::PING);
-    BOOST_CHECK_EQUAL(ping->first.m_process_queue_bytes_at_poll, after_block.bytes);
-    BOOST_CHECK_EQUAL(ping->first.m_process_queue_depth_at_poll, after_block.depth);
-    BOOST_CHECK_EQUAL(ping->first.m_process_queue_paused_at_poll, after_block.paused);
+    // Without an actual recorder, measured message metadata and clocks remain
+    // untouched throughout the ordinary queue path.
+    BOOST_CHECK_EQUAL(ping->first.m_process_queue_id, 0U);
+    BOOST_CHECK(ping->first.m_process_queue_ready == SteadyClock::time_point{});
+    BOOST_CHECK(ping->first.m_process_queue_poll == SteadyClock::time_point{});
+    BOOST_CHECK_EQUAL(ping->first.m_process_queue_bytes_at_ready, 0U);
+    BOOST_CHECK_EQUAL(ping->first.m_process_queue_depth_at_ready, 0U);
+    BOOST_CHECK(!ping->first.m_process_queue_paused_at_ready);
+    BOOST_CHECK_EQUAL(ping->first.m_process_queue_bytes_at_poll, 0U);
+    BOOST_CHECK_EQUAL(ping->first.m_process_queue_depth_at_poll, 0U);
+    BOOST_CHECK(!ping->first.m_process_queue_paused_at_poll);
     // The next exact-front producer remains queued and suppresses more-work.
     BOOST_CHECK(!ping->second);
     const auto after_ping{node.GetProcessQueueSnapshot()};
@@ -237,6 +248,9 @@ BOOST_AUTO_TEST_CASE(cnode_conditional_poll)
     auto cmpctblock{node.PollMessage()};
     BOOST_REQUIRE(cmpctblock);
     BOOST_CHECK_EQUAL(cmpctblock->first.m_type, NetMsgType::CMPCTBLOCK);
+    BOOST_CHECK_EQUAL(cmpctblock->first.m_process_queue_id, 0U);
+    BOOST_CHECK(cmpctblock->first.m_process_queue_ready == SteadyClock::time_point{});
+    BOOST_CHECK(cmpctblock->first.m_process_queue_poll == SteadyClock::time_point{});
     BOOST_CHECK(cmpctblock->second);
     const auto after_cmpctblock{node.GetProcessQueueSnapshot()};
     BOOST_CHECK_EQUAL(after_cmpctblock.bytes, message_usage[3]);
@@ -251,6 +265,9 @@ BOOST_AUTO_TEST_CASE(cnode_conditional_poll)
     auto blocktxn{node.PollMessage()};
     BOOST_REQUIRE(blocktxn);
     BOOST_CHECK_EQUAL(blocktxn->first.m_type, NetMsgType::BLOCKTXN);
+    BOOST_CHECK_EQUAL(blocktxn->first.m_process_queue_id, 0U);
+    BOOST_CHECK(blocktxn->first.m_process_queue_ready == SteadyClock::time_point{});
+    BOOST_CHECK(blocktxn->first.m_process_queue_poll == SteadyClock::time_point{});
     BOOST_CHECK(!blocktxn->second);
     const auto empty{node.GetProcessQueueSnapshot()};
     BOOST_CHECK_EQUAL(empty.bytes, 0);

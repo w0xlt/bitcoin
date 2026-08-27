@@ -67,8 +67,6 @@ public:
     AsyncPNBProbeSlot* slots{nullptr};
     const bool test_gates;
     std::atomic<uint64_t> active_job{0};
-    std::atomic<uint32_t> deferred_handler_generation{0};
-    std::atomic<int64_t> deferred_handler_peer{-1};
 
     explicit Impl(bool enable_test_gates) : test_gates{enable_test_gates} {}
 };
@@ -221,15 +219,6 @@ void AsyncPNBPeerServiceProbe::SetActiveJob(uint64_t job) noexcept
     m_impl->active_job.store(job, std::memory_order_release);
 }
 
-bool AsyncPNBPeerServiceProbe::HandlerPrePollDeferred(int64_t peer) const noexcept
-{
-    if (!m_impl->test_gates) return false;
-    const uint32_t generation{
-        m_impl->deferred_handler_generation.load(std::memory_order_acquire)};
-    return generation != 0 &&
-           m_impl->deferred_handler_peer.load(std::memory_order_acquire) == peer;
-}
-
 bool AsyncPNBPeerServiceProbe::ResultReadyCollectionDeferred() const noexcept
 {
     if (!m_impl->test_gates) return false;
@@ -241,38 +230,17 @@ bool AsyncPNBPeerServiceProbe::ResultReadyCollectionDeferred() const noexcept
            m_impl->header->test_gate_release.load(std::memory_order_acquire) < generation;
 }
 
-bool AsyncPNBPeerServiceProbe::ResumeHandlerPrePoll(int64_t peer) noexcept
-{
-    if (!m_impl->test_gates) return false;
-    uint32_t generation{
-        m_impl->deferred_handler_generation.load(std::memory_order_acquire)};
-    if (generation == 0 ||
-        m_impl->deferred_handler_peer.load(std::memory_order_acquire) != peer ||
-        m_impl->header->test_gate_release.load(std::memory_order_acquire) < generation) {
-        return false;
-    }
-    if (!m_impl->deferred_handler_generation.compare_exchange_strong(
-            generation, 0, std::memory_order_acq_rel)) {
-        return false;
-    }
-    m_impl->deferred_handler_peer.store(-1, std::memory_order_release);
-    return true;
-}
-
 bool AsyncPNBPeerServiceProbe::TestGate(AsyncPNBProbeTestGate gate, uint64_t job,
                                        int64_t peer, const uint256* hash) noexcept
 {
+    return WaitTestGate(gate, job, peer, hash);
+}
+
+bool AsyncPNBPeerServiceProbe::WaitTestGate(AsyncPNBProbeTestGate gate, uint64_t job,
+                                           int64_t peer, const uint256* hash,
+                                           int64_t detail1, int64_t detail2) noexcept
+{
     if (!m_impl->test_gates) return false;
-    if (gate == AsyncPNBProbeTestGate::HANDLER_PRE_POLL) {
-        const uint32_t deferred_generation{
-            m_impl->deferred_handler_generation.load(std::memory_order_acquire)};
-        const uint32_t released{
-            m_impl->header->test_gate_release.load(std::memory_order_acquire)};
-        if (deferred_generation > released &&
-            m_impl->deferred_handler_peer.load(std::memory_order_acquire) == peer) {
-            return true;
-        }
-    }
     const uint32_t generation{
         m_impl->header->test_gate_generation.load(std::memory_order_acquire)};
     if (generation == 0 ||
@@ -285,13 +253,9 @@ bool AsyncPNBPeerServiceProbe::TestGate(AsyncPNBProbeTestGate gate, uint64_t job
     if (expected_peer != -1 && expected_peer != peer) return false;
 
     Record(AsyncPNBProbeEvent::TEST_GATE_ENTERED, std::chrono::steady_clock::now(),
-           {static_cast<int64_t>(gate), generation, static_cast<int64_t>(job), peer},
+           {static_cast<int64_t>(gate), generation, static_cast<int64_t>(job), peer,
+            detail1, detail2},
            {}, {}, hash);
-    if (gate == AsyncPNBProbeTestGate::HANDLER_PRE_POLL) {
-        m_impl->deferred_handler_peer.store(peer, std::memory_order_release);
-        m_impl->deferred_handler_generation.store(generation, std::memory_order_release);
-        return true;
-    }
     const auto deadline{std::chrono::steady_clock::now() + TEST_GATE_TIMEOUT};
     while (m_impl->header->test_gate_release.load(std::memory_order_acquire) < generation) {
         if (std::chrono::steady_clock::now() >= deadline) {
@@ -301,6 +265,32 @@ bool AsyncPNBPeerServiceProbe::TestGate(AsyncPNBProbeTestGate gate, uint64_t job
         std::this_thread::sleep_for(std::chrono::milliseconds{1});
     }
     return false;
+}
+
+bool AsyncPNBPeerServiceProbe::TestHeaderTipGate(int64_t height,
+                                                int64_t timestamp) noexcept
+{
+    const uint64_t active_job{m_impl->active_job.load(std::memory_order_acquire)};
+    if (active_job == 0) return false;
+    return WaitTestGate(AsyncPNBProbeTestGate::PNB_HEADER_TIP,
+                        active_job,
+                        /*peer=*/-1, /*hash=*/nullptr, height, timestamp);
+}
+
+void AsyncPNBPeerServiceProbe::RecordTargetDisconnect(int64_t peer) noexcept
+{
+    if (!m_impl->test_gates) return;
+    const uint32_t generation{
+        m_impl->header->test_gate_generation.load(std::memory_order_acquire)};
+    const uint32_t gate{m_impl->header->test_gate.load(std::memory_order_acquire)};
+    if (generation == 0 || gate == static_cast<uint32_t>(AsyncPNBProbeTestGate::NONE) ||
+        m_impl->header->test_gate_release.load(std::memory_order_acquire) >= generation) {
+        return;
+    }
+    Record(AsyncPNBProbeEvent::TEST_TARGET_DISCONNECTED,
+           std::chrono::steady_clock::now(),
+           {peer, gate, generation,
+            static_cast<int64_t>(m_impl->active_job.load(std::memory_order_acquire))});
 }
 
 void AsyncPNBPeerServiceProbe::BlockChecked(

@@ -1106,7 +1106,8 @@ private:
     bool ProcessAsyncP2PBlockResult(std::optional<NodeId> collector = std::nullopt)
         EXCLUSIVE_LOCKS_REQUIRED(NetEventsInterface::g_msgproc_mutex);
     void ProcessP2PBlockCompletion(uint64_t job_id, NodeId source,
-                                   const uint256& hash, bool new_block,
+                                   const uint256& hash, bool process_new_block,
+                                   bool new_block,
                                    P2PBlockContinuation continuation)
         EXCLUSIVE_LOCKS_REQUIRED(NetEventsInterface::g_msgproc_mutex);
     bool AsyncP2PBlockActive() const
@@ -3826,48 +3827,56 @@ void PeerManagerImpl::ProcessBlock(CNode& node, const std::shared_ptr<const CBlo
         return;
     }
 
-    const uint64_t job_id{++m_next_pnb_job_id};
+    const uint64_t job_id{m_async_pnb_probe ? ++m_next_pnb_job_id : 0};
     const uint256 hash{block->GetHash()};
-    const char* continuation_name{continuation == P2PBlockContinuation::STANDARD
-                                      ? "standard"
-                                      : "optimistic_compact"};
     if (m_async_pnb_probe) {
+        const char* continuation_name{continuation == P2PBlockContinuation::STANDARD
+                                          ? "standard"
+                                          : "optimistic_compact"};
         m_async_pnb_probe->Record(
             node::AsyncPNBProbeEvent::JOB_SUBMIT, SteadyClock::now(),
             {static_cast<int64_t>(job_id), node.GetId(), 0},
             continuation_name, {}, &hash);
     }
     bool new_block{false};
-    const auto pnb_start{SteadyClock::now()};
+    SteadyClock::time_point pnb_start;
     if (m_async_pnb_probe) {
+        pnb_start = SteadyClock::now();
         m_async_pnb_probe->Record(
             node::AsyncPNBProbeEvent::PNB_START, pnb_start,
             {static_cast<int64_t>(job_id), 0}, {}, {}, &hash);
     }
-    m_chainman.ProcessNewBlock(block, force_processing, min_pow_checked, &new_block);
-    const auto pnb_end{SteadyClock::now()};
+    const bool process_new_block{
+        m_chainman.ProcessNewBlock(block, force_processing, min_pow_checked, &new_block)};
     if (m_async_pnb_probe) {
+        const auto pnb_end{SteadyClock::now()};
         m_async_pnb_probe->Record(
             node::AsyncPNBProbeEvent::PNB_END, pnb_end,
             {static_cast<int64_t>(job_id),
-             Ticks<std::chrono::nanoseconds>(pnb_end - pnb_start), new_block, 0},
+             Ticks<std::chrono::nanoseconds>(pnb_end - pnb_start),
+             process_new_block, new_block, 0},
             {}, {}, &hash);
     }
-    ProcessP2PBlockCompletion(job_id, node.GetId(), hash, new_block, continuation);
+    ProcessP2PBlockCompletion(job_id, node.GetId(), hash, process_new_block,
+                              new_block, continuation);
 }
 
 void PeerManagerImpl::ProcessP2PBlockCompletion(uint64_t job_id, NodeId source,
                                                 const uint256& hash,
+                                                bool process_new_block,
                                                 bool new_block,
                                                 P2PBlockContinuation continuation)
 {
     AssertLockHeld(NetEventsInterface::g_msgproc_mutex);
 
+    bool source_live{false};
     if (new_block) {
-        m_connman.ForNode(source, [](CNode* node) {
+        source_live = m_connman.ForNode(source, [](CNode* node) {
             node->m_last_block_time = GetTime<std::chrono::seconds>();
             return true;
         });
+    } else if (m_async_pnb_probe) {
+        source_live = m_connman.ForNode(source, [](CNode*) { return true; });
     }
 
     LOCK(cs_main);
@@ -3892,7 +3901,8 @@ void PeerManagerImpl::ProcessP2PBlockCompletion(uint64_t job_id, NodeId source,
                 : "optimistic_compact"};
         m_async_pnb_probe->Record(
             node::AsyncPNBProbeEvent::CONTINUATION, SteadyClock::now(),
-            {static_cast<int64_t>(job_id), source, new_block},
+            {static_cast<int64_t>(job_id), source, process_new_block,
+             new_block, source_live},
             continuation_name, {}, &hash);
     }
 }
@@ -3909,7 +3919,7 @@ void PeerManagerImpl::StartAsyncP2PBlockValidation(
     Assert(!m_pending_block_validation);
     Assert(block != nullptr);
 
-    const uint64_t job_id{++m_next_pnb_job_id};
+    const uint64_t job_id{m_async_pnb_probe ? ++m_next_pnb_job_id : 0};
     const uint256 hash{block->GetHash()};
     m_pending_block_validation = PendingP2PBlock{
         .job_id = job_id,
@@ -3917,10 +3927,10 @@ void PeerManagerImpl::StartAsyncP2PBlockValidation(
         .hash = hash,
         .continuation = continuation,
     };
-    const char* continuation_name{continuation == P2PBlockContinuation::STANDARD
-                                      ? "standard"
-                                      : "optimistic_compact"};
     if (m_async_pnb_probe) {
+        const char* continuation_name{continuation == P2PBlockContinuation::STANDARD
+                                          ? "standard"
+                                          : "optimistic_compact"};
         m_async_pnb_probe->Record(
             node::AsyncPNBProbeEvent::JOB_SUBMIT, SteadyClock::now(),
             {static_cast<int64_t>(job_id), source, 1},
@@ -3932,10 +3942,10 @@ void PeerManagerImpl::StartAsyncP2PBlockValidation(
         .min_pow_checked = min_pow_checked,
         .job_id = job_id,
     })};
-    const char* status_name{status == node::P2PBlockValidationSubmit::ACCEPTED
-                                ? "accepted"
-                                : status == node::P2PBlockValidationSubmit::FULL ? "full" : "stopping"};
     if (m_async_pnb_probe) {
+        const char* status_name{status == node::P2PBlockValidationSubmit::ACCEPTED
+                                    ? "accepted"
+                                    : status == node::P2PBlockValidationSubmit::FULL ? "full" : "stopping"};
         m_async_pnb_probe->Record(
             node::AsyncPNBProbeEvent::SLOT_SUBMIT, SteadyClock::now(),
             {static_cast<int64_t>(job_id), source,
@@ -3974,8 +3984,8 @@ bool PeerManagerImpl::ProcessAsyncP2PBlockResult(std::optional<NodeId> collector
     if (!result) return false;
 
     const PendingP2PBlock pending{*m_pending_block_validation};
-    const auto summary_time{SteadyClock::now()};
     if (m_async_pnb_probe) {
+        const auto summary_time{SteadyClock::now()};
         m_async_pnb_probe->Record(
             node::AsyncPNBProbeEvent::BUSY_SEND_PREFIX_SUMMARY, summary_time,
             {static_cast<int64_t>(pending.job_id), pending.source,
@@ -3984,17 +3994,21 @@ bool PeerManagerImpl::ProcessAsyncP2PBlockResult(std::optional<NodeId> collector
              pending.busy_send_prefix_max_peer, pending.busy_send_prefix_max_start_ns,
              pending.busy_send_prefix_max_end_ns, 1}, {}, {}, &pending.hash);
     }
-    const char* continuation_name{pending.continuation == P2PBlockContinuation::STANDARD
-                                      ? "standard"
-                                      : "optimistic_compact"};
     if (m_async_pnb_probe) {
+        const char* continuation_name{pending.continuation == P2PBlockContinuation::STANDARD
+                                          ? "standard"
+                                          : "optimistic_compact"};
+        const bool source_live{m_connman.ForNode(
+            pending.source, [](CNode*) { return true; })};
         m_async_pnb_probe->Record(
             node::AsyncPNBProbeEvent::RESULT_COLLECTION, SteadyClock::now(),
             {static_cast<int64_t>(pending.job_id), pending.source,
-             result->new_block, 1}, continuation_name, {}, &pending.hash);
+             result->process_new_block, result->new_block, 1, source_live},
+            continuation_name, {}, &pending.hash);
     }
     ProcessP2PBlockCompletion(pending.job_id, pending.source, pending.hash,
-                              result->new_block, pending.continuation);
+                              result->process_new_block, result->new_block,
+                              pending.continuation);
     m_pending_block_validation.reset();
     return true;
 }
@@ -5767,7 +5781,9 @@ bool PeerManagerImpl::ProcessMessages(CNode& node, std::atomic<bool>& interruptM
         if (AsyncP2PBlockActiveFor(node.GetId())) return false;
     }
 
-    const auto handler_turn_start{SteadyClock::now()};
+    const auto handler_turn_start{m_async_pnb_probe
+                                      ? SteadyClock::now()
+                                      : SteadyClock::time_point{}};
     const bool async_busy{m_block_validation && AsyncP2PBlockActive()};
 
     PeerRef maybe_peer{GetPeerRef(node.GetId())};
@@ -5775,42 +5791,46 @@ bool PeerManagerImpl::ProcessMessages(CNode& node, std::atomic<bool>& interruptM
     Peer& peer{*maybe_peer};
     const bool test_gates_enabled{
         m_async_pnb_probe && m_async_pnb_probe->TestGatesEnabled()};
-    const bool resume_handler_pre_poll{
-        test_gates_enabled &&
-        m_async_pnb_probe->ResumeHandlerPrePoll(node.GetId())};
-    if (!resume_handler_pre_poll && test_gates_enabled &&
-        m_async_pnb_probe->HandlerPrePollDeferred(node.GetId())) {
-        return true;
-    }
 
     // For outbound connections, ensure that the initial VERSION message
     // has been sent first before processing any incoming messages
-    if (!resume_handler_pre_poll) {
-        if (!node.IsInboundConn() && !peer.m_outbound_version_message_sent) return false;
+    if (!node.IsInboundConn() && !peer.m_outbound_version_message_sent) return false;
 
-        {
-            LOCK(peer.m_getdata_requests_mutex);
-            if (!peer.m_getdata_requests.empty()) {
-                ProcessGetData(node, peer, interruptMsgProc);
-            }
+    {
+        LOCK(peer.m_getdata_requests_mutex);
+        if (!peer.m_getdata_requests.empty()) {
+            ProcessGetData(node, peer, interruptMsgProc);
         }
+    }
 
-        const bool processed_orphan{ProcessOrphanTx(peer)};
+    const bool processed_orphan{ProcessOrphanTx(peer)};
 
-        if (node.fDisconnect)
-            return false;
+    if (node.fDisconnect)
+        return false;
 
-        if (processed_orphan) return true;
+    if (processed_orphan) return true;
 
-        // this maintains the order of responses
-        // and prevents m_getdata_requests to grow unbounded
-        {
-            LOCK(peer.m_getdata_requests_mutex);
-            if (!peer.m_getdata_requests.empty()) return true;
-        }
+    // this maintains the order of responses
+    // and prevents m_getdata_requests to grow unbounded
+    {
+        LOCK(peer.m_getdata_requests_mutex);
+        if (!peer.m_getdata_requests.empty()) return true;
+    }
 
-        // Don't bother if send buffer is too full to respond anyway
-        if (node.fPauseSend) return false;
+    // Don't bother if send buffer is too full to respond anyway
+    if (node.fPauseSend) return false;
+
+    if (test_gates_enabled && node.GetProcessQueueSnapshot().depth != 0) {
+        const uint64_t active_job{m_pending_block_validation
+                                      ? m_pending_block_validation->job_id
+                                      : 0};
+        m_async_pnb_probe->Record(
+            node::AsyncPNBProbeEvent::HANDLER_PREFIX_COMPLETE,
+            SteadyClock::now(),
+            {node.GetId(),
+             TicksSinceEpoch<std::chrono::nanoseconds>(handler_turn_start),
+             m_pending_block_validation.has_value(),
+             static_cast<int64_t>(active_job)});
     }
 
     static constexpr std::array<std::string_view, 3> PNB_PRODUCERS{
@@ -5818,17 +5838,6 @@ bool PeerManagerImpl::ProcessMessages(CNode& node, std::atomic<bool>& interruptM
         NetMsgType::CMPCTBLOCK,
         NetMsgType::BLOCKTXN,
     };
-    if (!resume_handler_pre_poll && test_gates_enabled &&
-        node.GetProcessQueueSnapshot().depth != 0) {
-        const uint64_t active_job{m_pending_block_validation
-                                      ? m_pending_block_validation->job_id
-                                      : 0};
-        if (m_async_pnb_probe->TestGate(
-                node::AsyncPNBProbeTestGate::HANDLER_PRE_POLL,
-                active_job, node.GetId(), nullptr)) {
-            return true;
-        }
-    }
     auto poll_result{async_busy ? node.PollMessage(PNB_PRODUCERS) : node.PollMessage()};
     if (!poll_result) {
         // No message to process
@@ -5905,6 +5914,18 @@ bool PeerManagerImpl::ProcessMessages(CNode& node, std::atomic<bool>& interruptM
         LogDebug(BCLog::NET, "%s(%s, %u bytes): Unknown exception caught\n", __func__, SanitizeString(msg.m_type), msg.m_message_size);
     }
 
+    if (test_gates_enabled && measured_service_request) {
+        const uint64_t active_job{m_pending_block_validation
+                                      ? m_pending_block_validation->job_id
+                                      : 0};
+        m_async_pnb_probe->Record(
+            node::AsyncPNBProbeEvent::HANDLER_TAIL_COMPLETE,
+            SteadyClock::now(),
+            {node.GetId(), static_cast<int64_t>(msg.m_process_queue_id),
+             TicksSinceEpoch<std::chrono::nanoseconds>(handler_turn_start),
+             m_pending_block_validation.has_value(),
+             static_cast<int64_t>(active_job)}, msg.m_type);
+    }
     if (measured_service_request) {
         const uint64_t active_job{m_pending_block_validation
                                       ? m_pending_block_validation->job_id
@@ -6501,9 +6522,12 @@ bool PeerManagerImpl::SendMessages(CNode& node)
     AssertLockHeld(g_msgproc_mutex);
 
     const bool async_busy{m_block_validation && AsyncP2PBlockActive()};
-    const auto busy_prefix_start{async_busy ? SteadyClock::now() : SteadyClock::time_point{}};
+    const bool measure_busy_prefix{async_busy && bool{m_async_pnb_probe}};
+    const auto busy_prefix_start{measure_busy_prefix
+                                     ? SteadyClock::now()
+                                     : SteadyClock::time_point{}};
     const auto record_busy_prefix{[&](SteadyClock::time_point end) {
-        Assert(async_busy);
+        Assert(measure_busy_prefix);
         PendingP2PBlock& pending{*Assert(m_pending_block_validation)};
         const int64_t start_ns{TicksSinceEpoch<std::chrono::nanoseconds>(busy_prefix_start)};
         const int64_t end_ns{TicksSinceEpoch<std::chrono::nanoseconds>(end)};
@@ -6519,7 +6543,7 @@ bool PeerManagerImpl::SendMessages(CNode& node)
     }};
     PeerRef maybe_peer{GetPeerRef(node.GetId())};
     if (!maybe_peer) {
-        if (async_busy) record_busy_prefix(SteadyClock::now());
+        if (measure_busy_prefix) record_busy_prefix(SteadyClock::now());
         return false;
     }
     Peer& peer{*maybe_peer};
@@ -6528,16 +6552,8 @@ bool PeerManagerImpl::SendMessages(CNode& node)
     // We must call MaybeDiscourageAndDisconnect first, to ensure that we'll
     // disconnect misbehaving peers even before the version handshake is complete.
     const bool disconnected{MaybeDiscourageAndDisconnect(node, peer)};
-    if (async_busy) record_busy_prefix(SteadyClock::now());
+    if (measure_busy_prefix) record_busy_prefix(SteadyClock::now());
     if (disconnected) return true;
-
-    // Quick-test gate only: preserve the mandatory discourage/disconnect
-    // prefix, then keep this pre-cleared peer away from the ordinary
-    // cs_main-taking tail until its generation is released.
-    if (m_async_pnb_probe && m_async_pnb_probe->TestGatesEnabled() &&
-        m_async_pnb_probe->HandlerPrePollDeferred(node.GetId())) {
-        return true;
-    }
 
     // Preserve source ordering until its result continuation has run. Every
     // unrelated peer follows the ordinary complete send path.

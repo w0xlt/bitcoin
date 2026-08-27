@@ -12,6 +12,7 @@
 #include <kernel/context.h>
 #include <kernel/warning.h>
 #include <node/abort.h>
+#include <node/async_pnb_peer_service_probe.h>
 #include <node/interface_ui.h>
 #include <node/warnings.h>
 #include <util/check.h>
@@ -70,6 +71,11 @@ kernel::InterruptResult KernelNotifications::blockTip(SynchronizationState state
 void KernelNotifications::headerTip(SynchronizationState state, int64_t height, int64_t timestamp, bool presync)
 {
     uiInterface.NotifyHeaderTip(state, height, timestamp, presync);
+    // Quick-test-only authority at the existing kernel notification between
+    // AcceptBlock and ActivateBestChain. The null/default path is inert.
+    if (m_async_pnb_probe && m_async_pnb_probe->TestGatesEnabled()) {
+        (void)m_async_pnb_probe->TestHeaderTipGate(height, timestamp);
+    }
 }
 
 void KernelNotifications::progress(const bilingual_str& title, int progress_percent, bool resume_possible)

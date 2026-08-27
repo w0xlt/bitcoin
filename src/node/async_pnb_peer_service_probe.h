@@ -24,7 +24,7 @@ class path;
 
 namespace node {
 
-inline constexpr uint32_t ASYNC_PNB_PROBE_SCHEMA{2};
+inline constexpr uint32_t ASYNC_PNB_PROBE_SCHEMA{3};
 inline constexpr uint32_t ASYNC_PNB_PROBE_CAPACITY{65'536};
 inline constexpr uint32_t ASYNC_PNB_PROBE_ENDIAN{0x01020304};
 inline constexpr uint32_t ASYNC_PNB_PROBE_FLAG_TEST_GATES{1U};
@@ -48,6 +48,9 @@ enum class AsyncPNBProbeEvent : uint32_t {
     TEST_INTERFACE_REGISTERED,
     TEST_INTERFACE_UNREGISTERED,
     TEST_SHUTDOWN_STARTED,
+    HANDLER_PREFIX_COMPLETE,
+    HANDLER_TAIL_COMPLETE,
+    TEST_TARGET_DISCONNECTED,
 };
 
 enum class AsyncPNBProbeTestGate : uint32_t {
@@ -55,7 +58,7 @@ enum class AsyncPNBProbeTestGate : uint32_t {
     WORKER_QUEUED,
     VALIDATION_RUNNING,
     RESULT_READY,
-    HANDLER_PRE_POLL,
+    PNB_HEADER_TIP,
 };
 
 /** Fixed mmap ABI. Create() rejects non-little-endian hosts. */
@@ -124,21 +127,23 @@ public:
 
     bool TestGatesEnabled() const noexcept;
     void SetActiveJob(uint64_t job) noexcept;
-    /** Keep a latched test handler from re-entering its already-run prefix. */
-    bool HandlerPrePollDeferred(int64_t peer) const noexcept;
     /** Hold a published result uncollected at the quick-test boundary. */
     bool ResultReadyCollectionDeferred() const noexcept;
-    /** Resume exactly one test-latched handler at the post-prefix boundary. */
-    bool ResumeHandlerPrePoll(int64_t peer) noexcept;
-    /** Return true only when HANDLER_PRE_POLL has latched this peer for deferral. */
     bool TestGate(AsyncPNBProbeTestGate gate, uint64_t job,
                   int64_t peer, const uint256* hash) noexcept;
+    /** Quick-test hook in the existing kernel header-tip notification. */
+    bool TestHeaderTipGate(int64_t height, int64_t timestamp) noexcept;
+    /** Record target-side fDisconnect/removal authority for an active test gate. */
+    void RecordTargetDisconnect(int64_t peer) noexcept;
 
 protected:
     void BlockChecked(const std::shared_ptr<const CBlock>& block,
                       const BlockValidationState& state) override;
 
 private:
+    bool WaitTestGate(AsyncPNBProbeTestGate gate, uint64_t job,
+                      int64_t peer, const uint256* hash,
+                      int64_t detail1 = 0, int64_t detail2 = 0) noexcept;
     class Impl;
     explicit AsyncPNBPeerServiceProbe(std::unique_ptr<Impl> impl);
     std::unique_ptr<Impl> m_impl;

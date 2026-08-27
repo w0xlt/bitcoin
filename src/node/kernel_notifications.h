@@ -13,6 +13,8 @@
 #include <atomic>
 #include <cstdint>
 #include <functional>
+#include <memory>
+#include <utility>
 
 class ArgsManager;
 class CBlockIndex;
@@ -25,6 +27,7 @@ enum class Warning;
 
 namespace node {
 
+class AsyncPNBPeerServiceProbe;
 class Warnings;
 inline constexpr int DEFAULT_STOPATHEIGHT{0};
 
@@ -49,6 +52,12 @@ public:
     [[nodiscard]] kernel::InterruptResult blockTip(SynchronizationState state, const CBlockIndex& index, double verification_progress) override EXCLUSIVE_LOCKS_REQUIRED(!m_tip_block_mutex);
 
     void headerTip(SynchronizationState state, int64_t height, int64_t timestamp, bool presync) override;
+
+    /** Install the optional experiment recorder before node threads start. */
+    void SetAsyncPNBPeerServiceProbe(std::shared_ptr<AsyncPNBPeerServiceProbe> probe)
+    {
+        m_async_pnb_probe = std::move(probe);
+    }
 
     void progress(const bilingual_str& title, int progress_percent, bool resume_possible) override;
 
@@ -84,6 +93,7 @@ private:
     const std::function<bool()>& m_shutdown_request;
     std::atomic<int>& m_exit_status;
     node::Warnings& m_warnings;
+    std::shared_ptr<AsyncPNBPeerServiceProbe> m_async_pnb_probe;
 };
 
 void ReadNotificationArgs(const ArgsManager& args, KernelNotifications& notifications);
