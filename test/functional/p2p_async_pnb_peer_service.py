@@ -648,7 +648,9 @@ class ResourceSampler:
 class AsyncPNBPeerService(BitcoinTestFramework):
     def add_options(self, parser):
         parser.add_argument("--output-dir")
+        parser.add_argument("--peer-service-dispatch-only", action="store_true")
         parser.add_argument("--peer-service-mode", choices=("control", "candidate"), default="candidate")
+        parser.add_argument("--peer-service-probe", choices=("enabled", "disabled"), default="enabled")
         parser.add_argument("--peer-service-profile", choices=tuple(PROFILES), default="curve")
         parser.add_argument("--peer-service-reference-run")
         parser.add_argument("--peer-service-seed", type=int, default=0xA51C0DE)
@@ -657,6 +659,8 @@ class AsyncPNBPeerService(BitcoinTestFramework):
         self.num_nodes = 1
         self.setup_clean_chain = False
         self.uses_wallet = False
+        assert self.options.peer_service_probe == "enabled" or self.options.peer_service_dispatch_only
+        assert not self.options.peer_service_dispatch_only or self.options.output_dir is None
         if self.options.randomseed is None:
             self.options.randomseed = self.options.peer_service_seed
         assert self.options.randomseed == self.options.peer_service_seed, \
@@ -682,16 +686,23 @@ class AsyncPNBPeerService(BitcoinTestFramework):
     def setup_nodes(self):
         """Refresh the cached chain with an identical height-200 block in every arm."""
         self.probe_dir = Path(self.options.tmpdir).resolve()
-        self.test_gates_enabled = self.options.output_dir is None
-        self.extra_args[0] += [
-            f"-asyncpnbpeerserviceprobedir={self.probe_dir}",
-            f"-asyncpnbpeerservicetestgates={int(self.test_gates_enabled)}",
-        ]
+        self.probe_enabled = self.options.peer_service_probe == "enabled"
+        self.test_gates_enabled = (
+            self.probe_enabled
+            and self.options.output_dir is None
+            and not self.options.peer_service_dispatch_only)
+        if self.probe_enabled:
+            self.extra_args[0] += [
+                f"-asyncpnbpeerserviceprobedir={self.probe_dir}",
+                f"-asyncpnbpeerservicetestgates={int(self.test_gates_enabled)}",
+            ]
         self.add_nodes(self.num_nodes, self.extra_args)
         self.start_nodes()
-        self.markers = MarkerReader(
-            self.probe_dir, self.options.timeout_factor,
-            expect_test_gates=self.test_gates_enabled)
+        self.markers = (
+            MarkerReader(
+                self.probe_dir, self.options.timeout_factor,
+                expect_test_gates=self.test_gates_enabled)
+            if self.probe_enabled else None)
         assert not self.uses_wallet and len(self.nodes) == 1
         node = self.nodes[0]
         assert node.getblockcount() == 199
@@ -1995,6 +2006,58 @@ class AsyncPNBPeerService(BitcoinTestFramework):
             overlap_outcome,
             {"outcomes": mixed_outcomes, "transcripts": mixed_transcripts})
 
+    def _run_dispatch_oracle(self):
+        """Prove ordinary and correlated response dispatch without running PNB."""
+        node = self.nodes[0]
+        peer = node.add_p2p_connection(PeerServicePeer())
+        peer_id = self._map_peer_id(peer)
+        checkpoint = self.markers.checkpoint() if self.markers else 0
+
+        first_nonce = 0xA700000000000001
+        first_fixture = {"nonce": first_nonce}
+        self._begin_service_request(peer, "ping", first_fixture)
+        first_ping = peer.finish_service_request()
+        self._validate_service_response(first_ping, first_fixture)
+
+        tip_hash = node.getbestblockhash()
+        tip_header = node.getblockheader(tip_hash)
+        request = msg_getheaders()
+        request.locator = CBlockLocator()
+        request.locator.vHave = [int(tip_header["previousblockhash"], 16)]
+        request.hashstop = int(tip_hash, 16)
+        peer.begin_service_request("getheaders", request, ("headers",))
+        headers_timing = peer.finish_service_request()
+        assert headers_timing["completed"] and headers_timing["connected"]
+        assert [response["type"] for response in headers_timing["responses"]] == ["headers"]
+        headers = headers_timing["responses"][0]["message"].headers
+        assert len(headers) == 1 and headers[0].hash_int == int(tip_hash, 16)
+
+        second_nonce = 0xA700000000000002
+        second_fixture = {"nonce": second_nonce}
+        self._begin_service_request(peer, "ping", second_fixture)
+        second_ping = peer.finish_service_request()
+        self._validate_service_response(second_ping, second_fixture)
+        assert peer.is_connected
+        assert node.getbestblockhash() == tip_hash
+        assert any(info["id"] == peer_id for info in node.getpeerinfo())
+
+        if self.markers:
+            targets = [
+                self._target_service(peer_id, first_ping, checkpoint),
+                self._target_service(peer_id, headers_timing, checkpoint),
+                self._target_service(peer_id, second_ping, checkpoint),
+            ]
+            assert [target["service"] for target in targets] == [
+                "ping", "getheaders", "ping"]
+            probe = self.markers.finalize(require_gate_none=True)
+            assert len(probe["files"]) == 1
+            assert probe["files"][0]["status"] == 0
+            assert probe["files"][0]["overflow_count"] == 0
+            assert probe["files"][0]["test_gate_error"] == 0
+
+        peer.peer_disconnect()
+        peer.wait_for_disconnect()
+
     def _provenance(self, node, binary):
         source_dir = Path(self.config["environment"]["SRCDIR"])
         build_dir = Path(self.config["environment"]["BUILDDIR"])
@@ -2281,6 +2344,9 @@ class AsyncPNBPeerService(BitcoinTestFramework):
     def run_test(self):
         self.pause_metrics = {"pause_observations": 0, "snapshots_checked": 0}
         self.trial_inputs = []
+        if self.options.peer_service_dispatch_only:
+            self._run_dispatch_oracle()
+            return
         if self.options.output_dir is None:
             self._run_quick()
             return

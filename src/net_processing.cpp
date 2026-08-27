@@ -5005,9 +5005,14 @@ void PeerManagerImpl::ProcessMessage(Peer& peer, CNode& pfrom, const CNetMessage
             LogDebug(BCLog::NET, "Ignoring getheaders from peer=%d because active chain has too little work; sending empty response\n", pfrom.GetId());
             // Just respond with an empty headers message, to tell the peer to
             // go away but not treat us as unresponsive.
-            PushMeasuredMessage(
-                pfrom, net_message.m_process_queue_id, NetMsgType::GETHEADERS,
-                NetMsg::Make(NetMsgType::HEADERS, std::vector<CBlockHeader>()));
+            if (net_message.m_process_queue_id != 0) {
+                PushMeasuredMessage(
+                    pfrom, net_message.m_process_queue_id, NetMsgType::GETHEADERS,
+                    NetMsg::Make(NetMsgType::HEADERS, std::vector<CBlockHeader>()));
+            } else {
+                MakeAndPushMessage(pfrom, NetMsgType::HEADERS,
+                                   std::vector<CBlockHeader>());
+            }
             return;
         }
 
@@ -5056,9 +5061,14 @@ void PeerManagerImpl::ProcessMessage(Peer& peer, CNode& pfrom, const CNetMessage
         // will re-announce the new block via headers (or compact blocks again)
         // in the SendMessages logic.
         nodestate->pindexBestHeaderSent = pindex ? pindex : m_chainman.ActiveChain().Tip();
-        PushMeasuredMessage(
-            pfrom, net_message.m_process_queue_id, NetMsgType::GETHEADERS,
-            NetMsg::Make(NetMsgType::HEADERS, TX_WITH_WITNESS(vHeaders)));
+        if (net_message.m_process_queue_id != 0) {
+            PushMeasuredMessage(
+                pfrom, net_message.m_process_queue_id, NetMsgType::GETHEADERS,
+                NetMsg::Make(NetMsgType::HEADERS, TX_WITH_WITNESS(vHeaders)));
+        } else {
+            MakeAndPushMessage(pfrom, NetMsgType::HEADERS,
+                               TX_WITH_WITNESS(vHeaders));
+        }
         return;
     }
 
@@ -5586,9 +5596,13 @@ void PeerManagerImpl::ProcessMessage(Peer& peer, CNode& pfrom, const CNetMessage
             // it, if the remote node sends a ping once per second and this node takes 5
             // seconds to respond to each, the 5th ping the remote sends would appear to
             // return very quickly.
-            PushMeasuredMessage(
-                pfrom, net_message.m_process_queue_id, NetMsgType::PING,
-                NetMsg::Make(NetMsgType::PONG, nonce), nonce);
+            if (net_message.m_process_queue_id != 0) {
+                PushMeasuredMessage(
+                    pfrom, net_message.m_process_queue_id, NetMsgType::PING,
+                    NetMsg::Make(NetMsgType::PONG, nonce), nonce);
+            } else {
+                MakeAndPushMessage(pfrom, NetMsgType::PONG, nonce);
+            }
         }
         return;
     }
