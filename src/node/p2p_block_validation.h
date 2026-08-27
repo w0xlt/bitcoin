@@ -23,12 +23,23 @@ enum class P2PBlockValidationSubmit {
     STOPPING,
 };
 
+enum class P2PBlockDeliveryRoute : uint8_t {
+    UNKNOWN = 0,
+    FULL_BLOCK,
+    COMPACT_BLOCK,
+    BLOCKTXN,
+};
+
 //! Immutable inputs retained for one asynchronous ProcessNewBlock call.
 struct P2PBlockValidationRequest {
     std::shared_ptr<const CBlock> block;
     bool force_processing;
     bool min_pow_checked;
     uint64_t job_id{0}; //!< Inert measurement correlation only.
+    int64_t source{-1};
+    P2PBlockDeliveryRoute delivery_route{P2PBlockDeliveryRoute::UNKNOWN};
+    bool initial_block_download{false};
+    int32_t active_height{-1};
 };
 
 //! Minimal result needed by the existing P2P continuation.

@@ -26,6 +26,7 @@
 #include <future>
 #include <memory>
 #include <optional>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -363,7 +364,7 @@ BOOST_AUTO_TEST_CASE(stop_drains_each_occupied_state_once)
     }
 }
 
-BOOST_AUTO_TEST_CASE(probe_gate_disabled_and_overflow_authority)
+BOOST_AUTO_TEST_CASE(probe_gate_disabled_and_circular_stream_authority)
 {
 #ifndef WIN32
     const fs::path disabled_dir{m_path_root / "disabled"};
@@ -399,7 +400,7 @@ BOOST_AUTO_TEST_CASE(probe_gate_disabled_and_overflow_authority)
     BOOST_CHECK(!disabled_probe->TestHeaderTipGate(/*height=*/1, /*timestamp=*/2));
     disabled_probe->RecordTargetDisconnect(/*peer=*/7);
     BOOST_CHECK(!disabled_probe->ResultReadyCollectionDeferred());
-    BOOST_CHECK_EQUAL(disabled_header->next_sequence.load(std::memory_order_acquire), 0U);
+    BOOST_CHECK_EQUAL(disabled_header->producer_sequence.load(std::memory_order_acquire), 0U);
     BOOST_CHECK_EQUAL(disabled_header->status.load(std::memory_order_acquire), 0U);
     BOOST_CHECK_EQUAL(munmap(disabled_mapping, mapping_size), 0);
     BOOST_CHECK_EQUAL(close(disabled_fd), 0);
@@ -425,34 +426,66 @@ BOOST_AUTO_TEST_CASE(probe_gate_disabled_and_overflow_authority)
     header->test_gate_release.store(1, std::memory_order_release);
     BOOST_CHECK(!probe->ResultReadyCollectionDeferred());
 
-    // Reservations beyond the fixed capacity are hard-invalid and never
-    // modulo-wrap onto a published slot.
+    // A keeping-up consumer can acknowledge and wrap indefinitely without
+    // invalidating the stream.
     auto* slots{reinterpret_cast<node::AsyncPNBProbeSlot*>(
         static_cast<unsigned char*>(mapping) + sizeof(node::AsyncPNBProbeFileHeader))};
-    BOOST_REQUIRE_EQUAL(header->next_sequence.load(std::memory_order_acquire), 0U);
-    for (uint32_t index{0}; index < node::ASYNC_PNB_PROBE_CAPACITY; ++index) {
+    BOOST_REQUIRE(header->process_epoch != 0);
+    BOOST_REQUIRE_EQUAL(header->producer_sequence.load(std::memory_order_acquire), 0U);
+    for (uint64_t sequence{1}; sequence <= node::ASYNC_PNB_PROBE_CAPACITY + 1ULL;
+         ++sequence) {
+        probe->Record(node::AsyncPNBProbeEvent::TEST_INTERFACE_REGISTERED,
+                      std::chrono::steady_clock::time_point{});
+        const auto& slot{slots[(sequence - 1) & (node::ASYNC_PNB_PROBE_CAPACITY - 1)]};
+        BOOST_REQUIRE_EQUAL(slot.published_sequence.load(std::memory_order_acquire), sequence);
+        BOOST_CHECK_EQUAL(slot.record.sequence, sequence);
+        BOOST_CHECK_EQUAL(slot.record.process_epoch, header->process_epoch);
+        header->consumer_ack.store(sequence, std::memory_order_release);
+    }
+    BOOST_CHECK_EQUAL(header->loss_count.load(std::memory_order_acquire), 0U);
+    BOOST_CHECK_EQUAL(header->status.load(std::memory_order_acquire),
+                      node::ASYNC_PNB_PROBE_FLAG_TEST_GATES);
+    BOOST_CHECK_EQUAL(slots[0].published_sequence.load(std::memory_order_acquire),
+                      node::ASYNC_PNB_PROBE_CAPACITY + 1ULL);
+
+    // Concurrent producers reserve unique consecutive sequences and publish
+    // complete records into the circular stream.
+    const uint64_t concurrent_begin{
+        header->producer_sequence.load(std::memory_order_acquire) + 1};
+    constexpr uint64_t THREADS{4};
+    constexpr uint64_t RECORDS_PER_THREAD{256};
+    std::vector<std::thread> producers;
+    for (uint64_t thread{0}; thread < THREADS; ++thread) {
+        producers.emplace_back([&] {
+            for (uint64_t record{0}; record < RECORDS_PER_THREAD; ++record) {
+                probe->Record(node::AsyncPNBProbeEvent::TEST_INTERFACE_REGISTERED,
+                              std::chrono::steady_clock::time_point{});
+            }
+        });
+    }
+    for (auto& producer : producers) producer.join();
+    const uint64_t concurrent_end{concurrent_begin + THREADS * RECORDS_PER_THREAD - 1};
+    BOOST_CHECK_EQUAL(header->producer_sequence.load(std::memory_order_acquire), concurrent_end);
+    for (uint64_t sequence{concurrent_begin}; sequence <= concurrent_end; ++sequence) {
+        const auto& slot{slots[(sequence - 1) & (node::ASYNC_PNB_PROBE_CAPACITY - 1)]};
+        BOOST_CHECK_EQUAL(slot.published_sequence.load(std::memory_order_acquire), sequence);
+        BOOST_CHECK_EQUAL(slot.record.sequence, sequence);
+        BOOST_CHECK_EQUAL(slot.record.process_epoch, header->process_epoch);
+    }
+    header->consumer_ack.store(concurrent_end, std::memory_order_release);
+
+    // Falling more than one capacity behind is permanently and observably
+    // invalid, while publication continues for diagnostics.
+    for (uint64_t index{0}; index <= node::ASYNC_PNB_PROBE_CAPACITY; ++index) {
         probe->Record(node::AsyncPNBProbeEvent::TEST_INTERFACE_REGISTERED,
                       std::chrono::steady_clock::time_point{});
     }
-    const uint64_t first_checksum{slots[0].checksum};
-    BOOST_CHECK_EQUAL(header->next_sequence.load(std::memory_order_acquire),
-                      node::ASYNC_PNB_PROBE_CAPACITY);
-    BOOST_CHECK_EQUAL(slots[node::ASYNC_PNB_PROBE_CAPACITY - 1]
-                          .published_sequence.load(std::memory_order_acquire),
-                      node::ASYNC_PNB_PROBE_CAPACITY);
-    probe->Record(node::AsyncPNBProbeEvent::TEST_INTERFACE_REGISTERED,
-                  std::chrono::steady_clock::time_point{});
-    BOOST_CHECK_EQUAL(header->next_sequence.load(std::memory_order_acquire),
-                      node::ASYNC_PNB_PROBE_CAPACITY + 1U);
-    BOOST_CHECK_EQUAL(header->overflow_count.load(std::memory_order_acquire), 1U);
+    BOOST_CHECK_EQUAL(header->producer_sequence.load(std::memory_order_acquire),
+                      concurrent_end + node::ASYNC_PNB_PROBE_CAPACITY + 1ULL);
+    BOOST_CHECK_EQUAL(header->loss_count.load(std::memory_order_acquire), 1U);
     BOOST_CHECK_EQUAL(header->status.load(std::memory_order_acquire),
                       node::ASYNC_PNB_PROBE_FLAG_TEST_GATES |
-                          node::ASYNC_PNB_PROBE_FLAG_OVERFLOW);
-    BOOST_CHECK_EQUAL(slots[0].published_sequence.load(std::memory_order_acquire), 1U);
-    BOOST_CHECK_EQUAL(slots[0].record.sequence, 1U);
-    BOOST_CHECK_EQUAL(slots[0].record.event,
-                      static_cast<uint32_t>(node::AsyncPNBProbeEvent::TEST_INTERFACE_REGISTERED));
-    BOOST_CHECK_EQUAL(slots[0].checksum, first_checksum);
+                          node::ASYNC_PNB_PROBE_FLAG_LOSS);
 
     BOOST_CHECK_EQUAL(munmap(mapping, mapping_size), 0);
     BOOST_CHECK_EQUAL(close(fd), 0);

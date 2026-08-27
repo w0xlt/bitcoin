@@ -136,11 +136,18 @@ struct CSerializedNetMsg {
         CSerializedNetMsg copy;
         copy.data = data;
         copy.m_type = m_type;
+        copy.m_outbound_id = m_outbound_id;
+        copy.m_causal_inbound_id = m_causal_inbound_id;
         return copy;
     }
 
     std::vector<unsigned char> data;
     std::string m_type;
+
+    // Fixed measurement labels are assigned only when the optional probe is
+    // present and are never serialized or included in send-memory accounting.
+    uint64_t m_outbound_id{0};
+    uint64_t m_causal_inbound_id{0};
 
     /** Compute total memory usage of this object (own memory + any dynamic memory). */
     size_t GetMemoryUsage() const noexcept;
@@ -152,6 +159,8 @@ struct CNetMsgSendQueueSnapshot {
     size_t bytes;
     size_t depth;
     bool paused;
+    uint64_t outbound_id;
+    uint64_t causal_inbound_id;
 };
 
 /**
@@ -261,6 +270,7 @@ public:
     // intentionally not inspected while the socket thread fills these fields.
     uint64_t m_process_queue_id{0};
     SteadyClock::time_point m_process_queue_ready{};
+    SteadyClock::time_point m_process_queue_front{};
     SteadyClock::time_point m_process_queue_poll{};
     size_t m_process_queue_bytes_at_ready{0};
     size_t m_process_queue_depth_at_ready{0};
@@ -343,6 +353,12 @@ public:
         const std::string& /*m_type*/
     >;
 
+    struct MessageInfo {
+        uint64_t outbound_id{0};
+        uint64_t causal_inbound_id{0};
+        size_t total_wire_bytes{0};
+    };
+
     /** Get bytes to send on the wire, if any, along with other information about it.
      *
      * As a const function, it does not modify the transport's observable state, and is thus safe
@@ -386,7 +402,11 @@ public:
      *
      * If bytes_sent=0, this call has no effect.
      */
-    virtual void MarkBytesSent(size_t bytes_sent) noexcept = 0;
+    /** Return true iff this write completed a measured application message. */
+    virtual bool MarkBytesSent(size_t bytes_sent) noexcept = 0;
+
+    /** Measurement identity for the application message owning current bytes. */
+    virtual MessageInfo GetMessageInfo() const noexcept = 0;
 
     /** Return the memory usage of this transport attributable to buffered data to send. */
     virtual size_t GetSendMemoryUsage() const noexcept = 0;
@@ -445,6 +465,7 @@ private:
     bool m_sending_header GUARDED_BY(m_send_mutex) {false};
     /** How many bytes have been sent so far (from m_header_to_send, or from m_message_to_send.data). */
     size_t m_bytes_sent GUARDED_BY(m_send_mutex) {0};
+    size_t m_message_wire_size GUARDED_BY(m_send_mutex) {0};
 
 public:
     explicit V1Transport(NodeId node_id) noexcept;
@@ -474,7 +495,8 @@ public:
 
     bool SetMessageToSend(CSerializedNetMsg& msg) noexcept override EXCLUSIVE_LOCKS_REQUIRED(!m_send_mutex);
     BytesToSend GetBytesToSend(bool have_next_message) const noexcept override EXCLUSIVE_LOCKS_REQUIRED(!m_send_mutex);
-    void MarkBytesSent(size_t bytes_sent) noexcept override EXCLUSIVE_LOCKS_REQUIRED(!m_send_mutex);
+    bool MarkBytesSent(size_t bytes_sent) noexcept override EXCLUSIVE_LOCKS_REQUIRED(!m_send_mutex);
+    MessageInfo GetMessageInfo() const noexcept override EXCLUSIVE_LOCKS_REQUIRED(!m_send_mutex);
     size_t GetSendMemoryUsage() const noexcept override EXCLUSIVE_LOCKS_REQUIRED(!m_send_mutex);
     bool ShouldReconnectV1() const noexcept override { return false; }
 };
@@ -639,6 +661,9 @@ private:
     std::vector<uint8_t> m_send_garbage GUARDED_BY(m_send_mutex);
     /** Type of the message being sent. */
     std::string m_send_type GUARDED_BY(m_send_mutex);
+    uint64_t m_send_outbound_id GUARDED_BY(m_send_mutex){0};
+    uint64_t m_send_causal_inbound_id GUARDED_BY(m_send_mutex){0};
+    size_t m_send_message_wire_size GUARDED_BY(m_send_mutex){0};
     /** Current sender state. */
     SendState m_send_state GUARDED_BY(m_send_mutex);
     /** Whether we've sent at least 24 bytes (which would trigger disconnect for V1 peers). */
@@ -684,7 +709,8 @@ public:
     // Send side functions.
     bool SetMessageToSend(CSerializedNetMsg& msg) noexcept override EXCLUSIVE_LOCKS_REQUIRED(!m_send_mutex);
     BytesToSend GetBytesToSend(bool have_next_message) const noexcept override EXCLUSIVE_LOCKS_REQUIRED(!m_send_mutex);
-    void MarkBytesSent(size_t bytes_sent) noexcept override EXCLUSIVE_LOCKS_REQUIRED(!m_send_mutex);
+    bool MarkBytesSent(size_t bytes_sent) noexcept override EXCLUSIVE_LOCKS_REQUIRED(!m_send_mutex);
+    MessageInfo GetMessageInfo() const noexcept override EXCLUSIVE_LOCKS_REQUIRED(!m_send_mutex);
     size_t GetSendMemoryUsage() const noexcept override EXCLUSIVE_LOCKS_REQUIRED(!m_send_mutex);
 
     // Miscellaneous functions.
@@ -735,6 +761,13 @@ public:
     uint64_t nSendBytes GUARDED_BY(cs_vSend){0};
     /** Messages still to be fed to m_transport->SetMessageToSend. */
     std::deque<CSerializedNetMsg> vSendMsg GUARDED_BY(cs_vSend);
+    /** Fixed measurement state, excluded from send-memory accounting. */
+    uint64_t m_next_outbound_id GUARDED_BY(cs_vSend){0};
+    uint64_t m_active_outbound_id GUARDED_BY(cs_vSend){0};
+    uint64_t m_active_outbound_causal_id GUARDED_BY(cs_vSend){0};
+    size_t m_active_outbound_bytes GUARDED_BY(cs_vSend){0};
+    SteadyClock::time_point m_active_outbound_first_write GUARDED_BY(cs_vSend){};
+    std::array<char, CMessageHeader::MESSAGE_TYPE_SIZE + 1> m_active_outbound_type GUARDED_BY(cs_vSend){};
     Mutex cs_vSend;
     Mutex m_sock_mutex;
     Mutex cs_vRecv;
@@ -958,11 +991,18 @@ public:
           bool inbound_onion,
           uint64_t network_key,
           CNodeOptions&& node_opts = {});
+    ~CNode();
     CNode(const CNode&) = delete;
     CNode& operator=(const CNode&) = delete;
 
     NodeId GetId() const {
         return id;
+    }
+
+    int64_t MeasurementConnectionElapsedNs() const
+    {
+        if (m_measurement_connected == SteadyClock::time_point{}) return 0;
+        return Ticks<std::chrono::nanoseconds>(SteadyClock::now() - m_measurement_connected);
     }
 
     uint64_t GetLocalNonce() const {
@@ -1051,6 +1091,8 @@ private:
     std::list<CNetMessage> m_msg_process_queue GUARDED_BY(m_msg_process_queue_mutex);
     size_t m_msg_process_queue_size GUARDED_BY(m_msg_process_queue_mutex){0};
     uint64_t m_next_process_queue_id GUARDED_BY(m_msg_process_queue_mutex){0};
+
+    SteadyClock::time_point m_measurement_connected{};
 
     // Our address, as reported by the peer
     CService m_addr_local GUARDED_BY(m_addr_local_mutex);

@@ -67,6 +67,7 @@ public:
     AsyncPNBProbeSlot* slots{nullptr};
     const bool test_gates;
     std::atomic<uint64_t> active_job{0};
+    std::atomic<int64_t> active_source{-1};
 
     explicit Impl(bool enable_test_gates) : test_gates{enable_test_gates} {}
 };
@@ -128,12 +129,30 @@ std::shared_ptr<AsyncPNBPeerServiceProbe> AsyncPNBPeerServiceProbe::Create(
 
     std::memset(impl->mapping, 0, impl->mapping_size);
     impl->header = ::new (impl->mapping) AsyncPNBProbeFileHeader{};
+    const auto creation_wall{std::chrono::system_clock::now()};
+    const auto creation_steady{std::chrono::steady_clock::now()};
+    const int64_t wall_ns{std::chrono::duration_cast<std::chrono::nanoseconds>(
+        creation_wall.time_since_epoch()).count()};
+    const int64_t steady_ns{std::chrono::duration_cast<std::chrono::nanoseconds>(
+        creation_steady.time_since_epoch()).count()};
+    uint64_t process_epoch{1469598103934665603ULL};
+    for (const uint64_t value : {static_cast<uint64_t>(wall_ns),
+                                 static_cast<uint64_t>(steady_ns),
+                                 static_cast<uint64_t>(getpid())}) {
+        process_epoch ^= value;
+        process_epoch *= 1099511628211ULL;
+    }
+    if (process_epoch == 0) process_epoch = 1;
     impl->header->magic = PROBE_MAGIC;
     impl->header->schema = ASYNC_PNB_PROBE_SCHEMA;
     impl->header->header_size = sizeof(AsyncPNBProbeFileHeader);
     impl->header->record_size = sizeof(AsyncPNBProbeSlot);
     impl->header->capacity = ASYNC_PNB_PROBE_CAPACITY;
     impl->header->endian = ASYNC_PNB_PROBE_ENDIAN;
+    impl->header->pid = getpid();
+    impl->header->process_epoch = process_epoch;
+    impl->header->creation_wall_ns = wall_ns;
+    impl->header->creation_steady_ns = steady_ns;
     impl->header->status.store(
         test_gates ? ASYNC_PNB_PROBE_FLAG_TEST_GATES : 0,
         std::memory_order_relaxed);
@@ -164,6 +183,8 @@ AsyncPNBPeerServiceProbe::~AsyncPNBPeerServiceProbe()
 {
 #ifndef WIN32
     if (m_impl->mapping != MAP_FAILED) {
+        m_impl->header->status.fetch_or(
+            ASYNC_PNB_PROBE_FLAG_CLOSED, std::memory_order_release);
         (void)msync(m_impl->mapping, m_impl->mapping_size, MS_SYNC);
         (void)munmap(m_impl->mapping, m_impl->mapping_size);
     }
@@ -180,18 +201,21 @@ void AsyncPNBPeerServiceProbe::Record(
     const uint256* hash) noexcept
 {
     const uint64_t sequence{
-        m_impl->header->next_sequence.fetch_add(1, std::memory_order_relaxed) + 1};
-    if (sequence > ASYNC_PNB_PROBE_CAPACITY) {
-        m_impl->header->overflow_count.fetch_add(1, std::memory_order_relaxed);
+        m_impl->header->producer_sequence.fetch_add(1, std::memory_order_relaxed) + 1};
+    const uint64_t consumer_ack{
+        m_impl->header->consumer_ack.load(std::memory_order_acquire)};
+    if (sequence > consumer_ack + ASYNC_PNB_PROBE_CAPACITY) {
+        m_impl->header->loss_count.fetch_add(1, std::memory_order_relaxed);
         m_impl->header->status.fetch_or(
-            ASYNC_PNB_PROBE_FLAG_OVERFLOW, std::memory_order_release);
-        return;
+            ASYNC_PNB_PROBE_FLAG_LOSS, std::memory_order_release);
     }
-    AsyncPNBProbeSlot& slot{m_impl->slots[sequence - 1]};
+    AsyncPNBProbeSlot& slot{
+        m_impl->slots[(sequence - 1) & (ASYNC_PNB_PROBE_CAPACITY - 1)]};
     slot.published_sequence.store(0, std::memory_order_release);
 
     AsyncPNBProbeEventRecord record{};
     record.sequence = sequence;
+    record.process_epoch = m_impl->header->process_epoch;
     record.event = static_cast<uint32_t>(event);
     record.steady_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
         time.time_since_epoch()).count();
@@ -217,6 +241,16 @@ bool AsyncPNBPeerServiceProbe::TestGatesEnabled() const noexcept
 void AsyncPNBPeerServiceProbe::SetActiveJob(uint64_t job) noexcept
 {
     m_impl->active_job.store(job, std::memory_order_release);
+}
+
+void AsyncPNBPeerServiceProbe::SetActiveSource(int64_t source) noexcept
+{
+    m_impl->active_source.store(source, std::memory_order_release);
+}
+
+bool AsyncPNBPeerServiceProbe::IsActiveSource(int64_t source) const noexcept
+{
+    return m_impl->active_source.load(std::memory_order_acquire) == source;
 }
 
 bool AsyncPNBPeerServiceProbe::ResultReadyCollectionDeferred() const noexcept

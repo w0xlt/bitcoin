@@ -88,7 +88,10 @@ private:
                 probe_hash = request.block->GetHash();
                 const auto worker_wake{SteadyClock::now()};
                 m_probe->Record(AsyncPNBProbeEvent::WORKER_WAKE, worker_wake,
-                                {static_cast<int64_t>(request.job_id), 1}, {}, {}, &*probe_hash);
+                                {static_cast<int64_t>(request.job_id), 1,
+                                 request.source,
+                                 static_cast<int64_t>(request.delivery_route)},
+                                {}, {}, &*probe_hash);
                 if (m_probe->TestGatesEnabled()) m_probe->SetActiveJob(request.job_id);
             }
             bool new_block{false};
@@ -96,7 +99,12 @@ private:
             if (m_probe) {
                 pnb_start = SteadyClock::now();
                 m_probe->Record(AsyncPNBProbeEvent::PNB_START, pnb_start,
-                                {static_cast<int64_t>(request.job_id), 1}, {}, {}, &*probe_hash);
+                                {static_cast<int64_t>(request.job_id), 1,
+                                 request.source,
+                                 static_cast<int64_t>(request.delivery_route),
+                                 request.initial_block_download,
+                                 request.active_height},
+                                {}, {}, &*probe_hash);
             }
             const bool process_new_block{m_process_new_block(
                 request.block,
@@ -110,7 +118,8 @@ private:
                     AsyncPNBProbeEvent::PNB_END, pnb_end,
                     {static_cast<int64_t>(request.job_id),
                      Ticks<std::chrono::nanoseconds>(pnb_end - pnb_start),
-                     process_new_block, new_block, 1},
+                     process_new_block, new_block, 1, request.source,
+                     static_cast<int64_t>(request.delivery_route)},
                     {}, {}, &*probe_hash);
             }
             request.block.reset();

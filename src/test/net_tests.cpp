@@ -332,6 +332,73 @@ BOOST_AUTO_TEST_CASE(send_queue_snapshot_precedes_optimistic_drain)
     BOOST_CHECK_EQUAL(node.m_send_memusage, 0);
 }
 
+BOOST_AUTO_TEST_CASE(v1_transport_measurement_metadata_is_inert_and_persistent)
+{
+    const auto drain{[](V1Transport& transport, CSerializedNetMsg& message,
+                        size_t maximum_write) {
+        std::vector<uint8_t> wire;
+        BOOST_REQUIRE(transport.SetMessageToSend(message));
+        const auto initial{transport.GetMessageInfo()};
+        while (true) {
+            const auto& [bytes, _more, _type]{transport.GetBytesToSend(false)};
+            if (bytes.empty()) break;
+            const size_t count{std::min(maximum_write, bytes.size())};
+            wire.insert(wire.end(), bytes.begin(), bytes.begin() + count);
+            const auto before{transport.GetMessageInfo()};
+            BOOST_CHECK_EQUAL(before.outbound_id, initial.outbound_id);
+            BOOST_CHECK_EQUAL(before.causal_inbound_id, initial.causal_inbound_id);
+            const bool completed{transport.MarkBytesSent(count)};
+            if (completed) {
+                BOOST_CHECK_EQUAL(wire.size(), initial.total_wire_bytes);
+            }
+        }
+        return wire;
+    }};
+
+    CSerializedNetMsg measured;
+    measured.m_type = NetMsgType::PING;
+    measured.data = {0, 1, 2, 3, 4, 5, 6, 7};
+    measured.m_outbound_id = 41;
+    measured.m_causal_inbound_id = 17;
+    CSerializedNetMsg plain{measured.Copy()};
+    plain.m_outbound_id = 0;
+    plain.m_causal_inbound_id = 0;
+    BOOST_CHECK_EQUAL(measured.GetMemoryUsage(), plain.GetMemoryUsage());
+
+    V1Transport measured_transport{/*node_id=*/1};
+    const auto measured_wire{drain(measured_transport, measured, /*maximum_write=*/3)};
+    BOOST_CHECK_EQUAL(measured_wire.size(), CMessageHeader::HEADER_SIZE + 8U);
+    BOOST_CHECK_EQUAL(measured_transport.GetMessageInfo().outbound_id, 0U);
+
+    V1Transport plain_transport{/*node_id=*/1};
+    const auto plain_wire{drain(plain_transport, plain, /*maximum_write=*/5)};
+    BOOST_CHECK(measured_wire == plain_wire);
+
+    // A second message cannot displace an active measured message, and an
+    // empty payload completes on the final header write with its IDs intact.
+    CSerializedNetMsg first;
+    first.m_type = NetMsgType::INV;
+    first.data = {9, 8, 7};
+    first.m_outbound_id = 42;
+    first.m_causal_inbound_id = 18;
+    CSerializedNetMsg second;
+    second.m_type = NetMsgType::VERACK;
+    second.m_outbound_id = 43;
+    second.m_causal_inbound_id = 19;
+    V1Transport queued_transport{/*node_id=*/2};
+    BOOST_REQUIRE(queued_transport.SetMessageToSend(first));
+    BOOST_CHECK(!queued_transport.SetMessageToSend(second));
+    BOOST_CHECK_EQUAL(second.m_outbound_id, 43U);
+    while (true) {
+        const auto& [bytes, _more, _type]{queued_transport.GetBytesToSend(false)};
+        if (bytes.empty()) break;
+        queued_transport.MarkBytesSent(bytes.size());
+    }
+    const auto empty_wire{drain(queued_transport, second, /*maximum_write=*/7)};
+    BOOST_CHECK_EQUAL(empty_wire.size(), CMessageHeader::HEADER_SIZE);
+    BOOST_CHECK_EQUAL(queued_transport.GetMessageInfo().outbound_id, 0U);
+}
+
 BOOST_AUTO_TEST_CASE(cnetaddr_basic)
 {
     CNetAddr addr;
@@ -1264,6 +1331,7 @@ class V2TransportTester
     std::vector<uint8_t> m_to_send; //!< Bytes we have queued up to send to m_transport.
     std::vector<uint8_t> m_received; //!< Bytes we have received from m_transport.
     std::deque<CSerializedNetMsg> m_msg_to_send; //!< Messages to be sent *by* m_transport to us.
+    std::vector<Transport::MessageInfo> m_completed_messages;
     bool m_sent_aad{false};
 
 public:
@@ -1329,7 +1397,10 @@ public:
                 size_t to_receive = 1 + m_rng.randrange(recv_bytes.size());
                 m_received.insert(m_received.end(), recv_bytes.begin(), recv_bytes.begin() + to_receive);
                 progress = true;
-                m_transport.MarkBytesSent(to_receive);
+                const auto message_info{m_transport.GetMessageInfo()};
+                if (m_transport.MarkBytesSent(to_receive)) {
+                    m_completed_messages.push_back(message_info);
+                }
             }
             if (!progress) break;
         }
@@ -1383,12 +1454,20 @@ public:
     }
 
     /** Schedule a message to be sent to us by the transport. */
-    void AddMessage(std::string m_type, std::vector<uint8_t> payload)
+    void AddMessage(std::string m_type, std::vector<uint8_t> payload,
+                    uint64_t outbound_id = 0, uint64_t causal_inbound_id = 0)
     {
         CSerializedNetMsg msg;
         msg.m_type = std::move(m_type);
         msg.data = std::move(payload);
+        msg.m_outbound_id = outbound_id;
+        msg.m_causal_inbound_id = causal_inbound_id;
         m_msg_to_send.push_back(std::move(msg));
+    }
+
+    const std::vector<Transport::MessageInfo>& CompletedMessages() const
+    {
+        return m_completed_messages;
     }
 
     /** Expect ellswift key to have been received from transport and process it.
@@ -1806,6 +1885,47 @@ BOOST_AUTO_TEST_CASE(v2transport_test)
         tester.SendV1Version(Params().MessageStart());
         auto ret = tester.Interact();
         BOOST_CHECK(ret);
+    }
+
+    // Measurement IDs survive native V2 packet construction and partial
+    // writes, and completion reports the encrypted wire size exactly once.
+    {
+        V2TransportTester tester(m_rng, true);
+        BOOST_REQUIRE(tester.Interact());
+        tester.SendKey();
+        tester.SendGarbage();
+        tester.ReceiveKey();
+        tester.SendGarbageTerm();
+        tester.SendVersion();
+        BOOST_REQUIRE(tester.Interact());
+        tester.ReceiveGarbage();
+        tester.ReceiveVersion();
+        const std::vector<uint8_t> payload{1, 3, 3, 7};
+        tester.AddMessage(NetMsgType::PING, payload,
+                          /*outbound_id=*/91, /*causal_inbound_id=*/37);
+        BOOST_REQUIRE(tester.Interact());
+        tester.ReceiveMessage(uint8_t{18}, payload); // ping short id
+        BOOST_REQUIRE_EQUAL(tester.CompletedMessages().size(), 1U);
+        const auto& info{tester.CompletedMessages().front()};
+        BOOST_CHECK_EQUAL(info.outbound_id, 91U);
+        BOOST_CHECK_EQUAL(info.causal_inbound_id, 37U);
+        BOOST_CHECK_EQUAL(info.total_wire_bytes,
+                          payload.size() + 1 + BIP324Cipher::EXPANSION);
+    }
+
+    // V2's code-proven V1 fallback delegates the same metadata contract.
+    {
+        V2TransportTester tester(m_rng, false);
+        tester.SendV1Version(Params().MessageStart());
+        BOOST_REQUIRE(tester.Interact());
+        tester.AddMessage(NetMsgType::PONG, {4, 2},
+                          /*outbound_id=*/92, /*causal_inbound_id=*/38);
+        BOOST_REQUIRE(tester.Interact());
+        BOOST_REQUIRE_EQUAL(tester.CompletedMessages().size(), 1U);
+        const auto& info{tester.CompletedMessages().front()};
+        BOOST_CHECK_EQUAL(info.outbound_id, 92U);
+        BOOST_CHECK_EQUAL(info.causal_inbound_id, 38U);
+        BOOST_CHECK_EQUAL(info.total_wire_bytes, CMessageHeader::HEADER_SIZE + 2U);
     }
 
     // Send wrong network's V1 header

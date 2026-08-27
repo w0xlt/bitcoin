@@ -137,6 +137,31 @@ static const int MAX_BLOCKS_IN_TRANSIT_PER_PEER = 16;
 static constexpr auto BLOCK_STALLING_TIMEOUT_DEFAULT{2s};
 /** Maximum timeout for stalling block download. */
 static constexpr auto BLOCK_STALLING_TIMEOUT_MAX{64s};
+
+struct InboundCausalContext {
+    NodeId peer{-1};
+    uint64_t inbound_id{0};
+};
+thread_local InboundCausalContext g_inbound_causal_context;
+
+enum class BlockRequestRemoval : int64_t {
+    REMOVED = 0,
+    COMPLETED = 1,
+};
+
+class InboundCausalScope
+{
+public:
+    InboundCausalScope(NodeId peer, uint64_t inbound_id)
+        : m_previous{g_inbound_causal_context}
+    {
+        g_inbound_causal_context = {peer, inbound_id};
+    }
+    ~InboundCausalScope() { g_inbound_causal_context = m_previous; }
+
+private:
+    InboundCausalContext m_previous;
+};
 /** Maximum depth of blocks we're willing to serve as compact blocks to peers
  *  when requested. For older blocks, a regular BLOCK response will be sent. */
 static const int MAX_CMPCTBLOCK_DEPTH = 5;
@@ -395,10 +420,12 @@ struct Peer {
 
     /** Protects m_getdata_requests **/
     Mutex m_getdata_requests_mutex;
+    struct GetDataRequest {
+        CInv inv;
+        uint64_t causal_inbound_id{0};
+    };
     /** Work queue of items requested by this peer **/
-    std::deque<CInv> m_getdata_requests GUARDED_BY(m_getdata_requests_mutex);
-    /** Measurement-only correlation for an eligible GETDATA response. */
-    uint64_t m_measurement_getdata_msg_id GUARDED_BY(m_getdata_requests_mutex){0};
+    std::deque<GetDataRequest> m_getdata_requests GUARDED_BY(m_getdata_requests_mutex);
 
     /** Time of the last getheaders message to this peer */
     NodeClock::time_point m_last_getheaders_timestamp GUARDED_BY(NetEventsInterface::g_msgproc_mutex){};
@@ -636,6 +663,9 @@ private:
         NodeId source;
         uint256 hash;
         P2PBlockContinuation continuation;
+        node::P2PBlockDeliveryRoute delivery_route;
+        bool initial_block_download;
+        int active_height;
         uint64_t busy_send_prefix_count{0};
         int64_t busy_send_prefix_total_ns{0};
         int64_t busy_send_prefix_max_ns{0};
@@ -828,17 +858,24 @@ private:
                                const BlockTransactionsRequest& req,
                                uint64_t measurement_msg_id = 0);
 
-    /** Send a message to a peer */
-    void PushMessage(CNode& node, CSerializedNetMsg&& msg) const { m_connman.PushMessage(&node, std::move(msg)); }
+    /** Send a message to a peer, inheriting only same-peer handler context. */
+    void PushMessage(CNode& node, CSerializedNetMsg&& msg) const
+    {
+        if (m_async_pnb_probe &&
+            g_inbound_causal_context.peer == node.GetId()) {
+            msg.m_causal_inbound_id = g_inbound_causal_context.inbound_id;
+        }
+        m_connman.PushMessage(&node, std::move(msg));
+    }
     template <typename... Args>
     void MakeAndPushMessage(CNode& node, std::string msg_type, Args&&... args) const
     {
-        m_connman.PushMessage(&node, NetMsg::Make(std::move(msg_type), std::forward<Args>(args)...));
+        PushMessage(node, NetMsg::Make(std::move(msg_type), std::forward<Args>(args)...));
     }
-    void PushMeasuredMessage(CNode& node, uint64_t msg_id,
-                             std::string_view request_type,
-                             CSerializedNetMsg&& msg,
-                             uint64_t nonce = 0)
+    std::optional<uint64_t> PushMeasuredMessage(CNode& node, uint64_t msg_id,
+                                                std::string_view request_type,
+                                                CSerializedNetMsg&& msg,
+                                                uint64_t nonce = 0)
         EXCLUSIVE_LOCKS_REQUIRED(NetEventsInterface::g_msgproc_mutex);
     template <typename... Args>
     [[maybe_unused]] void MakeAndPushFeature(CNode& node, std::string_view feature_id, Args&&... args) const
@@ -1030,7 +1067,10 @@ private:
      * flight from that peer (to avoid one peer's network traffic from
      * affecting another's state).
      */
-    void RemoveBlockRequest(const uint256& hash, std::optional<NodeId> from_peer) EXCLUSIVE_LOCKS_REQUIRED(cs_main);
+    void RemoveBlockRequest(
+        const uint256& hash, std::optional<NodeId> from_peer,
+        BlockRequestRemoval removal = BlockRequestRemoval::REMOVED)
+        EXCLUSIVE_LOCKS_REQUIRED(cs_main);
 
     /* Mark a block as in flight
      * Returns false, still setting pit, if the block was already in flight from the same peer
@@ -1095,13 +1135,17 @@ private:
     /** Process a new block synchronously. Perform any post-processing housekeeping. */
     void ProcessBlock(CNode& node, const std::shared_ptr<const CBlock>& block,
                       bool force_processing, bool min_pow_checked,
-                      P2PBlockContinuation continuation);
+                      P2PBlockContinuation continuation,
+                      node::P2PBlockDeliveryRoute delivery_route);
 
     void StartAsyncP2PBlockValidation(NodeId source,
                                       std::shared_ptr<const CBlock> block,
                                       bool force_processing,
                                       bool min_pow_checked,
-                                      P2PBlockContinuation continuation)
+                                      P2PBlockContinuation continuation,
+                                      node::P2PBlockDeliveryRoute delivery_route,
+                                      bool initial_block_download,
+                                      int active_height)
         EXCLUSIVE_LOCKS_REQUIRED(NetEventsInterface::g_msgproc_mutex);
     bool ProcessAsyncP2PBlockResult(std::optional<NodeId> collector = std::nullopt)
         EXCLUSIVE_LOCKS_REQUIRED(NetEventsInterface::g_msgproc_mutex);
@@ -1116,7 +1160,9 @@ private:
         EXCLUSIVE_LOCKS_REQUIRED(NetEventsInterface::g_msgproc_mutex);
 
     /** Process compact block txns  */
-    void ProcessCompactBlockTxns(CNode& pfrom, Peer& peer, const BlockTransactions& block_transactions)
+    void ProcessCompactBlockTxns(CNode& pfrom, Peer& peer,
+                                 const BlockTransactions& block_transactions,
+                                 node::P2PBlockDeliveryRoute delivery_route)
         EXCLUSIVE_LOCKS_REQUIRED(g_msgproc_mutex, !m_most_recent_block_mutex);
 
     /**
@@ -1358,7 +1404,9 @@ bool PeerManagerImpl::IsBlockRequestedFromOutbound(const uint256& hash)
     return false;
 }
 
-void PeerManagerImpl::RemoveBlockRequest(const uint256& hash, std::optional<NodeId> from_peer)
+void PeerManagerImpl::RemoveBlockRequest(const uint256& hash,
+                                         std::optional<NodeId> from_peer,
+                                         BlockRequestRemoval removal)
 {
     auto range = mapBlocksInFlight.equal_range(hash);
     if (range.first == range.second) {
@@ -1383,6 +1431,7 @@ void PeerManagerImpl::RemoveBlockRequest(const uint256& hash, std::optional<Node
             // First block on the queue was received, update the start download time for the next one
             state.m_downloading_since = std::max(state.m_downloading_since, GetTime<std::chrono::microseconds>());
         }
+        const int height{list_it->pindex->nHeight};
         state.vBlocksInFlight.erase(list_it);
 
         if (state.vBlocksInFlight.empty()) {
@@ -1390,6 +1439,15 @@ void PeerManagerImpl::RemoveBlockRequest(const uint256& hash, std::optional<Node
             m_peers_downloading_from--;
         }
         state.m_stalling_since = 0us;
+
+        if (m_async_pnb_probe) {
+            m_async_pnb_probe->Record(
+                node::AsyncPNBProbeEvent::BLOCK_REQUEST_REMOVED,
+                SteadyClock::now(),
+                {node_id, height, static_cast<int64_t>(removal),
+                 static_cast<int64_t>(state.vBlocksInFlight.size())},
+                {}, {}, &hash);
+        }
 
         range.first = mapBlocksInFlight.erase(range.first);
     }
@@ -1427,6 +1485,13 @@ bool PeerManagerImpl::BlockRequested(NodeId nodeid, const CBlockIndex& block, st
     auto itInFlight = mapBlocksInFlight.insert(std::make_pair(hash, std::make_pair(nodeid, it)));
     if (pit) {
         *pit = &itInFlight->second.second;
+    }
+    if (m_async_pnb_probe) {
+        m_async_pnb_probe->Record(
+            node::AsyncPNBProbeEvent::BLOCK_REQUESTED, SteadyClock::now(),
+            {nodeid, block.nHeight,
+             static_cast<int64_t>(state->vBlocksInFlight.size())},
+            {}, {}, &hash);
     }
     return true;
 }
@@ -1706,10 +1771,9 @@ void PeerManagerImpl::FindNextBlocks(std::vector<const CBlockIndex*>& vBlocks, c
 
 } // namespace
 
-void PeerManagerImpl::PushMeasuredMessage(CNode& node, uint64_t msg_id,
-                                          std::string_view request_type,
-                                          CSerializedNetMsg&& msg,
-                                          uint64_t nonce)
+std::optional<uint64_t> PeerManagerImpl::PushMeasuredMessage(
+    CNode& node, uint64_t msg_id, std::string_view request_type,
+    CSerializedNetMsg&& msg, uint64_t nonce)
 {
     AssertLockHeld(g_msgproc_mutex);
     Assert(msg_id != 0);
@@ -1718,9 +1782,10 @@ void PeerManagerImpl::PushMeasuredMessage(CNode& node, uint64_t msg_id,
         std::min(msg.m_type.size(), response_type.size() - 1)};
     std::copy_n(msg.m_type.data(), response_type_size, response_type.data());
     const size_t response_bytes{msg.data.size()};
+    msg.m_causal_inbound_id = msg_id;
     const auto snapshot{m_connman.PushMessage(
         &node, std::move(msg), /*capture_send_queue=*/true)};
-    if (!snapshot) return;
+    if (!snapshot) return std::nullopt;
     const uint64_t active_job{m_pending_block_validation
                                   ? m_pending_block_validation->job_id
                                   : 0};
@@ -1730,10 +1795,16 @@ void PeerManagerImpl::PushMeasuredMessage(CNode& node, uint64_t msg_id,
             {node.GetId(), static_cast<int64_t>(msg_id), static_cast<int64_t>(nonce),
              static_cast<int64_t>(response_bytes), static_cast<int64_t>(snapshot->bytes),
              static_cast<int64_t>(snapshot->depth), snapshot->paused,
-             m_pending_block_validation.has_value(), static_cast<int64_t>(active_job)},
+             m_pending_block_validation.has_value(), static_cast<int64_t>(active_job),
+             static_cast<int64_t>(snapshot->outbound_id)},
             request_type,
             std::string_view{response_type.data(), response_type_size});
+        m_async_pnb_probe->Record(
+            node::AsyncPNBProbeEvent::CAUSAL_LINK, snapshot->time,
+            {node.GetId(), static_cast<int64_t>(msg_id),
+             static_cast<int64_t>(snapshot->outbound_id)});
     }
+    return snapshot->outbound_id;
 }
 
 void PeerManagerImpl::PushNodeVersion(CNode& pnode, const Peer& peer,
@@ -1890,6 +1961,17 @@ void PeerManagerImpl::FinalizeNode(const CNode& node)
     }
     CNodeState *state = State(nodeid);
     assert(state != nullptr);
+
+    if (m_async_pnb_probe) {
+        m_async_pnb_probe->Record(
+            node::AsyncPNBProbeEvent::PEER_FINALIZED, SteadyClock::now(),
+            {nodeid, static_cast<int64_t>(node.m_conn_type),
+             node.fSuccessfullyConnected.load(), node.fDisconnect.load(),
+             node.MeasurementConnectionElapsedNs(),
+             static_cast<int64_t>(state->vBlocksInFlight.size()),
+             m_async_pnb_probe->IsActiveSource(nodeid),
+             static_cast<int64_t>(node.m_transport->GetInfo().transport_type)});
+    }
 
     if (state->fSyncStarted)
         nSyncStarted--;
@@ -2892,19 +2974,21 @@ void PeerManagerImpl::ProcessGetData(CNode& pfrom, Peer& peer, const std::atomic
 
     auto tx_relay = peer.GetTxRelay();
 
-    std::deque<CInv>::iterator it = peer.m_getdata_requests.begin();
+    std::deque<Peer::GetDataRequest>::iterator it = peer.m_getdata_requests.begin();
     std::vector<CInv> vNotFound;
+    std::vector<uint64_t> notfound_causal_ids;
 
     // Process as many TX items from the front of the getdata queue as
     // possible, since they're common and it's efficient to batch process
     // them.
-    while (it != peer.m_getdata_requests.end() && it->IsGenTxMsg()) {
+    while (it != peer.m_getdata_requests.end() && it->inv.IsGenTxMsg()) {
         if (interruptMsgProc) return;
         // The send buffer provides backpressure. If there's no space in
         // the buffer, pause processing until the next call.
         if (pfrom.fPauseSend) break;
 
-        const CInv &inv = *it++;
+        const Peer::GetDataRequest& request = *it++;
+        const CInv& inv{request.inv};
 
         if (tx_relay == nullptr) {
             // Ignore GETDATA requests for transactions from block-relay-only
@@ -2916,7 +3000,7 @@ void PeerManagerImpl::ProcessGetData(CNode& pfrom, Peer& peer, const std::atomic
             // WTX and WITNESS_TX imply we serialize with witness
             const auto maybe_with_witness = (inv.IsMsgTx() ? TX_NO_WITNESS : TX_WITH_WITNESS);
             auto tx_message{NetMsg::Make(NetMsgType::TX, maybe_with_witness(*tx))};
-            const uint64_t msg_id{std::exchange(peer.m_measurement_getdata_msg_id, 0)};
+            const uint64_t msg_id{request.causal_inbound_id};
             if (msg_id != 0) {
                 PushMeasuredMessage(
                     pfrom, msg_id, NetMsgType::GETDATA,
@@ -2927,14 +3011,25 @@ void PeerManagerImpl::ProcessGetData(CNode& pfrom, Peer& peer, const std::atomic
             m_mempool.RemoveUnbroadcastTx(tx->GetHash());
         } else {
             vNotFound.push_back(inv);
+            if (m_async_pnb_probe && request.causal_inbound_id != 0 &&
+                std::ranges::find(notfound_causal_ids,
+                                  request.causal_inbound_id) ==
+                    notfound_causal_ids.end()) {
+                notfound_causal_ids.push_back(request.causal_inbound_id);
+            }
         }
     }
 
     // Only process one BLOCK item per call, since they're uncommon and can be
     // expensive to process.
     if (it != peer.m_getdata_requests.end() && !pfrom.fPauseSend) {
-        const CInv &inv = *it++;
+        const Peer::GetDataRequest& request = *it++;
+        const CInv& inv{request.inv};
         if (inv.IsGenBlkMsg()) {
+            std::optional<InboundCausalScope> causal_scope;
+            if (m_async_pnb_probe && request.causal_inbound_id != 0) {
+                causal_scope.emplace(pfrom.GetId(), request.causal_inbound_id);
+            }
             ProcessGetBlockData(pfrom, peer, inv);
         }
         // else: If the first item on the queue is an unknown type, we erase it
@@ -2962,11 +3057,23 @@ void PeerManagerImpl::ProcessGetData(CNode& pfrom, Peer& peer, const std::atomic
         // transactions that we relay; if a peer is missing a parent, they may
         // assume we have them and request the parents from us.
         auto notfound_message{NetMsg::Make(NetMsgType::NOTFOUND, vNotFound)};
-        const uint64_t msg_id{std::exchange(peer.m_measurement_getdata_msg_id, 0)};
+        const uint64_t msg_id{notfound_causal_ids.empty()
+                                  ? 0
+                                  : notfound_causal_ids.front()};
         if (msg_id != 0) {
-            PushMeasuredMessage(
+            const auto outbound_id{PushMeasuredMessage(
                 pfrom, msg_id, NetMsgType::GETDATA,
-                std::move(notfound_message));
+                std::move(notfound_message))};
+            if (outbound_id && m_async_pnb_probe) {
+                for (size_t index{1}; index < notfound_causal_ids.size(); ++index) {
+                    m_async_pnb_probe->Record(
+                        node::AsyncPNBProbeEvent::CAUSAL_LINK,
+                        SteadyClock::now(),
+                        {pfrom.GetId(),
+                         static_cast<int64_t>(notfound_causal_ids[index]),
+                         static_cast<int64_t>(*outbound_id)});
+                }
+            }
         } else {
             PushMessage(pfrom, std::move(notfound_message));
         }
@@ -3818,12 +3925,20 @@ void PeerManagerImpl::ProcessGetCFCheckPt(CNode& node, Peer& peer, DataStream& v
 
 void PeerManagerImpl::ProcessBlock(CNode& node, const std::shared_ptr<const CBlock>& block,
                                    bool force_processing, bool min_pow_checked,
-                                   P2PBlockContinuation continuation)
+                                   P2PBlockContinuation continuation,
+                                   node::P2PBlockDeliveryRoute delivery_route)
 {
     AssertLockHeld(NetEventsInterface::g_msgproc_mutex);
+    bool initial_block_download{false};
+    int active_height{-1};
+    if (m_async_pnb_probe) {
+        initial_block_download = m_chainman.IsInitialBlockDownload();
+        active_height = WITH_LOCK(cs_main, return m_chainman.ActiveChain().Height());
+    }
     if (m_block_validation) {
         StartAsyncP2PBlockValidation(
-            node.GetId(), block, force_processing, min_pow_checked, continuation);
+            node.GetId(), block, force_processing, min_pow_checked, continuation,
+            delivery_route, initial_block_download, active_height);
         return;
     }
 
@@ -3835,7 +3950,9 @@ void PeerManagerImpl::ProcessBlock(CNode& node, const std::shared_ptr<const CBlo
                                           : "optimistic_compact"};
         m_async_pnb_probe->Record(
             node::AsyncPNBProbeEvent::JOB_SUBMIT, SteadyClock::now(),
-            {static_cast<int64_t>(job_id), node.GetId(), 0},
+            {static_cast<int64_t>(job_id), node.GetId(), 0,
+             static_cast<int64_t>(delivery_route), initial_block_download,
+             active_height, force_processing, min_pow_checked},
             continuation_name, {}, &hash);
     }
     bool new_block{false};
@@ -3844,7 +3961,9 @@ void PeerManagerImpl::ProcessBlock(CNode& node, const std::shared_ptr<const CBlo
         pnb_start = SteadyClock::now();
         m_async_pnb_probe->Record(
             node::AsyncPNBProbeEvent::PNB_START, pnb_start,
-            {static_cast<int64_t>(job_id), 0}, {}, {}, &hash);
+            {static_cast<int64_t>(job_id), 0, node.GetId(),
+             static_cast<int64_t>(delivery_route), initial_block_download,
+             active_height}, {}, {}, &hash);
     }
     const bool process_new_block{
         m_chainman.ProcessNewBlock(block, force_processing, min_pow_checked, &new_block)};
@@ -3854,7 +3973,8 @@ void PeerManagerImpl::ProcessBlock(CNode& node, const std::shared_ptr<const CBlo
             node::AsyncPNBProbeEvent::PNB_END, pnb_end,
             {static_cast<int64_t>(job_id),
              Ticks<std::chrono::nanoseconds>(pnb_end - pnb_start),
-             process_new_block, new_block, 0},
+             process_new_block, new_block, 0, node.GetId(),
+             static_cast<int64_t>(delivery_route)},
             {}, {}, &hash);
     }
     ProcessP2PBlockCompletion(job_id, node.GetId(), hash, process_new_block,
@@ -3883,7 +4003,7 @@ void PeerManagerImpl::ProcessP2PBlockCompletion(uint64_t job_id, NodeId source,
     if (new_block) {
         // In case this block came from a different peer than we requested
         // from, erase the block request now anyway (as it is stored on disk).
-        RemoveBlockRequest(hash, std::nullopt);
+        RemoveBlockRequest(hash, std::nullopt, BlockRequestRemoval::COMPLETED);
     } else {
         mapBlockSource.erase(hash);
     }
@@ -3891,7 +4011,7 @@ void PeerManagerImpl::ProcessP2PBlockCompletion(uint64_t job_id, NodeId source,
         const CBlockIndex* index{Assert(m_chainman.m_blockman.LookupBlockIndex(hash))};
         if (index->IsValid(BLOCK_VALID_TRANSACTIONS)) {
             // Preserve optimistic compact reconstruction's post-PNB cleanup.
-            RemoveBlockRequest(hash, std::nullopt);
+            RemoveBlockRequest(hash, std::nullopt, BlockRequestRemoval::COMPLETED);
         }
     }
     if (m_async_pnb_probe) {
@@ -3912,7 +4032,10 @@ void PeerManagerImpl::StartAsyncP2PBlockValidation(
     std::shared_ptr<const CBlock> block,
     bool force_processing,
     bool min_pow_checked,
-    P2PBlockContinuation continuation)
+    P2PBlockContinuation continuation,
+    node::P2PBlockDeliveryRoute delivery_route,
+    bool initial_block_download,
+    int active_height)
 {
     AssertLockHeld(NetEventsInterface::g_msgproc_mutex);
     Assert(m_block_validation);
@@ -3926,14 +4049,20 @@ void PeerManagerImpl::StartAsyncP2PBlockValidation(
         .source = source,
         .hash = hash,
         .continuation = continuation,
+        .delivery_route = delivery_route,
+        .initial_block_download = initial_block_download,
+        .active_height = active_height,
     };
     if (m_async_pnb_probe) {
+        m_async_pnb_probe->SetActiveSource(source);
         const char* continuation_name{continuation == P2PBlockContinuation::STANDARD
                                           ? "standard"
                                           : "optimistic_compact"};
         m_async_pnb_probe->Record(
             node::AsyncPNBProbeEvent::JOB_SUBMIT, SteadyClock::now(),
-            {static_cast<int64_t>(job_id), source, 1},
+            {static_cast<int64_t>(job_id), source, 1,
+             static_cast<int64_t>(delivery_route), initial_block_download,
+             active_height, force_processing, min_pow_checked},
             continuation_name, {}, &hash);
     }
     const auto status{m_block_validation->Submit({
@@ -3941,6 +4070,10 @@ void PeerManagerImpl::StartAsyncP2PBlockValidation(
         .force_processing = force_processing,
         .min_pow_checked = min_pow_checked,
         .job_id = job_id,
+        .source = source,
+        .delivery_route = delivery_route,
+        .initial_block_download = initial_block_download,
+        .active_height = active_height,
     })};
     if (m_async_pnb_probe) {
         const char* status_name{status == node::P2PBlockValidationSubmit::ACCEPTED
@@ -4010,6 +4143,7 @@ bool PeerManagerImpl::ProcessAsyncP2PBlockResult(std::optional<NodeId> collector
                               result->process_new_block, result->new_block,
                               pending.continuation);
     m_pending_block_validation.reset();
+    if (m_async_pnb_probe) m_async_pnb_probe->SetActiveSource(-1);
     return true;
 }
 
@@ -4026,7 +4160,9 @@ bool PeerManagerImpl::AsyncP2PBlockActiveFor(NodeId source) const
            m_pending_block_validation->source == source;
 }
 
-void PeerManagerImpl::ProcessCompactBlockTxns(CNode& pfrom, Peer& peer, const BlockTransactions& block_transactions)
+void PeerManagerImpl::ProcessCompactBlockTxns(
+    CNode& pfrom, Peer& peer, const BlockTransactions& block_transactions,
+    node::P2PBlockDeliveryRoute delivery_route)
 {
     std::shared_ptr<CBlock> pblock = std::make_shared<CBlock>();
     bool fBlockRead{false};
@@ -4090,7 +4226,8 @@ void PeerManagerImpl::ProcessCompactBlockTxns(CNode& pfrom, Peer& peer, const Bl
             }
         } else {
             // Block is okay for further processing
-            RemoveBlockRequest(block_transactions.blockhash, pfrom.GetId()); // it is now an empty pointer
+            RemoveBlockRequest(block_transactions.blockhash, pfrom.GetId(),
+                               BlockRequestRemoval::COMPLETED); // it is now an empty pointer
             fBlockRead = true;
             // mapBlockSource is used for potentially punishing peers and
             // updating which peers send us compact blocks, so the race
@@ -4109,7 +4246,7 @@ void PeerManagerImpl::ProcessCompactBlockTxns(CNode& pfrom, Peer& peer, const Bl
         // protections in the compact block handler -- see related comment
         // in compact block optimistic reconstruction handling.
         ProcessBlock(pfrom, pblock, /*force_processing=*/true, /*min_pow_checked=*/true,
-                     P2PBlockContinuation::STANDARD);
+                     P2PBlockContinuation::STANDARD, delivery_route);
     }
     return;
 }
@@ -4462,6 +4599,14 @@ void PeerManagerImpl::ProcessMessage(Peer& peer, CNode& pfrom, const CNetMessage
 
         if (pfrom.IsPrivateBroadcastConn()) {
             pfrom.fSuccessfullyConnected = true;
+            if (m_async_pnb_probe) {
+                m_async_pnb_probe->Record(
+                    node::AsyncPNBProbeEvent::HANDSHAKE_COMPLETE,
+                    SteadyClock::now(),
+                    {pfrom.GetId(),
+                     static_cast<int64_t>(pfrom.m_transport->GetInfo().transport_type),
+                     pfrom.MeasurementConnectionElapsedNs()});
+            }
             // The peer may intend to later send us NetMsgType::FEEFILTER limiting
             // cheap transactions, but we don't wait for that and thus we may send
             // them a transaction below their threshold. This is ok because this
@@ -4500,6 +4645,14 @@ void PeerManagerImpl::ProcessMessage(Peer& peer, CNode& pfrom, const CNetMessage
         }
 
         pfrom.fSuccessfullyConnected = true;
+        if (m_async_pnb_probe) {
+            m_async_pnb_probe->Record(
+                node::AsyncPNBProbeEvent::HANDSHAKE_COMPLETE,
+                SteadyClock::now(),
+                {pfrom.GetId(),
+                 static_cast<int64_t>(pfrom.m_transport->GetInfo().transport_type),
+                 pfrom.MeasurementConnectionElapsedNs()});
+        }
         return;
     }
 
@@ -4830,10 +4983,12 @@ void PeerManagerImpl::ProcessMessage(Peer& peer, CNode& pfrom, const CNetMessage
 
         {
             LOCK(peer.m_getdata_requests_mutex);
-            if (!vInv.empty()) {
-                peer.m_measurement_getdata_msg_id = net_message.m_process_queue_id;
+            for (CInv& inv : vInv) {
+                peer.m_getdata_requests.push_back({
+                    .inv = std::move(inv),
+                    .causal_inbound_id = net_message.m_process_queue_id,
+                });
             }
-            peer.m_getdata_requests.insert(peer.m_getdata_requests.end(), vInv.begin(), vInv.end());
             ProcessGetData(pfrom, peer, interruptMsgProc);
         }
 
@@ -4974,7 +5129,11 @@ void PeerManagerImpl::ProcessMessage(Peer& peer, CNode& pfrom, const CNetMessage
         // actually receive all the data read from disk over the network.
         LogDebug(BCLog::NET, "Peer %d sent us a getblocktxn for a block > %i deep\n", pfrom.GetId(), MAX_BLOCKTXN_DEPTH);
         CInv inv{MSG_WITNESS_BLOCK, req.blockhash};
-        WITH_LOCK(peer.m_getdata_requests_mutex, peer.m_getdata_requests.push_back(inv));
+        WITH_LOCK(peer.m_getdata_requests_mutex,
+                  peer.m_getdata_requests.push_back({
+                      .inv = inv,
+                      .causal_inbound_id = net_message.m_process_queue_id,
+                  }));
         // The message processing loop will go around again (without pausing) and we'll respond then
         return;
     }
@@ -5377,7 +5536,9 @@ void PeerManagerImpl::ProcessMessage(Peer& peer, CNode& pfrom, const CNetMessage
         if (fProcessBLOCKTXN) {
             BlockTransactions txn;
             txn.blockhash = blockhash;
-            return ProcessCompactBlockTxns(pfrom, peer, txn);
+            return ProcessCompactBlockTxns(
+                pfrom, peer, txn,
+                node::P2PBlockDeliveryRoute::COMPACT_BLOCK);
         }
 
         if (fRevertToHeaderProcessing) {
@@ -5406,7 +5567,8 @@ void PeerManagerImpl::ProcessMessage(Peer& peer, CNode& pfrom, const CNetMessage
             // compact blocks with less work than our tip, it is safe to treat
             // reconstructed compact blocks as having been requested.
             ProcessBlock(pfrom, pblock, /*force_processing=*/true, /*min_pow_checked=*/true,
-                         P2PBlockContinuation::OPTIMISTIC_COMPACT);
+                         P2PBlockContinuation::OPTIMISTIC_COMPACT,
+                         node::P2PBlockDeliveryRoute::COMPACT_BLOCK);
         }
         return;
     }
@@ -5422,7 +5584,8 @@ void PeerManagerImpl::ProcessMessage(Peer& peer, CNode& pfrom, const CNetMessage
         BlockTransactions resp;
         vRecv >> resp;
 
-        return ProcessCompactBlockTxns(pfrom, peer, resp);
+        return ProcessCompactBlockTxns(
+            pfrom, peer, resp, node::P2PBlockDeliveryRoute::BLOCKTXN);
     }
 
     if (msg_type == NetMsgType::HEADERS)
@@ -5498,7 +5661,7 @@ void PeerManagerImpl::ProcessMessage(Peer& peer, CNode& pfrom, const CNetMessage
             // Always process the block if we requested it, since we may
             // need it even when it's not a candidate for a new best tip.
             forceProcessing = IsBlockRequested(hash);
-            RemoveBlockRequest(hash, pfrom.GetId());
+            RemoveBlockRequest(hash, pfrom.GetId(), BlockRequestRemoval::COMPLETED);
             // mapBlockSource is only used for punishing peers and setting
             // which peers send us compact blocks, so the race between here and
             // cs_main in ProcessNewBlock is fine.
@@ -5510,7 +5673,8 @@ void PeerManagerImpl::ProcessMessage(Peer& peer, CNode& pfrom, const CNetMessage
             }
         }
         ProcessBlock(pfrom, pblock, forceProcessing, min_pow_checked,
-                     P2PBlockContinuation::STANDARD);
+                     P2PBlockContinuation::STANDARD,
+                     node::P2PBlockDeliveryRoute::FULL_BLOCK);
         return;
     }
 
@@ -5748,12 +5912,22 @@ bool PeerManagerImpl::MaybeDiscourageAndDisconnect(CNode& pnode, Peer& peer)
     if (pnode.HasPermission(NetPermissionFlags::NoBan)) {
         // We never disconnect or discourage peers for bad behavior if they have NetPermissionFlags::NoBan permission
         LogWarning("Not punishing noban peer %d!", peer.m_id);
+        if (m_async_pnb_probe) {
+            m_async_pnb_probe->Record(
+                node::AsyncPNBProbeEvent::DISCOURAGEMENT,
+                SteadyClock::now(), {peer.m_id, 0, 0, 0});
+        }
         return false;
     }
 
     if (pnode.IsManualConn()) {
         // We never disconnect or discourage manual peers for bad behavior
         LogWarning("Not punishing manually connected peer %d!", peer.m_id);
+        if (m_async_pnb_probe) {
+            m_async_pnb_probe->Record(
+                node::AsyncPNBProbeEvent::DISCOURAGEMENT,
+                SteadyClock::now(), {peer.m_id, 1, 0, 0});
+        }
         return false;
     }
 
@@ -5763,6 +5937,11 @@ bool PeerManagerImpl::MaybeDiscourageAndDisconnect(CNode& pnode, Peer& peer)
         LogDebug(BCLog::NET, "Warning: disconnecting but not discouraging %s peer %d!\n",
                  pnode.m_inbound_onion ? "inbound onion" : "local", peer.m_id);
         pnode.fDisconnect = true;
+        if (m_async_pnb_probe) {
+            m_async_pnb_probe->Record(
+                node::AsyncPNBProbeEvent::DISCOURAGEMENT,
+                SteadyClock::now(), {peer.m_id, 2, 1, 0});
+        }
         return true;
     }
 
@@ -5770,6 +5949,11 @@ bool PeerManagerImpl::MaybeDiscourageAndDisconnect(CNode& pnode, Peer& peer)
     LogDebug(BCLog::NET, "Disconnecting and discouraging peer %d!\n", peer.m_id);
     if (m_banman) m_banman->Discourage(pnode.addr);
     m_connman.DisconnectNode(pnode.addr);
+    if (m_async_pnb_probe) {
+        m_async_pnb_probe->Record(
+            node::AsyncPNBProbeEvent::DISCOURAGEMENT,
+            SteadyClock::now(), {peer.m_id, 3, 1, m_banman != nullptr});
+    }
     return true;
 }
 
@@ -5861,27 +6045,31 @@ bool PeerManagerImpl::ProcessMessages(CNode& node, std::atomic<bool>& interruptM
     CNetMessage& msg{poll_result->first};
     bool fMoreWork = poll_result->second;
     const bool measured_service_request{msg.m_process_queue_id != 0};
+    SteadyClock::time_point handler_start;
     if (measured_service_request) {
-        const auto handler_start{SteadyClock::now()};
+        handler_start = SteadyClock::now();
         const uint64_t active_job{m_pending_block_validation
                                       ? m_pending_block_validation->job_id
                                       : 0};
+        const NodeId active_source{m_pending_block_validation
+                                       ? m_pending_block_validation->source
+                                       : -1};
         if (m_async_pnb_probe) {
             m_async_pnb_probe->Record(
                 node::AsyncPNBProbeEvent::HANDLER_START, handler_start,
                 {node.GetId(), static_cast<int64_t>(msg.m_process_queue_id),
                  TicksSinceEpoch<std::chrono::nanoseconds>(handler_turn_start),
-                 Ticks<std::chrono::nanoseconds>(handler_start - handler_turn_start),
                  TicksSinceEpoch<std::chrono::nanoseconds>(msg.m_process_queue_ready),
+                 TicksSinceEpoch<std::chrono::nanoseconds>(msg.m_process_queue_front),
                  TicksSinceEpoch<std::chrono::nanoseconds>(msg.m_process_queue_poll),
-                 static_cast<int64_t>(msg.m_process_queue_bytes_at_ready),
-                 static_cast<int64_t>(msg.m_process_queue_depth_at_ready),
-                 msg.m_process_queue_paused_at_ready,
                  static_cast<int64_t>(msg.m_process_queue_bytes_at_poll),
                  static_cast<int64_t>(msg.m_process_queue_depth_at_poll),
                  msg.m_process_queue_paused_at_poll,
                  m_pending_block_validation.has_value(),
-                 static_cast<int64_t>(active_job)}, msg.m_type);
+                 static_cast<int64_t>(active_job), active_source,
+                 active_source == node.GetId(),
+                 static_cast<int64_t>(msg.m_message_size),
+                 static_cast<int64_t>(msg.m_raw_message_size)}, msg.m_type);
         }
     }
 
@@ -5899,9 +6087,15 @@ bool PeerManagerImpl::ProcessMessages(CNode& node, std::atomic<bool>& interruptM
     }
 
     bool interrupted{false};
+    int64_t handler_outcome{0};
     try {
+        std::optional<InboundCausalScope> causal_scope;
+        if (m_async_pnb_probe) {
+            causal_scope.emplace(node.GetId(), msg.m_process_queue_id);
+        }
         ProcessMessage(peer, node, msg, msg.m_type, msg.m_recv, msg.m_time, interruptMsgProc);
         interrupted = interruptMsgProc;
+        if (interrupted) handler_outcome = 1;
         if (m_block_validation && AsyncP2PBlockActiveFor(node.GetId()) &&
             m_opts.unit_test_async_pnb_hook) {
             m_opts.unit_test_async_pnb_hook("post_block_handler");
@@ -5923,8 +6117,10 @@ bool PeerManagerImpl::ProcessMessages(CNode& node, std::atomic<bool>& interruptM
             if (m_txdownloadman.HaveMoreWork(peer.m_id)) fMoreWork = true;
         }
     } catch (const std::exception& e) {
+        handler_outcome = 2;
         LogDebug(BCLog::NET, "%s(%s, %u bytes): Exception '%s' (%s) caught\n", __func__, SanitizeString(msg.m_type), msg.m_message_size, e.what(), typeid(e).name());
     } catch (...) {
+        handler_outcome = 3;
         LogDebug(BCLog::NET, "%s(%s, %u bytes): Unknown exception caught\n", __func__, SanitizeString(msg.m_type), msg.m_message_size);
     }
 
@@ -5944,12 +6140,17 @@ bool PeerManagerImpl::ProcessMessages(CNode& node, std::atomic<bool>& interruptM
         const uint64_t active_job{m_pending_block_validation
                                       ? m_pending_block_validation->job_id
                                       : 0};
+        const NodeId active_source{m_pending_block_validation
+                                       ? m_pending_block_validation->source
+                                       : -1};
         if (m_async_pnb_probe) {
             m_async_pnb_probe->Record(
                 node::AsyncPNBProbeEvent::HANDLER_COMPLETE, SteadyClock::now(),
                 {node.GetId(), static_cast<int64_t>(msg.m_process_queue_id),
+                 handler_outcome, node.fDisconnect.load(),
                  m_pending_block_validation.has_value(),
-                 static_cast<int64_t>(active_job)}, msg.m_type);
+                 static_cast<int64_t>(active_job), active_source,
+                 active_source == node.GetId(), fMoreWork}, msg.m_type);
         }
     }
     if (m_block_validation && AsyncP2PBlockActiveFor(node.GetId())) return false;
@@ -5996,6 +6197,22 @@ void PeerManagerImpl::ConsiderEviction(CNode& pto, Peer& peer, std::chrono::seco
                 // They've run out of time to catch up!
                 LogInfo("Outbound peer has old chain, best known block = %s, %s", state.pindexBestKnownBlock != nullptr ? state.pindexBestKnownBlock->GetBlockHash().ToString() : "<none>", pto.DisconnectMsg());
                 pto.fDisconnect = true;
+                if (m_async_pnb_probe) {
+                    const uint256 best_known_hash{state.pindexBestKnownBlock
+                                                      ? state.pindexBestKnownBlock->GetBlockHash()
+                                                      : uint256{}};
+                    const uint256* hash{state.pindexBestKnownBlock
+                                            ? &best_known_hash
+                                            : nullptr};
+                    m_async_pnb_probe->Record(
+                        node::AsyncPNBProbeEvent::BLOCK_TIMEOUT,
+                        SteadyClock::now(),
+                        {pto.GetId(), 4,
+                         state.pindexBestKnownBlock
+                             ? state.pindexBestKnownBlock->nHeight
+                             : -1},
+                        {}, {}, hash);
+                }
             } else {
                 assert(state.m_chain_sync.m_work_header);
                 // Here, we assume that the getheaders message goes out,
@@ -6948,6 +7165,18 @@ bool PeerManagerImpl::SendMessages(CNode& node)
             // should only happen during initial block download.
             LogInfo("Peer is stalling block download, %s", node.DisconnectMsg());
             node.fDisconnect = true;
+            if (m_async_pnb_probe) {
+                const CBlockIndex* stalled{state.vBlocksInFlight.empty()
+                                                ? nullptr
+                                                : state.vBlocksInFlight.front().pindex};
+                const uint256 stalled_hash{stalled ? stalled->GetBlockHash()
+                                                    : uint256{}};
+                m_async_pnb_probe->Record(
+                    node::AsyncPNBProbeEvent::BLOCK_TIMEOUT,
+                    SteadyClock::now(),
+                    {node.GetId(), 1, stalled ? stalled->nHeight : -1},
+                    {}, {}, stalled ? &stalled_hash : nullptr);
+            }
             // Increase timeout for the next peer so that we don't disconnect multiple peers if our own
             // bandwidth is insufficient.
             const auto new_timeout = std::min(2 * stalling_timeout, BLOCK_STALLING_TIMEOUT_MAX);
@@ -6967,6 +7196,14 @@ bool PeerManagerImpl::SendMessages(CNode& node)
             if (current_time > state.m_downloading_since + std::chrono::seconds{consensusParams.nPowTargetSpacing} * (BLOCK_DOWNLOAD_TIMEOUT_BASE + BLOCK_DOWNLOAD_TIMEOUT_PER_PEER * nOtherPeersWithValidatedDownloads)) {
                 LogInfo("Timeout downloading block %s, %s", queuedBlock.pindex->GetBlockHash().ToString(), node.DisconnectMsg());
                 node.fDisconnect = true;
+                if (m_async_pnb_probe) {
+                    const uint256 block_hash{queuedBlock.pindex->GetBlockHash()};
+                    m_async_pnb_probe->Record(
+                        node::AsyncPNBProbeEvent::BLOCK_TIMEOUT,
+                        SteadyClock::now(),
+                        {node.GetId(), 2, queuedBlock.pindex->nHeight},
+                        {}, {}, &block_hash);
+                }
                 return true;
             }
         }
@@ -6983,6 +7220,15 @@ bool PeerManagerImpl::SendMessages(CNode& node)
                     if (!node.HasPermission(NetPermissionFlags::NoBan)) {
                         LogInfo("Timeout downloading headers, %s", node.DisconnectMsg());
                         node.fDisconnect = true;
+                        if (m_async_pnb_probe) {
+                            m_async_pnb_probe->Record(
+                                node::AsyncPNBProbeEvent::BLOCK_TIMEOUT,
+                                SteadyClock::now(),
+                                {node.GetId(), 3,
+                                 m_chainman.m_best_header
+                                     ? m_chainman.m_best_header->nHeight
+                                     : -1});
+                        }
                         return true;
                     } else {
                         LogInfo("Timeout downloading headers from noban peer, not %s", node.DisconnectMsg());
