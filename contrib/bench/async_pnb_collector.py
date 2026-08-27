@@ -313,14 +313,14 @@ def thread_category(name):
     return "other"
 
 
-def capture_clock_pair(monotonic_clock=time.monotonic_ns, wall_clock=time.time_ns):
-    """Capture wall time with a conservative representative monotonic interval.
+def capture_clock_pair(monotonic_before, *, monotonic_clock=time.monotonic_ns,
+                       wall_clock=time.time_ns):
+    """Finish an acquisition's conservative representative clock interval.
 
-    The wall read occurs between the two monotonic reads. The persisted
-    monotonic midpoint M and uncertainty U=ceil((after-before)/2) therefore
-    guarantee that the corresponding monotonic instant is in [M-U, M+U].
+    The caller takes ``monotonic_before`` before acquisition. The wall read and
+    final monotonic read occur after acquisition, so every observation in the
+    row lies in the persisted [M-U, M+U] interval.
     """
-    monotonic_before = monotonic_clock()
     wall = wall_clock()
     monotonic_after = monotonic_clock()
     if (type(monotonic_before) is not int or type(monotonic_after) is not int or
@@ -335,22 +335,29 @@ def capture_clock_pair(monotonic_clock=time.monotonic_ns, wall_clock=time.time_n
     }
 
 
-def sample_resources(pid, clock_ticks, page_size):
-    stat = read_proc_stat(pid)
-    status = read_key_values(f"/proc/{pid}/status")
-    io = read_key_values(f"/proc/{pid}/io")
+def sample_resources(pid, clock_ticks, page_size, *,
+                     monotonic_clock=time.monotonic_ns,
+                     wall_clock=time.time_ns, stat_reader=read_proc_stat,
+                     key_value_reader=read_key_values, task_entries=None):
+    monotonic_before = monotonic_clock()
+    stat = stat_reader(pid)
+    status = key_value_reader(f"/proc/{pid}/status")
+    io = key_value_reader(f"/proc/{pid}/io")
     thread_ticks = Counter()
     task_dir = Path(f"/proc/{pid}/task")
-    for entry in task_dir.iterdir():
+    entries = task_dir.iterdir() if task_entries is None else task_entries(task_dir)
+    for entry in entries:
         if not entry.name.isdigit():
             continue
         try:
-            thread = read_proc_stat(pid, int(entry.name))
+            thread = stat_reader(pid, int(entry.name))
         except FileNotFoundError:
             continue
         thread_ticks[thread_category(thread["comm"])] += thread["utime"] + thread["stime"]
     return {
-        **capture_clock_pair(),
+        **capture_clock_pair(
+            monotonic_before, monotonic_clock=monotonic_clock,
+            wall_clock=wall_clock),
         "process_user_seconds": stat["utime"] / clock_ticks,
         "process_system_seconds": stat["stime"] / clock_ticks,
         "thread_msghand_seconds": thread_ticks["msghand"] / clock_ticks,
@@ -386,23 +393,31 @@ def filtered_peer(peer):
     return result
 
 
-def run_rpc(cli, cli_args, expected_chain, *, runner=subprocess.run,
-            clock_capture=capture_clock_pair):
+def run_rpc(cli, cli_args, expected_chain, *, clock_state,
+            runner=subprocess.run, monotonic_clock=time.monotonic_ns,
+            wall_clock=time.time_ns):
+    monotonic_before = monotonic_clock()
+
     def call(method):
         completed = runner(
             [cli, *cli_args, method], check=True, capture_output=True,
             text=True, timeout=30)
         return json.loads(completed.stdout)
 
-    chain = call("getblockchaininfo")
-    totals = call("getnettotals")
-    network = call("getnetworkinfo")
-    peers = call("getpeerinfo")
+    try:
+        chain = call("getblockchaininfo")
+        totals = call("getnettotals")
+        network = call("getnetworkinfo")
+        peers = call("getpeerinfo")
+    finally:
+        clock_state.update(capture_clock_pair(
+            monotonic_before, monotonic_clock=monotonic_clock,
+            wall_clock=wall_clock))
     if chain.get("chain") != expected_chain:
         raise CollectionError(
             f"RPC chain mismatch: expected {expected_chain}, got {chain.get('chain')}")
     return {
-        **clock_capture(),
+        **clock_state,
         "chain": {
             key: chain[key] for key in
             ("chain", "blocks", "headers", "verificationprogress", "initialblockdownload")
@@ -422,8 +437,8 @@ def run_rpc(cli, cli_args, expected_chain, *, runner=subprocess.run,
     }
 
 
-def rpc_failure_row(error, *, clock_capture=capture_clock_pair):
-    return {**clock_capture(), "error": type(error).__name__}
+def rpc_failure_row(error, clock_state):
+    return {**clock_state, "error": type(error).__name__}
 
 
 def sha256_file(path):
@@ -638,14 +653,57 @@ def run_self_tests():
     assert mapping["mapping_uncertainty_ns"] == 9_000_000_017
     assert mapping["compatibility"] == "wall_offset_bridge_with_reported_uncertainty"
 
-    monotonic_reads = iter((100, 142))
+    monotonic_reads = iter((142,))
     captured = capture_clock_pair(
-        monotonic_clock=lambda: next(monotonic_reads), wall_clock=lambda: 1_000)
+        100, monotonic_clock=lambda: next(monotonic_reads),
+        wall_clock=lambda: 1_000)
     assert captured == {
         "monotonic_ns": 121,
         "wall_ns": 1_000,
         "clock_capture_uncertainty_ns": 21,
     }
+
+    # Exercise the production resource caller with injected acquisition. The
+    # odd span proves floor M and ceil U across all /proc reads.
+    resource_timeline = []
+    resource_monotonic_reads = iter((100, 143))
+
+    def resource_monotonic():
+        value = next(resource_monotonic_reads)
+        resource_timeline.append(("monotonic", value))
+        return value
+
+    def resource_stat(_pid, tid=None):
+        resource_timeline.append(("stat", tid))
+        return {"comm": "msghand", "utime": 10, "stime": 5,
+                "threads": 1, "start_ticks": 1, "rss_pages": 2}
+
+    def resource_values(path):
+        resource_timeline.append(("values", Path(path).name))
+        return {}
+
+    def resource_tasks(_path):
+        resource_timeline.append(("tasks", None))
+        return []
+
+    def resource_wall():
+        resource_timeline.append(("wall", 1_000))
+        return 1_000
+
+    resource_sample = sample_resources(
+        123, 100, 4096, monotonic_clock=resource_monotonic,
+        wall_clock=resource_wall, stat_reader=resource_stat,
+        key_value_reader=resource_values, task_entries=resource_tasks)
+    assert resource_timeline == [
+        ("monotonic", 100), ("stat", None), ("values", "status"),
+        ("values", "io"), ("tasks", None), ("wall", 1_000),
+        ("monotonic", 143)]
+    assert {key: resource_sample[key] for key in (
+        "monotonic_ns", "wall_ns", "clock_capture_uncertainty_ns")} == {
+            "monotonic_ns": 121,
+            "wall_ns": 1_000,
+            "clock_capture_uncertainty_ns": 22,
+        }
 
     rpc_results = {
         "getblockchaininfo": {
@@ -663,18 +721,77 @@ def run_self_tests():
         def __init__(self, value):
             self.stdout = json.dumps(value)
 
+    rpc_timeline = []
+
     def fake_runner(arguments, **_kwargs):
+        rpc_timeline.append(("rpc", arguments[-1]))
         return Completed(rpc_results[arguments[-1]])
 
+    rpc_monotonic_reads = iter((200, 245))
+
+    def rpc_monotonic():
+        value = next(rpc_monotonic_reads)
+        rpc_timeline.append(("monotonic", value))
+        return value
+
+    def rpc_wall():
+        rpc_timeline.append(("wall", 2_000))
+        return 2_000
+
+    rpc_clock = {}
     rpc_success = run_rpc(
         "bitcoin-cli", [], "regtest", runner=fake_runner,
-        clock_capture=lambda: captured)
+        clock_state=rpc_clock, monotonic_clock=rpc_monotonic,
+        wall_clock=rpc_wall)
+    assert rpc_timeline == [
+        ("monotonic", 200), ("rpc", "getblockchaininfo"),
+        ("rpc", "getnettotals"), ("rpc", "getnetworkinfo"),
+        ("rpc", "getpeerinfo"), ("wall", 2_000),
+        ("monotonic", 245)]
+    assert {key: rpc_success[key] for key in (
+        "monotonic_ns", "wall_ns", "clock_capture_uncertainty_ns")} == {
+            "monotonic_ns": 222,
+            "wall_ns": 2_000,
+            "clock_capture_uncertainty_ns": 23,
+        }
     assert set(rpc_success) == {
         "monotonic_ns", "wall_ns", "clock_capture_uncertainty_ns", "chain",
         "warnings_present", "network_totals", "network", "peers"}
-    rpc_failure = rpc_failure_row(
-        subprocess.TimeoutExpired("bitcoin-cli", 30),
-        clock_capture=lambda: captured)
+    failure_timeline = []
+    failure_monotonic_reads = iter((300, 347))
+
+    def failure_monotonic():
+        value = next(failure_monotonic_reads)
+        failure_timeline.append(("monotonic", value))
+        return value
+
+    def failing_runner(arguments, **_kwargs):
+        failure_timeline.append(("rpc", arguments[-1]))
+        raise subprocess.TimeoutExpired("bitcoin-cli", 30)
+
+    def failure_wall():
+        failure_timeline.append(("wall", 3_000))
+        return 3_000
+
+    failure_clock = {}
+    try:
+        run_rpc(
+            "bitcoin-cli", [], "regtest", runner=failing_runner,
+            clock_state=failure_clock, monotonic_clock=failure_monotonic,
+            wall_clock=failure_wall)
+    except subprocess.TimeoutExpired as error:
+        rpc_failure = rpc_failure_row(error, failure_clock)
+    else:
+        raise AssertionError("RPC failure did not preserve its exception")
+    assert failure_timeline == [
+        ("monotonic", 300), ("rpc", "getblockchaininfo"),
+        ("wall", 3_000), ("monotonic", 347)]
+    assert {key: rpc_failure[key] for key in (
+        "monotonic_ns", "wall_ns", "clock_capture_uncertainty_ns")} == {
+            "monotonic_ns": 323,
+            "wall_ns": 3_000,
+            "clock_capture_uncertainty_ns": 24,
+        }
     assert set(rpc_failure) == {
         "monotonic_ns", "wall_ns", "clock_capture_uncertainty_ns", "error"}
     assert rpc_failure["error"] == "TimeoutExpired"
@@ -753,7 +870,7 @@ def collect(args):
         "clock_origin": {"monotonic_ns": start_mono, "wall_ns": start_wall},
         "clock_mapping": mapping,
         "sample_clock_capture": {
-            "method": "wall read bracketed by monotonic reads",
+            "method": "sample acquisition and wall read bracketed by monotonic reads",
             "representative_monotonic": "midpoint=floor((before+after)/2)",
             "uncertainty": "ceil((monotonic_after-monotonic_before)/2)",
         },
@@ -944,9 +1061,11 @@ def collect(args):
 
                 if (cutoff is None and now >= next_rpc and
                         process_exit_state == "running_at_collection_end"):
+                    rpc_clock = {}
                     try:
                         snapshot = run_rpc(
-                            args.bitcoin_cli, args.bitcoin_cli_arg, args.expected_chain)
+                            args.bitcoin_cli, args.bitcoin_cli_arg, args.expected_chain,
+                            clock_state=rpc_clock)
                         rpc_file.write(json.dumps(
                             snapshot, sort_keys=True, separators=(",", ":")) + "\n")
                         rpc_file.flush()
@@ -963,7 +1082,7 @@ def collect(args):
                             snapshot["clock_capture_uncertainty_ns"])
                     except (OSError, subprocess.SubprocessError, json.JSONDecodeError) as error:
                         rpc_failures += 1
-                        failure = rpc_failure_row(error)
+                        failure = rpc_failure_row(error, rpc_clock)
                         rpc_file.write(json.dumps(
                             failure, sort_keys=True, separators=(",", ":")) + "\n")
                         rpc_file.flush()

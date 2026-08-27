@@ -1102,9 +1102,9 @@ def reconcile_collector(manifest, summary, events, resources, rpc, artifacts, er
             mono_values.append(mono)
             wall_values.append(wall)
             uncertainties.append(uncertainty)
-            # The helper guarantees that the wall read's monotonic instant is
-            # within [M-U, M+U]. Since samples are taken strictly inside the
-            # collection window, that entire interval must remain in bounds.
+            # The collector guarantees that all row acquisition and its wall
+            # read are within [M-U, M+U]. Since samples are taken strictly
+            # inside the collection window, that entire interval stays bound.
             if start_ok and end_ok and not (
                     start_boundary["collector_monotonic_before_ns"] <=
                     lower and upper <=
@@ -1127,7 +1127,7 @@ def reconcile_collector(manifest, summary, events, resources, rpc, artifacts, er
                     end_boundary["collector_wall_midpoint_ns"] -
                     end_boundary["collector_monotonic_midpoint_ns"])
                 # Global tolerance covers the independently measured mapping
-                # and drift. U covers only this row's bracket residual.
+                # and drift. U covers this row's full acquisition bracket.
                 if not (min(start_delta, end_delta) - row_tolerance <= wall - mono <=
                         max(start_delta, end_delta) + row_tolerance):
                     errors.append(f"{name} row clock-domain residual mismatch")
@@ -1191,7 +1191,7 @@ def reconcile_collector(manifest, summary, events, resources, rpc, artifacts, er
         errors.append("RPC clock capture uncertainty maximum mismatch")
 
     capture_metadata = {
-        "method": "wall read bracketed by monotonic reads",
+        "method": "sample acquisition and wall read bracketed by monotonic reads",
         "representative_monotonic": "midpoint=floor((before+after)/2)",
         "uncertainty": "ceil((monotonic_after-monotonic_before)/2)",
         "max_uncertainty_ns": {
@@ -2336,7 +2336,7 @@ def run_self_tests():
             "clock_mapping": mapping,
             "cutoff_clock_mapping": cutoff_mapping,
             "sample_clock_capture": {
-                "method": "wall read bracketed by monotonic reads",
+                "method": "sample acquisition and wall read bracketed by monotonic reads",
                 "representative_monotonic": "midpoint=floor((before+after)/2)",
                 "uncertainty": "ceil((monotonic_after-monotonic_before)/2)",
                 "max_uncertainty_ns": {
@@ -2894,6 +2894,30 @@ def run_self_tests():
         20 / 1e9, mapping_uncertainty_ns=2)
     assert bracketed_join_event[0]["_phase"] == "ibd"
     assert bracketed_join_event[0]["_rpc_join_age_ns"] == 17
+    # A slow RPC batch spans [10, 30]. An event inside that acquisition is not
+    # certainly later than the state observation. An event after the interval
+    # is still too old from the earliest possible observation, although the
+    # old post-batch point timestamp would accept it.
+    widened_join = prepare_rpc_states(
+        [{"monotonic_ns": 20, "clock_capture_uncertainty_ns": 10,
+          "chain": {"initialblockdownload": True}}], 20)
+    assert widened_join(20) == ("unclassified", None)
+    assert widened_join(31) == ("unclassified", 21)
+    widened_events = [
+        {"event_code": 30, "values": [7], "process_epoch": epoch,
+         "steady_ns": value, "mapped_monotonic_ns": value}
+        for value in (20, 31)]
+    annotate(
+        widened_events,
+        [{"monotonic_ns": 20, "clock_capture_uncertainty_ns": 10,
+          "chain": {"initialblockdownload": True}}],
+        20 / 1e9)
+    assert [event["_phase"] for event in widened_events] == [
+        "unclassified", "unclassified"]
+    old_post_batch_join = prepare_rpc_states(
+        [{"monotonic_ns": 30, "clock_capture_uncertainty_ns": 0,
+          "chain": {"initialblockdownload": True}}], 20)
+    assert old_post_batch_join(31) == ("ibd", 1)
     uncertainty_events = [
         {"event_code": 30, "values": [7], "process_epoch": epoch,
          "steady_ns": 12, "mapped_monotonic_ns": 12},
