@@ -202,16 +202,32 @@ void AsyncPNBPeerServiceProbe::Record(
 {
     const uint64_t sequence{
         m_impl->header->producer_sequence.fetch_add(1, std::memory_order_relaxed) + 1};
-    const uint64_t consumer_ack{
-        m_impl->header->consumer_ack.load(std::memory_order_acquire)};
-    if (sequence > consumer_ack + ASYNC_PNB_PROBE_CAPACITY) {
+    const auto mark_loss{[&] {
         m_impl->header->loss_count.fetch_add(1, std::memory_order_relaxed);
         m_impl->header->status.fetch_or(
             ASYNC_PNB_PROBE_FLAG_LOSS, std::memory_order_release);
+    }};
+    const uint64_t consumer_ack{
+        m_impl->header->consumer_ack.load(std::memory_order_acquire)};
+    if ((sequence & ASYNC_PNB_PROBE_SLOT_CLAIM) != 0 ||
+        sequence > consumer_ack + ASYNC_PNB_PROBE_CAPACITY) {
+        mark_loss();
+        return;
     }
     AsyncPNBProbeSlot& slot{
         m_impl->slots[(sequence - 1) & (ASYNC_PNB_PROBE_CAPACITY - 1)]};
-    slot.published_sequence.store(0, std::memory_order_release);
+    uint64_t expected_publication{
+        sequence > ASYNC_PNB_PROBE_CAPACITY
+            ? sequence - ASYNC_PNB_PROBE_CAPACITY
+            : 0};
+    if (!slot.published_sequence.compare_exchange_strong(
+            expected_publication, sequence | ASYNC_PNB_PROBE_SLOT_CLAIM,
+            std::memory_order_acq_rel, std::memory_order_acquire)) {
+        // Never wait for or race a delayed writer. The reserved sequence is a
+        // permanent gap, and the collector will reject the retained run.
+        mark_loss();
+        return;
+    }
 
     AsyncPNBProbeEventRecord record{};
     record.sequence = sequence;

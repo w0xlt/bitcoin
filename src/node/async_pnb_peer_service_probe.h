@@ -31,6 +31,8 @@ inline constexpr uint32_t ASYNC_PNB_PROBE_ENDIAN{0x01020304};
 inline constexpr uint32_t ASYNC_PNB_PROBE_FLAG_TEST_GATES{1U};
 inline constexpr uint32_t ASYNC_PNB_PROBE_FLAG_LOSS{2U};
 inline constexpr uint32_t ASYNC_PNB_PROBE_FLAG_CLOSED{4U};
+/** published_sequence high-bit marker: a producer owns and is filling the slot. */
+inline constexpr uint64_t ASYNC_PNB_PROBE_SLOT_CLAIM{uint64_t{1} << 63};
 
 enum class AsyncPNBProbeEvent : uint32_t {
     COMPLETE_MESSAGE_READY = 1,

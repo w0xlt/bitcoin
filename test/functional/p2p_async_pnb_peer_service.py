@@ -43,6 +43,7 @@ from test_framework.messages import (
     CInv,
     HeaderAndShortIDs,
     calculate_shortid,
+    msg_addr,
     msg_block,
     msg_blocktxn,
     msg_cmpctblock,
@@ -93,6 +94,7 @@ PROBE_ENDIAN = 0x01020304
 PROBE_STATUS_TEST_GATES = 1
 PROBE_STATUS_LOSS = 2
 PROBE_STATUS_CLOSED = 4
+PROBE_SLOT_CLAIM = 1 << 63
 PROBE_HEADER = struct.Struct("<8s5IiI4xQqqQQQ4Ii20x")
 PROBE_EVENT = struct.Struct("<QQIIq16q24s24s32s")
 PROBE_EVENTS = {
@@ -193,6 +195,8 @@ class ProbeSliceReader:
         assert 1 <= sequence <= self.next_sequence
         offset = PROBE_HEADER_SIZE + ((sequence - 1) & (PROBE_CAPACITY - 1)) * PROBE_RECORD_SIZE
         published_before = struct.unpack_from("<Q", self.mapping, offset)[0]
+        if published_before & PROBE_SLOT_CLAIM:
+            return None
         if published_before == 0:
             return None
         assert published_before == sequence
@@ -234,6 +238,7 @@ class PeerServicePeer(P2PInterface):
         self.block_requests = []
         self.block_request_types = []
         self.blocktxn_requests = []
+        self.address_messages = []
         self.pong_nonces = []
         self.service_request = None
 
@@ -285,9 +290,19 @@ class PeerServicePeer(P2PInterface):
         self._record_service_response("verack", message)
 
     def on_addr(self, message):
+        self.address_messages.append({
+            "message": message,
+            "received_ns": time.perf_counter_ns(),
+            "type": "addr",
+        })
         self._record_service_response("addr", message)
 
     def on_addrv2(self, message):
+        self.address_messages.append({
+            "message": message,
+            "received_ns": time.perf_counter_ns(),
+            "type": "addrv2",
+        })
         self._record_service_response("addrv2", message)
 
     def on_blocktxn(self, message):
@@ -337,6 +352,12 @@ class PeerServicePeer(P2PInterface):
             "responses": responses,
             "service": request["service"],
         }
+
+    def wait_for_service_response_count(self, count):
+        self.wait_until(
+            lambda: self.service_request is not None and
+                    len(self.service_request["responses"]) >= count,
+            timeout=PING_TIMEOUT)
 
 
 class MarkerReader:
@@ -398,8 +419,9 @@ class MarkerReader:
                           active_source=values[6], source_related=values[7],
                           more_work=values[8], msg=text1)
         elif event == 4:
+            assert values[2] == 0, "response event reserved field retained payload data"
             fields.update(
-                peer=values[0], msg_id=values[1], nonce=values[2],
+                peer=values[0], msg_id=values[1], reserved=values[2],
                 response_bytes=values[3], send_queue_bytes=values[4],
                 send_queue_depth=values[5], pause_send=values[6],
                 active_slot=values[7], job=values[8], outbound_id=values[9],
@@ -760,6 +782,10 @@ class AsyncPNBPeerService(BitcoinTestFramework):
             f"-v2transport={int(self.options.peer_service_collector_integration)}",
         ]
         args += ["-par=1", "-prevoutfetchthreads=0"]
+        if self.options.peer_service_collector_integration:
+            # Advertise only inside loopback regtest so GETADDR coverage can
+            # distinguish the initial self-announcement from its deferred batch.
+            args += ["-externalip=2.2.2.2", "-whitelist=addr@127.0.0.1"]
         self.extra_args = [args]
 
     def setup_nodes(self):
@@ -2152,7 +2178,8 @@ class AsyncPNBPeerService(BitcoinTestFramework):
             f"--pid={node.process.pid}",
             f"--probe-dir={self.probe_dir}",
             f"--output={output}",
-            "--duration=3",
+            "--duration=5",
+            "--event-flush-interval=0.05",
             "--resource-interval=0.05",
             "--rpc-interval=0.1",
             "--expected-chain=regtest",
@@ -2164,11 +2191,57 @@ class AsyncPNBPeerService(BitcoinTestFramework):
         process = subprocess.Popen(
             command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         try:
+            collector_mocktime = self.refresh_block["time"]
+            assert node.getnodeaddresses(0) == []
+            empty_addr = node.add_p2p_connection(
+                PeerServicePeer(), supports_v2_p2p=False)
+            empty_addr_id = self._map_peer_id(empty_addr)
+            # Inbound peers enable address relay only after their first
+            # address-related message. Enable it independently of GETADDR so
+            # the initial self-announcement is observably earlier.
+            empty_addr.send_and_ping(msg_addr())
+            empty_addr.wait_until(lambda: len(empty_addr.address_messages) == 1)
+            assert [addr.ip for addr in
+                    empty_addr.address_messages[0]["message"].addrs] == ["2.2.2.2"]
+            empty_addr.begin_service_request(
+                "getaddr", msg_getaddr(), ("addr",))
+            collector_mocktime += 10 * 60
+            node.setmocktime(collector_mocktime)
+            # A later PING is a processing barrier for the earlier GETADDR.
+            # With an empty AddrMan, its deferred decision sends no ADDR.
+            empty_addr.send_and_ping(msg_ping(nonce=0xC011EC7000000000))
+            empty_timing = empty_addr.finish_service_request(timeout=0)
+            assert not empty_timing["completed"] and empty_timing["responses"] == []
+            assert len(empty_addr.address_messages) == 1
+            empty_addr.peer_disconnect()
+            empty_addr.wait_for_disconnect()
+
+            seed_addresses = {f"1.2.3.{index}" for index in range(1, 17)}
+            for address in sorted(seed_addresses):
+                node.addpeeraddress(address, 18444)
             v1 = node.add_p2p_connection(
                 PeerServicePeer(), supports_v2_p2p=False)
             v2 = node.add_p2p_connection(
                 PeerServicePeer(), supports_v2_p2p=True)
+            v1_id = self._map_peer_id(v1)
             assert not v1.supports_v2_p2p and v2.supports_v2_p2p
+            v1.send_and_ping(msg_addr())
+            v1.wait_until(lambda: len(v1.address_messages) == 1)
+            assert [addr.ip for addr in v1.address_messages[0]["message"].addrs] == ["2.2.2.2"]
+            initial_addr_received_ns = v1.address_messages[0]["received_ns"]
+            v1.begin_service_request("getaddr", msg_getaddr(), ("addr",))
+            collector_mocktime += 10 * 60
+            node.setmocktime(collector_mocktime)
+            v1.wait_until(lambda: any(
+                addr.ip in seed_addresses
+                for response in v1.address_messages[1:]
+                for addr in response["message"].addrs))
+            addr_timing = v1.finish_service_request()
+            assert addr_timing["completed"] and len(addr_timing["responses"]) == 1
+            assert any(
+                addr.ip in seed_addresses
+                for addr in addr_timing["responses"][0]["message"].addrs)
+            assert initial_addr_received_ns < addr_timing["responses"][0]["received_ns"]
             v1.send_and_ping(msg_ping(nonce=0xC011EC7000000001))
             v2.send_and_ping(msg_ping(nonce=0xC011EC7000000002))
 
@@ -2184,9 +2257,19 @@ class AsyncPNBPeerService(BitcoinTestFramework):
             v1.send_without_ping(msg_block(block))
             self._wait_tip(block)
             v2.send_and_ping(msg_ping(nonce=0xC011EC7000000003))
+            removed_block = self._quick_block()
+            self._announce(v2, removed_block)
+            self.wait_until(
+                lambda: removed_block.hash_int in v2.block_requests,
+                timeout=PING_TIMEOUT,
+                check_interval=MARKER_POLL,
+            )
+            v2.peer_disconnect()
+            v2.wait_for_disconnect()
             for peer in (v1, v2):
-                peer.peer_disconnect()
-                peer.wait_for_disconnect()
+                if peer.is_connected:
+                    peer.peer_disconnect()
+                    peer.wait_for_disconnect()
 
             stdout, stderr = process.communicate(timeout=15 * self.options.timeout_factor)
             assert process.returncode == 0, (command, stdout, stderr)
@@ -2201,11 +2284,15 @@ class AsyncPNBPeerService(BitcoinTestFramework):
         assert summary["valid"] and summary["loss_count"] == 0
         assert summary["checksum_failures"] == 0
         assert summary["unstable_read_failures"] == 0
+        assert summary["event_sequence_read_last"] == summary["event_sequence_durable_last"]
+        assert summary["consumer_ack"] == summary["event_sequence_durable_last"]
+        assert summary["durable_flushes"] > 0
         assert summary["rpc_samples"] > 0 and summary["resource_samples"] > 0
         for required in (
                 "peer_created", "handshake_complete", "complete_message_ready",
                 "handler_start", "handler_complete", "outbound_queued", "socket_sent",
-                "job_submit", "pnb_start", "pnb_end", "continuation"):
+                "job_submit", "pnb_start", "pnb_end", "result_publication",
+                "result_collection", "continuation", "block_request_removed"):
             assert summary["event_counts"].get(required, 0) > 0, required
 
         events = [json.loads(line) for line in
@@ -2215,13 +2302,18 @@ class AsyncPNBPeerService(BitcoinTestFramework):
         completes = set()
         fronts = set()
         outbound = {}
+        causal_links = set()
         sockets = set()
+        getaddr_ids = {}
+        removal_reasons = []
         for event in events:
             values = event["values"]
             if event["event_code"] == 1:
                 key = (event["process_epoch"], values[0], values[1])
                 assert key not in inbound
                 inbound[key] = event.get("text1")
+                if event.get("text1") == "getaddr":
+                    getaddr_ids[values[0]] = values[1]
             elif event["event_code"] in {2, 3, 21}:
                 key = (event["process_epoch"], values[0], values[1])
                 {2: starts, 3: completes, 21: fronts}[event["event_code"]].add(key)
@@ -2231,11 +2323,50 @@ class AsyncPNBPeerService(BitcoinTestFramework):
                 outbound[key] = values[2]
             elif event["event_code"] == 24:
                 sockets.add((event["process_epoch"], values[0], values[1]))
+            elif event["event_code"] == 26:
+                causal_links.add((event["process_epoch"], values[0], values[1], values[2]))
+            elif event["event_code"] == 33:
+                removal_reasons.append(values[2])
+            elif event["event_code"] == 4:
+                assert values[2] == 0
+                assert not {0xC011EC7000000000, 0xC011EC7000000001,
+                            0xC011EC7000000002, 0xC011EC7000000003} & set(values)
         assert {"inv", "tx", "headers", "block"}.issubset(set(inbound.values()))
         assert set(inbound) == starts == completes == fronts
         assert set(outbound) == sockets
         for (epoch, peer, _outbound_id), causal_id in outbound.items():
             assert causal_id == 0 or (epoch, peer, causal_id) in inbound
+
+        epoch = events[0]["process_epoch"]
+        empty_getaddr_id = getaddr_ids[empty_addr_id]
+        batch_getaddr_id = getaddr_ids[v1_id]
+        empty_addr_outbound = [
+            event for event in events
+            if event["event_code"] == 23 and event["values"][0] == empty_addr_id
+            and event.get("text1") in {"addr", "addrv2"}]
+        assert len(empty_addr_outbound) == 1
+        assert empty_addr_outbound[0]["values"][2] == 0
+        assert not any(
+            event["values"][2] == empty_getaddr_id
+            for event in empty_addr_outbound)
+        assert not any(
+            link[0] == epoch and link[1] == empty_addr_id and
+            link[2] == empty_getaddr_id for link in causal_links)
+
+        batch_addr_outbound = [
+            event for event in events
+            if event["event_code"] == 23 and event["values"][0] == v1_id
+            and event.get("text1") in {"addr", "addrv2"}]
+        assert len([event for event in batch_addr_outbound
+                    if event["values"][2] == batch_getaddr_id]) == 1
+        initial_batch_peer = [event for event in batch_addr_outbound
+                              if event["values"][2] == 0]
+        causal_batch = [event for event in batch_addr_outbound
+                        if event["values"][2] == batch_getaddr_id]
+        assert len(initial_batch_peer) == len(causal_batch) == 1
+        assert initial_batch_peer[0]["sequence"] < causal_batch[0]["sequence"]
+        assert causal_batch[0]["values"][3] > initial_batch_peer[0]["values"][3]
+        assert 0 in removal_reasons and 1 in removal_reasons
 
         completed = subprocess.run(
             [sys.executable, str(analyzer), f"--input={output}", f"--output={analysis}"],
@@ -2247,7 +2378,15 @@ class AsyncPNBPeerService(BitcoinTestFramework):
         assert report["integrity"]["valid"]
         assert report["pnb"]["count"] == 1
         assert report["pnb"]["jobs"][0]["delivery_route"] == "full-block"
+        assert report["pnb"]["jobs"][0]["ordered_complete"]
+        assert report["pnb"]["during_pnb_rates_per_second"][
+            "useful_correlated_completed_responses"] == (
+                report["pnb"]["during_pnb_counts"][
+                    "useful_correlated_completed_responses"] /
+                report["pnb"]["time_seconds"])
         assert report["outbound"]["completed"] > 0
+        assert report["block_download"]["completed_removals"] > 0
+        assert report["block_download"]["noncompletion_removals"] > 0
         assert report["observability"]["true_peer_rtt"] == "not_observable"
 
     def _provenance(self, node, binary):

@@ -1685,6 +1685,28 @@ std::pair<size_t, bool> CConnman::SocketSendData(CNode& node) const
     size_t nSentSize = 0;
     bool data_left{false}; //!< second return value (whether unsent data remains)
     std::optional<bool> expected_more;
+    const auto send_queue_state{[&] {
+        const auto transport_info{node.m_transport->GetMessageInfo()};
+        const size_t bytes{node.m_send_memusage +
+                           node.m_transport->GetSendMemoryUsage()};
+        const size_t depth{static_cast<size_t>(
+                               std::distance(it, node.vSendMsg.end())) +
+                           (transport_info.outbound_id != 0)};
+        return std::tuple{bytes, depth, node.fPauseSend.load()};
+    }};
+    std::optional<std::tuple<size_t, size_t, bool>> previous_send_queue_state;
+    if (m_async_pnb_probe) previous_send_queue_state = send_queue_state();
+    const auto record_send_queue_state{[&] {
+        if (!m_async_pnb_probe) return;
+        const auto state{send_queue_state()};
+        if (previous_send_queue_state && state == *previous_send_queue_state) return;
+        previous_send_queue_state = state;
+        const auto [bytes, depth, paused]{state};
+        m_async_pnb_probe->Record(
+            node::AsyncPNBProbeEvent::SEND_QUEUE_STATE, SteadyClock::now(),
+            {node.GetId(), static_cast<int64_t>(bytes),
+             static_cast<int64_t>(depth), paused, 2});
+    }};
 
     while (true) {
         if (it != node.vSendMsg.end()) {
@@ -1696,6 +1718,7 @@ std::pair<size_t, bool> CConnman::SocketSendData(CNode& node) const
                 // Update memory usage of send buffer (as *it will be deleted).
                 node.m_send_memusage -= memusage;
                 ++it;
+                record_send_queue_state();
             }
         }
         const auto& [data, more, msg_type] = node.m_transport->GetBytesToSend(it != node.vSendMsg.end());
@@ -1734,6 +1757,7 @@ std::pair<size_t, bool> CConnman::SocketSendData(CNode& node) const
             node.nSendBytes += nBytes;
             // Notify transport that bytes have been processed.
             const bool message_completed{node.m_transport->MarkBytesSent(nBytes)};
+            record_send_queue_state();
             if (m_async_pnb_probe && message_info.outbound_id != 0) {
                 if (node.m_active_outbound_id == 0) {
                     node.m_active_outbound_id = message_info.outbound_id;
@@ -1791,24 +1815,12 @@ std::pair<size_t, bool> CConnman::SocketSendData(CNode& node) const
     }
 
     node.fPauseSend = node.m_send_memusage + node.m_transport->GetSendMemoryUsage() > nSendBufferMaxSize;
+    record_send_queue_state();
 
     if (it == node.vSendMsg.end()) {
         assert(node.m_send_memusage == 0);
     }
     node.vSendMsg.erase(node.vSendMsg.begin(), it);
-    if (m_async_pnb_probe) {
-        const auto transport_info{node.m_transport->GetMessageInfo()};
-        m_async_pnb_probe->Record(
-            node::AsyncPNBProbeEvent::SEND_QUEUE_STATE, SteadyClock::now(),
-            {node.GetId(),
-             static_cast<int64_t>(node.m_send_memusage +
-                                  (transport_info.outbound_id != 0
-                                       ? node.m_transport->GetSendMemoryUsage()
-                                       : 0)),
-             static_cast<int64_t>(node.vSendMsg.size() +
-                                  (transport_info.outbound_id != 0)),
-             node.fPauseSend.load(), 2});
-    }
     return {nSentSize, data_left};
 }
 
@@ -4279,7 +4291,7 @@ void CNode::MarkReceivedMsgsForProcessing()
         LOCK(m_msg_process_queue_mutex);
         size_t nSizeAdded{0};
         size_t ready_depth{m_msg_process_queue.size()};
-        bool expose_front{m_msg_process_queue.empty()};
+        const bool expose_front{m_msg_process_queue.empty() && !vRecvMsg.empty()};
         for (auto& msg : vRecvMsg) {
             // vRecvMsg contains only completed CNetMessage; the single possible
             // partially deserialized message is held by TransportDeserializer.
@@ -4302,27 +4314,28 @@ void CNode::MarkReceivedMsgsForProcessing()
                      static_cast<int64_t>(msg.m_process_queue_depth_at_ready),
                      msg.m_process_queue_paused_at_ready},
                     msg.m_type);
-                if (expose_front) {
-                    msg.m_process_queue_front = msg.m_process_queue_ready;
-                    m_async_pnb_probe->Record(
-                        node::AsyncPNBProbeEvent::MESSAGE_FRONT_READY,
-                        msg.m_process_queue_front,
-                        {GetId(), static_cast<int64_t>(msg.m_process_queue_id),
-                         static_cast<int64_t>(msg.m_process_queue_bytes_at_ready),
-                         static_cast<int64_t>(msg.m_process_queue_depth_at_ready),
-                         msg.m_process_queue_paused_at_ready},
-                        msg.m_type);
-                    expose_front = false;
-                }
             }
         }
         m_msg_process_queue.splice(m_msg_process_queue.end(), vRecvMsg);
         m_msg_process_queue_size += nSizeAdded;
         fPauseRecv = m_msg_process_queue_size > m_recv_flood_size;
         if (m_async_pnb_probe) {
+            const auto queue_mutation_time{SteadyClock::now()};
+            if (expose_front) {
+                CNetMessage& front{m_msg_process_queue.front()};
+                front.m_process_queue_front = queue_mutation_time;
+                m_async_pnb_probe->Record(
+                    node::AsyncPNBProbeEvent::MESSAGE_FRONT_READY,
+                    front.m_process_queue_front,
+                    {GetId(), static_cast<int64_t>(front.m_process_queue_id),
+                     static_cast<int64_t>(m_msg_process_queue_size),
+                     static_cast<int64_t>(m_msg_process_queue.size()),
+                     fPauseRecv.load()},
+                    front.m_type);
+            }
             m_async_pnb_probe->Record(
                 node::AsyncPNBProbeEvent::RECEIVE_QUEUE_STATE,
-                SteadyClock::now(),
+                queue_mutation_time,
                 {GetId(), static_cast<int64_t>(m_msg_process_queue_size),
                  static_cast<int64_t>(m_msg_process_queue.size()),
                  fPauseRecv.load(), 1});
@@ -4358,11 +4371,12 @@ std::optional<std::pair<CNetMessage, bool>> CNode::PollMessage(
     fPauseRecv = m_msg_process_queue_size > m_recv_flood_size;
 
     if (m_async_pnb_probe) {
+        const auto queue_mutation_time{SteadyClock::now()};
         if (!m_msg_process_queue.empty() &&
             m_msg_process_queue.front().m_process_queue_front ==
                 SteadyClock::time_point{}) {
             CNetMessage& next{m_msg_process_queue.front()};
-            next.m_process_queue_front = poll_time;
+            next.m_process_queue_front = queue_mutation_time;
             m_async_pnb_probe->Record(
                 node::AsyncPNBProbeEvent::MESSAGE_FRONT_READY,
                 next.m_process_queue_front,
@@ -4373,7 +4387,7 @@ std::optional<std::pair<CNetMessage, bool>> CNode::PollMessage(
                 next.m_type);
         }
         m_async_pnb_probe->Record(
-            node::AsyncPNBProbeEvent::RECEIVE_QUEUE_STATE, poll_time,
+            node::AsyncPNBProbeEvent::RECEIVE_QUEUE_STATE, queue_mutation_time,
             {GetId(), static_cast<int64_t>(m_msg_process_queue_size),
              static_cast<int64_t>(m_msg_process_queue.size()),
              fPauseRecv.load(), 2,
@@ -4465,9 +4479,7 @@ std::optional<CNetMsgSendQueueSnapshot> CConnman::PushMessage(
         if (capture_send_queue || m_async_pnb_probe) {
             const auto transport_info{pnode->m_transport->GetMessageInfo()};
             const size_t queue_bytes{pnode->m_send_memusage +
-                                     (transport_info.outbound_id != 0
-                                          ? pnode->m_transport->GetSendMemoryUsage()
-                                          : 0)};
+                                     pnode->m_transport->GetSendMemoryUsage()};
             const size_t queue_depth{pnode->vSendMsg.size() +
                                      (transport_info.outbound_id != 0)};
             send_queue.emplace(CNetMsgSendQueueSnapshot{

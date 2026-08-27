@@ -118,6 +118,12 @@ struct ConnmanTestMsg : public CConnman {
         return PushMessage(&node, std::move(msg), /*capture_send_queue=*/true);
     }
 
+    std::pair<size_t, bool> SocketSendDataPublic(CNode& node) const
+    {
+        LOCK(node.cs_vSend);
+        return SocketSendData(node);
+    }
+
     bool AlreadyConnectedToAddressPublic(const CNetAddr& addr) { return AlreadyConnectedToAddress(addr); };
 
     CNode* ConnectNodePublic(PeerManager& peerman, const char* pszDest, ConnectionType conn_type)

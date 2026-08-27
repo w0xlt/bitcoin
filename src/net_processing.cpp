@@ -874,8 +874,7 @@ private:
     }
     std::optional<uint64_t> PushMeasuredMessage(CNode& node, uint64_t msg_id,
                                                 std::string_view request_type,
-                                                CSerializedNetMsg&& msg,
-                                                uint64_t nonce = 0)
+                                                CSerializedNetMsg&& msg)
         EXCLUSIVE_LOCKS_REQUIRED(NetEventsInterface::g_msgproc_mutex);
     template <typename... Args>
     [[maybe_unused]] void MakeAndPushFeature(CNode& node, std::string_view feature_id, Args&&... args) const
@@ -1773,7 +1772,7 @@ void PeerManagerImpl::FindNextBlocks(std::vector<const CBlockIndex*>& vBlocks, c
 
 std::optional<uint64_t> PeerManagerImpl::PushMeasuredMessage(
     CNode& node, uint64_t msg_id, std::string_view request_type,
-    CSerializedNetMsg&& msg, uint64_t nonce)
+    CSerializedNetMsg&& msg)
 {
     AssertLockHeld(g_msgproc_mutex);
     Assert(msg_id != 0);
@@ -1792,17 +1791,13 @@ std::optional<uint64_t> PeerManagerImpl::PushMeasuredMessage(
     if (m_async_pnb_probe) {
         m_async_pnb_probe->Record(
             node::AsyncPNBProbeEvent::RESPONSE_QUEUED, snapshot->time,
-            {node.GetId(), static_cast<int64_t>(msg_id), static_cast<int64_t>(nonce),
+            {node.GetId(), static_cast<int64_t>(msg_id), 0,
              static_cast<int64_t>(response_bytes), static_cast<int64_t>(snapshot->bytes),
              static_cast<int64_t>(snapshot->depth), snapshot->paused,
              m_pending_block_validation.has_value(), static_cast<int64_t>(active_job),
              static_cast<int64_t>(snapshot->outbound_id)},
             request_type,
             std::string_view{response_type.data(), response_type_size});
-        m_async_pnb_probe->Record(
-            node::AsyncPNBProbeEvent::CAUSAL_LINK, snapshot->time,
-            {node.GetId(), static_cast<int64_t>(msg_id),
-             static_cast<int64_t>(snapshot->outbound_id)});
     }
     return snapshot->outbound_id;
 }
@@ -1976,7 +1971,9 @@ void PeerManagerImpl::FinalizeNode(const CNode& node)
     if (state->fSyncStarted)
         nSyncStarted--;
 
+    size_t blocks_remaining{state->vBlocksInFlight.size()};
     for (const QueuedBlock& entry : state->vBlocksInFlight) {
+        bool removed{false};
         auto range = mapBlocksInFlight.equal_range(entry.pindex->GetBlockHash());
         while (range.first != range.second) {
             auto [node_id, list_it] = range.first->second;
@@ -1984,6 +1981,21 @@ void PeerManagerImpl::FinalizeNode(const CNode& node)
                 range.first++;
             } else {
                 range.first = mapBlocksInFlight.erase(range.first);
+                removed = true;
+            }
+        }
+        if (removed) {
+            Assume(blocks_remaining > 0);
+            --blocks_remaining;
+            if (m_async_pnb_probe) {
+                const uint256& hash{entry.pindex->GetBlockHash()};
+                m_async_pnb_probe->Record(
+                    node::AsyncPNBProbeEvent::BLOCK_REQUEST_REMOVED,
+                    SteadyClock::now(),
+                    {nodeid, entry.pindex->nHeight,
+                     static_cast<int64_t>(BlockRequestRemoval::REMOVED),
+                     static_cast<int64_t>(blocks_remaining)},
+                    {}, {}, &hash);
             }
         }
     }
@@ -5763,7 +5775,7 @@ void PeerManagerImpl::ProcessMessage(Peer& peer, CNode& pfrom, const CNetMessage
             if (net_message.m_process_queue_id != 0) {
                 PushMeasuredMessage(
                     pfrom, net_message.m_process_queue_id, NetMsgType::PING,
-                    NetMsg::Make(NetMsgType::PONG, nonce), nonce);
+                    NetMsg::Make(NetMsgType::PONG, nonce));
             } else {
                 MakeAndPushMessage(pfrom, NetMsgType::PONG, nonce);
             }
@@ -6419,8 +6431,7 @@ void PeerManagerImpl::MaybeSendAddr(CNode& node, Peer& peer, std::chrono::micros
     // Nothing to do for non-address-relay peers
     if (!peer.m_addr_relay_enabled) return;
 
-    const auto push_addr_message{[&](CSerializedNetMsg&& msg) {
-        const uint64_t msg_id{std::exchange(peer.m_measurement_getaddr_msg_id, 0)};
+    const auto push_addr_message{[&](uint64_t msg_id, CSerializedNetMsg&& msg) {
         if (msg_id != 0) {
             PushMeasuredMessage(
                 node, msg_id, NetMsgType::GETADDR, std::move(msg));
@@ -6451,10 +6462,10 @@ void PeerManagerImpl::MaybeSendAddr(CNode& node, Peer& peer, std::chrono::micros
                 if (IsAddrCompatible(peer, local_addr)) {
                     std::vector<CAddress> self_announcement{local_addr};
                     if (peer.m_wants_addrv2) {
-                        push_addr_message(NetMsg::Make(
+                        PushMessage(node, NetMsg::Make(
                             NetMsgType::ADDRV2, CAddress::V2_NETWORK(self_announcement)));
                     } else {
-                        push_addr_message(NetMsg::Make(
+                        PushMessage(node, NetMsg::Make(
                             NetMsgType::ADDR, CAddress::V1_NETWORK(self_announcement)));
                     }
                 }
@@ -6487,14 +6498,19 @@ void PeerManagerImpl::MaybeSendAddr(CNode& node, Peer& peer, std::chrono::micros
     peer.m_addrs_to_send.erase(std::remove_if(peer.m_addrs_to_send.begin(), peer.m_addrs_to_send.end(), addr_already_known),
                            peer.m_addrs_to_send.end());
 
+    // This is the actual deferred GETADDR response decision. Consume its
+    // measurement ID even if filtering leaves no response, so later address
+    // relay traffic cannot inherit stale causality.
+    const uint64_t msg_id{std::exchange(peer.m_measurement_getaddr_msg_id, 0)};
+
     // No addr messages to send
     if (peer.m_addrs_to_send.empty()) return;
 
     if (peer.m_wants_addrv2) {
-        push_addr_message(NetMsg::Make(
+        push_addr_message(msg_id, NetMsg::Make(
             NetMsgType::ADDRV2, CAddress::V2_NETWORK(peer.m_addrs_to_send)));
     } else {
-        push_addr_message(NetMsg::Make(
+        push_addr_message(msg_id, NetMsg::Make(
             NetMsgType::ADDR, CAddress::V1_NETWORK(peer.m_addrs_to_send)));
     }
     peer.m_addrs_to_send.clear();

@@ -8,6 +8,7 @@ import argparse
 import csv
 import hashlib
 import json
+import math
 import mmap
 import os
 import platform
@@ -30,6 +31,7 @@ ENDIAN = 0x01020304
 STATUS_TEST_GATES = 1
 STATUS_LOSS = 2
 STATUS_CLOSED = 4
+SLOT_CLAIM = 1 << 63
 HEADER = struct.Struct("<8s5IiI4xQqqQQQ4Ii20x")
 EVENT = struct.Struct("<QQIIq16q24s24s32s")
 ACK_OFFSET = 72
@@ -99,6 +101,8 @@ def decode_text(raw):
 def validate_slot(expected, epoch, published_before, record, stored_checksum,
                   published_after):
     """Return None for an in-flight publication; raise on retained-run faults."""
+    if published_before & SLOT_CLAIM:
+        return None
     if published_before == 0 or published_before < expected:
         return None
     if published_before > expected:
@@ -186,6 +190,34 @@ class ProbeStream:
         os.close(self.fd)
 
 
+class DurableEventBatch:
+    """Publish consumer acknowledgement only after JSONL durability."""
+
+    def __init__(self, output, acknowledge, sync=os.fsync, initial_sequence=0):
+        self.output = output
+        self.acknowledge = acknowledge
+        self.sync = sync
+        self.pending_sequence = initial_sequence
+        self.durable_sequence = initial_sequence
+        self.flushes = 0
+
+    def note_written(self, sequence):
+        if sequence != self.pending_sequence + 1:
+            raise CollectionError(
+                f"nonconsecutive event write: {self.pending_sequence} to {sequence}")
+        self.pending_sequence = sequence
+
+    def make_durable(self):
+        if self.pending_sequence == self.durable_sequence:
+            return False
+        self.output.flush()
+        self.sync(self.output.fileno())
+        self.durable_sequence = self.pending_sequence
+        self.acknowledge(self.durable_sequence)
+        self.flushes += 1
+        return True
+
+
 class OpaqueIds:
     def __init__(self):
         self.ids = {}
@@ -202,6 +234,9 @@ class OpaqueIds:
 def decoded_event(unpacked, opaque):
     sequence, epoch, event, flags, steady_ns = unpacked[:5]
     values = list(unpacked[5:21])
+    if event == 4 and values[2] != 0:
+        raise CollectionError(
+            f"response_queued reserved field is nonzero at sequence {sequence}")
     result = {
         "sequence": sequence,
         "process_epoch": epoch,
@@ -415,6 +450,8 @@ def run_self_tests():
     good = checksum(packed)
     assert validate_slot(7, epoch, 0, packed, good, 0) is None
     assert validate_slot(7, epoch, 6, packed, good, 6) is None
+    assert validate_slot(
+        7, epoch, SLOT_CLAIM | 7, packed, good, SLOT_CLAIM | 7) is None
     assert validate_slot(7, epoch, 7, packed, good, 7)[0] == 7
     for arguments, expected in (
         ((7, epoch, 7, packed, good ^ 1, 7), "checksum"),
@@ -437,6 +474,45 @@ def run_self_tests():
         drained.append(validate_slot(
             sequence, epoch, sequence, record, checksum(record), sequence)[0])
     assert drained == [1, 2, 3, 4]
+
+    # Acknowledgement is sequenced strictly after flush and fsync, and a final
+    # forced drain publishes every written record rather than only a read cursor.
+    timeline = []
+
+    class Output:
+        def flush(self):
+            timeline.append("flush")
+
+        @staticmethod
+        def fileno():
+            return 123
+
+    durable = DurableEventBatch(
+        Output(),
+        lambda sequence: timeline.append(("ack", sequence)),
+        sync=lambda descriptor: timeline.append(("fsync", descriptor)))
+    durable.note_written(1)
+    durable.note_written(2)
+    assert durable.durable_sequence == 0 and timeline == []
+    assert durable.make_durable()
+    assert timeline == ["flush", ("fsync", 123), ("ack", 2)]
+    assert durable.durable_sequence == durable.pending_sequence == 2
+    assert not durable.make_durable()
+    durable.note_written(3)
+    assert durable.durable_sequence == 2
+    durable.make_durable()
+    assert timeline[-3:] == ["flush", ("fsync", 123), ("ack", 3)]
+
+    privacy_record = EVENT.pack(
+        8, epoch, 4, 0, 100, 1, 2, 99, *([0] * 13),
+        b"ping", b"pong", bytes(32))
+    privacy_unpacked = EVENT.unpack(privacy_record)
+    try:
+        decoded_event(privacy_unpacked, OpaqueIds())
+    except CollectionError as error:
+        assert "reserved field" in str(error)
+    else:
+        raise AssertionError("response nonce-like reserved value was retained")
     print("async_pnb_collector self-test: PASS")
 
 
@@ -495,8 +571,14 @@ def collect(args):
         "binary_sha256": binary_sha256,
         "mode": args.mode,
         "intervals_seconds": {
+            "event_flush": args.event_flush_interval,
             "resource": args.resource_interval,
-            "rpc": args.rpc_interval if args.bitcoin_cli else None,
+            "rpc": args.rpc_interval,
+        },
+        "durability": {
+            "ack_policy": "events_jsonl_flush_fsync_then_probe_ack",
+            "maximum_batch_seconds": args.event_flush_interval,
+            "lag_pressure_sequences": args.max_probe_lag,
         },
         "expected_chain": args.expected_chain,
         "environment": env,
@@ -536,15 +618,20 @@ def collect(args):
     deadline = start_mono + int(args.duration * 1_000_000_000)
     cutoff = None
     cutoff_deadline = None
+    durability = None
+    maximum_durable_lag = 0
+    maximum_read_ahead = 0
 
     try:
-        with events_path.open("a", encoding="utf-8", buffering=1) as events_file, \
+        with events_path.open("a", encoding="utf-8", buffering=1024 * 1024) as events_file, \
              resources_path.open("w", encoding="utf-8", newline="") as resources_file, \
              rpc_path.open("a", encoding="utf-8", buffering=1) as rpc_file:
             resource_writer = csv.DictWriter(resources_file, fieldnames=RESOURCE_FIELDS)
             resource_writer.writeheader()
             resources_file.flush()
             os.fsync(resources_file.fileno())
+            durability = DurableEventBatch(events_file, stream.acknowledge)
+            last_event_flush = time.monotonic_ns()
 
             while True:
                 now = time.monotonic_ns()
@@ -568,11 +655,12 @@ def collect(args):
 
                 header = stream.read_header()
                 producer = header[11]
-                durable = stream.expected - 1
-                if producer - durable > args.max_probe_lag:
-                    raise CollectionError(
-                        f"configured maximum probe lag exceeded: {producer - durable} > "
-                        f"{args.max_probe_lag}")
+                durable = durability.durable_sequence
+                maximum_durable_lag = max(maximum_durable_lag, producer - durable)
+                if (durability.pending_sequence > durable and
+                        producer - durable >= args.max_probe_lag):
+                    durability.make_durable()
+                    last_event_flush = time.monotonic_ns()
                 target = min(producer, cutoff) if cutoff is not None else producer
                 pending = []
                 while stream.expected <= target:
@@ -585,33 +673,56 @@ def collect(args):
                     for event in pending:
                         events_file.write(json.dumps(event, sort_keys=True, separators=(",", ":")) + "\n")
                         event_counts[event["event"]] += 1
-                        first_event = event["steady_ns"] if first_event is None else first_event
-                        last_event = event["steady_ns"]
-                    events_file.flush()
-                    os.fsync(events_file.fileno())
-                    stream.acknowledge(stream.expected - 1)
+                        first_event = (event["steady_ns"] if first_event is None else
+                                       min(first_event, event["steady_ns"]))
+                        last_event = (event["steady_ns"] if last_event is None else
+                                      max(last_event, event["steady_ns"]))
+                        durability.note_written(event["sequence"])
+
+                read_sequence = stream.expected - 1
+                maximum_read_ahead = max(
+                    maximum_read_ahead,
+                    read_sequence - durability.durable_sequence)
+                now = time.monotonic_ns()
+                force_for_lag = (
+                    durability.pending_sequence > durability.durable_sequence and
+                    producer - durability.durable_sequence >= args.max_probe_lag)
+                interval_elapsed = (
+                    durability.pending_sequence > durability.durable_sequence and
+                    now - last_event_flush >=
+                    int(args.event_flush_interval * 1_000_000_000))
+                final_drain = (
+                    cutoff is not None and read_sequence >= cutoff and
+                    durability.pending_sequence > durability.durable_sequence)
+                if force_for_lag or interval_elapsed or final_drain:
+                    durability.make_durable()
+                    last_event_flush = time.monotonic_ns()
+                if producer - durability.durable_sequence > args.max_probe_lag:
+                    raise CollectionError(
+                        f"configured maximum durable probe lag exceeded: "
+                        f"{producer - durability.durable_sequence} > {args.max_probe_lag}")
 
                 now = time.monotonic_ns()
-                if now >= next_resource and process_exit_state == "running_at_collection_end":
-                    sample = sample_resources(pid, clock_ticks, page_size)
-                    resource_writer.writerow(sample)
-                    resources_file.flush()
-                    resource_samples += 1
-                    first_resource = sample["monotonic_ns"] if first_resource is None else first_resource
-                    last_resource = sample["monotonic_ns"]
-                    if args.max_rss_mib is not None and sample["rss_bytes"] > args.max_rss_mib * 1024 * 1024:
-                        raise CollectionError(
-                            f"RSS abort threshold exceeded: {sample['rss_bytes']} bytes")
+                if now >= next_resource:
+                    if process_exit_state == "running_at_collection_end":
+                        sample = sample_resources(pid, clock_ticks, page_size)
+                        resource_writer.writerow(sample)
+                        resources_file.flush()
+                        resource_samples += 1
+                        first_resource = sample["monotonic_ns"] if first_resource is None else first_resource
+                        last_resource = sample["monotonic_ns"]
+                        if args.max_rss_mib is not None and sample["rss_bytes"] > args.max_rss_mib * 1024 * 1024:
+                            raise CollectionError(
+                                f"RSS abort threshold exceeded: {sample['rss_bytes']} bytes")
+                    if args.min_output_free_mib is not None:
+                        free = shutil.disk_usage(output_dir).free
+                        if free < args.min_output_free_mib * 1024 * 1024:
+                            raise CollectionError(
+                                f"output free-space abort threshold crossed: {free} bytes")
                     next_resource = time.monotonic_ns() + int(
                         args.resource_interval * 1_000_000_000)
 
-                if args.min_output_free_mib is not None:
-                    free = shutil.disk_usage(output_dir).free
-                    if free < args.min_output_free_mib * 1024 * 1024:
-                        raise CollectionError(
-                            f"output free-space abort threshold crossed: {free} bytes")
-
-                if (args.bitcoin_cli and now >= next_rpc and
+                if (now >= next_rpc and
                         process_exit_state == "running_at_collection_end"):
                     try:
                         snapshot = run_rpc(
@@ -633,8 +744,9 @@ def collect(args):
                     next_rpc = time.monotonic_ns() + int(
                         args.rpc_interval * 1_000_000_000)
 
-                if cutoff is not None and stream.expected > cutoff:
-                    # All reservations at the collection boundary are durable.
+                if (cutoff is not None and stream.expected > cutoff and
+                        durability.durable_sequence >= cutoff):
+                    # All reservations at the collection boundary are durable and acknowledged.
                     break
                 if cutoff_deadline is not None and now >= cutoff_deadline:
                     raise CollectionError(
@@ -662,8 +774,11 @@ def collect(args):
                 integrity_errors.append("closed stream was not fully drained")
         if signal_seen["number"] is not None:
             integrity_errors.append("collection interrupted by signal")
-        if args.bitcoin_cli and rpc_samples == 0:
-            integrity_errors.append("bitcoin-cli was supplied but no valid RPC snapshot was collected")
+        if rpc_samples == 0:
+            integrity_errors.append("no valid bitcoin-cli RPC snapshot was collected")
+        event_count = sum(event_counts.values())
+        durable_sequence = durability.durable_sequence if durability else 0
+        pending_sequence = durability.pending_sequence if durability else 0
         summary = {
             "complete": True,
             "valid": not integrity_errors,
@@ -671,8 +786,14 @@ def collect(args):
             "process_exit_state": process_exit_state,
             "process_epoch": stream.epoch,
             "event_counts": dict(sorted(event_counts.items())),
-            "event_sequence_first": 1 if event_counts else None,
-            "event_sequence_last": stream.expected - 1 if event_counts else None,
+            "event_count": event_count,
+            "event_sequence_first": 1 if event_count else None,
+            "event_sequence_last": durable_sequence if event_count else None,
+            "event_sequence_read_last": pending_sequence if event_count else None,
+            "event_sequence_durable_last": durable_sequence if event_count else None,
+            "durable_flushes": durability.flushes if durability else 0,
+            "maximum_durable_lag": maximum_durable_lag,
+            "maximum_read_ahead": maximum_read_ahead,
             "producer_sequence_observed": final_header[11],
             "collection_cutoff_sequence": cutoff,
             "consumer_ack": final_header[12],
@@ -690,8 +811,7 @@ def collect(args):
             "rpc_samples": rpc_samples,
             "rpc_monotonic_bounds_ns": [first_rpc, last_rpc],
             "rpc_failures": rpc_failures,
-            "unavailable": (["rpc_state", "network_byte_deltas", "ibd_state_joins"]
-                            if not args.bitcoin_cli else []) + [
+            "unavailable": [
                 "peer_response_receive", "peer_rtt", "remote_processing"],
         }
         write_json(summary_path, summary)
@@ -700,6 +820,14 @@ def collect(args):
             "valid": summary["valid"],
             "stop_reason": stop_reason,
             "end_clock": {"monotonic_ns": time.monotonic_ns(), "wall_ns": time.time_ns()},
+            "event_stream": {
+                "process_epoch": stream.epoch,
+                "count": event_count,
+                "sequence_first": summary["event_sequence_first"],
+                "sequence_last": summary["event_sequence_last"],
+                "durable_sequence": durable_sequence,
+                "event_counts": summary["event_counts"],
+            },
         })
         write_json(manifest_path, manifest)
         stream.close()
@@ -717,6 +845,7 @@ def parse_args():
     parser.add_argument("--duration", type=float)
     parser.add_argument("--resource-interval", type=float, default=1.0)
     parser.add_argument("--rpc-interval", type=float, default=5.0)
+    parser.add_argument("--event-flush-interval", type=float, default=0.05)
     parser.add_argument("--expected-chain", choices=("main", "test", "signet", "regtest"))
     parser.add_argument("--mode", choices=("control", "candidate"))
     parser.add_argument("--max-probe-lag", type=int, default=CAPACITY - 1024)
@@ -734,8 +863,10 @@ def parse_args():
     for name in ("probe_dir", "output", "duration", "expected_chain", "mode"):
         if getattr(args, name) is None:
             parser.error(f"--{name.replace('_', '-')} is required")
-    for name in ("duration", "resource_interval", "rpc_interval"):
-        if getattr(args, name) <= 0:
+    if not args.bitcoin_cli:
+        parser.error("--bitcoin-cli is required for expected-chain verification")
+    for name in ("duration", "resource_interval", "rpc_interval", "event_flush_interval"):
+        if not math.isfinite(getattr(args, name)) or getattr(args, name) <= 0:
             parser.error(f"--{name.replace('_', '-')} must be positive")
     if not 0 < args.max_probe_lag < CAPACITY:
         parser.error(f"--max-probe-lag must be between 1 and {CAPACITY - 1}")

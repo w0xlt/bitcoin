@@ -23,6 +23,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstring>
 #include <future>
 #include <memory>
 #include <optional>
@@ -474,9 +475,21 @@ BOOST_AUTO_TEST_CASE(probe_gate_disabled_and_circular_stream_authority)
     }
     header->consumer_ack.store(concurrent_end, std::memory_order_release);
 
-    // Falling more than one capacity behind is permanently and observably
-    // invalid, while publication continues for diagnostics.
-    for (uint64_t index{0}; index <= node::ASYNC_PNB_PROBE_CAPACITY; ++index) {
+    // Pin the next slot in a claimed/in-flight state, then adversarially
+    // advance the acknowledgement and wrap a full capacity. The contending
+    // writer must fail without waiting and, critically, without touching the
+    // non-atomic record owned by the delayed writer.
+    const uint64_t delayed_sequence{concurrent_end + 1};
+    auto& delayed_slot{
+        slots[(delayed_sequence - 1) & (node::ASYNC_PNB_PROBE_CAPACITY - 1)]};
+    uint64_t expected_previous{delayed_sequence - node::ASYNC_PNB_PROBE_CAPACITY};
+    BOOST_REQUIRE(delayed_slot.published_sequence.compare_exchange_strong(
+        expected_previous, delayed_sequence | node::ASYNC_PNB_PROBE_SLOT_CLAIM,
+        std::memory_order_acq_rel, std::memory_order_acquire));
+    const node::AsyncPNBProbeEventRecord delayed_record{delayed_slot.record};
+    header->producer_sequence.store(delayed_sequence, std::memory_order_release);
+    header->consumer_ack.store(delayed_sequence, std::memory_order_release);
+    for (uint64_t index{0}; index < node::ASYNC_PNB_PROBE_CAPACITY; ++index) {
         probe->Record(node::AsyncPNBProbeEvent::TEST_INTERFACE_REGISTERED,
                       std::chrono::steady_clock::time_point{});
     }
@@ -486,6 +499,10 @@ BOOST_AUTO_TEST_CASE(probe_gate_disabled_and_circular_stream_authority)
     BOOST_CHECK_EQUAL(header->status.load(std::memory_order_acquire),
                       node::ASYNC_PNB_PROBE_FLAG_TEST_GATES |
                           node::ASYNC_PNB_PROBE_FLAG_LOSS);
+    BOOST_CHECK_EQUAL(delayed_slot.published_sequence.load(std::memory_order_acquire),
+                      delayed_sequence | node::ASYNC_PNB_PROBE_SLOT_CLAIM);
+    BOOST_CHECK_EQUAL(
+        std::memcmp(&delayed_slot.record, &delayed_record, sizeof(delayed_record)), 0);
 
     BOOST_CHECK_EQUAL(munmap(mapping, mapping_size), 0);
     BOOST_CHECK_EQUAL(close(fd), 0);

@@ -13,6 +13,7 @@
 #include <netaddress.h>
 #include <netbase.h>
 #include <netmessagemaker.h>
+#include <node/async_pnb_peer_service_probe.h>
 #include <node/protocol_version.h>
 #include <serialize.h>
 #include <span.h>
@@ -22,9 +23,16 @@
 #include <test/util/random.h>
 #include <test/util/setup_common.h>
 #include <test/util/validation.h>
+#include <util/fs.h>
 #include <util/strencodings.h>
 #include <util/string.h>
 #include <validation.h>
+
+#ifndef WIN32
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
 
 #include <boost/test/unit_test.hpp>
 
@@ -41,6 +49,43 @@
 using namespace std::literals;
 using namespace util::hex_literals;
 using util::ToString;
+
+namespace {
+
+class PartialSendSock final : public ZeroSock
+{
+public:
+    explicit PartialSendSock(size_t partial_bytes) : m_partial_bytes{partial_bytes} {}
+
+    ssize_t Send(const void*, size_t len, int) const override
+    {
+        ++m_send_calls;
+        return std::min(len, m_partial_bytes);
+    }
+
+    mutable size_t m_send_calls{0};
+
+private:
+    PartialSendSock& operator=(Sock&&) override { return *this; }
+    const size_t m_partial_bytes;
+};
+
+class BlockOnceSendSock final : public ZeroSock
+{
+public:
+    ssize_t Send(const void*, size_t len, int) const override
+    {
+        if (m_send_calls++ == 0) return 0;
+        return len;
+    }
+
+    mutable size_t m_send_calls{0};
+
+private:
+    BlockOnceSendSock& operator=(Sock&&) override { return *this; }
+};
+
+} // namespace
 
 BOOST_FIXTURE_TEST_SUITE(net_tests, RegTestingSetup)
 
@@ -304,6 +349,435 @@ BOOST_AUTO_TEST_CASE(cnetmessage_measurement_metadata_queue_accounting)
     BOOST_CHECK_EQUAL(queue_bytes, 2 * plain_usage);
 }
 
+BOOST_AUTO_TEST_CASE(measured_poll_timestamps_new_front_after_pop)
+{
+#ifndef WIN32
+    const fs::path probe_dir{m_path_root / "front-probe"};
+    BOOST_REQUIRE(fs::create_directory(probe_dir));
+    auto probe{node::AsyncPNBPeerServiceProbe::Create(
+        probe_dir, /*test_gates=*/false)};
+    BOOST_REQUIRE(probe);
+
+    CNode node{/*id=*/71,
+               /*sock=*/nullptr,
+               /*addrIn=*/CAddress{},
+               /*nKeyedNetGroupIn=*/0,
+               /*nLocalHostNonceIn=*/0,
+               /*addrBindIn=*/CAddress{},
+               /*addrNameIn=*/std::string{},
+               /*conn_type_in=*/ConnectionType::INBOUND,
+               /*inbound_onion=*/false,
+               /*network_key=*/0,
+               CNodeOptions{.recv_flood_size = 1,
+                            .async_pnb_probe = probe}};
+
+    // Feed two complete messages in one socket batch, then publish the batch
+    // together. This distinguishes per-message ready state from the actual
+    // post-splice state at which the first message becomes queue front.
+    V1Transport sender{/*node_id=*/71};
+    std::vector<uint8_t> wire;
+    for (uint64_t nonce : {1U, 2U}) {
+        auto message{NetMsg::Make(NetMsgType::PING, nonce)};
+        BOOST_REQUIRE(sender.SetMessageToSend(message));
+        while (true) {
+            const auto& [bytes, _more, _type]{sender.GetBytesToSend(false)};
+            if (bytes.empty()) break;
+            wire.insert(wire.end(), bytes.begin(), bytes.end());
+            sender.MarkBytesSent(bytes.size());
+        }
+    }
+    bool complete{false};
+    BOOST_REQUIRE(node.ReceiveMsgBytes(wire, complete));
+    BOOST_REQUIRE(complete);
+    node.MarkReceivedMsgsForProcessing();
+
+    auto first{node.PollMessage()};
+    BOOST_REQUIRE(first);
+    BOOST_REQUIRE_NE(first->first.m_process_queue_id, 0U);
+    auto second{node.PollMessage()};
+    BOOST_REQUIRE(second);
+    BOOST_REQUIRE_NE(second->first.m_process_queue_id, 0U);
+    BOOST_CHECK(first->first.m_process_queue_paused_at_ready);
+    BOOST_CHECK(second->first.m_process_queue_paused_at_ready);
+    BOOST_CHECK_EQUAL(first->first.m_process_queue_depth_at_ready, 1U);
+    BOOST_CHECK_EQUAL(second->first.m_process_queue_depth_at_ready, 2U);
+    BOOST_CHECK_EQUAL(first->first.m_process_queue_depth_at_poll, 2U);
+    BOOST_CHECK(first->first.m_process_queue_poll != SteadyClock::time_point{});
+    BOOST_CHECK(second->first.m_process_queue_front > first->first.m_process_queue_poll);
+    BOOST_CHECK(second->first.m_process_queue_poll >= second->first.m_process_queue_front);
+
+    std::vector<fs::path> probe_files;
+    for (const auto& entry : fs::directory_iterator{probe_dir}) {
+        if (fs::PathToString(entry.path().filename()).starts_with("async-pnb-probe-")) {
+            probe_files.push_back(entry.path());
+        }
+    }
+    BOOST_REQUIRE_EQUAL(probe_files.size(), 1U);
+    const int fd{open(fs::PathToString(probe_files[0]).c_str(), O_RDWR | O_CLOEXEC)};
+    BOOST_REQUIRE(fd >= 0);
+    constexpr size_t mapping_size{
+        sizeof(node::AsyncPNBProbeFileHeader) +
+        node::ASYNC_PNB_PROBE_CAPACITY * sizeof(node::AsyncPNBProbeSlot)};
+    void* mapping{mmap(nullptr, mapping_size, PROT_READ | PROT_WRITE,
+                       MAP_SHARED, fd, 0)};
+    BOOST_REQUIRE(mapping != MAP_FAILED);
+    auto* header{static_cast<node::AsyncPNBProbeFileHeader*>(mapping)};
+    auto* slots{reinterpret_cast<node::AsyncPNBProbeSlot*>(
+        static_cast<unsigned char*>(mapping) +
+        sizeof(node::AsyncPNBProbeFileHeader))};
+    const node::AsyncPNBProbeEventRecord* first_ready{nullptr};
+    const node::AsyncPNBProbeEventRecord* first_front{nullptr};
+    size_t complete_count{0};
+    const uint64_t produced{header->producer_sequence.load(std::memory_order_acquire)};
+    for (uint64_t sequence{1}; sequence <= produced; ++sequence) {
+        const auto& record{slots[(sequence - 1) &
+                                 (node::ASYNC_PNB_PROBE_CAPACITY - 1)].record};
+        const auto event{static_cast<node::AsyncPNBProbeEvent>(record.event)};
+        if (event == node::AsyncPNBProbeEvent::COMPLETE_MESSAGE_READY) {
+            ++complete_count;
+            BOOST_CHECK_EQUAL(record.values[6], 1);
+            if (record.values[1] ==
+                static_cast<int64_t>(first->first.m_process_queue_id)) {
+                first_ready = &record;
+            }
+        } else if (event == node::AsyncPNBProbeEvent::MESSAGE_FRONT_READY &&
+                   record.values[1] ==
+                       static_cast<int64_t>(first->first.m_process_queue_id)) {
+            first_front = &record;
+        }
+    }
+    BOOST_CHECK_EQUAL(complete_count, 2U);
+    BOOST_REQUIRE(first_ready != nullptr);
+    BOOST_REQUIRE(first_front != nullptr);
+    BOOST_CHECK(first_front->steady_ns > first_ready->steady_ns);
+    BOOST_CHECK_EQUAL(first_front->values[2],
+                      first->first.m_process_queue_bytes_at_poll);
+    BOOST_CHECK_EQUAL(first_front->values[3], 2);
+    BOOST_CHECK_EQUAL(first_front->values[4], 1);
+    BOOST_CHECK_EQUAL(munmap(mapping, mapping_size), 0);
+    BOOST_CHECK_EQUAL(close(fd), 0);
+#else
+    BOOST_TEST_MESSAGE("async-PNB mmap probe is explicitly unsupported on Windows");
+#endif
+}
+
+BOOST_AUTO_TEST_CASE(measured_partial_socket_write_reports_one_drop)
+{
+#ifndef WIN32
+    const fs::path probe_dir{m_path_root / "partial-drop-probe"};
+    BOOST_REQUIRE(fs::create_directory(probe_dir));
+    auto probe{node::AsyncPNBPeerServiceProbe::Create(
+        probe_dir, /*test_gates=*/false)};
+    BOOST_REQUIRE(probe);
+
+    std::vector<fs::path> probe_files;
+    for (const auto& entry : fs::directory_iterator{probe_dir}) {
+        if (fs::PathToString(entry.path().filename()).starts_with("async-pnb-probe-")) {
+            probe_files.push_back(entry.path());
+        }
+    }
+    BOOST_REQUIRE_EQUAL(probe_files.size(), 1U);
+    const int fd{open(fs::PathToString(probe_files[0]).c_str(), O_RDWR | O_CLOEXEC)};
+    BOOST_REQUIRE(fd >= 0);
+    constexpr size_t mapping_size{
+        sizeof(node::AsyncPNBProbeFileHeader) +
+        node::ASYNC_PNB_PROBE_CAPACITY * sizeof(node::AsyncPNBProbeSlot)};
+    void* mapping{mmap(nullptr, mapping_size, PROT_READ | PROT_WRITE,
+                       MAP_SHARED, fd, 0)};
+    BOOST_REQUIRE(mapping != MAP_FAILED);
+    auto* header{static_cast<node::AsyncPNBProbeFileHeader*>(mapping)};
+    auto* slots{reinterpret_cast<node::AsyncPNBProbeSlot*>(
+        static_cast<unsigned char*>(mapping) +
+        sizeof(node::AsyncPNBProbeFileHeader))};
+
+    auto& connman{static_cast<ConnmanTestMsg&>(*m_node.connman)};
+    CConnman::Options options;
+    options.nSendBufferMaxSize = 1'000'000;
+    options.nReceiveFloodSize = 1'000'000;
+    options.m_async_pnb_probe = probe;
+    connman.Init(options);
+
+    constexpr size_t PARTIAL_BYTES{7};
+    auto sock{std::make_shared<PartialSendSock>(PARTIAL_BYTES)};
+    auto measured_node{std::make_unique<CNode>(
+        /*id=*/72,
+        sock,
+        /*addrIn=*/CAddress{},
+        /*nKeyedNetGroupIn=*/0,
+        /*nLocalHostNonceIn=*/0,
+        /*addrBindIn=*/CAddress{},
+        /*addrNameIn=*/std::string{},
+        /*conn_type_in=*/ConnectionType::INBOUND,
+        /*inbound_onion=*/false,
+        /*network_key=*/0,
+        CNodeOptions{.async_pnb_probe = probe})};
+    CSerializedNetMsg message;
+    message.m_type = NetMsgType::PING;
+    message.data.resize(32, 0x5a);
+    message.m_causal_inbound_id = 909;
+    const auto snapshot{connman.PushMessageWithSendQueueSnapshot(
+        *measured_node, std::move(message))};
+    BOOST_REQUIRE(snapshot);
+    BOOST_REQUIRE_NE(snapshot->outbound_id, 0U);
+    BOOST_CHECK_EQUAL(snapshot->causal_inbound_id, 909U);
+    BOOST_CHECK_EQUAL(sock->m_send_calls, 1U);
+
+    measured_node->CloseSocketDisconnect();
+    measured_node.reset();
+
+    size_t queued_count{0};
+    size_t sent_count{0};
+    size_t dropped_count{0};
+    size_t send_queue_states{0};
+    size_t duplicate_queue_states{0};
+    std::optional<std::tuple<int64_t, int64_t, int64_t>> previous_queue_state;
+    const node::AsyncPNBProbeEventRecord* dropped{nullptr};
+    const uint64_t produced{header->producer_sequence.load(std::memory_order_acquire)};
+    for (uint64_t sequence{1}; sequence <= produced; ++sequence) {
+        const auto& slot{slots[(sequence - 1) &
+                               (node::ASYNC_PNB_PROBE_CAPACITY - 1)]};
+        BOOST_REQUIRE_EQUAL(
+            slot.published_sequence.load(std::memory_order_acquire), sequence);
+        const auto event{static_cast<node::AsyncPNBProbeEvent>(slot.record.event)};
+        if (event == node::AsyncPNBProbeEvent::OUTBOUND_QUEUED) ++queued_count;
+        if (event == node::AsyncPNBProbeEvent::SOCKET_SENT) ++sent_count;
+        if (event == node::AsyncPNBProbeEvent::OUTBOUND_DROPPED) {
+            ++dropped_count;
+            dropped = &slot.record;
+        }
+        if (event == node::AsyncPNBProbeEvent::SEND_QUEUE_STATE) {
+            ++send_queue_states;
+            const auto state{std::tuple{slot.record.values[1],
+                                        slot.record.values[2],
+                                        slot.record.values[3]}};
+            if (previous_queue_state && state == *previous_queue_state) {
+                ++duplicate_queue_states;
+            }
+            previous_queue_state = state;
+        }
+    }
+    BOOST_CHECK_EQUAL(queued_count, 1U);
+    BOOST_CHECK_EQUAL(sent_count, 0U);
+    BOOST_CHECK_GE(send_queue_states, 1U);
+    BOOST_CHECK_EQUAL(duplicate_queue_states, 0U);
+    BOOST_REQUIRE_EQUAL(dropped_count, 1U);
+    BOOST_REQUIRE(dropped != nullptr);
+    BOOST_CHECK_EQUAL(dropped->values[0], 72);
+    BOOST_CHECK_EQUAL(dropped->values[1], snapshot->outbound_id);
+    BOOST_CHECK_EQUAL(dropped->values[2], 909);
+    BOOST_CHECK_EQUAL(dropped->values[3], PARTIAL_BYTES);
+
+    BOOST_CHECK_EQUAL(munmap(mapping, mapping_size), 0);
+    BOOST_CHECK_EQUAL(close(fd), 0);
+#else
+    BOOST_TEST_MESSAGE("async-PNB mmap probe is explicitly unsupported on Windows");
+#endif
+}
+
+BOOST_AUTO_TEST_CASE(measured_send_queue_records_each_message_completion)
+{
+#ifndef WIN32
+    const fs::path probe_dir{m_path_root / "multi-send-probe"};
+    BOOST_REQUIRE(fs::create_directory(probe_dir));
+    auto probe{node::AsyncPNBPeerServiceProbe::Create(
+        probe_dir, /*test_gates=*/false)};
+    BOOST_REQUIRE(probe);
+
+    std::vector<fs::path> probe_files;
+    for (const auto& entry : fs::directory_iterator{probe_dir}) {
+        if (fs::PathToString(entry.path().filename()).starts_with("async-pnb-probe-")) {
+            probe_files.push_back(entry.path());
+        }
+    }
+    BOOST_REQUIRE_EQUAL(probe_files.size(), 1U);
+    const int fd{open(fs::PathToString(probe_files[0]).c_str(), O_RDWR | O_CLOEXEC)};
+    BOOST_REQUIRE(fd >= 0);
+    constexpr size_t mapping_size{
+        sizeof(node::AsyncPNBProbeFileHeader) +
+        node::ASYNC_PNB_PROBE_CAPACITY * sizeof(node::AsyncPNBProbeSlot)};
+    void* mapping{mmap(nullptr, mapping_size, PROT_READ | PROT_WRITE,
+                       MAP_SHARED, fd, 0)};
+    BOOST_REQUIRE(mapping != MAP_FAILED);
+    auto* header{static_cast<node::AsyncPNBProbeFileHeader*>(mapping)};
+    auto* slots{reinterpret_cast<node::AsyncPNBProbeSlot*>(
+        static_cast<unsigned char*>(mapping) +
+        sizeof(node::AsyncPNBProbeFileHeader))};
+
+    auto& connman{static_cast<ConnmanTestMsg&>(*m_node.connman)};
+    CConnman::Options options;
+    options.nSendBufferMaxSize = 1'000'000;
+    options.nReceiveFloodSize = 1'000'000;
+    options.m_async_pnb_probe = probe;
+    connman.Init(options);
+
+    auto sock{std::make_shared<BlockOnceSendSock>()};
+    CNode measured_node{/*id=*/73,
+                        sock,
+                        /*addrIn=*/CAddress{},
+                        /*nKeyedNetGroupIn=*/0,
+                        /*nLocalHostNonceIn=*/0,
+                        /*addrBindIn=*/CAddress{},
+                        /*addrNameIn=*/std::string{},
+                        /*conn_type_in=*/ConnectionType::INBOUND,
+                        /*inbound_onion=*/false,
+                        /*network_key=*/0,
+                        CNodeOptions{.async_pnb_probe = probe}};
+    CSerializedNetMsg first;
+    first.m_type = NetMsgType::PING;
+    first.data.resize(8, 0x11);
+    first.m_causal_inbound_id = 1001;
+    const auto first_snapshot{connman.PushMessageWithSendQueueSnapshot(
+        measured_node, std::move(first))};
+    BOOST_REQUIRE(first_snapshot);
+    BOOST_CHECK_EQUAL(sock->m_send_calls, 1U);
+
+    CSerializedNetMsg second;
+    second.m_type = NetMsgType::PONG;
+    second.data.resize(9, 0x22);
+    second.m_causal_inbound_id = 1002;
+    const auto second_snapshot{connman.PushMessageWithSendQueueSnapshot(
+        measured_node, std::move(second))};
+    BOOST_REQUIRE(second_snapshot);
+    BOOST_CHECK_EQUAL(sock->m_send_calls, 1U);
+    const auto [sent_bytes, data_left]{connman.SocketSendDataPublic(measured_node)};
+    BOOST_CHECK_GT(sent_bytes, 0U);
+    BOOST_CHECK(!data_left);
+
+    size_t queued_count{0};
+    size_t sent_count{0};
+    size_t dropped_count{0};
+    size_t terminal_states{0};
+    size_t duplicate_queue_states{0};
+    std::optional<std::tuple<int64_t, int64_t, int64_t>> previous_queue_state;
+    bool saw_two_deep{false};
+    bool saw_intermediate_one_deep{false};
+    const uint64_t produced{header->producer_sequence.load(std::memory_order_acquire)};
+    for (uint64_t sequence{1}; sequence <= produced; ++sequence) {
+        const auto& slot{slots[(sequence - 1) &
+                               (node::ASYNC_PNB_PROBE_CAPACITY - 1)]};
+        BOOST_REQUIRE_EQUAL(
+            slot.published_sequence.load(std::memory_order_acquire), sequence);
+        const auto event{static_cast<node::AsyncPNBProbeEvent>(slot.record.event)};
+        if (event == node::AsyncPNBProbeEvent::OUTBOUND_QUEUED) ++queued_count;
+        if (event == node::AsyncPNBProbeEvent::SOCKET_SENT) ++sent_count;
+        if (event == node::AsyncPNBProbeEvent::OUTBOUND_DROPPED) ++dropped_count;
+        if (event == node::AsyncPNBProbeEvent::SEND_QUEUE_STATE) {
+            const auto state{std::tuple{slot.record.values[1],
+                                        slot.record.values[2],
+                                        slot.record.values[3]}};
+            if (previous_queue_state && state == *previous_queue_state) {
+                ++duplicate_queue_states;
+            }
+            previous_queue_state = state;
+            if (slot.record.values[2] == 2) saw_two_deep = true;
+            if (slot.record.values[4] == 2 && slot.record.values[2] == 1) {
+                saw_intermediate_one_deep = true;
+            }
+            if (slot.record.values[2] == 0) ++terminal_states;
+        }
+    }
+    BOOST_CHECK_EQUAL(queued_count, 2U);
+    BOOST_CHECK_EQUAL(sent_count, 2U);
+    BOOST_CHECK_EQUAL(dropped_count, 0U);
+    BOOST_CHECK(saw_two_deep);
+    BOOST_CHECK(saw_intermediate_one_deep);
+    BOOST_CHECK_EQUAL(terminal_states, 1U);
+    BOOST_CHECK_EQUAL(duplicate_queue_states, 0U);
+
+    BOOST_CHECK_EQUAL(munmap(mapping, mapping_size), 0);
+    BOOST_CHECK_EQUAL(close(fd), 0);
+#else
+    BOOST_TEST_MESSAGE("async-PNB mmap probe is explicitly unsupported on Windows");
+#endif
+}
+
+BOOST_AUTO_TEST_CASE(measured_send_queue_records_actual_pause_transition)
+{
+#ifndef WIN32
+    const fs::path probe_dir{m_path_root / "send-pause-probe"};
+    BOOST_REQUIRE(fs::create_directory(probe_dir));
+    auto probe{node::AsyncPNBPeerServiceProbe::Create(
+        probe_dir, /*test_gates=*/false)};
+    BOOST_REQUIRE(probe);
+    std::vector<fs::path> probe_files;
+    for (const auto& entry : fs::directory_iterator{probe_dir}) {
+        if (fs::PathToString(entry.path().filename()).starts_with("async-pnb-probe-")) {
+            probe_files.push_back(entry.path());
+        }
+    }
+    BOOST_REQUIRE_EQUAL(probe_files.size(), 1U);
+    const int fd{open(fs::PathToString(probe_files[0]).c_str(), O_RDWR | O_CLOEXEC)};
+    BOOST_REQUIRE(fd >= 0);
+    constexpr size_t mapping_size{
+        sizeof(node::AsyncPNBProbeFileHeader) +
+        node::ASYNC_PNB_PROBE_CAPACITY * sizeof(node::AsyncPNBProbeSlot)};
+    void* mapping{mmap(nullptr, mapping_size, PROT_READ | PROT_WRITE,
+                       MAP_SHARED, fd, 0)};
+    BOOST_REQUIRE(mapping != MAP_FAILED);
+    auto* header{static_cast<node::AsyncPNBProbeFileHeader*>(mapping)};
+    auto* slots{reinterpret_cast<node::AsyncPNBProbeSlot*>(
+        static_cast<unsigned char*>(mapping) +
+        sizeof(node::AsyncPNBProbeFileHeader))};
+
+    V1Transport empty_transport{/*node_id=*/74};
+    const size_t empty_transport_memory{empty_transport.GetSendMemoryUsage()};
+    auto& connman{static_cast<ConnmanTestMsg&>(*m_node.connman)};
+    CConnman::Options options;
+    options.nSendBufferMaxSize = empty_transport_memory + 1;
+    options.nReceiveFloodSize = 1'000'000;
+    options.m_async_pnb_probe = probe;
+    connman.Init(options);
+
+    auto sock{std::make_shared<ZeroSock>()};
+    CNode measured_node{/*id=*/74,
+                        sock,
+                        /*addrIn=*/CAddress{},
+                        /*nKeyedNetGroupIn=*/0,
+                        /*nLocalHostNonceIn=*/0,
+                        /*addrBindIn=*/CAddress{},
+                        /*addrNameIn=*/std::string{},
+                        /*conn_type_in=*/ConnectionType::INBOUND,
+                        /*inbound_onion=*/false,
+                        /*network_key=*/0,
+                        CNodeOptions{.async_pnb_probe = probe}};
+    CSerializedNetMsg message;
+    message.m_type = NetMsgType::PING;
+    message.data.resize(256, 0x33);
+    message.m_causal_inbound_id = 1003;
+    const auto snapshot{connman.PushMessageWithSendQueueSnapshot(
+        measured_node, std::move(message))};
+    BOOST_REQUIRE(snapshot);
+    BOOST_CHECK(snapshot->paused);
+    BOOST_CHECK(!measured_node.fPauseSend.load());
+
+    bool saw_paused{false};
+    const node::AsyncPNBProbeEventRecord* final_state{nullptr};
+    const uint64_t produced{header->producer_sequence.load(std::memory_order_acquire)};
+    for (uint64_t sequence{1}; sequence <= produced; ++sequence) {
+        const auto& slot{slots[(sequence - 1) &
+                               (node::ASYNC_PNB_PROBE_CAPACITY - 1)]};
+        BOOST_REQUIRE_EQUAL(
+            slot.published_sequence.load(std::memory_order_acquire), sequence);
+        if (static_cast<node::AsyncPNBProbeEvent>(slot.record.event) !=
+            node::AsyncPNBProbeEvent::SEND_QUEUE_STATE) {
+            continue;
+        }
+        saw_paused |= slot.record.values[3] != 0;
+        final_state = &slot.record;
+    }
+    BOOST_CHECK(saw_paused);
+    BOOST_REQUIRE(final_state != nullptr);
+    BOOST_CHECK_EQUAL(final_state->values[1], empty_transport_memory);
+    BOOST_CHECK_EQUAL(final_state->values[2], 0);
+    BOOST_CHECK_EQUAL(final_state->values[3], measured_node.fPauseSend.load());
+
+    BOOST_CHECK_EQUAL(munmap(mapping, mapping_size), 0);
+    BOOST_CHECK_EQUAL(close(fd), 0);
+#else
+    BOOST_TEST_MESSAGE("async-PNB mmap probe is explicitly unsupported on Windows");
+#endif
+}
+
 BOOST_AUTO_TEST_CASE(send_queue_snapshot_precedes_optimistic_drain)
 {
     auto& connman{static_cast<ConnmanTestMsg&>(*m_node.connman)};
@@ -318,7 +792,8 @@ BOOST_AUTO_TEST_CASE(send_queue_snapshot_precedes_optimistic_drain)
                /*inbound_onion=*/false,
                /*network_key=*/0};
     auto pong{NetMsg::Make(NetMsgType::PONG, uint64_t{42})};
-    const size_t expected_bytes{pong.GetMemoryUsage()};
+    const size_t expected_bytes{
+        pong.GetMemoryUsage() + node.m_transport->GetSendMemoryUsage()};
     const auto snapshot{connman.PushMessageWithSendQueueSnapshot(node, std::move(pong))};
     BOOST_REQUIRE(snapshot);
     BOOST_CHECK_EQUAL(snapshot->bytes, expected_bytes);
@@ -330,6 +805,33 @@ BOOST_AUTO_TEST_CASE(send_queue_snapshot_precedes_optimistic_drain)
     LOCK(node.cs_vSend);
     BOOST_CHECK(node.vSendMsg.empty());
     BOOST_CHECK_EQUAL(node.m_send_memusage, 0);
+}
+
+BOOST_AUTO_TEST_CASE(send_queue_snapshot_includes_v2_handshake_memory)
+{
+    auto& connman{static_cast<ConnmanTestMsg&>(*m_node.connman)};
+    CNode node{/*id=*/0,
+               /*sock=*/nullptr,
+               /*addrIn=*/CAddress{},
+               /*nKeyedNetGroupIn=*/0,
+               /*nLocalHostNonceIn=*/0,
+               /*addrBindIn=*/CAddress{},
+               /*addrNameIn=*/std::string{},
+               /*conn_type_in=*/ConnectionType::OUTBOUND_FULL_RELAY,
+               /*inbound_onion=*/false,
+               /*network_key=*/0,
+               CNodeOptions{.use_v2transport = true,
+                            .async_pnb_probe = {}}};
+    auto ping{NetMsg::Make(NetMsgType::PING, uint64_t{42})};
+    const size_t queued_memory{ping.GetMemoryUsage()};
+    const auto snapshot{connman.PushMessageWithSendQueueSnapshot(
+        node, std::move(ping))};
+    BOOST_REQUIRE(snapshot);
+    LOCK(node.cs_vSend);
+    const size_t transport_memory{node.m_transport->GetSendMemoryUsage()};
+    BOOST_REQUIRE_GT(transport_memory, 0U);
+    BOOST_CHECK_EQUAL(snapshot->bytes, queued_memory + transport_memory);
+    BOOST_CHECK_EQUAL(snapshot->depth, 1U);
 }
 
 BOOST_AUTO_TEST_CASE(v1_transport_measurement_metadata_is_inert_and_persistent)
