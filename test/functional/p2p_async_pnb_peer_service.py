@@ -52,9 +52,11 @@ from test_framework.messages import (
     msg_getheaders,
     msg_generic,
     msg_headers,
+    msg_inv,
     msg_ping,
     msg_sendaddrv2,
     msg_sendcmpct,
+    msg_tx,
     msg_verack,
     msg_version,
     msg_wtxidrelay,
@@ -83,15 +85,16 @@ PING_TIMEOUT = 60
 MARKER_POLL = 0.002
 
 PROBE_MAGIC = b"APNBPRB\0"
-PROBE_SCHEMA = 3
-PROBE_HEADER_SIZE = 64
+PROBE_SCHEMA = 4
+PROBE_HEADER_SIZE = 128
 PROBE_RECORD_SIZE = 256
 PROBE_CAPACITY = 65_536
 PROBE_ENDIAN = 0x01020304
 PROBE_STATUS_TEST_GATES = 1
-PROBE_STATUS_OVERFLOW = 2
-PROBE_HEADER = struct.Struct("<8s6IQ5Ii")
-PROBE_EVENT = struct.Struct("<QIIq16q24s24s32s")
+PROBE_STATUS_LOSS = 2
+PROBE_STATUS_CLOSED = 4
+PROBE_HEADER = struct.Struct("<8s5IiI4xQqqQQQ4Ii20x")
+PROBE_EVENT = struct.Struct("<QQIIq16q24s24s32s")
 PROBE_EVENTS = {
     1: "complete_message_ready",
     2: "handler_start",
@@ -113,6 +116,20 @@ PROBE_EVENTS = {
     18: "handler_prefix_complete",
     19: "handler_tail_complete",
     20: "test_target_disconnected",
+    21: "message_front_ready",
+    22: "receive_queue_state",
+    23: "outbound_queued",
+    24: "socket_sent",
+    25: "outbound_dropped",
+    26: "causal_link",
+    27: "peer_created",
+    28: "handshake_complete",
+    29: "peer_finalized",
+    30: "discouragement",
+    31: "send_queue_state",
+    32: "block_requested",
+    33: "block_request_removed",
+    34: "block_timeout",
 }
 PROBE_GATES = {
     "none": 0,
@@ -143,21 +160,24 @@ class ProbeSliceReader:
         assert header[:6] == (
             PROBE_MAGIC, PROBE_SCHEMA, PROBE_HEADER_SIZE,
             PROBE_RECORD_SIZE, PROBE_CAPACITY, PROBE_ENDIAN)
-        status = header[6]
-        assert status & ~(PROBE_STATUS_TEST_GATES | PROBE_STATUS_OVERFLOW) == 0
+        assert header[6] == int(self.path.stem.rsplit("-", 1)[1])
+        status = header[7]
+        assert status & ~(PROBE_STATUS_TEST_GATES | PROBE_STATUS_LOSS | PROBE_STATUS_CLOSED) == 0
         assert bool(status & PROBE_STATUS_TEST_GATES) == self.expect_test_gates
-        if status & PROBE_STATUS_OVERFLOW or header[8]:
+        if status & PROBE_STATUS_LOSS or header[13]:
             raise AssertionError(
-                f"async-PNB probe overflow: {self.path} count={header[8]}")
-        if header[7] > PROBE_CAPACITY:
+                f"async-PNB probe loss: {self.path} count={header[13]}")
+        if header[11] > header[12] + PROBE_CAPACITY:
             raise AssertionError(
-                f"async-PNB probe capacity exceeded: {self.path} "
-                f"next={header[7]} capacity={PROBE_CAPACITY}")
-        if header[12]:
+                f"async-PNB probe consumer lag: {self.path} "
+                f"producer={header[11]} ack={header[12]} capacity={PROBE_CAPACITY}")
+        if header[17]:
             raise AssertionError(
-                f"async-PNB test gate timeout: {self.path} generation={header[12]}")
+                f"async-PNB test gate timeout: {self.path} generation={header[17]}")
         self.header = header
-        self.next_sequence = header[7]
+        self.process_epoch = header[8]
+        assert self.process_epoch != 0
+        self.next_sequence = header[11]
         return header
 
     @staticmethod
@@ -171,13 +191,13 @@ class ProbeSliceReader:
     def read_event(self, sequence):
         self.read_header()
         assert 1 <= sequence <= self.next_sequence
-        offset = PROBE_HEADER_SIZE + (sequence - 1) * PROBE_RECORD_SIZE
+        offset = PROBE_HEADER_SIZE + ((sequence - 1) & (PROBE_CAPACITY - 1)) * PROBE_RECORD_SIZE
         published_before = struct.unpack_from("<Q", self.mapping, offset)[0]
         if published_before == 0:
             return None
         assert published_before == sequence
         record = self.mapping[offset + 8:offset + 8 + PROBE_EVENT.size]
-        checksum = struct.unpack_from("<Q", self.mapping, offset + 240)[0]
+        checksum = struct.unpack_from("<Q", self.mapping, offset + 248)[0]
         published_after = struct.unpack_from("<Q", self.mapping, offset)[0]
         if published_before != published_after:
             raise AssertionError(
@@ -186,7 +206,9 @@ class ProbeSliceReader:
         if checksum != self.checksum(record):
             raise AssertionError(
                 f"async-PNB probe checksum mismatch: {self.path} sequence={sequence}")
-        return PROBE_EVENT.unpack(record)
+        event = PROBE_EVENT.unpack(record)
+        assert event[1] == self.process_epoch
+        return event
 
     def close(self):
         self.mapping.close()
@@ -359,37 +381,43 @@ class MarkerReader:
         assert event in PROBE_EVENTS, event
         fields = {"event": PROBE_EVENTS[event]}
         if event == 1:
-            fields.update(peer=values[0], msg_id=values[1], queue_bytes=values[2],
-                          queue_depth=values[3], pause_recv=values[4], msg=text1)
+            fields.update(peer=values[0], msg_id=values[1], payload_bytes=values[2],
+                          wire_bytes=values[3], queue_bytes=values[4],
+                          queue_depth=values[5], pause_recv=values[6], msg=text1)
         elif event == 2:
             fields.update(
                 peer=values[0], msg_id=values[1], handler_turn_start_ns=values[2],
-                handler_prefix_ns=values[3], ready_ns=values[4], poll_ns=values[5],
-                ready_queue_bytes=values[6], ready_queue_depth=values[7],
-                ready_pause_recv=values[8], poll_queue_bytes=values[9],
-                poll_queue_depth=values[10], poll_pause_recv=values[11],
-                active_slot=values[12], job=values[13], msg=text1)
+                ready_ns=values[3], front_ns=values[4], poll_ns=values[5],
+                poll_queue_bytes=values[6], poll_queue_depth=values[7],
+                poll_pause_recv=values[8], active_slot=values[9], job=values[10],
+                active_source=values[11], source_related=values[12],
+                payload_bytes=values[13], wire_bytes=values[14], msg=text1)
         elif event == 3:
-            fields.update(peer=values[0], msg_id=values[1], active_slot=values[2],
-                          job=values[3], msg=text1)
+            fields.update(peer=values[0], msg_id=values[1], outcome=values[2],
+                          disconnect=values[3], active_slot=values[4], job=values[5],
+                          active_source=values[6], source_related=values[7],
+                          more_work=values[8], msg=text1)
         elif event == 4:
             fields.update(
                 peer=values[0], msg_id=values[1], nonce=values[2],
                 response_bytes=values[3], send_queue_bytes=values[4],
                 send_queue_depth=values[5], pause_send=values[6],
-                active_slot=values[7], job=values[8], msg=text1, response=text2)
+                active_slot=values[7], job=values[8], outbound_id=values[9],
+                msg=text1, response=text2)
         elif event == 5:
             fields.update(job=values[0], source=values[1], active_slot=values[2],
-                          mode="async" if values[2] else "sync", continuation=text1)
+                          mode="async" if values[2] else "sync", route=values[3],
+                          ibd=values[4], active_height=values[5], continuation=text1)
         elif event == 6:
             fields.update(job=values[0], source=values[1], status_code=values[2],
                           active_slot=values[3], status=text1)
         elif event in {7, 8}:
-            fields.update(job=values[0], active_slot=values[1])
+            fields.update(job=values[0], active_slot=values[1], source=values[2],
+                          route=values[3], ibd=values[4], active_height=values[5])
         elif event == 9:
             fields.update(job=values[0], duration_ns=values[1],
                           process_new_block=values[2], new_block=values[3],
-                          active_slot=values[4])
+                          active_slot=values[4], source=values[5], route=values[6])
         elif event == 10:
             fields.update(job=values[0], process_new_block=values[1],
                           new_block=values[2], active_slot=values[3])
@@ -420,6 +448,46 @@ class MarkerReader:
         elif event == 20:
             fields.update(peer=values[0], gate=values[1], generation=values[2],
                           job=values[3])
+        elif event == 21:
+            fields.update(peer=values[0], msg_id=values[1], queue_bytes=values[2],
+                          queue_depth=values[3], pause_recv=values[4], msg=text1)
+        elif event in {22, 31}:
+            fields.update(peer=values[0], queue_bytes=values[1],
+                          queue_depth=values[2], paused=values[3], reason=values[4],
+                          msg_id=values[5])
+        elif event == 23:
+            fields.update(peer=values[0], outbound_id=values[1],
+                          causal_msg_id=values[2], payload_bytes=values[3],
+                          queue_bytes=values[4], queue_depth=values[5],
+                          pause_send=values[6], msg=text1)
+        elif event == 24:
+            fields.update(peer=values[0], outbound_id=values[1],
+                          causal_msg_id=values[2], first_write_ns=values[3],
+                          last_write_ns=values[4], wire_bytes=values[5],
+                          written_bytes=values[6], msg=text1)
+        elif event == 25:
+            fields.update(peer=values[0], outbound_id=values[1],
+                          causal_msg_id=values[2], written_bytes=values[3], msg=text1)
+        elif event == 26:
+            fields.update(peer=values[0], msg_id=values[1], outbound_id=values[2])
+        elif event == 27:
+            fields.update(peer=values[0], connection_type=values[1], network=values[2],
+                          onion=values[3], configured_transport=values[4])
+        elif event == 28:
+            fields.update(peer=values[0], actual_transport=values[1],
+                          elapsed_ns=values[2])
+        elif event == 29:
+            fields.update(peer=values[0], connection_type=values[1],
+                          handshake_complete=values[2], disconnect=values[3],
+                          elapsed_ns=values[4], blocks_in_flight=values[5],
+                          active_source=values[6], actual_transport=values[7])
+        elif event == 30:
+            fields.update(peer=values[0], decision=values[1], disconnect=values[2])
+        elif event in {32, 33}:
+            fields.update(peer=values[0], height=values[1], reason=values[2],
+                          blocks_in_flight=values[3])
+        elif event == 34:
+            fields.update(peer=values[0], reason=values[1], height=values[2])
         return fields
 
     def _poll_file(self, state):
@@ -432,21 +500,27 @@ class MarkerReader:
                 # is an in-flight append, not an unstable/torn slot; final
                 # parsing after node exit requires every reservation below.
                 return
-            sequence, event, flags, steady_ns = record[:4]
+            sequence, process_epoch, event, flags, steady_ns = record[:5]
             assert sequence == state["expected_sequence"]
-            values = record[4:20]
-            text1 = self._decode_text(record[20])
-            text2 = self._decode_text(record[21])
+            values = record[5:21]
+            text1 = self._decode_text(record[21])
+            text2 = self._decode_text(record[22])
             marker = self._decode_event(event, values, text1, text2)
             marker.update(
                 flags=flags, probe_pid=state["pid"], probe_sequence=sequence,
-                sequence=len(self.events) + 1, steady_ns=steady_ns)
-            raw_hash = record[22]
+                process_epoch=process_epoch, sequence=len(self.events) + 1,
+                steady_ns=steady_ns)
+            if event == 2:
+                marker["handler_prefix_ns"] = steady_ns - marker["handler_turn_start_ns"]
+            raw_hash = record[23]
             if any(raw_hash):
                 marker["hash"] = raw_hash[::-1].hex()
             self.events.append(marker)
             state["event_count"] += 1
             state["expected_sequence"] += 1
+            # Acknowledge only after the complete, checksummed event has been
+            # incorporated into the reader's durable logical stream.
+            struct.pack_into("<Q", reader.mapping, 72, sequence)
 
     def poll(self):
         self._discover()
@@ -497,13 +571,13 @@ class MarkerReader:
         state = self.files[-1]
         reader = state["reader"]
         header = reader.read_header()
-        generation = header[10] + 1
-        assert generation > header[11]
+        generation = header[15] + 1
+        assert generation > header[16]
         assert -(1 << 31) <= peer < (1 << 31)
-        struct.pack_into("<i", reader.mapping, 60, peer)
-        struct.pack_into("<I", reader.mapping, 44, PROBE_GATES[gate])
+        struct.pack_into("<i", reader.mapping, 104, peer)
+        struct.pack_into("<I", reader.mapping, 88, PROBE_GATES[gate])
         # Publish the generation after the peer and gate fields.
-        struct.pack_into("<I", reader.mapping, 48, generation)
+        struct.pack_into("<I", reader.mapping, 92, generation)
         return generation
 
     def release_gate(self, generation, *, clear=True):
@@ -512,12 +586,12 @@ class MarkerReader:
         # Use the raw validated mapping so failure cleanup can still release a
         # generation after the reader has correctly made gate_error fatal.
         header = PROBE_HEADER.unpack_from(reader.mapping, 0)
-        assert generation <= header[10]
-        if header[11] < generation:
-            struct.pack_into("<I", reader.mapping, 52, generation)
-        if clear and generation == header[10]:
-            struct.pack_into("<I", reader.mapping, 44, PROBE_GATES["none"])
-            struct.pack_into("<i", reader.mapping, 60, -1)
+        assert generation <= header[15]
+        if header[16] < generation:
+            struct.pack_into("<I", reader.mapping, 96, generation)
+        if clear and generation == header[15]:
+            struct.pack_into("<I", reader.mapping, 88, PROBE_GATES["none"])
+            struct.pack_into("<i", reader.mapping, 104, -1)
 
     def wait_gate(self, gate, generation, after=0, **fields):
         return self.wait(
@@ -530,21 +604,21 @@ class MarkerReader:
         for state in self.files:
             reader = state["reader"]
             header = reader.read_header()
-            assert state["expected_sequence"] == header[7] + 1, (
-                reader.path, state["expected_sequence"], header[7])
+            assert state["expected_sequence"] == header[11] + 1, (
+                reader.path, state["expected_sequence"], header[11])
             if require_gate_none:
-                assert header[9] == PROBE_GATES["none"], header
-                assert header[11] == header[10], header
+                assert header[14] == PROBE_GATES["none"], header
+                assert header[16] == header[15], header
             files.append({
                 "event_count": state["event_count"],
                 "path": str(reader.path),
                 "pid": state["pid"],
-                "status": header[6],
-                "overflow_count": header[8],
-                "test_gate": header[9],
-                "test_gate_generation": header[10],
-                "test_gate_release": header[11],
-                "test_gate_error": header[12],
+                "status": header[7],
+                "overflow_count": header[13],
+                "test_gate": header[14],
+                "test_gate_generation": header[15],
+                "test_gate_release": header[16],
+                "test_gate_error": header[17],
             })
         return {
             "event_count": len(self.events),
@@ -649,6 +723,7 @@ class AsyncPNBPeerService(BitcoinTestFramework):
     def add_options(self, parser):
         parser.add_argument("--output-dir")
         parser.add_argument("--peer-service-dispatch-only", action="store_true")
+        parser.add_argument("--peer-service-collector-integration", action="store_true")
         parser.add_argument("--peer-service-mode", choices=("control", "candidate"), default="candidate")
         parser.add_argument("--peer-service-probe", choices=("enabled", "disabled"), default="enabled")
         parser.add_argument("--peer-service-profile", choices=tuple(PROFILES), default="curve")
@@ -661,6 +736,10 @@ class AsyncPNBPeerService(BitcoinTestFramework):
         self.uses_wallet = False
         assert self.options.peer_service_probe == "enabled" or self.options.peer_service_dispatch_only
         assert not self.options.peer_service_dispatch_only or self.options.output_dir is None
+        assert not self.options.peer_service_collector_integration or (
+            self.options.peer_service_probe == "enabled"
+            and not self.options.peer_service_dispatch_only
+            and self.options.output_dir is None)
         if self.options.randomseed is None:
             self.options.randomseed = self.options.peer_service_seed
         assert self.options.randomseed == self.options.peer_service_seed, \
@@ -678,7 +757,7 @@ class AsyncPNBPeerService(BitcoinTestFramework):
             "-nodebug",
             "-nologratelimit",
             "-persistmempool=0",
-            "-v2transport=0",
+            f"-v2transport={int(self.options.peer_service_collector_integration)}",
         ]
         args += ["-par=1", "-prevoutfetchthreads=0"]
         self.extra_args = [args]
@@ -690,7 +769,8 @@ class AsyncPNBPeerService(BitcoinTestFramework):
         self.test_gates_enabled = (
             self.probe_enabled
             and self.options.output_dir is None
-            and not self.options.peer_service_dispatch_only)
+            and not self.options.peer_service_dispatch_only
+            and not self.options.peer_service_collector_integration)
         if self.probe_enabled:
             self.extra_args[0] += [
                 f"-asyncpnbpeerserviceprobedir={self.probe_dir}",
@@ -702,7 +782,7 @@ class AsyncPNBPeerService(BitcoinTestFramework):
             MarkerReader(
                 self.probe_dir, self.options.timeout_factor,
                 expect_test_gates=self.test_gates_enabled)
-            if self.probe_enabled else None)
+            if self.probe_enabled and not self.options.peer_service_collector_integration else None)
         assert not self.uses_wallet and len(self.nodes) == 1
         node = self.nodes[0]
         assert node.getblockcount() == 199
@@ -2058,6 +2138,118 @@ class AsyncPNBPeerService(BitcoinTestFramework):
         peer.peer_disconnect()
         peer.wait_for_disconnect()
 
+    def _run_collector_integration(self):
+        """Exercise the standalone collector on V1, V2, ordinary, and PNB traffic."""
+        node = self.nodes[0]
+        source_dir = Path(self.config["environment"]["SRCDIR"])
+        collector = source_dir / "contrib" / "bench" / "async_pnb_collector.py"
+        analyzer = source_dir / "contrib" / "bench" / "async_pnb_analyzer.py"
+        output = (Path(self.options.tmpdir) / "collector-output").resolve()
+        analysis = (Path(self.options.tmpdir) / "collector-analysis").resolve()
+        bitcoin_cli = Path(node.binaries.paths.bitcoincli).resolve()
+        command = [
+            sys.executable, str(collector),
+            f"--pid={node.process.pid}",
+            f"--probe-dir={self.probe_dir}",
+            f"--output={output}",
+            "--duration=3",
+            "--resource-interval=0.05",
+            "--rpc-interval=0.1",
+            "--expected-chain=regtest",
+            "--mode=candidate",
+            f"--bitcoin-cli={bitcoin_cli}",
+            f"--bitcoin-cli-arg=-datadir={node.datadir_path}",
+            f"--binary={Path(node.args[0]).resolve()}",
+        ]
+        process = subprocess.Popen(
+            command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        try:
+            v1 = node.add_p2p_connection(
+                PeerServicePeer(), supports_v2_p2p=False)
+            v2 = node.add_p2p_connection(
+                PeerServicePeer(), supports_v2_p2p=True)
+            assert not v1.supports_v2_p2p and v2.supports_v2_p2p
+            v1.send_and_ping(msg_ping(nonce=0xC011EC7000000001))
+            v2.send_and_ping(msg_ping(nonce=0xC011EC7000000002))
+
+            # HEADERS is an ordinary inbound message, followed by a full-block
+            # delivery through the real peer-manager PNB route.
+            self._initialize_block_inputs()
+            block = self._quick_block()
+            v1.send_and_ping(msg_inv([CInv(MSG_TX, 0xC011EC70)]))
+            # A syntactically valid coinbase transaction exercises the TX
+            # receive/handler path while remaining ineligible for the mempool.
+            v1.send_and_ping(msg_tx(block.vtx[0]))
+            self._announce(v1, block)
+            v1.send_without_ping(msg_block(block))
+            self._wait_tip(block)
+            v2.send_and_ping(msg_ping(nonce=0xC011EC7000000003))
+            for peer in (v1, v2):
+                peer.peer_disconnect()
+                peer.wait_for_disconnect()
+
+            stdout, stderr = process.communicate(timeout=15 * self.options.timeout_factor)
+            assert process.returncode == 0, (command, stdout, stderr)
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait()
+
+        assert {entry.name for entry in output.iterdir()} == {
+            "manifest.json", "events.jsonl", "resources.csv", "rpc.jsonl", "summary.json"}
+        summary = json.loads((output / "summary.json").read_text(encoding="utf-8"))
+        assert summary["valid"] and summary["loss_count"] == 0
+        assert summary["checksum_failures"] == 0
+        assert summary["unstable_read_failures"] == 0
+        assert summary["rpc_samples"] > 0 and summary["resource_samples"] > 0
+        for required in (
+                "peer_created", "handshake_complete", "complete_message_ready",
+                "handler_start", "handler_complete", "outbound_queued", "socket_sent",
+                "job_submit", "pnb_start", "pnb_end", "continuation"):
+            assert summary["event_counts"].get(required, 0) > 0, required
+
+        events = [json.loads(line) for line in
+                  (output / "events.jsonl").read_text(encoding="utf-8").splitlines()]
+        inbound = {}
+        starts = set()
+        completes = set()
+        fronts = set()
+        outbound = {}
+        sockets = set()
+        for event in events:
+            values = event["values"]
+            if event["event_code"] == 1:
+                key = (event["process_epoch"], values[0], values[1])
+                assert key not in inbound
+                inbound[key] = event.get("text1")
+            elif event["event_code"] in {2, 3, 21}:
+                key = (event["process_epoch"], values[0], values[1])
+                {2: starts, 3: completes, 21: fronts}[event["event_code"]].add(key)
+            elif event["event_code"] == 23:
+                key = (event["process_epoch"], values[0], values[1])
+                assert key not in outbound
+                outbound[key] = values[2]
+            elif event["event_code"] == 24:
+                sockets.add((event["process_epoch"], values[0], values[1]))
+        assert {"inv", "tx", "headers", "block"}.issubset(set(inbound.values()))
+        assert set(inbound) == starts == completes == fronts
+        assert set(outbound) == sockets
+        for (epoch, peer, _outbound_id), causal_id in outbound.items():
+            assert causal_id == 0 or (epoch, peer, causal_id) in inbound
+
+        completed = subprocess.run(
+            [sys.executable, str(analyzer), f"--input={output}", f"--output={analysis}"],
+            check=False, capture_output=True, text=True,
+            timeout=15 * self.options.timeout_factor)
+        assert completed.returncode == 0, completed.stderr
+        assert {entry.name for entry in analysis.iterdir()} == {"analysis.json", "analysis.md"}
+        report = json.loads((analysis / "analysis.json").read_text(encoding="utf-8"))
+        assert report["integrity"]["valid"]
+        assert report["pnb"]["count"] == 1
+        assert report["pnb"]["jobs"][0]["delivery_route"] == "full-block"
+        assert report["outbound"]["completed"] > 0
+        assert report["observability"]["true_peer_rtt"] == "not_observable"
+
     def _provenance(self, node, binary):
         source_dir = Path(self.config["environment"]["SRCDIR"])
         build_dir = Path(self.config["environment"]["BUILDDIR"])
@@ -2347,6 +2539,9 @@ class AsyncPNBPeerService(BitcoinTestFramework):
         if self.options.peer_service_dispatch_only:
             self._run_dispatch_oracle()
             return
+        if self.options.peer_service_collector_integration:
+            self._run_collector_integration()
+            return
         if self.options.output_dir is None:
             self._run_quick()
             return
@@ -2413,7 +2608,7 @@ class AsyncPNBPeerService(BitcoinTestFramework):
                 "events_artifact": "target.log",
                 "status": "parsed",
             }
-            assert all(file["status"] == 0 for file in probe["files"]), probe
+            assert all(file["status"] == PROBE_STATUS_CLOSED for file in probe["files"]), probe
             assert all(file["test_gate"] == PROBE_GATES["none"] for file in probe["files"]), probe
             probe_lines = self.markers.marker_lines()
         except Exception as error:
