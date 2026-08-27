@@ -153,6 +153,8 @@ static std::optional<std::string_view> MempoolHealthError(MemPoolFeeRateEstimato
         return "Not enough recent block data for fee rate estimation";
     case MemPoolFeeRateEstimator::MempoolHealth::LOW_COVERAGE:
         return "Mempool is unreliable for fee rate estimation";
+    case MemPoolFeeRateEstimator::MempoolHealth::STALE_DATA:
+        return "Mined-block statistics do not match the active chain";
     case MemPoolFeeRateEstimator::MempoolHealth::HEALTHY:
         return std::nullopt;
     }
@@ -325,6 +327,35 @@ static constexpr uint64_t MIN_REPRESENTATIVE_WINDOW_WEIGHT{DEFAULT_BLOCK_MAX_WEI
 MemPoolFeeRateEstimator::MempoolHealth MemPoolFeeRateEstimator::GetMempoolHealth() const
 {
     LOCK(cs);
+    return GetMempoolHealthInternal();
+}
+
+MemPoolFeeRateEstimator::MempoolHealth MemPoolFeeRateEstimator::GetMempoolHealthForTip(
+    const uint256& tip_hash, int tip_height) const
+{
+    LOCK(cs);
+    // Block-removal notifications update these statistics asynchronously. A
+    // newly connected tip may be rejected until its notification is processed.
+    if (!m_prev_mined_blocks.empty()) {
+        const auto& tracked_tip{m_prev_mined_blocks.back()};
+        if (tracked_tip.m_height != static_cast<uint64_t>(tip_height) || m_mined_blocks_tip_hash != tip_hash) {
+            LogDebug(BCLog::ESTIMATEFEE,
+                     "%s: mempool health check failed; tracked_tip_height=%s tracked_tip_hash=%s "
+                     "active_tip_height=%s active_tip_hash=%s",
+                     FeeRateEstimatorTypeToString(FeeRateEstimatorType::MEMPOOL_POLICY),
+                     tracked_tip.m_height,
+                     m_mined_blocks_tip_hash.ToString(),
+                     tip_height,
+                     tip_hash.ToString());
+            return MempoolHealth::STALE_DATA;
+        }
+    }
+    return GetMempoolHealthInternal();
+}
+
+MemPoolFeeRateEstimator::MempoolHealth MemPoolFeeRateEstimator::GetMempoolHealthInternal() const
+{
+    AssertLockHeld(cs);
     const auto estimator_name{FeeRateEstimatorTypeToString(FeeRateEstimatorType::MEMPOOL_POLICY)};
     if (m_prev_mined_blocks.size() < MEMPOOL_HEALTH_WINDOW_BLOCKS) {
         LogDebug(BCLog::ESTIMATEFEE, "%s: mempool health check failed; tracked_blocks=%s required_blocks=%s",
@@ -365,31 +396,40 @@ util::Expected<FeeRateEstimation, FeeRateEstimationError> MemPoolFeeRateEstimato
     if (!m_mempool.GetLoadTried()) {
         return EstimationError(strprintf("%s: Mempool not loaded yet, no fee rate estimate available", FeeRateEstimatorTypeToString(estimator_type)));
     }
-    if (auto error{MempoolHealthError(GetMempoolHealth())}) {
-        return EstimationError(strprintf("%s: %s", FeeRateEstimatorTypeToString(estimator_type), *error));
-    }
-    // The estimator lock is not held while building a block template, so
-    // in a rare edge case concurrent callers may duplicate work.
-    //
-    // Cached fee rate estimates are tagged with the chain tip they were computed on
-    // and only served from the cache while that tip is current.
-    //
-    // The fee rate estimate returned directly below may still reflect a tip that went
-    // stale during the call; that is an accepted tradeoff of not holding
-    // locks across block assembly.
+    std::unique_ptr<node::CBlockTemplate> blocktemplate;
     {
-        const uint256 tip_hash{WITH_LOCK(::cs_main, return Assume(m_chainman.CurrentChainstate().m_chain.Tip())->GetBlockHash())};
-        LOCK(cs);
-        const auto cached_estimate = m_cache.GetCachedEstimate(tip_hash);
-        if (cached_estimate) {
-            const auto cached_feerate{
-                conservative ? cached_estimate->m_conservative : cached_estimate->m_economical};
-            return FeeRateEstimation{estimator_type, cached_feerate, MEMPOOL_FEE_ESTIMATOR_MAX_TARGET};
+        LOCK(::cs_main);
+        if (m_chainman.IsInitialBlockDownload()) {
+            return EstimationError(strprintf(
+                "%s: Initial block download is active, no fee rate estimate available",
+                FeeRateEstimatorTypeToString(estimator_type)));
         }
+        const CBlockIndex* active_tip{m_chainman.ActiveTip()};
+        if (!active_tip) {
+            return EstimationError(strprintf(
+                "%s: No active chain tip, no fee rate estimate available",
+                FeeRateEstimatorTypeToString(estimator_type)));
+        }
+        const uint256& tip_hash{active_tip->GetBlockHash()};
+        if (auto error{MempoolHealthError(GetMempoolHealthForTip(tip_hash, active_tip->nHeight))}) {
+            return EstimationError(strprintf("%s: %s", FeeRateEstimatorTypeToString(estimator_type), *error));
+        }
+        // The estimator lock is not held while building a block template, so
+        // concurrent callers may duplicate work. Holding cs_main keeps the
+        // active tip fixed between the health check and block assembly.
+        {
+            LOCK(cs);
+            const auto cached_estimate{m_cache.GetCachedEstimate(tip_hash)};
+            if (cached_estimate) {
+                const auto cached_feerate{
+                    conservative ? cached_estimate->m_conservative : cached_estimate->m_economical};
+                return FeeRateEstimation{estimator_type, cached_feerate, MEMPOOL_FEE_ESTIMATOR_MAX_TARGET};
+            }
+        }
+        node::BlockCreateOptions options;
+        options.test_block_validity = false;
+        blocktemplate = node::BlockAssembler{m_chainman.CurrentChainstate(), &m_mempool, options}.CreateNewBlock();
     }
-    node::BlockCreateOptions options;
-    options.test_block_validity = false;
-    const auto blocktemplate = WITH_LOCK(::cs_main, return (node::BlockAssembler{m_chainman.CurrentChainstate(), &m_mempool, options}).CreateNewBlock());
     if (!blocktemplate) return EstimationError(strprintf("%s: Failed to create block template for fee rate estimation", FeeRateEstimatorTypeToString(estimator_type)));
     // Sort again because the rounding up when converting from weight to vsize may cause slight misorder.
     std::sort(blocktemplate->m_package_feerates.begin(), blocktemplate->m_package_feerates.end(), [](const auto& a, const auto& b) { return ByRatio{a} > ByRatio{b}; });

@@ -31,6 +31,7 @@ SECONDS_PER_HOUR = 60 * 60
 MIN_BUCKET_FEERATE = Decimal(100) / Decimal(COIN)
 TXS_COUNT = 24
 BLOCK_POLICY_ESTIMATOR_ERROR = "Insufficient data or no feerate found"
+MEMPOOL_POLICY_STALE_ERROR = "mempool_policy: Mined-block statistics do not match the active chain"
 BLOCK_POLICY_ESTIMATOR_FILE_PATH = "fees/block_policy_estimates.dat"
 
 def small_txpuzzle_randfee(
@@ -570,6 +571,21 @@ class EstimateFeeTest(BitcoinTestFramework):
         combined_estimate = node0.estimatesmartfee(1, "economical", {"fee_rate_estimator": "none"})
         verify_estimate_response(combined_estimate, floor, [])
         assert_equal(combined_estimate["estimator"], "mempool_policy")
+
+        self.log.info("Test mempool estimates are rejected when mined-block data does not match the active tip")
+        tip = node0.getbestblockhash()
+        tip_height = node0.getblockcount()
+        node0.invalidateblock(tip)
+        assert_equal(node0.getblockcount(), tip_height - 1)
+        stale_estimate = node0.estimatesmartfee(1, "economical", {"fee_rate_estimator": "mempool_policy"})
+        assert "feerate" not in stale_estimate
+        assert_equal(stale_estimate["errors"], [MEMPOOL_POLICY_STALE_ERROR])
+
+        node0.reconsiderblock(tip)
+        node0.syncwithvalidationinterfacequeue()
+        assert_equal(node0.getbestblockhash(), tip)
+        restored_estimate = node0.estimatesmartfee(1, "economical", {"fee_rate_estimator": "mempool_policy"})
+        verify_estimate_response(restored_estimate, floor, [])
 
     def test_stale_mempool_block_stats_are_rejected_on_load(self):
         # Persisted mempool block stats must be tied to the best block hash,

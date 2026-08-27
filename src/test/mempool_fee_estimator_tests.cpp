@@ -3,12 +3,14 @@
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
 #include <kernel/mempool_entry.h>
+#include <node/mining_types.h>
 #include <policy/fees/estimator_args.h>
 #include <policy/fees/mempool_estimator.h>
 #include <policy/policy.h>
 #include <primitives/block.h>
 #include <random.h>
 #include <test/util/setup_common.h>
+#include <test/util/mining.h>
 #include <test/util/txmempool.h>
 #include <txmempool.h>
 #include <uint256.h>
@@ -21,7 +23,7 @@
 
 #include <string>
 
-BOOST_FIXTURE_TEST_SUITE(mempool_fee_estimator_tests, TestingSetup)
+BOOST_FIXTURE_TEST_SUITE(mempool_fee_estimator_tests, RegTestingSetup)
 
 static inline CTransactionRef MakeRandomTx()
 {
@@ -145,6 +147,15 @@ BOOST_AUTO_TEST_CASE(MempoolFeeRateEstimator)
     BOOST_CHECK(!mempool_estimator.IsMempoolHealthy());
     BOOST_CHECK(mempool_estimator.GetMempoolHealth() == MemPoolFeeRateEstimator::MempoolHealth::INSUFFICIENT_DATA);
     {
+        m_node.chainman->m_cached_is_ibd = true;
+        const auto result = mempool_estimator.EstimateFeeRate(/*conservative=*/true);
+        const std::string ibd_err{strprintf("%s: Initial block download is active, no fee rate estimate available",
+                                            FeeRateEstimatorTypeToString(FeeRateEstimatorType::MEMPOOL_POLICY))};
+        BOOST_CHECK(!result);
+        BOOST_CHECK_EQUAL(result.error().reason, ibd_err);
+        m_node.chainman->m_cached_is_ibd = false;
+    }
+    {
         const auto result = mempool_estimator.EstimateFeeRate(/*conservative=*/true);
         const std::string insufficient_err{strprintf("%s: Not enough recent block data for fee rate estimation",
                                                      FeeRateEstimatorTypeToString(FeeRateEstimatorType::MEMPOOL_POLICY))};
@@ -236,6 +247,17 @@ BOOST_AUTO_TEST_CASE(MempoolFeeRateEstimator)
         if (i < MEMPOOL_HEALTH_WINDOW_BLOCKS - 1) {
             BOOST_CHECK(!mempool_estimator.IsMempoolHealthy());
         }
+    }
+    BOOST_CHECK(mempool_estimator.IsMempoolHealthy());
+
+    // Replace the synthetic mined-block window above with data ending at the
+    // active tip so it can be used for fee rate estimation.
+    const node::BlockCreateOptions block_options{.use_mempool = false};
+    for (size_t i{0}; i < MEMPOOL_HEALTH_WINDOW_BLOCKS; ++i) {
+        auto block{PrepareBlock(m_node, block_options)};
+        BOOST_REQUIRE(!MineBlock(m_node, block).IsNull());
+        const auto block_height{WITH_LOCK(::cs_main, return m_node.chainman->ActiveHeight())};
+        mempool_estimator.MempoolTxsRemovedForBlock(block, {}, static_cast<unsigned int>(block_height));
     }
     BOOST_CHECK(mempool_estimator.IsMempoolHealthy());
     {

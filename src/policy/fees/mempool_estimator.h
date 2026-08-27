@@ -130,6 +130,8 @@ public:
         INSUFFICIENT_DATA,
         //! Recent blocks include too few mempool transactions to estimate a fee rate.
         LOW_COVERAGE,
+        //! Recent mined-block data does not end at the active chain tip.
+        STALE_DATA,
     };
     MempoolHealth GetMempoolHealth() const EXCLUSIVE_LOCKS_REQUIRED(!cs);
     //! Checks if recent mined blocks indicate a healthy mempool state.
@@ -142,6 +144,9 @@ public:
     bool Write(AutoFile& file) const EXCLUSIVE_LOCKS_REQUIRED(!cs);
 
 private:
+    MempoolHealth GetMempoolHealthForTip(const uint256& tip_hash, int tip_height) const
+        EXCLUSIVE_LOCKS_REQUIRED(!cs);
+    MempoolHealth GetMempoolHealthInternal() const EXCLUSIVE_LOCKS_REQUIRED(cs);
     void ReadFromDisk() EXCLUSIVE_LOCKS_REQUIRED(!cs);
     //! Tracks weight statistics for the last MEMPOOL_HEALTH_WINDOW_BLOCKS mined blocks.
     std::vector<MinedBlockStats> m_prev_mined_blocks GUARDED_BY(cs);
