@@ -1394,8 +1394,10 @@ def analyze(manifest, summary, events, resources, rpc, max_join_age, artifacts=N
                 front_latency.append(delta)
                 per_peer[key[1]].append(delta)
                 no_service_intervals.append(delta)
-        else:
-            no_service_intervals.append(max(0, observation_end - front.get(key, ready)["steady_ns"]))
+        elif key in front:
+            front_time = min(max(front[key]["steady_ns"], observation_start),
+                             observation_end)
+            no_service_intervals.append(observation_end - front_time)
     for key, started in starts.items():
         if key not in ends:
             continue
@@ -2529,6 +2531,20 @@ def run_self_tests():
     assert report["queues"]["receive"]["pause_duration_ns"] == 100_000_000
     assert report["queues"]["receive"]["open_pause_intervals_at_epoch_end"] == 0
     assert report["queues"]["send"]["byte_depth_area_byte_ns"] == 4_000_000_000
+
+    unfinished = []
+    add(unfinished, 1, 100_000_000, [9, 301, 10, 34], text1="ping")
+    unfinished_report = fixture_report(
+        unfinished, start_mono=50_000_000, end_mono=500_000_000)
+    assert unfinished_report["integrity"]["valid"]
+    assert unfinished_report["fairness"][
+        "max_front_ready_without_handler_service_ns"] is None
+    add(unfinished, 21, 200_000_000, [9, 301, 10, 1, 0], text1="ping")
+    unfinished_front_report = fixture_report(
+        unfinished, start_mono=50_000_000, end_mono=500_000_000)
+    assert unfinished_front_report["integrity"]["valid"]
+    assert unfinished_front_report["fairness"][
+        "max_front_ready_without_handler_service_ns"] == 300_000_000
 
     # Both complete control and complete async lifecycles are accepted, while
     # only a submit-starting contiguous prefix is a boundary truncation.
