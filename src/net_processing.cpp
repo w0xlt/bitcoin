@@ -2988,7 +2988,6 @@ void PeerManagerImpl::ProcessGetData(CNode& pfrom, Peer& peer, const std::atomic
 
     std::deque<Peer::GetDataRequest>::iterator it = peer.m_getdata_requests.begin();
     std::vector<CInv> vNotFound;
-    std::vector<uint64_t> notfound_causal_ids;
 
     // Process as many TX items from the front of the getdata queue as
     // possible, since they're common and it's efficient to batch process
@@ -3023,12 +3022,6 @@ void PeerManagerImpl::ProcessGetData(CNode& pfrom, Peer& peer, const std::atomic
             m_mempool.RemoveUnbroadcastTx(tx->GetHash());
         } else {
             vNotFound.push_back(inv);
-            if (m_async_pnb_probe && request.causal_inbound_id != 0 &&
-                std::ranges::find(notfound_causal_ids,
-                                  request.causal_inbound_id) ==
-                    notfound_causal_ids.end()) {
-                notfound_causal_ids.push_back(request.causal_inbound_id);
-            }
         }
     }
 
@@ -3051,9 +3044,36 @@ void PeerManagerImpl::ProcessGetData(CNode& pfrom, Peer& peer, const std::atomic
         // https://bitcoincore.org/en/2024/07/03/disclose-getdata-cpu.
     }
 
-    peer.m_getdata_requests.erase(peer.m_getdata_requests.begin(), it);
-
     if (!vNotFound.empty()) {
+        // vNotFound is an ordered subsequence of the processed GETDATA range.
+        // Walk those existing containers directly so measurement introduces
+        // no allocation or copy in this hot path.
+        const auto for_each_notfound_request{[&](auto&& callback) {
+            auto notfound{vNotFound.cbegin()};
+            for (auto request{peer.m_getdata_requests.cbegin()};
+                 request != it && notfound != vNotFound.cend(); ++request) {
+                if (request->inv.type != notfound->type ||
+                    request->inv.hash != notfound->hash) continue;
+                callback(request);
+                ++notfound;
+            }
+            Assume(notfound == vNotFound.cend());
+        }};
+        uint64_t msg_id{0};
+        if (m_async_pnb_probe) {
+            for_each_notfound_request([&](const auto& request) {
+                if (msg_id == 0) msg_id = request->causal_inbound_id;
+            });
+        }
+
+        // Probe-off preserves the original erase-before-send order. Probe-on
+        // retains the already-processed range only until fixed-size causal
+        // relations have been emitted under the same existing queue lock.
+        const bool defer_erase{msg_id != 0};
+        if (!defer_erase) {
+            peer.m_getdata_requests.erase(peer.m_getdata_requests.begin(), it);
+        }
+
         // Let the peer know that we didn't find what it asked for, so it doesn't
         // have to wait around forever.
         // SPV clients care about this message: it's needed when they are
@@ -3069,26 +3089,35 @@ void PeerManagerImpl::ProcessGetData(CNode& pfrom, Peer& peer, const std::atomic
         // transactions that we relay; if a peer is missing a parent, they may
         // assume we have them and request the parents from us.
         auto notfound_message{NetMsg::Make(NetMsgType::NOTFOUND, vNotFound)};
-        const uint64_t msg_id{notfound_causal_ids.empty()
-                                  ? 0
-                                  : notfound_causal_ids.front()};
         if (msg_id != 0) {
             const auto outbound_id{PushMeasuredMessage(
                 pfrom, msg_id, NetMsgType::GETDATA,
                 std::move(notfound_message))};
             if (outbound_id && m_async_pnb_probe) {
-                for (size_t index{1}; index < notfound_causal_ids.size(); ++index) {
-                    m_async_pnb_probe->Record(
-                        node::AsyncPNBProbeEvent::CAUSAL_LINK,
-                        SteadyClock::now(),
-                        {pfrom.GetId(),
-                         static_cast<int64_t>(notfound_causal_ids[index]),
-                         static_cast<int64_t>(*outbound_id)});
-                }
+                // Each inbound GETDATA appends one contiguous FIFO group under
+                // this mutex (the deep-block fallback appends a one-item
+                // group), so an ID transition is exactly a new source group.
+                node::detail::ContiguousCausalIdTracker causal_ids{msg_id};
+                for_each_notfound_request([&](const auto& request) {
+                    const uint64_t causal_id{request->causal_inbound_id};
+                    causal_ids.Visit(causal_id, [&](uint64_t distinct_id) {
+                        m_async_pnb_probe->Record(
+                            node::AsyncPNBProbeEvent::CAUSAL_LINK,
+                            SteadyClock::now(),
+                            {pfrom.GetId(),
+                             static_cast<int64_t>(distinct_id),
+                             static_cast<int64_t>(*outbound_id)});
+                    });
+                });
             }
         } else {
             PushMessage(pfrom, std::move(notfound_message));
         }
+        if (defer_erase) {
+            peer.m_getdata_requests.erase(peer.m_getdata_requests.begin(), it);
+        }
+    } else {
+        peer.m_getdata_requests.erase(peer.m_getdata_requests.begin(), it);
     }
 }
 

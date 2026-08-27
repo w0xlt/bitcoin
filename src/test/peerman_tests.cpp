@@ -31,6 +31,7 @@
 #include <limits>
 #include <memory>
 #include <string_view>
+#include <vector>
 
 namespace {
 
@@ -332,6 +333,23 @@ bool HasSendMessage(CNode& node, std::string_view msg_type)
 } // namespace
 
 BOOST_FIXTURE_TEST_SUITE(peerman_tests, RegTestingSetup)
+
+BOOST_AUTO_TEST_CASE(async_pnb_getdata_contiguous_causal_groups)
+{
+    // One NOTFOUND response uses A as its primary causal ID. A,A is one
+    // contiguous source group and B contributes exactly one extra relation.
+    constexpr uint64_t primary{101};
+    const std::vector<uint64_t> processed_ids{primary, primary, 202};
+    std::vector<uint64_t> extra_links;
+    node::detail::ContiguousCausalIdTracker tracker{primary};
+    for (const uint64_t id : processed_ids) {
+        tracker.Visit(id, [&](uint64_t distinct_id) {
+            extra_links.push_back(distinct_id);
+        });
+    }
+    BOOST_CHECK_EQUAL(extra_links.size(), 1U);
+    BOOST_CHECK_EQUAL(extra_links.front(), 202U);
+}
 
 /** Window, in blocks, for connecting to NODE_NETWORK_LIMITED peers */
 static constexpr int64_t NODE_NETWORK_LIMITED_ALLOW_CONN_BLOCKS = 144;

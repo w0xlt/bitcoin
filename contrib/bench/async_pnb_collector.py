@@ -144,6 +144,8 @@ class ProbeStream:
         self.expected = 1
         self.header = self.read_header(initial=True)
         self.epoch = self.header[8]
+        self.creation_wall_ns = self.header[9]
+        self.creation_steady_ns = self.header[10]
 
     def read_header(self, initial=False):
         header = HEADER.unpack_from(self.mapping, 0)
@@ -160,9 +162,14 @@ class ProbeStream:
                 f"producer reported sequence loss: status={header[7]:#x} count={header[13]}")
         if header[8] == 0:
             raise CollectionError("zero process epoch")
+        if header[9] <= 0 or header[10] <= 0:
+            raise CollectionError("nonpositive probe clock origin")
         if not initial and header[8] != self.epoch:
             raise CollectionError(
                 f"process epoch changed: expected {self.epoch}, got {header[8]}")
+        if not initial and header[9:11] != (
+                self.creation_wall_ns, self.creation_steady_ns):
+            raise CollectionError("probe clock origins changed during collection")
         if header[11] < header[12]:
             raise CollectionError(
                 f"consumer acknowledgement exceeds producer: {header[12]} > {header[11]}")
@@ -402,6 +409,63 @@ def sha256_file(path):
             digest.update(chunk)
 
 
+def artifact_facts(path, *, csv_header=False):
+    with Path(path).open("rb") as source:
+        rows = sum(1 for _line in source)
+    return {
+        "bytes": Path(path).stat().st_size,
+        "data_rows": max(0, rows - 1) if csv_header else rows,
+        "lines": rows,
+        "sha256": sha256_file(path),
+    }
+
+
+def capture_probe_boundary(stream):
+    """Bracket a probe producer snapshot in both collector clock domains."""
+    monotonic_before = time.monotonic_ns()
+    wall_before = time.time_ns()
+    header = stream.read_header()
+    wall_after = time.time_ns()
+    monotonic_after = time.monotonic_ns()
+    return {
+        "producer_sequence": header[11],
+        "collector_monotonic_before_ns": monotonic_before,
+        "collector_monotonic_after_ns": monotonic_after,
+        "collector_monotonic_midpoint_ns":
+            monotonic_before + (monotonic_after - monotonic_before) // 2,
+        "collector_wall_before_ns": wall_before,
+        "collector_wall_after_ns": wall_after,
+        "collector_wall_midpoint_ns": wall_before + (wall_after - wall_before) // 2,
+        "capture_uncertainty_ns":
+            (monotonic_after - monotonic_before + wall_after - wall_before + 1) // 2,
+    }
+
+
+def clock_mapping(probe_header, boundary):
+    probe_wall = probe_header[9]
+    probe_steady = probe_header[10]
+    collector_wall = boundary["collector_wall_midpoint_ns"]
+    collector_monotonic = boundary["collector_monotonic_midpoint_ns"]
+    probe_wall_minus_steady = probe_wall - probe_steady
+    collector_wall_minus_monotonic = collector_wall - collector_monotonic
+    residual = collector_wall_minus_monotonic - probe_wall_minus_steady
+    return {
+        "probe_creation_wall_ns": probe_wall,
+        "probe_creation_steady_ns": probe_steady,
+        "collector_wall_ns": collector_wall,
+        "collector_monotonic_ns": collector_monotonic,
+        "probe_wall_minus_steady_ns": probe_wall_minus_steady,
+        "collector_wall_minus_monotonic_ns": collector_wall_minus_monotonic,
+        "steady_to_collector_monotonic_offset_ns": -residual,
+        "steady_to_wall_offset_ns": probe_wall_minus_steady,
+        "origin_residual_ns": residual,
+        "capture_uncertainty_ns": boundary["capture_uncertainty_ns"],
+        "mapping_uncertainty_ns": abs(residual) + boundary["capture_uncertainty_ns"],
+        "compatibility": "wall_offset_bridge_with_reported_uncertainty",
+        "method": "wall-offset bridge; residual may include pre-attach wall correction; no affine/drift claim",
+    }
+
+
 def environment_identity():
     cpu_model = "unavailable"
     try:
@@ -475,6 +539,25 @@ def run_self_tests():
             sequence, epoch, sequence, record, checksum(record), sequence)[0])
     assert drained == [1, 2, 3, 4]
 
+    # Clock origins are immutable producer authority. Reject invalid origins
+    # at collection time, rather than deferring the fault to offline analysis.
+    valid_header = [
+        MAGIC, SCHEMA, HEADER_SIZE, RECORD_SIZE, CAPACITY, ENDIAN,
+        123, 0, epoch, 10, 20, 0, 0, 0, 0, 0, 0, 0, -1,
+    ]
+    for origin_index in (9, 10):
+        invalid_header = list(valid_header)
+        invalid_header[origin_index] = 0
+        probe = ProbeStream.__new__(ProbeStream)
+        probe.pid = 123
+        probe.mapping = bytearray(HEADER.pack(*invalid_header))
+        try:
+            probe.read_header(initial=True)
+        except CollectionError as error:
+            assert "clock origin" in str(error)
+        else:
+            raise AssertionError("nonpositive probe clock origin was accepted")
+
     # Acknowledgement is sequenced strictly after flush and fsync, and a final
     # forced drain publishes every written record rather than only a read cursor.
     timeline = []
@@ -513,6 +596,20 @@ def run_self_tests():
         assert "reserved field" in str(error)
     else:
         raise AssertionError("response nonce-like reserved value was retained")
+
+    # The wall-offset bridge reports, rather than rejects, a large origin
+    # residual because it may reflect legitimate wall correction before attach.
+    header = [0] * 19
+    header[9], header[10] = 5_000_000_000, 1_000_000_000
+    boundary = {
+        "collector_wall_midpoint_ns": 15_000_000_000,
+        "collector_monotonic_midpoint_ns": 2_000_000_000,
+        "capture_uncertainty_ns": 17,
+    }
+    mapping = clock_mapping(header, boundary)
+    assert mapping["origin_residual_ns"] == 9_000_000_000
+    assert mapping["mapping_uncertainty_ns"] == 9_000_000_017
+    assert mapping["compatibility"] == "wall_offset_bridge_with_reported_uncertainty"
     print("async_pnb_collector self-test: PASS")
 
 
@@ -536,6 +633,8 @@ def collect(args):
     initial_stat = read_proc_stat(pid)
     probe_path = probe_dir / f"async-pnb-probe-{pid}.bin"
     stream = ProbeStream(probe_path, pid)
+    start_boundary = capture_probe_boundary(stream)
+    mapping = clock_mapping(stream.header, start_boundary)
     try:
         binary_sha256 = sha256_file(args.binary) if args.binary else None
     except OSError as error:
@@ -551,8 +650,9 @@ def collect(args):
     for path in (events_path, rpc_path):
         path.touch(mode=0o600)
 
-    start_mono = time.monotonic_ns()
-    start_wall = time.time_ns()
+    start_mono = start_boundary["collector_monotonic_midpoint_ns"]
+    start_wall = start_boundary["collector_wall_midpoint_ns"]
+    measured_sequence_first = start_boundary["producer_sequence"] + 1
     env = environment_identity()
     manifest = {
         "collector_schema": 1,
@@ -583,22 +683,35 @@ def collect(args):
         "expected_chain": args.expected_chain,
         "environment": env,
         "clock_origin": {"monotonic_ns": start_mono, "wall_ns": start_wall},
+        "clock_mapping": mapping,
+        "collection_window": {
+            "start": start_boundary,
+            "sequence_first": measured_sequence_first,
+        },
         "complete": False,
         "valid": False,
     }
     write_json(manifest_path, manifest)
 
     event_counts = Counter()
+    event_scope_counts = Counter()
     integrity_errors = []
     rpc_failures = 0
     resource_samples = 0
     rpc_samples = 0
+    rpc_rows = 0
     first_event = None
     last_event = None
+    first_measured_event_mono = None
+    last_measured_event_mono = None
     first_resource = None
     last_resource = None
+    first_resource_wall = None
+    last_resource_wall = None
     first_rpc = None
     last_rpc = None
+    first_rpc_wall = None
+    last_rpc_wall = None
     process_exit_state = "running_at_collection_end"
     stop_reason = "duration_complete"
     signal_seen = {"number": None}
@@ -617,6 +730,7 @@ def collect(args):
     next_rpc = start_mono
     deadline = start_mono + int(args.duration * 1_000_000_000)
     cutoff = None
+    cutoff_boundary = None
     cutoff_deadline = None
     durability = None
     maximum_durable_lag = 0
@@ -637,10 +751,12 @@ def collect(args):
                 now = time.monotonic_ns()
                 if signal_seen["number"] is not None and cutoff is None:
                     stop_reason = f"signal_{signal_seen['number']}"
-                    cutoff = stream.read_header()[11]
+                    cutoff_boundary = capture_probe_boundary(stream)
+                    cutoff = cutoff_boundary["producer_sequence"]
                     cutoff_deadline = now + 5_000_000_000
                 elif now >= deadline and cutoff is None:
-                    cutoff = stream.read_header()[11]
+                    cutoff_boundary = capture_probe_boundary(stream)
+                    cutoff = cutoff_boundary["producer_sequence"]
                     cutoff_deadline = now + 5_000_000_000
 
                 try:
@@ -650,8 +766,10 @@ def collect(args):
                 except FileNotFoundError:
                     if process_exit_state == "running_at_collection_end":
                         process_exit_state = "exited_during_collection"
-                        cutoff = stream.read_header()[11]
-                        cutoff_deadline = now + 5_000_000_000
+                        if cutoff is None:
+                            cutoff_boundary = capture_probe_boundary(stream)
+                            cutoff = cutoff_boundary["producer_sequence"]
+                            cutoff_deadline = now + 5_000_000_000
 
                 header = stream.read_header()
                 producer = header[11]
@@ -667,16 +785,36 @@ def collect(args):
                     event = stream.read_one(stream.expected)
                     if event is None:
                         break
-                    pending.append(decoded_event(event, opaque))
+                    decoded = decoded_event(event, opaque)
+                    decoded["mapped_monotonic_ns"] = (
+                        decoded["steady_ns"] +
+                        mapping["steady_to_collector_monotonic_offset_ns"])
+                    decoded["mapped_wall_ns"] = (
+                        decoded["steady_ns"] +
+                        mapping["steady_to_wall_offset_ns"])
+                    decoded["collection_scope"] = (
+                        "pre_attach_backlog"
+                        if decoded["sequence"] < measured_sequence_first
+                        else "measured")
+                    pending.append(decoded)
                     stream.expected += 1
                 if pending:
                     for event in pending:
                         events_file.write(json.dumps(event, sort_keys=True, separators=(",", ":")) + "\n")
                         event_counts[event["event"]] += 1
+                        event_scope_counts[event["collection_scope"]] += 1
                         first_event = (event["steady_ns"] if first_event is None else
                                        min(first_event, event["steady_ns"]))
                         last_event = (event["steady_ns"] if last_event is None else
                                       max(last_event, event["steady_ns"]))
+                        if event["collection_scope"] == "measured":
+                            mapped_mono = event["mapped_monotonic_ns"]
+                            first_measured_event_mono = (
+                                mapped_mono if first_measured_event_mono is None else
+                                min(first_measured_event_mono, mapped_mono))
+                            last_measured_event_mono = (
+                                mapped_mono if last_measured_event_mono is None else
+                                max(last_measured_event_mono, mapped_mono))
                         durability.note_written(event["sequence"])
 
                 read_sequence = stream.expected - 1
@@ -703,7 +841,7 @@ def collect(args):
                         f"{producer - durability.durable_sequence} > {args.max_probe_lag}")
 
                 now = time.monotonic_ns()
-                if now >= next_resource:
+                if cutoff is None and now >= next_resource:
                     if process_exit_state == "running_at_collection_end":
                         sample = sample_resources(pid, clock_ticks, page_size)
                         resource_writer.writerow(sample)
@@ -711,6 +849,10 @@ def collect(args):
                         resource_samples += 1
                         first_resource = sample["monotonic_ns"] if first_resource is None else first_resource
                         last_resource = sample["monotonic_ns"]
+                        first_resource_wall = (
+                            sample["wall_ns"] if first_resource_wall is None
+                            else first_resource_wall)
+                        last_resource_wall = sample["wall_ns"]
                         if args.max_rss_mib is not None and sample["rss_bytes"] > args.max_rss_mib * 1024 * 1024:
                             raise CollectionError(
                                 f"RSS abort threshold exceeded: {sample['rss_bytes']} bytes")
@@ -722,7 +864,7 @@ def collect(args):
                     next_resource = time.monotonic_ns() + int(
                         args.resource_interval * 1_000_000_000)
 
-                if (now >= next_rpc and
+                if (cutoff is None and now >= next_rpc and
                         process_exit_state == "running_at_collection_end"):
                     try:
                         snapshot = run_rpc(
@@ -731,16 +873,30 @@ def collect(args):
                             snapshot, sort_keys=True, separators=(",", ":")) + "\n")
                         rpc_file.flush()
                         rpc_samples += 1
+                        rpc_rows += 1
                         first_rpc = snapshot["monotonic_ns"] if first_rpc is None else first_rpc
                         last_rpc = snapshot["monotonic_ns"]
+                        first_rpc_wall = (
+                            snapshot["wall_ns"] if first_rpc_wall is None
+                            else first_rpc_wall)
+                        last_rpc_wall = snapshot["wall_ns"]
                     except (OSError, subprocess.SubprocessError, json.JSONDecodeError) as error:
                         rpc_failures += 1
-                        rpc_file.write(json.dumps({
+                        failure = {
                             "monotonic_ns": time.monotonic_ns(),
                             "wall_ns": time.time_ns(),
                             "error": type(error).__name__,
-                        }, sort_keys=True, separators=(",", ":")) + "\n")
+                        }
+                        rpc_file.write(json.dumps(
+                            failure, sort_keys=True, separators=(",", ":")) + "\n")
                         rpc_file.flush()
+                        rpc_rows += 1
+                        first_rpc = failure["monotonic_ns"] if first_rpc is None else first_rpc
+                        last_rpc = failure["monotonic_ns"]
+                        first_rpc_wall = (
+                            failure["wall_ns"] if first_rpc_wall is None
+                            else first_rpc_wall)
+                        last_rpc_wall = failure["wall_ns"]
                     next_rpc = time.monotonic_ns() + int(
                         args.rpc_interval * 1_000_000_000)
 
@@ -763,11 +919,45 @@ def collect(args):
     finally:
         for number, handler in old_handlers.items():
             signal.signal(number, handler)
+        if cutoff_boundary is None:
+            try:
+                cutoff_boundary = capture_probe_boundary(stream)
+                cutoff = cutoff_boundary["producer_sequence"]
+            except (CollectionError, OSError) as error:
+                integrity_errors.append(str(error))
         try:
             final_header = stream.read_header()
         except (CollectionError, OSError) as error:
             integrity_errors.append(str(error))
             final_header = stream.header
+        if cutoff_boundary is None:
+            end_mono = time.monotonic_ns()
+            end_wall = time.time_ns()
+            cutoff = final_header[11] if cutoff is None else cutoff
+            cutoff_boundary = {
+                "producer_sequence": cutoff,
+                "collector_monotonic_before_ns": end_mono,
+                "collector_monotonic_after_ns": end_mono,
+                "collector_monotonic_midpoint_ns": end_mono,
+                "collector_wall_before_ns": end_wall,
+                "collector_wall_after_ns": end_wall,
+                "collector_wall_midpoint_ns": end_wall,
+                "capture_uncertainty_ns": 0,
+            }
+        end_mapping = clock_mapping(final_header, cutoff_boundary)
+        monotonic_elapsed_ns = (
+            cutoff_boundary["collector_monotonic_midpoint_ns"] - start_mono)
+        wall_elapsed_ns = (
+            cutoff_boundary["collector_wall_midpoint_ns"] - start_wall)
+        clock_drift_ns = wall_elapsed_ns - monotonic_elapsed_ns
+        mapping["collection_wall_minus_monotonic_drift_ns"] = clock_drift_ns
+        mapping["cutoff_capture_uncertainty_ns"] = (
+            cutoff_boundary["capture_uncertainty_ns"])
+        mapping["mapping_uncertainty_ns"] += (
+            abs(clock_drift_ns) + cutoff_boundary["capture_uncertainty_ns"])
+        end_mapping["collection_wall_minus_monotonic_drift_ns"] = clock_drift_ns
+        if wall_elapsed_ns <= 0:
+            integrity_errors.append("collector wall clock did not advance across collection")
         if final_header[7] & STATUS_CLOSED:
             process_exit_state = "closed_and_drained" if stream.expected > final_header[11] else "closed_not_drained"
             if stream.expected <= final_header[11]:
@@ -779,6 +969,52 @@ def collect(args):
         event_count = sum(event_counts.values())
         durable_sequence = durability.durable_sequence if durability else 0
         pending_sequence = durability.pending_sequence if durability else 0
+        duration_ns = (
+            cutoff_boundary["collector_monotonic_midpoint_ns"] - start_mono)
+        if duration_ns <= 0:
+            integrity_errors.append("nonpositive collector monotonic observation duration")
+        expected_backlog = min(start_boundary["producer_sequence"], cutoff)
+        expected_measured = max(0, cutoff - measured_sequence_first + 1)
+        if event_scope_counts["pre_attach_backlog"] != expected_backlog:
+            integrity_errors.append("pre-attach backlog event count mismatch")
+        if event_scope_counts["measured"] != expected_measured:
+            integrity_errors.append("measured-window event count mismatch")
+        if event_count != cutoff or pending_sequence != cutoff or durable_sequence != cutoff:
+            integrity_errors.append("full event stream was not durable through collection cutoff")
+        if final_header[12] != durable_sequence:
+            integrity_errors.append("probe acknowledgement disagrees with durable sequence")
+        clock_slack = mapping["mapping_uncertainty_ns"]
+        if (first_measured_event_mono is not None and
+                first_measured_event_mono < start_mono - clock_slack):
+            integrity_errors.append("measured event precedes mapped collection start")
+        if (last_measured_event_mono is not None and
+                last_measured_event_mono >
+                cutoff_boundary["collector_monotonic_midpoint_ns"] + clock_slack):
+            integrity_errors.append("measured event follows mapped collection cutoff")
+        collection_window = {
+            "sequence_first": measured_sequence_first,
+            "sequence_last": cutoff,
+            "pre_attach_sequence_last": start_boundary["producer_sequence"],
+            "start": start_boundary,
+            "end": cutoff_boundary,
+            "duration_ns": duration_ns,
+            "duration_source": "collector_python_monotonic_midpoints",
+            "pre_attach_backlog_event_count": event_scope_counts["pre_attach_backlog"],
+            "measured_event_count": event_scope_counts["measured"],
+            "measured_event_mapped_monotonic_bounds_ns": [
+                first_measured_event_mono, last_measured_event_mono],
+        }
+        data_artifacts = {
+            "events.jsonl": artifact_facts(events_path),
+            "resources.csv": artifact_facts(resources_path, csv_header=True),
+            "rpc.jsonl": artifact_facts(rpc_path),
+        }
+        if data_artifacts["events.jsonl"]["data_rows"] != event_count:
+            integrity_errors.append("events.jsonl row count changed before finalization")
+        if data_artifacts["resources.csv"]["data_rows"] != resource_samples:
+            integrity_errors.append("resources.csv row count changed before finalization")
+        if data_artifacts["rpc.jsonl"]["data_rows"] != rpc_rows:
+            integrity_errors.append("rpc.jsonl row count changed before finalization")
         summary = {
             "complete": True,
             "valid": not integrity_errors,
@@ -786,6 +1022,7 @@ def collect(args):
             "process_exit_state": process_exit_state,
             "process_epoch": stream.epoch,
             "event_counts": dict(sorted(event_counts.items())),
+            "event_scope_counts": dict(sorted(event_scope_counts.items())),
             "event_count": event_count,
             "event_sequence_first": 1 if event_count else None,
             "event_sequence_last": durable_sequence if event_count else None,
@@ -796,6 +1033,9 @@ def collect(args):
             "maximum_read_ahead": maximum_read_ahead,
             "producer_sequence_observed": final_header[11],
             "collection_cutoff_sequence": cutoff,
+            "collection_window": collection_window,
+            "clock_mapping": mapping,
+            "cutoff_clock_mapping": end_mapping,
             "consumer_ack": final_header[12],
             "loss_count": final_header[13],
             "probe_status": final_header[7],
@@ -808,18 +1048,32 @@ def collect(args):
             "event_steady_bounds_ns": [first_event, last_event],
             "resource_samples": resource_samples,
             "resource_monotonic_bounds_ns": [first_resource, last_resource],
+            "resource_wall_bounds_ns": [first_resource_wall, last_resource_wall],
             "rpc_samples": rpc_samples,
+            "rpc_rows": rpc_rows,
             "rpc_monotonic_bounds_ns": [first_rpc, last_rpc],
+            "rpc_wall_bounds_ns": [first_rpc_wall, last_rpc_wall],
             "rpc_failures": rpc_failures,
+            "artifact_integrity": data_artifacts,
             "unavailable": [
                 "peer_response_receive", "peer_rtt", "remote_processing"],
         }
         write_json(summary_path, summary)
+        manifest_artifacts = {
+            **data_artifacts,
+            "summary.json": artifact_facts(summary_path),
+        }
         manifest.update({
             "complete": True,
             "valid": summary["valid"],
             "stop_reason": stop_reason,
-            "end_clock": {"monotonic_ns": time.monotonic_ns(), "wall_ns": time.time_ns()},
+            "end_clock": {
+                "monotonic_ns": cutoff_boundary["collector_monotonic_midpoint_ns"],
+                "wall_ns": cutoff_boundary["collector_wall_midpoint_ns"]},
+            "clock_mapping": mapping,
+            "cutoff_clock_mapping": end_mapping,
+            "collection_window": collection_window,
+            "artifacts": manifest_artifacts,
             "event_stream": {
                 "process_epoch": stream.epoch,
                 "count": event_count,

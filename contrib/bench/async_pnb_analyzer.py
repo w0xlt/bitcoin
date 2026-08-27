@@ -7,6 +7,7 @@
 import argparse
 import bisect
 import csv
+import hashlib
 import json
 import math
 import os
@@ -37,6 +38,16 @@ EVENT_NAMES = {
     29: "peer_finalized", 30: "discouragement", 31: "send_queue_state",
     32: "block_requested", 33: "block_request_removed", 34: "block_timeout",
 }
+RESOURCE_FIELDS = (
+    "monotonic_ns", "wall_ns", "process_user_seconds", "process_system_seconds",
+    "thread_msghand_seconds", "thread_pnb_seconds", "thread_network_seconds",
+    "thread_validation_seconds", "thread_other_seconds", "rss_bytes", "thread_count",
+    "voluntary_ctxt_switches", "nonvoluntary_ctxt_switches", "rchar", "wchar",
+    "syscr", "syscw", "read_bytes", "write_bytes")
+RESOURCE_FLOAT_FIELDS = {
+    "process_user_seconds", "process_system_seconds", "thread_msghand_seconds",
+    "thread_pnb_seconds", "thread_network_seconds", "thread_validation_seconds",
+    "thread_other_seconds"}
 
 
 class AnalysisError(RuntimeError):
@@ -91,10 +102,40 @@ def read_jsonl(path):
 def read_resources(path):
     try:
         with path.open(encoding="utf-8", newline="") as source:
-            return [{key: float(value) for key, value in row.items()}
-                    for row in csv.DictReader(source)]
+            reader = csv.DictReader(source)
+            if tuple(reader.fieldnames or ()) != RESOURCE_FIELDS:
+                raise AnalysisError("resources.csv header mismatch")
+            result = []
+            for row in reader:
+                if None in row or any(value is None or value == "" for value in row.values()):
+                    raise AnalysisError("resources.csv malformed row")
+                result.append({
+                    key: (float(value) if key in RESOURCE_FLOAT_FIELDS else int(value))
+                    for key, value in row.items()})
+            return result
     except (OSError, ValueError) as error:
         raise AnalysisError(f"cannot read resources.csv: {error}") from error
+
+
+def file_facts(path, *, csv_header=False):
+    digest = hashlib.sha256()
+    lines = 0
+    try:
+        with path.open("rb") as source:
+            while True:
+                chunk = source.read(1024 * 1024)
+                if not chunk:
+                    break
+                digest.update(chunk)
+                lines += chunk.count(b"\n")
+        return {
+            "bytes": path.stat().st_size,
+            "data_rows": max(0, lines - 1) if csv_header else lines,
+            "lines": lines,
+            "sha256": digest.hexdigest(),
+        }
+    except OSError as error:
+        raise AnalysisError(f"cannot hash {path.name}: {error}") from error
 
 
 def event_peer(event):
@@ -161,7 +202,39 @@ def prepare_rpc_states(rpc, max_age_ns):
     return join
 
 
-def annotate(events, rpc, max_age_seconds):
+def phase_observation_seconds(rpc, start_ns, end_ns, max_age_ns,
+                              mapping_uncertainty_ns=0):
+    if end_ns <= start_ns:
+        return {name: 0.0 for name in
+                ("ibd", "transition", "post_ibd", "unclassified")}
+    join = prepare_rpc_states(rpc, max_age_ns)
+    points = {start_ns, end_ns}
+    for row in rpc:
+        if "error" in row or not isinstance(row.get("monotonic_ns"), int):
+            continue
+        sample = row["monotonic_ns"]
+        for boundary in (sample, sample + max_age_ns):
+            for point in (boundary - mapping_uncertainty_ns,
+                          boundary + mapping_uncertainty_ns):
+                if start_ns < point < end_ns:
+                    points.add(point)
+    ordered = sorted(points)
+    durations = Counter()
+    for left, right in zip(ordered, ordered[1:]):
+        # Classification at an expiry boundary itself is inclusive (age ==
+        # max), but that single instant has no interval width. An interior
+        # point correctly classifies the following stale gap as unclassified.
+        midpoint = left + (right - left) // 2
+        low_phase, _low_age = join(midpoint - mapping_uncertainty_ns)
+        high_phase, _high_age = join(midpoint + mapping_uncertainty_ns)
+        phase = (low_phase if low_phase == high_phase and
+                 low_phase != "unclassified" else "unclassified")
+        durations[phase] += right - left
+    return {name: durations[name] / 1e9 for name in
+            ("ibd", "transition", "post_ibd", "unclassified")}
+
+
+def annotate(events, rpc, max_age_seconds, mapping_uncertainty_ns=0):
     join = prepare_rpc_states(rpc, int(max_age_seconds * 1_000_000_000))
     peer_roles = {}
     for event in events:
@@ -170,8 +243,16 @@ def annotate(events, rpc, max_age_seconds):
                 event["values"][1], f"unknown-{event['values'][1]}")
     ages = []
     for event in events:
-        phase, age = join(event["steady_ns"])
+        mapped = event.get("mapped_monotonic_ns", event["steady_ns"])
+        low_phase, _low_age = join(mapped - mapping_uncertainty_ns)
+        high_phase, _high_age = join(mapped + mapping_uncertainty_ns)
+        midpoint_phase, age = join(mapped)
+        phase = (midpoint_phase if low_phase == high_phase == midpoint_phase and
+                 midpoint_phase != "unclassified" else "unclassified")
+        if phase == "unclassified":
+            age = None
         event["_phase"] = phase
+        event["_rpc_join_age_ns"] = age
         if age is not None:
             ages.append(age)
         peer = event_peer(event)
@@ -199,7 +280,7 @@ def keyed_messages(events):
     return complete, front, start, end, duplicate_keys
 
 
-def queue_metrics(events, code, end_ns, peer_finalizations):
+def queue_metrics(events, code, start_ns, end_ns, peer_finalizations):
     by_peer = defaultdict(list)
     invalid_negative = 0
     for event in events:
@@ -217,6 +298,7 @@ def queue_metrics(events, code, end_ns, peer_finalizations):
     pause_ns = 0
     open_pauses = 0
     post_finalization_samples = 0
+    observed_samples = 0
     for peer_key, samples in by_peer.items():
         samples.sort(key=lambda event: event["steady_ns"])
         finalized_ns = peer_finalizations.get(peer_key)
@@ -226,25 +308,31 @@ def queue_metrics(events, code, end_ns, peer_finalizations):
             values = sample["values"]
             if finalized_ns is not None and sample["steady_ns"] > finalized_ns:
                 post_finalization_samples += 1
+            if start_ns <= sample["steady_ns"] <= terminal_ns:
+                observed_samples += 1
             following = (samples[index + 1]["steady_ns"]
                          if index + 1 < len(samples) else terminal_ns)
             following = min(following, terminal_ns)
-            interval = max(0, following - sample["steady_ns"])
+            interval_start = max(start_ns, sample["steady_ns"])
+            interval = max(0, following - interval_start)
             byte_area += values[1] * interval
             depth_area += values[2] * interval
-            max_bytes = max(max_bytes, values[1])
-            max_depth = max(max_depth, values[2])
+            if interval or start_ns <= sample["steady_ns"] <= terminal_ns:
+                max_bytes = max(max_bytes, values[1])
+                max_depth = max(max_depth, values[2])
             paused = bool(values[3])
-            if paused != previous_pause:
+            if start_ns <= sample["steady_ns"] <= terminal_ns and paused != previous_pause:
                 pause_transitions += 1
             if paused:
                 pause_ns += interval
             previous_pause = paused
-        if (samples and bool(samples[-1]["values"][3]) and
+        active_samples = [sample for sample in samples if sample["steady_ns"] <= end_ns]
+        if (active_samples and bool(active_samples[-1]["values"][3]) and
                 finalized_ns is None):
             open_pauses += 1
     return {
-        "samples": sum(map(len, by_peer.values())),
+        "samples": observed_samples,
+        "retained_samples": sum(map(len, by_peer.values())),
         "byte_depth_area_byte_ns": byte_area,
         "depth_area_message_ns": depth_area,
         "max_bytes": max_bytes,
@@ -258,15 +346,21 @@ def queue_metrics(events, code, end_ns, peer_finalizations):
 
 
 def build_pnb_jobs(events, errors):
+    stage_names = {
+        5: "submit", 6: "slot_submit", 7: "worker_wake", 8: "start",
+        9: "end", 10: "publication", 11: "busy_summary",
+        12: "collection", 13: "continuation"}
     jobs = defaultdict(dict)
     for event in events:
         code = event["event_code"]
         values = event["values"]
-        if code not in (5, 8, 9, 10, 12, 13) or not values:
+        if code not in stage_names or not values:
             continue
+        if values[0] <= 0:
+            errors.append(
+                f"zero PNB job ID at sequence {event.get('sequence')}")
         key = (event["process_epoch"], values[0])
-        name = {5: "submit", 8: "start", 9: "end", 10: "publication",
-                12: "collection", 13: "continuation"}[code]
+        name = stage_names[code]
         if name in jobs[key]:
             errors.append(f"duplicate PNB {name} for epoch/job {key}")
         jobs[key][name] = event
@@ -274,25 +368,32 @@ def build_pnb_jobs(events, errors):
     for (epoch, job_id), parts in sorted(jobs.items()):
         labels_reconciled = True
         submit = parts.get("submit")
-        mode_flags = []
-        for name, index in (("submit", 2), ("start", 1), ("end", 4),
-                            ("publication", 3), ("collection", 4)):
-            if name in parts and len(parts[name]["values"]) > index:
-                raw_mode = parts[name]["values"][index]
-                if raw_mode not in (0, 1):
-                    errors.append(
-                        f"invalid PNB mode label for epoch/job {(epoch, job_id)}")
-                    labels_reconciled = False
-                mode_flags.append(bool(raw_mode))
-        if mode_flags and any(flag != mode_flags[0] for flag in mode_flags[1:]):
-            errors.append(f"mismatched PNB mode labels for epoch/job {(epoch, job_id)}")
+        async_mode = None
+        if submit:
+            raw_mode = submit["values"][2]
+            if raw_mode not in (0, 1):
+                errors.append(f"invalid PNB mode label for epoch/job {(epoch, job_id)}")
+                labels_reconciled = False
+            else:
+                async_mode = bool(raw_mode)
+        else:
+            errors.append(f"PNB lifecycle does not start at submit for epoch/job {(epoch, job_id)}")
             labels_reconciled = False
-        async_mode = bool(submit["values"][2]) if submit else (
-            mode_flags[0] if mode_flags else None)
-        required = (["submit", "start", "end", "publication", "collection", "continuation"]
-                    if async_mode else ["submit", "start", "end", "continuation"])
-        if async_mode is False and ({"publication", "collection"} & set(parts)):
+        async_required = [
+            "submit", "slot_submit", "worker_wake", "start", "end",
+            "publication", "busy_summary", "collection", "continuation"]
+        control_required = ["submit", "start", "end", "continuation"]
+        required = async_required if async_mode else control_required
+        async_only = {"slot_submit", "worker_wake", "publication",
+                      "busy_summary", "collection"}
+        if async_mode is False and (async_only & set(parts)):
             errors.append(f"control PNB has async-only stages for epoch/job {(epoch, job_id)}")
+            labels_reconciled = False
+        unexpected = set(parts) - set(required)
+        if unexpected:
+            errors.append(
+                f"unexpected PNB lifecycle stages for epoch/job {(epoch, job_id)}: "
+                f"{sorted(unexpected)}")
             labels_reconciled = False
         present_indices = [required.index(name) for name in required if name in parts]
         contiguous_prefix = bool(present_indices) and present_indices == list(
@@ -314,31 +415,52 @@ def build_pnb_jobs(events, errors):
             previous = current
         complete = all(name in parts for name in required)
 
-        block_ids = {part.get("block_id") for part in parts.values()
-                     if part.get("block_id")}
-        if len(block_ids) > 1:
+        block_ids = {part.get("block_id") for part in parts.values()}
+        if None in block_ids or len(block_ids) != 1:
             errors.append(f"mismatched PNB block labels for epoch/job {(epoch, job_id)}")
             labels_reconciled = False
         sources = set()
-        for name, index in (("submit", 1), ("start", 2), ("end", 5),
+        for name, index in (("submit", 1), ("slot_submit", 1), ("worker_wake", 2),
+                            ("start", 2), ("end", 5), ("busy_summary", 1),
                             ("collection", 1), ("continuation", 1)):
-            if name in parts and len(parts[name]["values"]) > index:
-                sources.add(parts[name]["values"][index])
-        if len(sources) > 1:
+            if name in parts:
+                source = parts[name]["values"][index]
+                if source < 0:
+                    errors.append(f"invalid PNB source label for epoch/job {(epoch, job_id)}")
+                    labels_reconciled = False
+                sources.add(source)
+        if len(sources) != 1:
             errors.append(f"mismatched PNB source labels for epoch/job {(epoch, job_id)}")
             labels_reconciled = False
         routes = set()
-        for name, index in (("submit", 3), ("start", 3), ("end", 6)):
-            if name in parts and len(parts[name]["values"]) > index:
+        for name, index in (("submit", 3), ("worker_wake", 3),
+                            ("start", 3), ("end", 6)):
+            if name in parts:
                 raw_route = parts[name]["values"][index]
-                if raw_route not in DELIVERY_ROUTES:
+                if raw_route not in (1, 2, 3):
                     errors.append(
                         f"invalid PNB route label for epoch/job {(epoch, job_id)}")
                     labels_reconciled = False
                 routes.add(raw_route)
-        if len(routes) > 1:
+        if len(routes) != 1:
             errors.append(f"mismatched PNB route labels for epoch/job {(epoch, job_id)}")
             labels_reconciled = False
+        expected_mode = 1 if async_mode else 0
+        for name, index in (("start", 1), ("end", 4)):
+            if name in parts and parts[name]["values"][index] != expected_mode:
+                errors.append(f"mismatched PNB mode labels for epoch/job {(epoch, job_id)}")
+                labels_reconciled = False
+        if async_mode:
+            for name, index in (("slot_submit", 3), ("worker_wake", 1),
+                                ("publication", 3), ("busy_summary", 8),
+                                ("collection", 4)):
+                if name in parts and parts[name]["values"][index] != 1:
+                    errors.append(f"mismatched PNB active-slot label for epoch/job {(epoch, job_id)}")
+                    labels_reconciled = False
+            slot = parts.get("slot_submit")
+            if slot and (slot["values"][2] != 0 or slot.get("text1") != "accepted"):
+                errors.append(f"invalid PNB submit status for epoch/job {(epoch, job_id)}")
+                labels_reconciled = False
         results = set()
         for name, first, second in (("end", 2, 3), ("publication", 1, 2),
                                     ("collection", 2, 3), ("continuation", 2, 3)):
@@ -350,14 +472,17 @@ def build_pnb_jobs(events, errors):
                     labels_reconciled = False
                 results.add((bool(parts[name]["values"][first]),
                              bool(parts[name]["values"][second])))
-        if len(results) > 1:
+        if len(results) > 1 or any(new and not processed for processed, new in results):
             errors.append(f"mismatched PNB result labels for epoch/job {(epoch, job_id)}")
             labels_reconciled = False
         continuations = {parts[name].get("text1") for name in
                          ("submit", "collection", "continuation")
-                         if name in parts and parts[name].get("text1")}
+                         if name in parts}
         if len(continuations) > 1:
             errors.append(f"mismatched PNB continuation labels for epoch/job {(epoch, job_id)}")
+            labels_reconciled = False
+        if continuations and not continuations <= {"standard", "optimistic_compact"}:
+            errors.append(f"invalid PNB continuation label for epoch/job {(epoch, job_id)}")
             labels_reconciled = False
 
         start = parts.get("start")
@@ -372,6 +497,11 @@ def build_pnb_jobs(events, errors):
                 errors.append(
                     f"invalid PNB IBD label for epoch/job {(epoch, job_id)}")
                 labels_reconciled = False
+            if (submit["values"][5] < -1 or
+                    submit["values"][6] not in (0, 1) or
+                    submit["values"][7] not in (0, 1)):
+                errors.append(f"invalid PNB submission labels for epoch/job {(epoch, job_id)}")
+                labels_reconciled = False
         if start and submit and len(start["values"]) > 5:
             if (start["values"][4] != submit["values"][4] or
                     start["values"][5] != submit["values"][5]):
@@ -381,6 +511,22 @@ def build_pnb_jobs(events, errors):
         if start and end and end["values"][1] != end["steady_ns"] - start["steady_ns"]:
             errors.append(f"PNB duration mismatch for epoch/job {(epoch, job_id)}")
             labels_reconciled = False
+        busy = parts.get("busy_summary")
+        if busy:
+            count, total, maximum, max_peer, max_start, max_end = busy["values"][2:8]
+            valid_busy = count >= 0 and total >= 0 and maximum >= 0
+            if count == 0:
+                valid_busy &= (total, maximum, max_peer, max_start, max_end) == (0, 0, -1, 0, 0)
+            else:
+                valid_busy &= (max_peer >= 0 and max_start <= max_end and
+                               maximum == max_end - max_start and total >= maximum)
+            if not valid_busy:
+                errors.append(f"invalid PNB busy-prefix summary for epoch/job {(epoch, job_id)}")
+                labels_reconciled = False
+        for name, index in (("collection", 5), ("continuation", 4)):
+            if name in parts and parts[name]["values"][index] not in (0, 1):
+                errors.append(f"invalid PNB source-live label for epoch/job {(epoch, job_id)}")
+                labels_reconciled = False
         route = event_route(submit) if submit else None
         item = {
             "process_epoch": epoch,
@@ -395,12 +541,19 @@ def build_pnb_jobs(events, errors):
             "phase": submit.get("_phase") if submit else "unclassified",
             "block_id": next(iter(block_ids)) if len(block_ids) == 1 else None,
             "submit_ns": submit["steady_ns"] if submit else None,
+            "submit_scope": submit.get("collection_scope") if submit else None,
             "start_ns": start["steady_ns"] if start else None,
             "start_sequence": start["sequence"] if start else None,
             "end_ns": end["steady_ns"] if end else None,
             "end_sequence": end["sequence"] if end else None,
             "publication_ns": parts["publication"]["steady_ns"]
                               if "publication" in parts else None,
+            "slot_submit_ns": parts["slot_submit"]["steady_ns"]
+                              if "slot_submit" in parts else None,
+            "worker_wake_ns": parts["worker_wake"]["steady_ns"]
+                              if "worker_wake" in parts else None,
+            "busy_summary_ns": parts["busy_summary"]["steady_ns"]
+                              if "busy_summary" in parts else None,
             "collection_ns": parts["collection"]["steady_ns"]
                              if "collection" in parts else None,
             "continuation_ns": continuation["steady_ns"] if continuation else None,
@@ -408,6 +561,7 @@ def build_pnb_jobs(events, errors):
             "process_new_block": next(iter(results))[0] if len(results) == 1 else None,
             "new_block": next(iter(results))[1] if len(results) == 1 else None,
             "continuation_kind": next(iter(continuations)) if len(continuations) == 1 else None,
+            "lifecycle_stages": [name for name in required if name in parts],
             "labels_reconciled": labels_reconciled,
             "ordered_complete": complete and ordered and not internal_gap and labels_reconciled,
             "incomplete_at_collection_boundary": (
@@ -467,13 +621,12 @@ def network_metrics(rpc, observation_seconds):
     }
 
 
-def subset_summary(events, context_events=None, *, include_interval_work=False):
+def subset_summary(events, context_events=None, *, observation_seconds,
+                   include_interval_work=False):
     if not events:
-        return {"event_count": 0, "observation_hours": 0}
+        return {"event_count": 0, "observation_hours": observation_seconds / 3600}
     context = context_events if context_events is not None else events
     counts = Counter(event["event"] for event in events)
-    span_seconds = (max(event["steady_ns"] for event in events) -
-                    min(event["steady_ns"] for event in events)) / 1e9
     pnb_seconds = sum(event["values"][1] for event in events
                       if event["event_code"] == 9) / 1e9
     payload_bytes = sum(event["values"][2] for event in events
@@ -572,7 +725,7 @@ def subset_summary(events, context_events=None, *, include_interval_work=False):
                 f"handler_start_{event['_pnb_source_relation']}"] += 1
     return {
         "event_count": len(events),
-        "observation_hours": span_seconds / 3600,
+        "observation_hours": observation_seconds / 3600,
         "complete_ready_count": counts["complete_message_ready"],
         "exact_front_count": counts["message_front_ready"],
         "handler_start_count": counts["handler_start"],
@@ -583,8 +736,8 @@ def subset_summary(events, context_events=None, *, include_interval_work=False):
         "outbound_incomplete_count": len(incomplete_outbound),
         "pnb_count": counts["pnb_end"],
         "pnb_time_seconds": pnb_seconds,
-        "pnb_wall_fraction": pnb_seconds / span_seconds if span_seconds else None,
-        "pnb_jobs_per_second": counts["pnb_end"] / span_seconds if span_seconds else None,
+        "pnb_wall_fraction": pnb_seconds / observation_seconds if observation_seconds else None,
+        "pnb_jobs_per_second": counts["pnb_end"] / observation_seconds if observation_seconds else None,
         "payload_bytes": payload_bytes,
         "wire_bytes": wire_bytes,
         "queue_to_front_ns": distribution(queue_to_front),
@@ -598,8 +751,8 @@ def subset_summary(events, context_events=None, *, include_interval_work=False):
     }
 
 
-def reconcile_collector(manifest, summary, events, errors):
-    """Cross-check JSONL authority against both finalized metadata files."""
+def reconcile_collector(manifest, summary, events, resources, rpc, artifacts, errors):
+    """Cross-check all retained rows, bounds, clocks, and finalized metadata."""
     actual_count = len(events)
     actual_first = events[0]["sequence"] if events else None
     actual_last = events[-1]["sequence"] if events else None
@@ -634,6 +787,11 @@ def reconcile_collector(manifest, summary, events, errors):
     cutoff = summary.get("collection_cutoff_sequence")
     if cutoff is not None and cutoff != (actual_last or 0):
         errors.append(f"collector cutoff mismatch: {cutoff!r} != {actual_last or 0!r}")
+    producer_observed = summary.get("producer_sequence_observed")
+    if (not isinstance(producer_observed, int) or producer_observed < (cutoff or 0)):
+        errors.append("collector producer sequence bound mismatch")
+    if not isinstance(summary.get("probe_status"), int) or summary.get("probe_status") & 3:
+        errors.append("collector probe status is lossy or test-gated")
     stream = manifest.get("event_stream")
     if not isinstance(stream, dict):
         errors.append("collector manifest missing event_stream authority")
@@ -664,8 +822,287 @@ def reconcile_collector(manifest, summary, events, errors):
     if summary.get("integrity_errors") != []:
         errors.append("collector summary contains integrity errors")
 
+    if not isinstance(artifacts, dict):
+        errors.append("actual collector artifact facts are unavailable")
+    else:
+        manifest_artifacts = manifest.get("artifacts")
+        summary_artifacts = summary.get("artifact_integrity")
+        if manifest_artifacts != artifacts:
+            errors.append("collector manifest artifact hashes/bounds mismatch")
+        expected_data = {name: artifacts.get(name) for name in
+                         ("events.jsonl", "resources.csv", "rpc.jsonl")}
+        if summary_artifacts != expected_data:
+            errors.append("collector summary artifact hashes/bounds mismatch")
+        row_expectations = {
+            "events.jsonl": len(events),
+            "resources.csv": len(resources),
+            "rpc.jsonl": len(rpc),
+        }
+        for name, rows in row_expectations.items():
+            fact = artifacts.get(name)
+            if not isinstance(fact, dict) or fact.get("data_rows") != rows:
+                errors.append(f"collector {name} retained row count mismatch")
 
-def analyze(manifest, summary, events, resources, rpc, max_join_age):
+    window = summary.get("collection_window")
+    if not isinstance(window, dict) or manifest.get("collection_window") != window:
+        errors.append("collector collection-window metadata mismatch")
+        window = {}
+    start_boundary = window.get("start")
+    end_boundary = window.get("end")
+
+    def validate_boundary(name, boundary):
+        fields = (
+            "producer_sequence", "collector_monotonic_before_ns",
+            "collector_monotonic_after_ns", "collector_monotonic_midpoint_ns",
+            "collector_wall_before_ns", "collector_wall_after_ns",
+            "collector_wall_midpoint_ns", "capture_uncertainty_ns")
+        if not isinstance(boundary, dict) or any(
+                not isinstance(boundary.get(field), int) for field in fields):
+            errors.append(f"malformed collection {name} boundary")
+            return False
+        mono_before = boundary["collector_monotonic_before_ns"]
+        mono_after = boundary["collector_monotonic_after_ns"]
+        wall_before = boundary["collector_wall_before_ns"]
+        wall_after = boundary["collector_wall_after_ns"]
+        if (mono_before <= 0 or wall_before <= 0 or mono_after < mono_before or
+                wall_after < wall_before or boundary["producer_sequence"] < 0):
+            errors.append(f"impossible collection {name} boundary")
+        if boundary["collector_monotonic_midpoint_ns"] != (
+                mono_before + (mono_after - mono_before) // 2):
+            errors.append(f"collection {name} monotonic midpoint mismatch")
+        if boundary["collector_wall_midpoint_ns"] != (
+                wall_before + (wall_after - wall_before) // 2):
+            errors.append(f"collection {name} wall midpoint mismatch")
+        uncertainty = (mono_after - mono_before + wall_after - wall_before + 1) // 2
+        if boundary["capture_uncertainty_ns"] != uncertainty:
+            errors.append(f"collection {name} capture uncertainty mismatch")
+        return True
+
+    start_ok = validate_boundary("start", start_boundary)
+    end_ok = validate_boundary("end", end_boundary)
+    if start_ok and end_ok:
+        start_mono = start_boundary["collector_monotonic_midpoint_ns"]
+        end_mono = end_boundary["collector_monotonic_midpoint_ns"]
+        start_wall = start_boundary["collector_wall_midpoint_ns"]
+        end_wall = end_boundary["collector_wall_midpoint_ns"]
+        duration_ns = end_mono - start_mono
+        if duration_ns <= 0 or end_wall <= start_wall:
+            errors.append("nonpositive collection clock interval")
+        if window.get("duration_ns") != duration_ns:
+            errors.append("collection monotonic duration mismatch")
+        if window.get("duration_source") != "collector_python_monotonic_midpoints":
+            errors.append("collection duration source mismatch")
+        if manifest.get("clock_origin") != {
+                "monotonic_ns": start_mono, "wall_ns": start_wall}:
+            errors.append("collector start clock origin mismatch")
+        if manifest.get("end_clock") != {
+                "monotonic_ns": end_mono, "wall_ns": end_wall}:
+            errors.append("collector cutoff clock mismatch")
+    else:
+        start_mono = end_mono = start_wall = end_wall = 0
+        duration_ns = 0
+
+    first_measured = window.get("sequence_first")
+    last_measured = window.get("sequence_last")
+    if (not isinstance(first_measured, int) or first_measured <= 0 or
+            not isinstance(last_measured, int) or last_measured < 0):
+        errors.append("invalid collection sequence window")
+        first_measured, last_measured = 1, 0
+    if window.get("pre_attach_sequence_last") != first_measured - 1:
+        errors.append("pre-attach sequence boundary mismatch")
+    if start_ok and start_boundary["producer_sequence"] != first_measured - 1:
+        errors.append("start producer cutoff mismatch")
+    if end_ok and end_boundary["producer_sequence"] != last_measured:
+        errors.append("end producer cutoff mismatch")
+    if last_measured != (actual_last or 0) or cutoff != last_measured:
+        errors.append("measured sequence cutoff disagrees with retained stream")
+    actual_scope = Counter()
+    for event in events:
+        expected_scope = (
+            "pre_attach_backlog" if event["sequence"] < first_measured
+            else "measured")
+        if event.get("collection_scope") != expected_scope:
+            errors.append(
+                f"event collection scope mismatch at sequence {event['sequence']}")
+        actual_scope[expected_scope] += 1
+    actual_scope = dict(sorted(actual_scope.items()))
+    if summary.get("event_scope_counts") != actual_scope:
+        errors.append("collector event-scope counts mismatch")
+    if window.get("pre_attach_backlog_event_count") != actual_scope.get(
+            "pre_attach_backlog", 0):
+        errors.append("collector backlog count mismatch")
+    if window.get("measured_event_count") != actual_scope.get("measured", 0):
+        errors.append("collector measured event count mismatch")
+
+    mapping = summary.get("clock_mapping")
+    cutoff_mapping = summary.get("cutoff_clock_mapping")
+    if manifest.get("clock_mapping") != mapping:
+        errors.append("manifest/summary start clock mapping mismatch")
+    if manifest.get("cutoff_clock_mapping") != cutoff_mapping:
+        errors.append("manifest/summary cutoff clock mapping mismatch")
+    if not isinstance(mapping, dict) or not isinstance(cutoff_mapping, dict):
+        errors.append("missing explicit clock mapping")
+        mapping = {}
+        cutoff_mapping = {}
+    probe_wall = mapping.get("probe_creation_wall_ns")
+    probe_steady = mapping.get("probe_creation_steady_ns")
+    if not isinstance(probe_wall, int) or not isinstance(probe_steady, int) or (
+            probe_wall <= 0 or probe_steady <= 0):
+        errors.append("invalid probe clock origins")
+    elif start_ok and end_ok:
+        probe_delta = probe_wall - probe_steady
+        collector_delta = start_wall - start_mono
+        residual = collector_delta - probe_delta
+        drift = (end_wall - start_wall) - (end_mono - start_mono)
+        expected_mapping = {
+            "collector_wall_ns": start_wall,
+            "collector_monotonic_ns": start_mono,
+            "probe_wall_minus_steady_ns": probe_delta,
+            "collector_wall_minus_monotonic_ns": collector_delta,
+            "steady_to_collector_monotonic_offset_ns": -residual,
+            "steady_to_wall_offset_ns": probe_delta,
+            "origin_residual_ns": residual,
+            "capture_uncertainty_ns": start_boundary["capture_uncertainty_ns"],
+            "cutoff_capture_uncertainty_ns": end_boundary["capture_uncertainty_ns"],
+            "collection_wall_minus_monotonic_drift_ns": drift,
+            "mapping_uncertainty_ns": (
+                abs(residual) + start_boundary["capture_uncertainty_ns"] +
+                abs(drift) + end_boundary["capture_uncertainty_ns"]),
+            "compatibility": "wall_offset_bridge_with_reported_uncertainty",
+            "method": "wall-offset bridge; residual may include pre-attach wall correction; no affine/drift claim",
+        }
+        for key, value in expected_mapping.items():
+            if mapping.get(key) != value:
+                errors.append(f"clock mapping {key} mismatch")
+        end_collector_delta = end_wall - end_mono
+        end_residual = end_collector_delta - probe_delta
+        expected_cutoff_mapping = {
+            "probe_creation_wall_ns": probe_wall,
+            "probe_creation_steady_ns": probe_steady,
+            "collector_wall_ns": end_wall,
+            "collector_monotonic_ns": end_mono,
+            "probe_wall_minus_steady_ns": probe_delta,
+            "collector_wall_minus_monotonic_ns": end_collector_delta,
+            "steady_to_collector_monotonic_offset_ns": -end_residual,
+            "steady_to_wall_offset_ns": probe_delta,
+            "origin_residual_ns": end_residual,
+            "capture_uncertainty_ns": end_boundary["capture_uncertainty_ns"],
+            "mapping_uncertainty_ns": (
+                abs(end_residual) + end_boundary["capture_uncertainty_ns"]),
+            "compatibility": "wall_offset_bridge_with_reported_uncertainty",
+            "method": "wall-offset bridge; residual may include pre-attach wall correction; no affine/drift claim",
+            "collection_wall_minus_monotonic_drift_ns": drift,
+        }
+        for key, value in expected_cutoff_mapping.items():
+            if cutoff_mapping.get(key) != value:
+                errors.append(f"cutoff clock mapping {key} mismatch")
+        mapped_bounds = []
+        offset = mapping.get("steady_to_collector_monotonic_offset_ns")
+        wall_offset = mapping.get("steady_to_wall_offset_ns")
+        uncertainty = mapping.get("mapping_uncertainty_ns")
+        if all(isinstance(value, int) for value in (offset, wall_offset, uncertainty)):
+            for event in events:
+                mapped_mono = event["steady_ns"] + offset
+                mapped_wall = event["steady_ns"] + wall_offset
+                if event.get("mapped_monotonic_ns") != mapped_mono:
+                    errors.append(f"mapped monotonic timestamp mismatch at {event['sequence']}")
+                if event.get("mapped_wall_ns") != mapped_wall:
+                    errors.append(f"mapped wall timestamp mismatch at {event['sequence']}")
+                if event.get("collection_scope") == "measured":
+                    mapped_bounds.append(mapped_mono)
+                    if not (start_mono - uncertainty <= mapped_mono <= end_mono + uncertainty):
+                        errors.append(f"measured event outside mapped clock bounds at {event['sequence']}")
+        actual_mapped_bounds = [min(mapped_bounds), max(mapped_bounds)] if mapped_bounds else [None, None]
+        if window.get("measured_event_mapped_monotonic_bounds_ns") != actual_mapped_bounds:
+            errors.append("measured mapped event bounds mismatch")
+
+    def validate_sample_rows(rows, name):
+        previous_mono = None
+        mono_values, wall_values = [], []
+        for index, row in enumerate(rows):
+            mono, wall = row.get("monotonic_ns"), row.get("wall_ns")
+            if not isinstance(mono, int) or not isinstance(wall, int) or mono <= 0 or wall <= 0:
+                errors.append(f"malformed {name} clock row {index}")
+                continue
+            if previous_mono is not None and mono <= previous_mono:
+                errors.append(f"non-increasing {name} monotonic clock")
+            previous_mono = mono
+            mono_values.append(mono)
+            wall_values.append(wall)
+            if start_ok and end_ok and not (
+                    start_boundary["collector_monotonic_before_ns"] <= mono <=
+                    end_boundary["collector_monotonic_after_ns"]):
+                errors.append(f"{name} row outside collection monotonic bounds")
+            wall_uncertainty = (
+                mapping.get("mapping_uncertainty_ns", 0)
+                if isinstance(mapping.get("mapping_uncertainty_ns", 0), int) else 0)
+            if start_ok and end_ok and not (
+                    start_boundary["collector_wall_before_ns"] - wall_uncertainty <= wall <=
+                    end_boundary["collector_wall_after_ns"] + wall_uncertainty):
+                errors.append(f"{name} row outside collection wall bounds")
+            if start_ok and end_ok:
+                start_delta = (
+                    start_boundary["collector_wall_midpoint_ns"] -
+                    start_boundary["collector_monotonic_midpoint_ns"])
+                end_delta = (
+                    end_boundary["collector_wall_midpoint_ns"] -
+                    end_boundary["collector_monotonic_midpoint_ns"])
+                if not (min(start_delta, end_delta) - wall_uncertainty <= wall - mono <=
+                        max(start_delta, end_delta) + wall_uncertainty):
+                    errors.append(f"{name} row clock-domain residual mismatch")
+        return ([min(mono_values), max(mono_values)] if mono_values else [None, None],
+                [min(wall_values), max(wall_values)] if wall_values else [None, None])
+
+    resource_mono, resource_wall = validate_sample_rows(resources, "resource")
+    for row in resources:
+        if any(not math.isfinite(row[field]) for field in RESOURCE_FLOAT_FIELDS):
+            errors.append("nonfinite resource counter")
+        if any(row[field] < 0 for field in RESOURCE_FIELDS if field not in (
+                "monotonic_ns", "wall_ns") and field not in RESOURCE_FLOAT_FIELDS):
+            errors.append("negative resource counter")
+    if summary.get("resource_samples") != len(resources):
+        errors.append("resource sample count mismatch")
+    if summary.get("resource_monotonic_bounds_ns") != resource_mono:
+        errors.append("resource monotonic bounds mismatch")
+    if summary.get("resource_wall_bounds_ns") != resource_wall:
+        errors.append("resource wall bounds mismatch")
+
+    valid_rpc = 0
+    failed_rpc = 0
+    for index, row in enumerate(rpc):
+        has_error = "error" in row
+        has_chain = isinstance(row.get("chain"), dict)
+        if has_error == has_chain:
+            errors.append(f"RPC row {index} failure/success shape mismatch")
+        if has_error:
+            failed_rpc += 1
+            if (set(row) != {"monotonic_ns", "wall_ns", "error"} or
+                    not isinstance(row["error"], str) or not row["error"]):
+                errors.append(f"RPC row {index} malformed error")
+        else:
+            valid_rpc += 1
+            chain = row.get("chain", {})
+            if (set(row) != {"monotonic_ns", "wall_ns", "chain", "warnings_present",
+                             "network_totals", "network", "peers"} or
+                    chain.get("chain") != manifest.get("expected_chain") or
+                    not isinstance(chain.get("initialblockdownload"), bool) or
+                    not isinstance(chain.get("blocks"), int) or
+                    not isinstance(chain.get("headers"), int)):
+                errors.append(f"RPC row {index} malformed chain snapshot")
+    rpc_mono, rpc_wall = validate_sample_rows(rpc, "RPC")
+    if summary.get("rpc_rows") != len(rpc):
+        errors.append("RPC retained row count mismatch")
+    if summary.get("rpc_samples") != valid_rpc:
+        errors.append("RPC success count mismatch")
+    if summary.get("rpc_failures") != failed_rpc:
+        errors.append("RPC failure count mismatch")
+    if summary.get("rpc_monotonic_bounds_ns") != rpc_mono:
+        errors.append("RPC monotonic bounds mismatch")
+    if summary.get("rpc_wall_bounds_ns") != rpc_wall:
+        errors.append("RPC wall bounds mismatch")
+
+
+def analyze(manifest, summary, events, resources, rpc, max_join_age, artifacts=None):
     integrity_errors = []
     previous = None
     structurally_valid = True
@@ -694,27 +1131,80 @@ def analyze(manifest, summary, events, resources, rpc, max_join_age):
                 len(event["values"]) < 3 or event["values"][2] != 0):
             integrity_errors.append(
                 f"response_queued reserved field is nonzero at sequence {event['sequence']}")
+        values = event.get("values", [])
+        code = event.get("event_code")
+        if code in (1, 2, 3, 4, 21) and len(values) > 1 and values[1] <= 0:
+            integrity_errors.append(
+                f"zero inbound causal ID at sequence {event.get('sequence')}")
+        if code == 22 and len(values) > 5 and values[4] == 2 and values[5] <= 0:
+            integrity_errors.append(
+                f"zero receive-pop causal ID at sequence {event.get('sequence')}")
+        if code == 26 and len(values) > 2 and (values[1] <= 0 or values[2] <= 0):
+            integrity_errors.append(
+                f"zero causal relation ID at sequence {event.get('sequence')}")
+        if code in range(5, 14) and values and values[0] <= 0:
+            integrity_errors.append(
+                f"zero PNB job ID at sequence {event.get('sequence')}")
 
     if structurally_valid:
-        reconcile_collector(manifest, summary, events, integrity_errors)
+        reconcile_collector(
+            manifest, summary, events, resources, rpc, artifacts,
+            integrity_errors)
 
-    join_ages = annotate(events, rpc, max_join_age)
-    complete, front, starts, ends, duplicates = keyed_messages(events)
+    all_events = events
+    raw_mapping_uncertainty = summary.get("clock_mapping", {}).get(
+        "mapping_uncertainty_ns", 0)
+    mapping_uncertainty_ns = (raw_mapping_uncertainty
+                              if isinstance(raw_mapping_uncertainty, int) and
+                              raw_mapping_uncertainty >= 0 else 0)
+    join_ages = annotate(
+        all_events, rpc, max_join_age,
+        mapping_uncertainty_ns=mapping_uncertainty_ns)
+    all_complete, all_front, all_starts, all_ends, duplicates = keyed_messages(all_events)
     if duplicates:
         integrity_errors.append(f"duplicate message lifecycle keys: {len(duplicates)}")
-    for stage_name, stages in (("front", front), ("start", starts), ("end", ends)):
+    for stage_name, stages in (("front", all_front), ("start", all_starts),
+                               ("end", all_ends)):
         for key in stages:
-            if key not in complete:
+            if key not in all_complete:
                 integrity_errors.append(
                     f"orphan message {stage_name} without complete-ready for {key}")
-    for key in complete:
-        present = [True, key in front, key in starts, key in ends]
+    for key in all_complete:
+        present = [True, key in all_front, key in all_starts, key in all_ends]
         last_present = max(index for index, value in enumerate(present) if value)
         if present[:last_present + 1] != [True] * (last_present + 1):
             integrity_errors.append(f"missing internal message lifecycle stage for {key}")
-    observation_start = min((event["steady_ns"] for event in events), default=0)
-    observation_end = max((event["steady_ns"] for event in events), default=observation_start)
-    observation_seconds = max(0, observation_end - observation_start) / 1e9
+    window = summary.get("collection_window", {})
+    mapping = summary.get("clock_mapping", {})
+    observation_ns = window.get("duration_ns", 0)
+    observation_seconds = observation_ns / 1e9 if isinstance(observation_ns, int) else 0
+    offset = mapping.get("steady_to_collector_monotonic_offset_ns", 0)
+    try:
+        observation_start_mono = window["start"]["collector_monotonic_midpoint_ns"]
+        observation_end_mono = window["end"]["collector_monotonic_midpoint_ns"]
+        observation_start = observation_start_mono - offset
+        observation_end = observation_end_mono - offset
+    except (KeyError, TypeError):
+        observation_start = min(
+            (event["steady_ns"] for event in all_events), default=0)
+        observation_end = max(
+            (event["steady_ns"] for event in all_events), default=observation_start)
+        observation_start_mono = observation_start + offset
+        observation_end_mono = observation_end + offset
+    events = [event for event in all_events
+              if event.get("collection_scope") == "measured"]
+    join_ages = [event["_rpc_join_age_ns"] for event in events
+                 if event["_rpc_join_age_ns"] is not None]
+    selected_message_keys = {
+        key for key, event in all_complete.items()
+        if event.get("collection_scope") == "measured"}
+    complete = {key: all_complete[key] for key in selected_message_keys}
+    front = {key: event for key, event in all_front.items()
+             if key in selected_message_keys}
+    starts = {key: event for key, event in all_starts.items()
+              if key in selected_message_keys}
+    ends = {key: event for key, event in all_ends.items()
+            if key in selected_message_keys}
 
     queue_latency = []
     front_latency = []
@@ -759,7 +1249,7 @@ def analyze(manifest, summary, events, resources, rpc, max_join_age):
     causal_outbound = defaultdict(set)
     causal_event_keys = set()
     legacy_responses = []
-    for event in events:
+    for event in all_events:
         values = event["values"]
         if event["event_code"] == 23:
             if len(values) < 7:
@@ -843,7 +1333,7 @@ def analyze(manifest, summary, events, resources, rpc, max_join_age):
     for key in set(socket) & set(dropped):
         integrity_errors.append(f"outbound has both socket completion and drop for {key}")
     for inbound_key, outbound_keys in causal_inbound.items():
-        if inbound_key not in complete:
+        if inbound_key not in all_complete:
             integrity_errors.append(f"causal link without inbound message for {inbound_key}")
         for outbound_key in outbound_keys:
             if outbound_key not in outbound:
@@ -863,7 +1353,7 @@ def analyze(manifest, summary, events, resources, rpc, max_join_age):
         if inbound_key not in causal_outbound.get(outbound_key, set()):
             integrity_errors.append(
                 f"legacy response without canonical causal link for {inbound_key}")
-        inbound = complete.get(inbound_key)
+        inbound = all_complete.get(inbound_key)
         queued = outbound.get(outbound_key)
         if inbound and response.get("text1", "") != inbound.get("text1", ""):
             integrity_errors.append(
@@ -881,6 +1371,14 @@ def analyze(manifest, summary, events, resources, rpc, max_join_age):
             if values[1] != queued["values"][2]:
                 integrity_errors.append(
                     f"legacy response primary causal mismatch for {outbound_key}")
+
+    # OUTBOUND_QUEUED inside the explicit measured sequence window is the
+    # canonical offered population. Full-stream maps above remain the authority
+    # for structural joins, including pre-attach lifecycle context.
+    outbound = {key: event for key, event in outbound.items()
+                if event.get("collection_scope") == "measured"}
+    socket = {key: event for key, event in socket.items() if key in outbound}
+    dropped = {key: event for key, event in dropped.items() if key in outbound}
 
     queue_to_first = []
     queue_to_last = []
@@ -917,7 +1415,7 @@ def analyze(manifest, summary, events, resources, rpc, max_join_age):
                 else:
                     front_to_response.append(delta)
 
-    pnb_jobs = build_pnb_jobs(events, integrity_errors)
+    pnb_jobs = build_pnb_jobs(all_events, integrity_errors)
     observed_job_modes = {job["mode"] for job in pnb_jobs}
     expected_job_mode = {"candidate": "async", "control": "control"}.get(
         manifest.get("mode"))
@@ -926,38 +1424,61 @@ def analyze(manifest, summary, events, resources, rpc, max_join_age):
         integrity_errors.append(
             f"PNB manifest/job mode mismatch: manifest={manifest.get('mode')!r}, "
             f"observed={sorted(observed_job_modes)!r}")
-    bounded_pnb_jobs = [
+    complete_pnb_jobs = [
         job for job in pnb_jobs
         if job["start_ns"] is not None and job["end_ns"] is not None and
-        job["end_ns"] >= job["start_ns"]]
-    bounded_pnb_jobs.sort(
+        job["end_ns"] >= job["start_ns"] and job["ordered_complete"]]
+    submitted_pnb_jobs = [job for job in pnb_jobs
+                          if job["submit_scope"] == "measured"]
+    completed_submitted_jobs = [job for job in complete_pnb_jobs
+                                if job["submit_scope"] == "measured"]
+    ordered_complete_jobs = sorted(
+        complete_pnb_jobs,
         key=lambda job: (job["start_ns"], job["start_sequence"]))
-    previous_end = None
-    previous_job = None
-    merged_intervals = []
-    for job in bounded_pnb_jobs:
-        start_position = (job["start_ns"], job["start_sequence"])
-        end_position = (job["end_ns"], job["end_sequence"])
-        if previous_end is not None and start_position < previous_end:
+    for previous_job, job in zip(ordered_complete_jobs, ordered_complete_jobs[1:]):
+        if ((job["start_ns"], job["start_sequence"]) <
+                (previous_job["end_ns"], previous_job["end_sequence"])):
             integrity_errors.append(
                 "overlapping PNB intervals for epoch/jobs "
                 f"{(previous_job['process_epoch'], previous_job['job_id'])} and "
                 f"{(job['process_epoch'], job['job_id'])}")
-        if previous_end is None or end_position > previous_end:
-            previous_end = end_position
-            previous_job = job
-        if merged_intervals and job["start_ns"] <= merged_intervals[-1][1]:
+    busy_pnb_intervals = []
+    for job in pnb_jobs:
+        if job["start_ns"] is None or not (
+                job["ordered_complete"] or
+                job["incomplete_at_collection_boundary"]):
+            continue
+        interval_start = max(job["start_ns"], observation_start)
+        interval_end = min(
+            job["end_ns"] if job["end_ns"] is not None else observation_end,
+            observation_end)
+        if interval_end > interval_start:
+            busy_pnb_intervals.append((job, interval_start, interval_end))
+    busy_pnb_intervals.sort(
+        key=lambda item: (item[1], item[0]["start_sequence"]))
+    for (previous_job, _previous_start, previous_end), (
+            job, start_ns, _end_ns) in zip(
+                busy_pnb_intervals, busy_pnb_intervals[1:]):
+        if start_ns < previous_end:
+            integrity_errors.append(
+                "overlapping PNB busy intervals for epoch/jobs "
+                f"{(previous_job['process_epoch'], previous_job['job_id'])} and "
+                f"{(job['process_epoch'], job['job_id'])}")
+    merged_intervals = []
+    for job, interval_start, interval_end in busy_pnb_intervals:
+        if merged_intervals and interval_start <= merged_intervals[-1][1]:
             merged_intervals[-1][1] = max(
-                merged_intervals[-1][1], job["end_ns"])
+                merged_intervals[-1][1], interval_end)
         else:
-            merged_intervals.append([job["start_ns"], job["end_ns"]])
+            merged_intervals.append([interval_start, interval_end])
     pnb_ns = sum(end - start for start, end in merged_intervals)
 
     def containing_pnb_jobs(event):
         position = (event["steady_ns"], event["sequence"])
-        return [job for job in bounded_pnb_jobs
-                if (job["start_ns"], job["start_sequence"]) <= position <=
-                   (job["end_ns"], job["end_sequence"])]
+        return [job for job, _start_ns, _end_ns in busy_pnb_intervals
+                if (job["start_ns"], job["start_sequence"]) <= position and
+                (job["end_ns"] is None or position <=
+                 (job["end_ns"], job["end_sequence"]))]
 
     def count_source_relationship(prefix, event, jobs):
         if len(jobs) != 1 or jobs[0]["source_peer"] is None:
@@ -1045,8 +1566,9 @@ def analyze(manifest, summary, events, resources, rpc, max_join_age):
     lifecycle_counts = Counter(event["event"] for event in events if event["event_code"] in range(27, 31))
     handshake_latencies = [event["values"][2] for event in events if event["event_code"] == 28]
     finalizations = [event for event in events if event["event_code"] == 29]
+    all_finalizations = [event for event in all_events if event["event_code"] == 29]
     peer_finalizations = {}
-    for event in finalizations:
+    for event in all_finalizations:
         if not event["values"]:
             integrity_errors.append("short peer_finalized event")
             continue
@@ -1062,7 +1584,7 @@ def analyze(manifest, summary, events, resources, rpc, max_join_age):
     block_removal_ns = []
     block_stall_ns = []
     unmatched_block_removals = 0
-    for event in events:
+    for event in all_events:
         if event["event_code"] == 32 and event.get("block_id"):
             block_requests[(event["process_epoch"], event["values"][0],
                             event["block_id"])].append(event["steady_ns"])
@@ -1075,19 +1597,22 @@ def analyze(manifest, summary, events, resources, rpc, max_join_age):
                 requested_ns = block_requests[key].popleft()
                 if event["steady_ns"] < requested_ns:
                     integrity_errors.append(f"block removal precedes request for {key}")
-                elif reason == 1:
+                elif reason == 1 and event.get("collection_scope") == "measured":
                     block_completion_ns.append(event["steady_ns"] - requested_ns)
-                elif reason == 0:
+                elif reason == 0 and event.get("collection_scope") == "measured":
                     block_removal_ns.append(event["steady_ns"] - requested_ns)
-            else:
+            elif event.get("collection_scope") == "measured":
                 unmatched_block_removals += 1
         elif event["event_code"] == 34 and event.get("block_id"):
             key = (event["process_epoch"], event["values"][0], event["block_id"])
-            if block_requests[key] and event["steady_ns"] >= block_requests[key][0]:
+            if (event.get("collection_scope") == "measured" and
+                    block_requests[key] and event["steady_ns"] >= block_requests[key][0]):
                 block_stall_ns.append(event["steady_ns"] - block_requests[key][0])
 
-    receive_queue = queue_metrics(events, 22, observation_end, peer_finalizations)
-    send_queue = queue_metrics(events, 31, observation_end, peer_finalizations)
+    receive_queue = queue_metrics(
+        all_events, 22, observation_start, observation_end, peer_finalizations)
+    send_queue = queue_metrics(
+        all_events, 31, observation_start, observation_end, peer_finalizations)
     if receive_queue["negative_counter_samples"] or send_queue["negative_counter_samples"]:
         integrity_errors.append("negative queue counter observed")
     if (receive_queue["post_finalization_samples"] or
@@ -1095,29 +1620,38 @@ def analyze(manifest, summary, events, resources, rpc, max_join_age):
         integrity_errors.append("queue state observed after peer finalization")
 
     phases = ("ibd", "transition", "post_ibd", "unclassified")
+    phase_seconds = phase_observation_seconds(
+        rpc, observation_start_mono, observation_end_mono,
+        int(max_join_age * 1_000_000_000),
+        mapping_uncertainty_ns=mapping_uncertainty_ns)
     breakdowns = {
         "phase": {phase: subset_summary(
-                       [event for event in events if event["_phase"] == phase], events)
+                       [event for event in events if event["_phase"] == phase],
+                       all_events, observation_seconds=phase_seconds[phase])
                   for phase in phases},
         "message_type": {name: subset_summary(
                               [event for event in events
-                               if event["_message_type"] == name], events)
+                               if event["_message_type"] == name], all_events,
+                              observation_seconds=observation_seconds)
                          for name in sorted({event["_message_type"] for event in events
                                              if event["_message_type"]})},
         "connection_role": {name: subset_summary(
                                  [event for event in events
-                                  if event["_role"] == name], events)
+                                  if event["_role"] == name], all_events,
+                                 observation_seconds=observation_seconds)
                             for name in sorted({event["_role"] for event in events})},
         "pnb_delivery_route": {name: subset_summary(
                                     [event for event in events
-                                     if event["_pnb_route"] == name], events,
+                                     if event["_pnb_route"] == name], all_events,
+                                    observation_seconds=observation_seconds,
                                     include_interval_work=True)
                                for name in sorted({job["delivery_route"]
-                                                   for job in bounded_pnb_jobs
+                                                   for job, _start, _end in busy_pnb_intervals
                                                    if job["delivery_route"]})},
         "process_epoch": {str(epoch): subset_summary(
                                [event for event in events
-                                if event["process_epoch"] == epoch], events)
+                                if event["process_epoch"] == epoch], all_events,
+                               observation_seconds=observation_seconds)
                           for epoch in sorted({event["process_epoch"] for event in events})},
     }
 
@@ -1139,23 +1673,47 @@ def analyze(manifest, summary, events, resources, rpc, max_join_age):
             "maximum_age_seconds": max_join_age,
             "joined_age_ns": distribution(join_ages),
             "unclassified_event_count": sum(event["_phase"] == "unclassified" for event in events),
+            "phase_observation_seconds": phase_seconds,
         },
         "observation": {
             "seconds": observation_seconds,
             "hours": observation_seconds / 3600,
             "event_count": len(events),
+            "retained_event_count": len(all_events),
+            "pre_attach_backlog_event_count": len(all_events) - len(events),
+            "sequence_first": window.get("sequence_first"),
+            "sequence_last": window.get("sequence_last"),
+            "duration_source": window.get("duration_source"),
+            "clock_mapping_uncertainty_ns": mapping.get("mapping_uncertainty_ns"),
         },
         "pnb": {
-            "count": len(bounded_pnb_jobs),
+            "count": len(submitted_pnb_jobs),
+            "submitted_count": len(submitted_pnb_jobs),
+            "completed_count": len(complete_pnb_jobs),
+            "completed_submitted_count": len(completed_submitted_jobs),
+            "busy_interval_count": len(busy_pnb_intervals),
             "time_seconds": pnb_seconds,
             "wall_fraction": pnb_seconds / observation_seconds if observation_seconds else None,
-            "jobs_per_second": len(bounded_pnb_jobs) / observation_seconds if observation_seconds else None,
-            "blocks_per_second": sum(bool(job["new_block"]) for job in pnb_jobs) /
+            "jobs_per_second": len(submitted_pnb_jobs) / observation_seconds if observation_seconds else None,
+            "blocks_per_second": sum(bool(job["new_block"]) for job in completed_submitted_jobs) /
                                  observation_seconds if observation_seconds else None,
             "process_new_block_failures": sum(
-                job["process_new_block"] is False for job in pnb_jobs),
+                job["process_new_block"] is False for job in completed_submitted_jobs),
             "incomplete_at_collection_boundary": sum(
-                job["incomplete_at_collection_boundary"] for job in pnb_jobs),
+                job["incomplete_at_collection_boundary"] and
+                job["submit_scope"] == "measured" for job in pnb_jobs),
+            "pre_attach_jobs_excluded": sum(
+                job["submit_scope"] == "pre_attach_backlog" for job in pnb_jobs),
+            "pre_attach_active_at_measured_start": sum(
+                job["submit_scope"] == "pre_attach_backlog" and
+                job["start_ns"] is not None and
+                (job["end_ns"] is None or job["end_ns"] >= observation_start)
+                for job in pnb_jobs),
+            "active_at_collection_cutoff": sum(
+                job["submit_scope"] == "measured" and
+                job["start_ns"] is not None and job["end_ns"] is None and
+                job["incomplete_at_collection_boundary"]
+                for job in pnb_jobs),
             "impossible_join_count": sum("PNB" in error for error in integrity_errors),
             "during_pnb_counts": dict(sorted(during.items())),
             "during_pnb_rates_per_second": {
@@ -1253,6 +1811,7 @@ def analyze(manifest, summary, events, resources, rpc, max_join_age):
                  "sequence_failures", "process_exit_state")},
             "analysis_errors": integrity_errors,
             "valid": not integrity_errors and bool(summary.get("valid")),
+            "clock_mapping": mapping,
         },
         "observability": {
             "peer_response_receive": "not_observable",
@@ -1318,7 +1877,9 @@ def run_self_tests():
     names = {
         1: "complete_message_ready", 2: "handler_start",
         3: "handler_complete", 4: "response_queued", 5: "job_submit",
+        6: "slot_submit", 7: "worker_wake",
         8: "pnb_start", 9: "pnb_end", 10: "result_publication",
+        11: "busy_send_prefix_summary",
         12: "result_collection", 13: "continuation",
         21: "message_front_ready", 22: "receive_queue_state",
         23: "outbound_queued", 24: "socket_sent",
@@ -1347,7 +1908,100 @@ def run_self_tests():
         events.append(item)
         return item
 
-    def collector_metadata(events, mode="candidate"):
+    def fixture_fact(value, rows, *, lines=None):
+        encoded = (json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode()
+        return {"bytes": len(encoded), "data_rows": rows,
+                "lines": rows if lines is None else lines,
+                "sha256": hashlib.sha256(encoded).hexdigest()}
+
+    def fixture_artifacts(events, resources, rpc_rows, summary):
+        return {
+            "events.jsonl": fixture_fact(events, len(events)),
+            "resources.csv": fixture_fact(
+                resources, len(resources), lines=len(resources) + 1),
+            "rpc.jsonl": fixture_fact(rpc_rows, len(rpc_rows)),
+            "summary.json": fixture_fact(summary, 1, lines=1),
+        }
+
+    def collector_metadata(events, mode="candidate", *, resources=(), rpc_rows=(),
+                           start_mono=None, end_mono=None, pre_attach_count=0):
+        probe_steady = 1
+        wall_offset = 1_000_000_000_000
+        probe_wall = probe_steady + wall_offset
+        start_mono = (min((item["steady_ns"] for item in events), default=1)
+                      if start_mono is None else start_mono)
+        end_mono = (max((item["steady_ns"] for item in events), default=start_mono + 1)
+                    if end_mono is None else end_mono)
+        assert 0 <= pre_attach_count <= len(events) and end_mono > start_mono > 0
+        start_boundary = {
+            "producer_sequence": pre_attach_count,
+            "collector_monotonic_before_ns": start_mono,
+            "collector_monotonic_after_ns": start_mono,
+            "collector_monotonic_midpoint_ns": start_mono,
+            "collector_wall_before_ns": start_mono + wall_offset,
+            "collector_wall_after_ns": start_mono + wall_offset,
+            "collector_wall_midpoint_ns": start_mono + wall_offset,
+            "capture_uncertainty_ns": 0,
+        }
+        end_boundary = {
+            "producer_sequence": len(events),
+            "collector_monotonic_before_ns": end_mono,
+            "collector_monotonic_after_ns": end_mono,
+            "collector_monotonic_midpoint_ns": end_mono,
+            "collector_wall_before_ns": end_mono + wall_offset,
+            "collector_wall_after_ns": end_mono + wall_offset,
+            "collector_wall_midpoint_ns": end_mono + wall_offset,
+            "capture_uncertainty_ns": 0,
+        }
+        mapping = {
+            "probe_creation_wall_ns": probe_wall,
+            "probe_creation_steady_ns": probe_steady,
+            "collector_wall_ns": start_mono + wall_offset,
+            "collector_monotonic_ns": start_mono,
+            "probe_wall_minus_steady_ns": wall_offset,
+            "collector_wall_minus_monotonic_ns": wall_offset,
+            "steady_to_collector_monotonic_offset_ns": 0,
+            "steady_to_wall_offset_ns": wall_offset,
+            "origin_residual_ns": 0,
+            "capture_uncertainty_ns": 0,
+            "mapping_uncertainty_ns": 0,
+            "compatibility": "wall_offset_bridge_with_reported_uncertainty",
+            "method": "wall-offset bridge; residual may include pre-attach wall correction; no affine/drift claim",
+            "collection_wall_minus_monotonic_drift_ns": 0,
+            "cutoff_capture_uncertainty_ns": 0,
+        }
+        cutoff_mapping = {
+            **{key: value for key, value in mapping.items()
+               if key not in ("cutoff_capture_uncertainty_ns", "mapping_uncertainty_ns")},
+            "collector_wall_ns": end_mono + wall_offset,
+            "collector_monotonic_ns": end_mono,
+            "capture_uncertainty_ns": 0,
+            "mapping_uncertainty_ns": 0,
+        }
+        for item in events:
+            item["mapped_monotonic_ns"] = item["steady_ns"]
+            item["mapped_wall_ns"] = item["steady_ns"] + wall_offset
+            item["collection_scope"] = (
+                "pre_attach_backlog" if item["sequence"] <= pre_attach_count
+                else "measured")
+        measured_times = [item["steady_ns"] for item in events
+                          if item["collection_scope"] == "measured"]
+        scope_counts = dict(sorted(Counter(
+            item["collection_scope"] for item in events).items()))
+        window = {
+            "sequence_first": pre_attach_count + 1,
+            "sequence_last": len(events),
+            "pre_attach_sequence_last": pre_attach_count,
+            "start": start_boundary,
+            "end": end_boundary,
+            "duration_ns": end_mono - start_mono,
+            "duration_source": "collector_python_monotonic_midpoints",
+            "pre_attach_backlog_event_count": pre_attach_count,
+            "measured_event_count": len(events) - pre_attach_count,
+            "measured_event_mapped_monotonic_bounds_ns": (
+                [min(measured_times), max(measured_times)] if measured_times
+                else [None, None]),
+        }
         counts = dict(sorted(Counter(item["event"] for item in events).items()))
         first = events[0]["sequence"] if events else None
         last = events[-1]["sequence"] if events else None
@@ -1355,6 +2009,20 @@ def run_self_tests():
             min((item["steady_ns"] for item in events), default=None),
             max((item["steady_ns"] for item in events), default=None),
         ]
+        resource_mono = [min((row["monotonic_ns"] for row in resources), default=None),
+                         max((row["monotonic_ns"] for row in resources), default=None)]
+        resource_wall = [min((row["wall_ns"] for row in resources), default=None),
+                         max((row["wall_ns"] for row in resources), default=None)]
+        rpc_mono = [min((row["monotonic_ns"] for row in rpc_rows), default=None),
+                    max((row["monotonic_ns"] for row in rpc_rows), default=None)]
+        rpc_wall = [min((row["wall_ns"] for row in rpc_rows), default=None),
+                    max((row["wall_ns"] for row in rpc_rows), default=None)]
+        preliminary_artifacts = {
+            "events.jsonl": fixture_fact(events, len(events)),
+            "resources.csv": fixture_fact(
+                resources, len(resources), lines=len(resources) + 1),
+            "rpc.jsonl": fixture_fact(rpc_rows, len(rpc_rows)),
+        }
         summary = {
             "complete": True,
             "valid": True,
@@ -1362,12 +2030,18 @@ def run_self_tests():
             "process_exit_state": "running_at_collection_end",
             "process_epoch": epoch,
             "event_counts": counts,
+            "event_scope_counts": scope_counts,
             "event_count": len(events),
             "event_sequence_first": first,
             "event_sequence_last": last,
             "event_sequence_read_last": last,
             "event_sequence_durable_last": last,
             "collection_cutoff_sequence": last or 0,
+            "producer_sequence_observed": last or 0,
+            "probe_status": 0,
+            "collection_window": window,
+            "clock_mapping": mapping,
+            "cutoff_clock_mapping": cutoff_mapping,
             "consumer_ack": last or 0,
             "loss_count": 0,
             "checksum_failures": 0,
@@ -1375,12 +2049,30 @@ def run_self_tests():
             "sequence_failures": 0,
             "integrity_errors": [],
             "event_steady_bounds_ns": bounds,
+            "resource_samples": len(resources),
+            "resource_monotonic_bounds_ns": resource_mono,
+            "resource_wall_bounds_ns": resource_wall,
+            "rpc_rows": len(rpc_rows),
+            "rpc_samples": sum("error" not in row for row in rpc_rows),
+            "rpc_failures": sum("error" in row for row in rpc_rows),
+            "rpc_monotonic_bounds_ns": rpc_mono,
+            "rpc_wall_bounds_ns": rpc_wall,
+            "artifact_integrity": preliminary_artifacts,
         }
+        artifacts = fixture_artifacts(events, resources, rpc_rows, summary)
         manifest = {
             "collector_schema": 1,
             "probe_schema": 4,
             "mode": mode,
             "expected_chain": "regtest",
+            "clock_origin": {"monotonic_ns": start_mono,
+                             "wall_ns": start_mono + wall_offset},
+            "end_clock": {"monotonic_ns": end_mono,
+                           "wall_ns": end_mono + wall_offset},
+            "clock_mapping": mapping,
+            "cutoff_clock_mapping": cutoff_mapping,
+            "collection_window": window,
+            "artifacts": artifacts,
             "complete": True,
             "valid": True,
             "stop_reason": "duration_complete",
@@ -1394,19 +2086,41 @@ def run_self_tests():
                 "event_counts": counts,
             },
         }
-        return manifest, summary
+        return manifest, summary, artifacts
 
     rpc_fixture = [{
-        "monotonic_ns": 0,
-        "chain": {"chain": "regtest", "initialblockdownload": False},
+        "monotonic_ns": 100_000_000,
+        "wall_ns": 1_000_100_000_000,
+        "chain": {"chain": "regtest", "blocks": 100, "headers": 100,
+                  "initialblockdownload": False},
+        "warnings_present": False,
+        "network_totals": {"totalbytesrecv": 0, "totalbytessent": 0,
+                           "timemillis": 0},
+        "network": {"networkactive": True, "connections": 0,
+                    "connections_in": 0, "connections_out": 0},
+        "peers": [],
     }]
 
-    def fixture_report(events, mode="candidate", mutate_metadata=None):
+    def fixture_report(events, mode="candidate", mutate_metadata=None, *,
+                       resources=(), rpc_rows=None, mutate_rows=None,
+                       start_mono=None, end_mono=None, pre_attach_count=0):
         cloned = json.loads(json.dumps(events))
-        manifest, summary = collector_metadata(cloned, mode)
+        cloned_resources = json.loads(json.dumps(resources))
+        cloned_rpc = json.loads(json.dumps(
+            rpc_fixture if rpc_rows is None else rpc_rows))
+        manifest, summary, artifacts = collector_metadata(
+            cloned, mode, resources=cloned_resources, rpc_rows=cloned_rpc,
+            start_mono=start_mono, end_mono=end_mono,
+            pre_attach_count=pre_attach_count)
         if mutate_metadata:
             mutate_metadata(manifest, summary)
-        return analyze(manifest, summary, cloned, [], rpc_fixture, 30.0)
+        if mutate_rows:
+            mutate_rows(cloned, cloned_resources, cloned_rpc)
+        artifacts = fixture_artifacts(
+            cloned, cloned_resources, cloned_rpc, summary)
+        return analyze(
+            manifest, summary, cloned, cloned_resources, cloned_rpc,
+            30.0, artifacts)
 
     valid = []
     add(valid, 1, 100_000_000, [7, 101, 10, 34], text1="ping")
@@ -1423,6 +2137,9 @@ def run_self_tests():
     add(valid, 33, 500_000_000, [7, 100, 1, 0], block_id="b000002")
     add(valid, 5, 600_000_000, [1, 7, 1, 1, 0, 100, 0, 0],
         text1="standard", block_id="b000001")
+    add(valid, 6, 610_000_000, [1, 7, 0, 1],
+        text1="accepted", block_id="b000001")
+    add(valid, 7, 620_000_000, [1, 1, 7, 1], block_id="b000001")
     add(valid, 23, 700_000_000, [7, 203, 0, 8, 8, 1, 0], text1="ping")
     add(valid, 8, 1_000_000_000, [1, 1, 7, 1, 0, 100], block_id="b000001")
     add(valid, 2, 1_100_000_000, [8, 103], text1="getdata")
@@ -1446,6 +2163,8 @@ def run_self_tests():
     add(valid, 9, 2_000_000_000, [1, 1_000_000_000, 1, 1, 1, 7, 1],
         block_id="b000001")
     add(valid, 10, 2_010_000_000, [1, 1, 1, 1], block_id="b000001")
+    add(valid, 11, 2_015_000_000, [1, 7, 0, 0, 0, -1, 0, 0, 1],
+        block_id="b000001")
     add(valid, 12, 2_020_000_000, [1, 7, 1, 1, 1, 1],
         text1="standard", block_id="b000001")
     add(valid, 13, 2_030_000_000, [1, 7, 1, 1, 1],
@@ -1519,9 +2238,11 @@ def run_self_tests():
          if event["event_code"] == 1 and event["values"][:2] == [7, 101]
          )["_phase"] = "ibd"
     ibd_subset = subset_summary(
-        [event for event in anchored if event["_phase"] == "ibd"], anchored)
+        [event for event in anchored if event["_phase"] == "ibd"], anchored,
+        observation_seconds=2.0)
     transition_subset = subset_summary(
-        [event for event in anchored if event["_phase"] == "transition"], anchored)
+        [event for event in anchored if event["_phase"] == "transition"], anchored,
+        observation_seconds=2.0)
     assert ibd_subset["complete_ready_count"] == 1
     assert ibd_subset["response_queued_count"] == 1
     assert transition_subset["complete_ready_count"] == 0
@@ -1556,7 +2277,9 @@ def run_self_tests():
 
     prefix = []
     add(prefix, 5, 1, [3, 9, 1, 1], text1="standard", block_id="b4")
-    add(prefix, 8, 2, [3, 1, 9, 1], block_id="b4")
+    add(prefix, 6, 2, [3, 9, 0, 1], text1="accepted", block_id="b4")
+    add(prefix, 7, 3, [3, 1, 9, 1], block_id="b4")
+    add(prefix, 8, 4, [3, 1, 9, 1], block_id="b4")
     errors = []
     prefix_job = build_pnb_jobs(prefix, errors)[0]
     assert not errors and prefix_job["incomplete_at_collection_boundary"]
@@ -1645,9 +2368,14 @@ def run_self_tests():
     overlap = json.loads(json.dumps(valid))
     add(overlap, 5, 1_400_000_000, [5, 7, 1, 1],
         text1="standard", block_id="b6")
+    add(overlap, 6, 1_405_000_000, [5, 7, 0, 1],
+        text1="accepted", block_id="b6")
+    add(overlap, 7, 1_408_000_000, [5, 1, 7, 1], block_id="b6")
     add(overlap, 8, 1_410_000_000, [5, 1, 7, 1], block_id="b6")
     add(overlap, 9, 1_800_000_000, [5, 390_000_000, 1, 1, 1, 7, 1], block_id="b6")
     add(overlap, 10, 1_810_000_000, [5, 1, 1, 1], block_id="b6")
+    add(overlap, 11, 1_815_000_000, [5, 7, 0, 0, 0, -1, 0, 0, 1],
+        block_id="b6")
     add(overlap, 12, 1_820_000_000, [5, 7, 1, 1, 1],
         text1="standard", block_id="b6")
     add(overlap, 13, 1_830_000_000, [5, 7, 1, 1, 1],
@@ -1655,6 +2383,223 @@ def run_self_tests():
     overlap_report = fixture_report(overlap)
     assert any("overlapping PNB intervals" in error
                for error in overlap_report["integrity"]["analysis_errors"])
+
+    def renumber(items):
+        for sequence, item in enumerate(items, 1):
+            item["sequence"] = sequence
+
+    # Async lifecycle validation includes every producer stage. These cases
+    # specifically fail logic that only knew submit/start/end/publication/
+    # collection/continuation.
+    for missing_code in (5, 6, 7, 8, 9, 10, 11, 12):
+        missing = json.loads(json.dumps(valid))
+        missing.remove(next(item for item in missing if item["event_code"] == missing_code))
+        renumber(missing)
+        missing_report = fixture_report(missing)
+        assert not missing_report["integrity"]["valid"], missing_code
+        assert any("PNB" in error for error in
+                   missing_report["integrity"]["analysis_errors"]), missing_code
+    missing_continuation = json.loads(json.dumps(valid))
+    missing_continuation.remove(next(
+        item for item in missing_continuation if item["event_code"] == 13))
+    renumber(missing_continuation)
+    continuation_report = fixture_report(missing_continuation)
+    assert continuation_report["integrity"]["valid"]
+    assert continuation_report["pnb"]["incomplete_at_collection_boundary"] == 1
+
+    for duplicate_code in range(5, 14):
+        duplicate = json.loads(json.dumps(valid))
+        original = next(item for item in duplicate
+                        if item["event_code"] == duplicate_code)
+        index = duplicate.index(original)
+        duplicate.insert(index + 1, json.loads(json.dumps(original)))
+        renumber(duplicate)
+        duplicate_report = fixture_report(duplicate)
+        assert any("duplicate PNB" in error for error in
+                   duplicate_report["integrity"]["analysis_errors"]), duplicate_code
+
+    reordered = json.loads(json.dumps(valid))
+    first_index = next(index for index, item in enumerate(reordered)
+                       if item["event_code"] == 6)
+    second_index = next(index for index, item in enumerate(reordered)
+                        if item["event_code"] == 7)
+    reordered[first_index], reordered[second_index] = (
+        reordered[second_index], reordered[first_index])
+    renumber(reordered)
+    reordered_report = fixture_report(reordered)
+    assert any("lifecycle order" in error for error in
+               reordered_report["integrity"]["analysis_errors"])
+
+    lifecycle_corruptions = (
+        (6, lambda item: (item["values"].__setitem__(2, 1),
+                          item.__setitem__("text1", "full")), "submit status"),
+        (7, lambda item: item["values"].__setitem__(2, 99), "source labels"),
+        (7, lambda item: item["values"].__setitem__(3, 2), "route labels"),
+        (10, lambda item: item["values"].__setitem__(2, 0), "result labels"),
+        (11, lambda item: item["values"].__setitem__(2, 1), "busy-prefix"),
+    )
+    for code, mutate, expected in lifecycle_corruptions:
+        corrupted = json.loads(json.dumps(valid))
+        mutate(next(item for item in corrupted if item["event_code"] == code))
+        corrupted_report = fixture_report(corrupted)
+        assert any(expected in error for error in
+                   corrupted_report["integrity"]["analysis_errors"]), (code, expected)
+    blank_continuation = json.loads(json.dumps(valid))
+    next(item for item in blank_continuation if item["event_code"] == 12)["text1"] = ""
+    blank_report = fixture_report(blank_continuation)
+    assert any("continuation label" in error for error in
+               blank_report["integrity"]["analysis_errors"])
+    wrong_hash = json.loads(json.dumps(valid))
+    next(item for item in wrong_hash if item["event_code"] == 11)["block_id"] = "b999999"
+    assert any("block labels" in error for error in
+               fixture_report(wrong_hash)["integrity"]["analysis_errors"])
+    cross_job = json.loads(json.dumps(valid))
+    next(item for item in cross_job if item["event_code"] == 11)["values"][0] = 2
+    assert not fixture_report(cross_job)["integrity"]["valid"]
+
+    # Every mandatory join identifier fails closed at zero; RECEIVE_QUEUE_STATE
+    # keeps its documented route-1 zero sentinel but route-2 pop requires an ID.
+    for code in (1, 2, 3, 4, 21):
+        zero = json.loads(json.dumps(valid))
+        next(item for item in zero if item["event_code"] == code)["values"][1] = 0
+        assert any("zero inbound causal ID" in error for error in
+                   fixture_report(zero)["integrity"]["analysis_errors"]), code
+    zero_pop = json.loads(json.dumps(valid))
+    pop = next(item for item in zero_pop if item["event_code"] == 22)
+    pop["values"][4:6] = [2, 0]
+    assert any("zero receive-pop causal ID" in error for error in
+               fixture_report(zero_pop)["integrity"]["analysis_errors"])
+    for relation_index in (1, 2):
+        zero_relation = json.loads(json.dumps(valid))
+        next(item for item in zero_relation if item["event_code"] == 26
+             )["values"][relation_index] = 0
+        assert any("zero causal relation ID" in error for error in
+                   fixture_report(zero_relation)["integrity"]["analysis_errors"])
+    for code in range(5, 14):
+        zero_job = json.loads(json.dumps(valid))
+        next(item for item in zero_job if item["event_code"] == code)["values"][0] = 0
+        assert any("zero PNB job ID" in error for error in
+                   fixture_report(zero_job)["integrity"]["analysis_errors"]), code
+
+    # Quiet boundaries, filtered rates, phase expiry, queue carry-in, and PNB
+    # jobs crossing either collection edge all use the explicit global window.
+    sparse = fixture_report(valid, start_mono=1, end_mono=10_000_000_001)
+    assert sparse["observation"]["seconds"] == 10
+    assert sparse["service_throughput"][
+        "useful_correlated_completed_responses_per_wall_second"] == 0.2
+    assert sparse["breakdowns"]["message_type"]["ping"][
+        "observation_hours"] == 10 / 3600
+    assert math.isclose(sum(sparse["rpc_join"]["phase_observation_seconds"].values()), 10)
+    phase_gap = phase_observation_seconds(
+        [{"monotonic_ns": 10, "chain": {"initialblockdownload": True}}],
+        1, 101, 20)
+    assert math.isclose(sum(phase_gap.values()), 100 / 1e9)
+    assert math.isclose(phase_gap["ibd"], 20 / 1e9)
+    assert math.isclose(phase_gap["unclassified"], 80 / 1e9)
+    uncertain_phase_gap = phase_observation_seconds(
+        [{"monotonic_ns": 10, "chain": {"initialblockdownload": True}}],
+        1, 101, 20, mapping_uncertainty_ns=5)
+    assert math.isclose(sum(uncertain_phase_gap.values()), 100 / 1e9)
+    assert math.isclose(uncertain_phase_gap["ibd"], 10 / 1e9)
+    assert math.isclose(uncertain_phase_gap["unclassified"], 90 / 1e9)
+    uncertainty_events = [
+        {"event_code": 30, "values": [7], "process_epoch": epoch,
+         "steady_ns": 12, "mapped_monotonic_ns": 12},
+        {"event_code": 30, "values": [7], "process_epoch": epoch,
+         "steady_ns": 20, "mapped_monotonic_ns": 20},
+        {"event_code": 30, "values": [7], "process_epoch": epoch,
+         "steady_ns": 28, "mapped_monotonic_ns": 28},
+    ]
+    annotate(uncertainty_events,
+             [{"monotonic_ns": 10,
+               "chain": {"initialblockdownload": True}}],
+             20 / 1e9, mapping_uncertainty_ns=5)
+    assert [event["_phase"] for event in uncertainty_events] == [
+        "unclassified", "ibd", "unclassified"]
+
+    preattach = json.loads(json.dumps(valid))
+    start_event = next(item for item in preattach if item["event_code"] == 8)
+    preattach_report = fixture_report(
+        preattach, pre_attach_count=start_event["sequence"],
+        start_mono=1_050_000_000, end_mono=2_100_000_000)
+    assert preattach_report["pnb"]["submitted_count"] == 0
+    assert preattach_report["pnb"]["pre_attach_active_at_measured_start"] == 1
+    assert preattach_report["pnb"]["busy_interval_count"] == 1
+    assert preattach_report["pnb"]["time_seconds"] == 0.95
+
+    active_cutoff = [item for item in json.loads(json.dumps(valid))
+                     if item["event_code"] not in (9, 10, 11, 12, 13)]
+    renumber(active_cutoff)
+    active_report = fixture_report(active_cutoff)
+    assert active_report["integrity"]["valid"]
+    assert active_report["pnb"]["active_at_collection_cutoff"] == 1
+    assert active_report["pnb"]["time_seconds"] == 1.1
+
+    tied = json.loads(json.dumps(valid))
+    pnb_end = next(item for item in tied if item["event_code"] == 9)
+    add(tied, 1, pnb_end["steady_ns"], [44, 444, 1, 25], text1="ping")
+    add(tied, 21, pnb_end["steady_ns"], [44, 444, 1, 1, 0], text1="ping")
+    add(tied, 2, pnb_end["steady_ns"], [44, 444], text1="ping")
+    add(tied, 3, pnb_end["steady_ns"], [44, 444, 0], text1="ping")
+    tied_report = fixture_report(tied)
+    assert tied_report["pnb"]["during_pnb_counts"]["handler_start"] == 2
+
+    queue_fixture = []
+    add(queue_fixture, 22, 500_000_000, [92, 50, 1, 1, 1])
+    add(queue_fixture, 29, 800_000_000, [92, 0, 1, 1])
+    queue_report = fixture_report(
+        queue_fixture, pre_attach_count=1,
+        start_mono=600_000_000, end_mono=1_000_000_000)
+    assert queue_report["queues"]["receive"]["byte_depth_area_byte_ns"] == 10_000_000_000
+    assert queue_report["queues"]["receive"]["pause_duration_ns"] == 200_000_000
+    assert queue_report["queues"]["receive"]["open_pause_intervals_at_epoch_end"] == 0
+
+    resource_row = {field: 0 for field in RESOURCE_FIELDS}
+    resource_row.update(monotonic_ns=200_000_000,
+                        wall_ns=1_000_200_000_000,
+                        rss_bytes=1024, thread_count=1)
+    assert fixture_report(valid, resources=[resource_row])["integrity"]["valid"]
+    deleted_resource = fixture_report(
+        valid, resources=[resource_row],
+        mutate_rows=lambda _events, rows, _rpc: rows.clear())
+    assert any("resource" in error.lower() or "artifact" in error.lower()
+               for error in deleted_resource["integrity"]["analysis_errors"])
+    altered_rpc = fixture_report(
+        valid, mutate_rows=lambda _events, _resources, rows:
+        rows[0]["chain"].__setitem__("blocks", 101))
+    assert any("artifact" in error.lower() for error in
+               altered_rpc["integrity"]["analysis_errors"])
+    malformed_rpc = fixture_report(
+        valid, mutate_rows=lambda _events, _resources, rows:
+        rows[0].__setitem__("error", "Injected"))
+    assert any("failure/success shape" in error for error in
+               malformed_rpc["integrity"]["analysis_errors"])
+    truncated_events = fixture_report(
+        valid, mutate_rows=lambda rows, _resources, _rpc: rows.pop())
+    assert any("artifact" in error.lower() or "event_count" in error
+               for error in truncated_events["integrity"]["analysis_errors"])
+
+    def corrupt_clock(manifest, summary):
+        summary["clock_mapping"]["steady_to_collector_monotonic_offset_ns"] += 1
+        manifest["clock_mapping"]["steady_to_collector_monotonic_offset_ns"] += 1
+
+    clock_report = fixture_report(valid, mutate_metadata=corrupt_clock)
+    assert any("clock mapping" in error or "mapped monotonic" in error
+               for error in clock_report["integrity"]["analysis_errors"])
+
+    def corrupt_origin(manifest, summary):
+        for metadata in (manifest, summary):
+            metadata["clock_mapping"]["probe_creation_wall_ns"] = 0
+            metadata["cutoff_clock_mapping"]["probe_creation_wall_ns"] = 0
+
+    origin_report = fixture_report(valid, mutate_metadata=corrupt_origin)
+    assert any("probe clock origins" in error for error in
+               origin_report["integrity"]["analysis_errors"])
+    artifact_report = fixture_report(
+        valid, mutate_metadata=lambda _manifest, summary:
+        summary["artifact_integrity"]["rpc.jsonl"].__setitem__("sha256", "0" * 64))
+    assert any("artifact" in error.lower() for error in
+               artifact_report["integrity"]["analysis_errors"])
     print("async_pnb_analyzer self-test: PASS")
 
 
@@ -1701,7 +2646,15 @@ def main():
         events = read_jsonl(source / "events.jsonl")
         resources = read_resources(source / "resources.csv")
         rpc = read_jsonl(source / "rpc.jsonl")
-        report = analyze(manifest, summary, events, resources, rpc, args.max_rpc_join_age)
+        artifacts = {
+            "events.jsonl": file_facts(source / "events.jsonl"),
+            "resources.csv": file_facts(source / "resources.csv", csv_header=True),
+            "rpc.jsonl": file_facts(source / "rpc.jsonl"),
+            "summary.json": file_facts(source / "summary.json"),
+        }
+        report = analyze(
+            manifest, summary, events, resources, rpc,
+            args.max_rpc_join_age, artifacts)
         if not args.allow_invalid and not report["integrity"]["valid"]:
             raise AnalysisError(
                 "analysis found invalid joins/order: " +

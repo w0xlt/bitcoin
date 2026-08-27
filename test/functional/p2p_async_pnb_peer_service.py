@@ -155,6 +155,8 @@ class ProbeSliceReader:
         self.fd = os.open(self.path, flags)
         self.mapping = mmap.mmap(self.fd, 0, access=mmap.ACCESS_WRITE)
         self.expect_test_gates = expect_test_gates
+        self.process_epoch = None
+        self.last_raw_slot = None
         self.header = self.read_header()
 
     def read_header(self):
@@ -176,9 +178,14 @@ class ProbeSliceReader:
         if header[17]:
             raise AssertionError(
                 f"async-PNB test gate timeout: {self.path} generation={header[17]}")
+        assert header[8] != 0
+        if self.process_epoch is None:
+            self.process_epoch = header[8]
+        elif header[8] != self.process_epoch:
+            raise AssertionError(
+                f"async-PNB probe epoch changed: {self.path} "
+                f"expected={self.process_epoch} observed={header[8]}")
         self.header = header
-        self.process_epoch = header[8]
-        assert self.process_epoch != 0
         self.next_sequence = header[11]
         return header
 
@@ -197,9 +204,12 @@ class ProbeSliceReader:
         published_before = struct.unpack_from("<Q", self.mapping, offset)[0]
         if published_before & PROBE_SLOT_CLAIM:
             return None
-        if published_before == 0:
+        if published_before < sequence:
             return None
-        assert published_before == sequence
+        if published_before > sequence:
+            raise AssertionError(
+                f"async-PNB probe sequence gap: {self.path} "
+                f"expected={sequence} observed={published_before}")
         record = self.mapping[offset + 8:offset + 8 + PROBE_EVENT.size]
         checksum = struct.unpack_from("<Q", self.mapping, offset + 248)[0]
         published_after = struct.unpack_from("<Q", self.mapping, offset)[0]
@@ -211,12 +221,132 @@ class ProbeSliceReader:
             raise AssertionError(
                 f"async-PNB probe checksum mismatch: {self.path} sequence={sequence}")
         event = PROBE_EVENT.unpack(record)
+        assert event[0] == sequence
         assert event[1] == self.process_epoch
+        self.last_raw_slot = bytes(record) + struct.pack("<Q", checksum)
         return event
+
+    def acknowledge(self, sequence):
+        struct.pack_into("<Q", self.mapping, 72, sequence)
 
     def close(self):
         self.mapping.close()
         os.close(self.fd)
+
+
+class ProbeEventJournal:
+    """Test-only durable retention preceding producer acknowledgement."""
+
+    MAGIC = b"APNBJNL1"
+
+    def __init__(self, path=None, *, output=None, sync=os.fsync, process_epoch=0):
+        assert (path is None) != (output is None)
+        self.path = Path(path).resolve() if path is not None else None
+        self.output = (self.path.open("xb", buffering=1024 * 1024)
+                       if output is None else output)
+        self.sync = sync
+        self.closed = False
+        self.output.write(struct.pack("<8sQ", self.MAGIC, process_epoch))
+
+    def append(self, raw_slot):
+        assert not self.closed and len(raw_slot) == PROBE_EVENT.size + 8
+        self.output.write(raw_slot)
+
+    def make_durable_and_acknowledge(self, sequence, acknowledge):
+        assert not self.closed
+        self.output.flush()
+        self.sync(self.output.fileno())
+        acknowledge(sequence)
+
+    def close(self, *, clean):
+        if self.closed:
+            return
+        self.output.flush()
+        self.sync(self.output.fileno())
+        self.output.close()
+        self.closed = True
+        if clean and self.path is not None:
+            assert self.path.parent.is_dir() and not self.path.is_symlink()
+            self.path.unlink()
+
+
+def probe_reader_contract_self_test(directory):
+    """Deterministically exercise wrap, epoch, and durable-ack semantics."""
+    directory = Path(directory).resolve()
+    pid = 999_999
+    path = directory / f"async-pnb-probe-{pid}.bin"
+    epoch = 0x123456789ABCDEF
+    sequence = PROBE_CAPACITY + 1
+    header = PROBE_HEADER.pack(
+        PROBE_MAGIC, PROBE_SCHEMA, PROBE_HEADER_SIZE, PROBE_RECORD_SIZE,
+        PROBE_CAPACITY, PROBE_ENDIAN, pid, 0, epoch, 10, 20,
+        sequence, 1, 0, 0, 0, 0, 0, -1)
+    with path.open("xb") as fixture:
+        fixture.truncate(PROBE_HEADER_SIZE + PROBE_CAPACITY * PROBE_RECORD_SIZE)
+        fixture.seek(0)
+        fixture.write(header)
+    reader = None
+    try:
+        reader = ProbeSliceReader(path, expect_test_gates=False)
+        offset = PROBE_HEADER_SIZE
+        values = [0] * 16
+        record = PROBE_EVENT.pack(
+            sequence, epoch, 1, 0, 25, *values, b"ping", b"", bytes(32))
+        struct.pack_into("<240sQ", reader.mapping, offset + 8,
+                         record, reader.checksum(record))
+        struct.pack_into("<Q", reader.mapping, offset, 1)
+        assert reader.read_event(sequence) is None
+        struct.pack_into("<Q", reader.mapping, offset, PROBE_SLOT_CLAIM | sequence)
+        assert reader.read_event(sequence) is None
+        struct.pack_into("<Q", reader.mapping, offset, sequence + 1)
+        try:
+            reader.read_event(sequence)
+        except AssertionError as error:
+            assert "sequence gap" in str(error)
+        else:
+            raise AssertionError("publication above expected sequence was accepted")
+        struct.pack_into("<Q", reader.mapping, offset, sequence)
+        assert reader.read_event(sequence)[0] == sequence
+        struct.pack_into("<Q", reader.mapping, 40, epoch + 1)
+        try:
+            reader.read_header()
+        except AssertionError as error:
+            assert "epoch changed" in str(error)
+        else:
+            raise AssertionError("probe epoch mutation was accepted")
+    finally:
+        if reader is not None:
+            reader.close()
+        if path.exists():
+            path.unlink()
+
+    timeline = []
+
+    class Output:
+        def write(self, value):
+            timeline.append(("write", len(value)))
+
+        def flush(self):
+            timeline.append("flush")
+
+        @staticmethod
+        def fileno():
+            return 123
+
+        def close(self):
+            timeline.append("close")
+
+    journal = ProbeEventJournal(
+        output=Output(), process_epoch=epoch,
+        sync=lambda descriptor: timeline.append(("fsync", descriptor)))
+    timeline.clear()
+    journal.append(record + struct.pack("<Q", ProbeSliceReader.checksum(record)))
+    journal.make_durable_and_acknowledge(
+        sequence, lambda value: timeline.append(("ack", value)))
+    assert timeline == [
+        ("write", PROBE_EVENT.size + 8), "flush", ("fsync", 123),
+        ("ack", sequence)]
+    journal.close(clean=True)
 
 PROFILES = {
     # One warmup and one retained isolated trial for every fixed class.
@@ -389,9 +519,14 @@ class MarkerReader:
             candidates.append((path.stat().st_mtime_ns, int(suffix), path))
         for _mtime, pid, path in sorted(candidates):
             reader = ProbeSliceReader(path, expect_test_gates=self.expect_test_gates)
+            journal = ProbeEventJournal(
+                self.directory / f"{path.name}.journal",
+                process_epoch=reader.process_epoch)
             self.files.append({
+                "durable_sequence": 0,
                 "event_count": 0,
                 "expected_sequence": 1,
+                "journal": journal,
                 "pid": pid,
                 "reader": reader,
             })
@@ -514,6 +649,7 @@ class MarkerReader:
 
     def _poll_file(self, state):
         reader = state["reader"]
+        journal = state["journal"]
         reader.read_header()
         while state["expected_sequence"] <= reader.next_sequence:
             record = reader.read_event(state["expected_sequence"])
@@ -521,9 +657,13 @@ class MarkerReader:
                 # next_sequence is reserved before release publication. This
                 # is an in-flight append, not an unstable/torn slot; final
                 # parsing after node exit requires every reservation below.
-                return
+                break
             sequence, process_epoch, event, flags, steady_ns = record[:5]
             assert sequence == state["expected_sequence"]
+            # Retain the exact checksummed record before it can become
+            # producer-reclaimable. The mmap acknowledgement below is made
+            # only after this journal batch has reached stable storage.
+            journal.append(reader.last_raw_slot)
             values = record[5:21]
             text1 = self._decode_text(record[21])
             text2 = self._decode_text(record[22])
@@ -540,9 +680,11 @@ class MarkerReader:
             self.events.append(marker)
             state["event_count"] += 1
             state["expected_sequence"] += 1
-            # Acknowledge only after the complete, checksummed event has been
-            # incorporated into the reader's durable logical stream.
-            struct.pack_into("<Q", reader.mapping, 72, sequence)
+        durable_target = state["expected_sequence"] - 1
+        if durable_target > state["durable_sequence"]:
+            journal.make_durable_and_acknowledge(
+                durable_target, reader.acknowledge)
+            state["durable_sequence"] = durable_target
 
     def poll(self):
         self._discover()
@@ -628,6 +770,8 @@ class MarkerReader:
             header = reader.read_header()
             assert state["expected_sequence"] == header[11] + 1, (
                 reader.path, state["expected_sequence"], header[11])
+            assert state["durable_sequence"] == state["expected_sequence"] - 1
+            assert header[12] == state["durable_sequence"]
             if require_gate_none:
                 assert header[14] == PROBE_GATES["none"], header
                 assert header[16] == header[15], header
@@ -661,6 +805,7 @@ class MarkerReader:
     def remove_files(self):
         paths = [state["reader"].path for state in self.files]
         for state in self.files:
+            state["journal"].close(clean=True)
             state["reader"].close()
         for path in paths:
             assert path.parent == self.directory and not path.is_symlink()
@@ -804,6 +949,8 @@ class AsyncPNBPeerService(BitcoinTestFramework):
             ]
         self.add_nodes(self.num_nodes, self.extra_args)
         self.start_nodes()
+        if self.probe_enabled and not self.options.peer_service_collector_integration:
+            probe_reader_contract_self_test(self.probe_dir)
         self.markers = (
             MarkerReader(
                 self.probe_dir, self.options.timeout_factor,
@@ -1032,7 +1179,11 @@ class AsyncPNBPeerService(BitcoinTestFramework):
         elif service == "getdata":
             peer.begin_service_request(
                 service,
-                msg_getdata([CInv(MSG_TX, fixture["unknown_tx_hash"])]),
+                msg_getdata([
+                    CInv(MSG_TX, fixture["unknown_tx_hash"]),
+                    CInv(MSG_TX, fixture["unknown_tx_hash"]),
+                    CInv(MSG_TX, fixture["unknown_tx_hash"]),
+                ]),
                 ("notfound",))
         else:
             raise AssertionError(service)
@@ -1071,8 +1222,9 @@ class AsyncPNBPeerService(BitcoinTestFramework):
         elif service == "getdata":
             assert response_types == ["notfound"]
             inv = responses[0]["message"].vec
-            assert len(inv) == 1
-            assert inv[0].type == MSG_TX and inv[0].hash == fixture["unknown_tx_hash"]
+            assert len(inv) == 3
+            assert all(item.type == MSG_TX and item.hash == fixture["unknown_tx_hash"]
+                       for item in inv)
         else:
             raise AssertionError(service)
 
@@ -2138,6 +2290,25 @@ class AsyncPNBPeerService(BitcoinTestFramework):
         headers = headers_timing["responses"][0]["message"].headers
         assert len(headers) == 1 and headers[0].hash_int == int(tip_hash, 16)
 
+        getdata_targets = []
+        for serial in (1, 2):
+            getdata_checkpoint = self.markers.checkpoint() if self.markers else 0
+            getdata_fixture = {"unknown_tx_hash": int.from_bytes(
+                hashlib.sha256(f"dispatch-notfound-{serial}".encode()).digest(), "big")}
+            self._begin_service_request(peer, "getdata", getdata_fixture)
+            getdata_timing = peer.finish_service_request()
+            self._validate_service_response(getdata_timing, getdata_fixture)
+            if self.markers:
+                target = self._target_service(
+                    peer_id, getdata_timing, getdata_checkpoint)
+                outbound = self.markers.unique(
+                    "outbound_queued", getdata_checkpoint, peer=peer_id,
+                    causal_msg_id=target["message_id"], msg="notfound")
+                assert target["response_markers"][0]["outbound_id"] == outbound["outbound_id"]
+                getdata_targets.append(target)
+        if self.markers:
+            assert len({target["message_id"] for target in getdata_targets}) == 2
+
         second_nonce = 0xA700000000000002
         second_fixture = {"nonce": second_nonce}
         self._begin_service_request(peer, "ping", second_fixture)
@@ -2163,6 +2334,11 @@ class AsyncPNBPeerService(BitcoinTestFramework):
 
         peer.peer_disconnect()
         peer.wait_for_disconnect()
+        if self.markers:
+            # Drain final peer lifecycle records, then clean the test-only
+            # durable journal and probe mapping on orderly dispatch completion.
+            self.markers.finalize(require_gate_none=True)
+            self.markers.remove_files()
 
     def _run_collector_integration(self):
         """Exercise the standalone collector on V1, V2, ordinary, and PNB traffic."""

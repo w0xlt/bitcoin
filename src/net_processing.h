@@ -39,6 +39,29 @@ class uint256;
 namespace node {
 class Warnings;
 class AsyncPNBPeerServiceProbe;
+
+namespace detail {
+/** Allocation-free grouping for contiguous inbound GETDATA causal IDs. */
+class ContiguousCausalIdTracker
+{
+public:
+    explicit ContiguousCausalIdTracker(uint64_t already_emitted = 0)
+        : m_last{already_emitted}
+    {
+    }
+
+    template <typename Callback>
+    void Visit(uint64_t causal_id, Callback&& callback)
+    {
+        if (causal_id == 0 || causal_id == m_last) return;
+        callback(causal_id);
+        m_last = causal_id;
+    }
+
+private:
+    uint64_t m_last;
+};
+} // namespace detail
 } // namespace node
 
 /** Whether transaction reconciliation protocol should be enabled by default. */
