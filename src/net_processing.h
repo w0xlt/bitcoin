@@ -41,25 +41,30 @@ class Warnings;
 class AsyncPNBPeerServiceProbe;
 
 namespace detail {
-/** Allocation-free grouping for contiguous inbound GETDATA causal IDs. */
-class ContiguousCausalIdTracker
+/** Allocation-free selection/grouping for exact NOTFOUND decisions. */
+class GetDataNotFoundCausalTracker
 {
 public:
-    explicit ContiguousCausalIdTracker(uint64_t already_emitted = 0)
+    explicit GetDataNotFoundCausalTracker(uint64_t already_emitted = 0)
         : m_last{already_emitted}
     {
     }
 
     template <typename Callback>
-    void Visit(uint64_t causal_id, Callback&& callback)
+    void Visit(bool appended_to_notfound, uint64_t causal_id, Callback&& callback)
     {
-        if (causal_id == 0 || causal_id == m_last) return;
+        if (!appended_to_notfound || causal_id == 0) return;
+        if (m_primary == 0) m_primary = causal_id;
+        if (causal_id == m_last) return;
         callback(causal_id);
         m_last = causal_id;
     }
 
+    uint64_t Primary() const noexcept { return m_primary; }
+
 private:
     uint64_t m_last;
+    uint64_t m_primary{0};
 };
 } // namespace detail
 } // namespace node

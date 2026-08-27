@@ -334,16 +334,43 @@ bool HasSendMessage(CNode& node, std::string_view msg_type)
 
 BOOST_FIXTURE_TEST_SUITE(peerman_tests, RegTestingSetup)
 
-BOOST_AUTO_TEST_CASE(async_pnb_getdata_contiguous_causal_groups)
+BOOST_AUTO_TEST_CASE(async_pnb_getdata_notfound_decision_causality)
 {
-    // One NOTFOUND response uses A as its primary causal ID. A,A is one
+    struct Decision {
+        CInv inv;
+        bool appended_to_notfound;
+        uint64_t causal_id;
+    };
+
+    // Equal inventory A is found, then equal inventory B is not found. The
+    // exact decision, rather than value matching, selects B as primary.
+    const CInv duplicate_inv{MSG_TX, uint256{1}};
+    const std::array<Decision, 2> equal_inventory{{
+        {duplicate_inv, false, 101},
+        {duplicate_inv, true, 202},
+    }};
+    BOOST_CHECK_EQUAL(equal_inventory[0].inv.type, equal_inventory[1].inv.type);
+    BOOST_CHECK(equal_inventory[0].inv.hash == equal_inventory[1].inv.hash);
+    node::detail::GetDataNotFoundCausalTracker selection;
+    for (const auto& decision : equal_inventory) {
+        selection.Visit(decision.appended_to_notfound, decision.causal_id,
+                        [](uint64_t) {});
+    }
+    BOOST_CHECK_EQUAL(selection.Primary(), 202U);
+
+    // One NOTFOUND response uses A as primary. Exact A,A decisions form one
     // contiguous source group and B contributes exactly one extra relation.
     constexpr uint64_t primary{101};
-    const std::vector<uint64_t> processed_ids{primary, primary, 202};
+    const std::array<Decision, 3> grouped{{
+        {CInv{MSG_TX, uint256{2}}, true, primary},
+        {CInv{MSG_TX, uint256{3}}, true, primary},
+        {CInv{MSG_TX, uint256{4}}, true, 202},
+    }};
     std::vector<uint64_t> extra_links;
-    node::detail::ContiguousCausalIdTracker tracker{primary};
-    for (const uint64_t id : processed_ids) {
-        tracker.Visit(id, [&](uint64_t distinct_id) {
+    node::detail::GetDataNotFoundCausalTracker tracker{primary};
+    for (const auto& decision : grouped) {
+        tracker.Visit(decision.appended_to_notfound, decision.causal_id,
+                      [&](uint64_t distinct_id) {
             extra_links.push_back(distinct_id);
         });
     }

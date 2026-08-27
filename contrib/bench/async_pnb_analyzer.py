@@ -202,11 +202,10 @@ def prepare_rpc_states(rpc, max_age_ns):
     return join
 
 
-def phase_observation_seconds(rpc, start_ns, end_ns, max_age_ns,
-                              mapping_uncertainty_ns=0):
+def phase_observation_intervals(rpc, start_ns, end_ns, max_age_ns,
+                                mapping_uncertainty_ns=0):
     if end_ns <= start_ns:
-        return {name: 0.0 for name in
-                ("ibd", "transition", "post_ibd", "unclassified")}
+        return []
     join = prepare_rpc_states(rpc, max_age_ns)
     points = {start_ns, end_ns}
     for row in rpc:
@@ -219,7 +218,7 @@ def phase_observation_seconds(rpc, start_ns, end_ns, max_age_ns,
                 if start_ns < point < end_ns:
                     points.add(point)
     ordered = sorted(points)
-    durations = Counter()
+    intervals = []
     for left, right in zip(ordered, ordered[1:]):
         # Classification at an expiry boundary itself is inclusive (age ==
         # max), but that single instant has no interval width. An interior
@@ -229,6 +228,16 @@ def phase_observation_seconds(rpc, start_ns, end_ns, max_age_ns,
         high_phase, _high_age = join(midpoint + mapping_uncertainty_ns)
         phase = (low_phase if low_phase == high_phase and
                  low_phase != "unclassified" else "unclassified")
+        intervals.append((phase, left, right))
+    return intervals
+
+
+def phase_observation_seconds(rpc, start_ns, end_ns, max_age_ns,
+                              mapping_uncertainty_ns=0):
+    durations = Counter()
+    for phase, left, right in phase_observation_intervals(
+            rpc, start_ns, end_ns, max_age_ns,
+            mapping_uncertainty_ns=mapping_uncertainty_ns):
         durations[phase] += right - left
     return {name: durations[name] / 1e9 for name in
             ("ibd", "transition", "post_ibd", "unclassified")}
@@ -351,11 +360,15 @@ def build_pnb_jobs(events, errors):
         9: "end", 10: "publication", 11: "busy_summary",
         12: "collection", 13: "continuation"}
     jobs = defaultdict(dict)
+    lifecycle_frontier_sequence = defaultdict(int)
     for event in events:
         code = event["event_code"]
         values = event["values"]
         if code not in stage_names or not values:
             continue
+        lifecycle_frontier_sequence[event["process_epoch"]] = max(
+            lifecycle_frontier_sequence[event["process_epoch"]],
+            event.get("sequence", 0))
         if values[0] <= 0:
             errors.append(
                 f"zero PNB job ID at sequence {event.get('sequence')}")
@@ -528,6 +541,15 @@ def build_pnb_jobs(events, errors):
                 errors.append(f"invalid PNB source-live label for epoch/job {(epoch, job_id)}")
                 labels_reconciled = False
         route = event_route(submit) if submit else None
+        incomplete_at_boundary = (
+            not complete and ordered and contiguous_prefix and labels_reconciled and
+            max(part["sequence"] for part in parts.values()) ==
+            lifecycle_frontier_sequence[epoch])
+        if (not complete and ordered and contiguous_prefix and labels_reconciled and
+                not incomplete_at_boundary):
+            errors.append(
+                f"incomplete PNB lifecycle precedes later PNB event for epoch/job "
+                f"{(epoch, job_id)}")
         item = {
             "process_epoch": epoch,
             "job_id": job_id,
@@ -539,6 +561,7 @@ def build_pnb_jobs(events, errors):
             "submission_ibd": submission_ibd,
             "submission_active_height": submission_active_height,
             "phase": submit.get("_phase") if submit else "unclassified",
+            "source_role": submit.get("_role", "unknown") if submit else "unknown",
             "block_id": next(iter(block_ids)) if len(block_ids) == 1 else None,
             "submit_ns": submit["steady_ns"] if submit else None,
             "submit_scope": submit.get("collection_scope") if submit else None,
@@ -564,8 +587,7 @@ def build_pnb_jobs(events, errors):
             "lifecycle_stages": [name for name in required if name in parts],
             "labels_reconciled": labels_reconciled,
             "ordered_complete": complete and ordered and not internal_gap and labels_reconciled,
-            "incomplete_at_collection_boundary": (
-                not complete and ordered and contiguous_prefix and labels_reconciled),
+            "incomplete_at_collection_boundary": incomplete_at_boundary,
         }
         result.append(item)
     return result
@@ -622,13 +644,10 @@ def network_metrics(rpc, observation_seconds):
 
 
 def subset_summary(events, context_events=None, *, observation_seconds,
-                   include_interval_work=False):
-    if not events:
-        return {"event_count": 0, "observation_hours": observation_seconds / 3600}
+                   include_interval_work=False, pnb_count=0,
+                   pnb_time_seconds=0.0):
     context = context_events if context_events is not None else events
     counts = Counter(event["event"] for event in events)
-    pnb_seconds = sum(event["values"][1] for event in events
-                      if event["event_code"] == 9) / 1e9
     payload_bytes = sum(event["values"][2] for event in events
                         if event["event_code"] == 1)
     wire_bytes = sum(event["values"][3] for event in events
@@ -734,10 +753,12 @@ def subset_summary(events, context_events=None, *, observation_seconds,
         "socket_complete_count": len(completed_outbound),
         "outbound_drop_count": len(dropped_outbound),
         "outbound_incomplete_count": len(incomplete_outbound),
-        "pnb_count": counts["pnb_end"],
-        "pnb_time_seconds": pnb_seconds,
-        "pnb_wall_fraction": pnb_seconds / observation_seconds if observation_seconds else None,
-        "pnb_jobs_per_second": counts["pnb_end"] / observation_seconds if observation_seconds else None,
+        "pnb_count": pnb_count,
+        "pnb_count_basis": "measured_job_submit",
+        "pnb_time_seconds": pnb_time_seconds,
+        "pnb_time_basis": "clipped_busy_interval_overlap",
+        "pnb_wall_fraction": pnb_time_seconds / observation_seconds if observation_seconds else None,
+        "pnb_jobs_per_second": pnb_count / observation_seconds if observation_seconds else None,
         "payload_bytes": payload_bytes,
         "wire_bytes": wire_bytes,
         "queue_to_front_ns": distribution(queue_to_front),
@@ -1136,9 +1157,33 @@ def analyze(manifest, summary, events, resources, rpc, max_join_age, artifacts=N
         if code in (1, 2, 3, 4, 21) and len(values) > 1 and values[1] <= 0:
             integrity_errors.append(
                 f"zero inbound causal ID at sequence {event.get('sequence')}")
-        if code == 22 and len(values) > 5 and values[4] == 2 and values[5] <= 0:
-            integrity_errors.append(
-                f"zero receive-pop causal ID at sequence {event.get('sequence')}")
+        if code == 22 and len(values) > 5:
+            reason, mutation_id = values[4], values[5]
+            if reason not in (1, 2):
+                integrity_errors.append(
+                    f"unknown receive queue mutation reason at sequence "
+                    f"{event.get('sequence')}")
+            elif reason == 1 and mutation_id != 0:
+                integrity_errors.append(
+                    f"receive-append mutation has nonzero ID at sequence "
+                    f"{event.get('sequence')}")
+            elif reason == 2 and mutation_id <= 0:
+                integrity_errors.append(
+                    f"zero receive-pop causal ID at sequence {event.get('sequence')}")
+        if code == 31 and len(values) > 5:
+            reason, mutation_id = values[4], values[5]
+            if reason not in (1, 2):
+                integrity_errors.append(
+                    f"unknown send queue mutation reason at sequence "
+                    f"{event.get('sequence')}")
+            elif reason == 1 and mutation_id <= 0:
+                integrity_errors.append(
+                    f"zero send-enqueue outbound ID at sequence "
+                    f"{event.get('sequence')}")
+            elif reason != 1 and mutation_id != 0:
+                integrity_errors.append(
+                    f"non-enqueue send mutation has nonzero ID at sequence "
+                    f"{event.get('sequence')}")
         if code == 26 and len(values) > 2 and (values[1] <= 0 or values[2] <= 0):
             integrity_errors.append(
                 f"zero causal relation ID at sequence {event.get('sequence')}")
@@ -1174,6 +1219,45 @@ def analyze(manifest, summary, events, resources, rpc, max_join_age, artifacts=N
         last_present = max(index for index, value in enumerate(present) if value)
         if present[:last_present + 1] != [True] * (last_present + 1):
             integrity_errors.append(f"missing internal message lifecycle stage for {key}")
+    max_progressed_id = defaultdict(int)
+    max_started_id = defaultdict(int)
+    for stages in (all_front, all_starts, all_ends):
+        for epoch, peer, message_id in stages:
+            max_progressed_id[(epoch, peer)] = max(
+                max_progressed_id[(epoch, peer)], message_id)
+    for epoch, peer, message_id in all_starts:
+        max_started_id[(epoch, peer)] = max(
+            max_started_id[(epoch, peer)], message_id)
+    latest_handler_start_sequence = defaultdict(int)
+    for (epoch, _peer, _message_id), event in all_starts.items():
+        latest_handler_start_sequence[epoch] = max(
+            latest_handler_start_sequence[epoch], event["sequence"])
+    latest_finalization_sequence = defaultdict(int)
+    for event in all_events:
+        if event.get("event_code") == 29 and event.get("values"):
+            latest_finalization_sequence[
+                (event["process_epoch"], event["values"][0])] = max(
+                    latest_finalization_sequence[
+                        (event["process_epoch"], event["values"][0])],
+                    event["sequence"])
+    for key, ready in all_complete.items():
+        epoch, peer, message_id = key
+        if key not in all_front and max_progressed_id[(epoch, peer)] > message_id:
+            integrity_errors.append(
+                f"message without front stage precedes later same-peer progress for {key}")
+        if (key in all_front and key not in all_starts and
+                max_started_id[(epoch, peer)] > message_id):
+            integrity_errors.append(
+                f"front-only message precedes later same-peer handler for {key}")
+        if key in all_starts and key not in all_ends:
+            if (all_starts[key]["sequence"] <
+                    latest_handler_start_sequence[epoch]):
+                integrity_errors.append(
+                    f"incomplete handler precedes later handler start for {key}")
+            if (latest_finalization_sequence[(epoch, peer)] >
+                    all_starts[key]["sequence"]):
+                integrity_errors.append(
+                    f"incomplete handler precedes peer finalization for {key}")
     window = summary.get("collection_window", {})
     mapping = summary.get("clock_mapping", {})
     observation_ns = window.get("duration_ns", 0)
@@ -1338,6 +1422,38 @@ def analyze(manifest, summary, events, resources, rpc, max_join_age, artifacts=N
         for outbound_key in outbound_keys:
             if outbound_key not in outbound:
                 integrity_errors.append(f"causal link without outbound offer for {outbound_key}")
+
+    receive_pop_keys = set()
+    send_enqueue_keys = set()
+    for event in all_events:
+        values = event["values"]
+        if event["event_code"] == 22 and values[4] == 2 and values[5] > 0:
+            key = (event["process_epoch"], values[0], values[5])
+            if key in receive_pop_keys:
+                integrity_errors.append(f"duplicate receive-pop join for {key}")
+                continue
+            receive_pop_keys.add(key)
+            if key not in all_complete:
+                integrity_errors.append(
+                    f"receive-pop mutation without inbound lifecycle for {key}")
+            elif (key not in all_front or
+                  event["sequence"] <= all_front[key]["sequence"] or
+                  event["sequence"] <= all_complete[key]["sequence"]):
+                integrity_errors.append(
+                    f"impossible receive-pop lifecycle join for {key}")
+        elif event["event_code"] == 31 and values[4] == 1 and values[5] > 0:
+            key = (event["process_epoch"], values[0], values[5])
+            if key in send_enqueue_keys:
+                integrity_errors.append(f"duplicate send-enqueue join for {key}")
+                continue
+            send_enqueue_keys.add(key)
+            if key not in outbound:
+                integrity_errors.append(
+                    f"send-enqueue mutation without outbound lifecycle for {key}")
+            elif (event["sequence"] <= outbound[key]["sequence"] or
+                  event["steady_ns"] != outbound[key]["steady_ns"]):
+                integrity_errors.append(
+                    f"impossible send-enqueue lifecycle join for {key}")
     for response in legacy_responses:
         values = response["values"]
         if len(values) < 10:
@@ -1620,39 +1736,97 @@ def analyze(manifest, summary, events, resources, rpc, max_join_age, artifacts=N
         integrity_errors.append("queue state observed after peer finalization")
 
     phases = ("ibd", "transition", "post_ibd", "unclassified")
-    phase_seconds = phase_observation_seconds(
+    phase_intervals = phase_observation_intervals(
         rpc, observation_start_mono, observation_end_mono,
         int(max_join_age * 1_000_000_000),
         mapping_uncertainty_ns=mapping_uncertainty_ns)
+    phase_duration_ns = Counter()
+    for phase, left, right in phase_intervals:
+        phase_duration_ns[phase] += right - left
+    phase_seconds = {phase: phase_duration_ns[phase] / 1e9 for phase in phases}
+
+    def measured_pnb_submissions(predicate):
+        return sum(predicate(job) for job in submitted_pnb_jobs)
+
+    def measured_pnb_time(predicate, phase=None):
+        total_ns = 0
+        for job, interval_start, interval_end in busy_pnb_intervals:
+            if not predicate(job):
+                continue
+            if phase is None:
+                total_ns += interval_end - interval_start
+                continue
+            mono_start = interval_start + offset
+            mono_end = interval_end + offset
+            for interval_phase, left, right in phase_intervals:
+                if interval_phase == phase:
+                    total_ns += max(0, min(mono_end, right) - max(mono_start, left))
+        return total_ns / 1e9
+
+    message_types = sorted({event["_message_type"] for event in events
+                            if event["_message_type"]})
+    connection_roles = sorted(
+        {event["_role"] for event in events} |
+        {job["source_role"] for job in submitted_pnb_jobs} |
+        {job["source_role"] for job, _start, _end in busy_pnb_intervals})
+    delivery_routes = sorted(
+        {job["delivery_route"] for job in submitted_pnb_jobs
+         if job["delivery_route"]} |
+        {job["delivery_route"] for job, _start, _end in busy_pnb_intervals
+         if job["delivery_route"]})
+    process_epochs = sorted(
+        {event["process_epoch"] for event in events} |
+        {job["process_epoch"] for job in submitted_pnb_jobs} |
+        {job["process_epoch"] for job, _start, _end in busy_pnb_intervals})
     breakdowns = {
         "phase": {phase: subset_summary(
                        [event for event in events if event["_phase"] == phase],
-                       all_events, observation_seconds=phase_seconds[phase])
+                       all_events, observation_seconds=phase_seconds[phase],
+                       pnb_count=measured_pnb_submissions(
+                           lambda job, phase=phase: job["phase"] == phase),
+                       pnb_time_seconds=measured_pnb_time(
+                           lambda _job: True, phase))
                   for phase in phases},
         "message_type": {name: subset_summary(
                               [event for event in events
                                if event["_message_type"] == name], all_events,
-                              observation_seconds=observation_seconds)
-                         for name in sorted({event["_message_type"] for event in events
-                                             if event["_message_type"]})},
+                              observation_seconds=observation_seconds,
+                              pnb_count=0, pnb_time_seconds=0.0)
+                         for name in message_types},
         "connection_role": {name: subset_summary(
                                  [event for event in events
                                   if event["_role"] == name], all_events,
-                                 observation_seconds=observation_seconds)
-                            for name in sorted({event["_role"] for event in events})},
+                                 observation_seconds=observation_seconds,
+                                 pnb_count=measured_pnb_submissions(
+                                     lambda job, name=name:
+                                     job["source_role"] == name),
+                                 pnb_time_seconds=measured_pnb_time(
+                                     lambda job, name=name:
+                                     job["source_role"] == name))
+                            for name in connection_roles},
         "pnb_delivery_route": {name: subset_summary(
                                     [event for event in events
                                      if event["_pnb_route"] == name], all_events,
                                     observation_seconds=observation_seconds,
-                                    include_interval_work=True)
-                               for name in sorted({job["delivery_route"]
-                                                   for job, _start, _end in busy_pnb_intervals
-                                                   if job["delivery_route"]})},
+                                    include_interval_work=True,
+                                    pnb_count=measured_pnb_submissions(
+                                        lambda job, name=name:
+                                        job["delivery_route"] == name),
+                                    pnb_time_seconds=measured_pnb_time(
+                                        lambda job, name=name:
+                                        job["delivery_route"] == name))
+                               for name in delivery_routes},
         "process_epoch": {str(epoch): subset_summary(
                                [event for event in events
                                 if event["process_epoch"] == epoch], all_events,
-                               observation_seconds=observation_seconds)
-                          for epoch in sorted({event["process_epoch"] for event in events})},
+                               observation_seconds=observation_seconds,
+                               pnb_count=measured_pnb_submissions(
+                                   lambda job, epoch=epoch:
+                                   job["process_epoch"] == epoch),
+                               pnb_time_seconds=measured_pnb_time(
+                                   lambda job, epoch=epoch:
+                                   job["process_epoch"] == epoch))
+                          for epoch in process_epochs},
     }
 
     return {
@@ -1908,6 +2082,10 @@ def run_self_tests():
         events.append(item)
         return item
 
+    def renumber(items):
+        for sequence, item in enumerate(items, 1):
+            item["sequence"] = sequence
+
     def fixture_fact(value, rows, *, lines=None):
         encoded = (json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode()
         return {"bytes": len(encoded), "data_rows": rows,
@@ -2128,7 +2306,8 @@ def run_self_tests():
     add(valid, 1, 120_000_000, [8, 103, 10, 34], text1="getdata")
     add(valid, 21, 130_000_000, [8, 103, 10, 1, 0], text1="getdata")
     add(valid, 22, 200_000_000, [90, 50, 1, 1, 1])
-    add(valid, 31, 210_000_000, [91, 40, 1, 1, 1])
+    # A socket-side send mutation uses the documented zero ID sentinel.
+    add(valid, 31, 210_000_000, [91, 40, 1, 1, 2, 0])
     add(valid, 32, 220_000_000, [7, 100, 1], block_id="b000002")
     add(valid, 29, 300_000_000, [90, 0, 1, 1])
     add(valid, 29, 310_000_000, [91, 0, 1, 1])
@@ -2283,6 +2462,31 @@ def run_self_tests():
     errors = []
     prefix_job = build_pnb_jobs(prefix, errors)[0]
     assert not errors and prefix_job["incomplete_at_collection_boundary"]
+
+    # The single slot cannot accept a later job until the prior lifecycle has
+    # reached collection/continuation, so later job activity disproves an
+    # earlier apparent cutoff prefix.
+    followed_prefix = json.loads(json.dumps(prefix))
+    add(followed_prefix, 5, 5, [4, 9, 1, 1, 0, 100, 0, 0],
+        text1="standard", block_id="b5")
+    add(followed_prefix, 6, 6, [4, 9, 0, 1],
+        text1="accepted", block_id="b5")
+    add(followed_prefix, 7, 7, [4, 1, 9, 1], block_id="b5")
+    add(followed_prefix, 8, 8, [4, 1, 9, 1, 0, 100], block_id="b5")
+    add(followed_prefix, 9, 9, [4, 1, 1, 0, 1, 9, 1], block_id="b5")
+    add(followed_prefix, 10, 10, [4, 1, 0, 1], block_id="b5")
+    add(followed_prefix, 11, 11, [4, 9, 0, 0, 0, -1, 0, 0, 1],
+        block_id="b5")
+    add(followed_prefix, 12, 12, [4, 9, 1, 0, 1, 1],
+        text1="standard", block_id="b5")
+    add(followed_prefix, 13, 13, [4, 9, 1, 0, 1],
+        text1="standard", block_id="b5")
+    errors = []
+    followed_jobs = build_pnb_jobs(followed_prefix, errors)
+    assert errors
+    assert any("precedes later PNB event" in error for error in errors)
+    assert not next(job for job in followed_jobs if job["job_id"] == 3)[
+        "incomplete_at_collection_boundary"]
     suffix = []
     add(suffix, 8, 1, [4, 1, 9, 1], block_id="b5")
     add(suffix, 9, 2, [4, 1, 1, 1, 1, 9, 1], block_id="b5")
@@ -2365,6 +2569,86 @@ def run_self_tests():
                      "drop causal ID mismatch", "drop message type mismatch"):
         assert any(expected in error for error in malformed_errors), expected
 
+    # HANDLER_START/COMPLETE is globally serialized by g_msgproc within an
+    # epoch. A later start proves an omitted earlier completion was internal.
+    missing_handler_end = json.loads(json.dumps(valid))
+    missing_handler_end.remove(next(
+        item for item in missing_handler_end
+        if item["event_code"] == 3 and item["values"][:2] == [8, 103]))
+    renumber(missing_handler_end)
+    missing_handler_report = fixture_report(missing_handler_end)
+    assert any("incomplete handler precedes later handler start" in error
+               for error in missing_handler_report["integrity"]["analysis_errors"])
+
+    # A front message may be discarded when its peer finalizes without ever
+    # entering the handler; an in-flight handler may be the final collected
+    # lifecycle prefix.
+    finalized_queued = []
+    add(finalized_queued, 1, 100_000_000, [40, 1, 10, 34], text1="ping")
+    add(finalized_queued, 21, 101_000_000, [40, 1, 10, 1, 0], text1="ping")
+    add(finalized_queued, 29, 102_000_000, [40, 0, 1, 1])
+    finalized_queued_report = fixture_report(finalized_queued)
+    assert finalized_queued_report["integrity"]["valid"], finalized_queued_report[
+        "integrity"]["analysis_errors"]
+    inflight_cutoff = []
+    add(inflight_cutoff, 1, 100_000_000, [41, 1, 10, 34], text1="ping")
+    add(inflight_cutoff, 21, 101_000_000, [41, 1, 10, 1, 0], text1="ping")
+    add(inflight_cutoff, 22, 102_000_000, [41, 0, 0, 0, 2, 1])
+    add(inflight_cutoff, 2, 103_000_000, [41, 1], text1="ping")
+    inflight_cutoff_report = fixture_report(inflight_cutoff)
+    assert inflight_cutoff_report["integrity"]["valid"], inflight_cutoff_report[
+        "integrity"]["analysis_errors"]
+    finalized_inflight = json.loads(json.dumps(inflight_cutoff))
+    add(finalized_inflight, 29, 104_000_000, [41, 0, 1, 1])
+    assert any("incomplete handler precedes peer finalization" in error
+               for error in fixture_report(finalized_inflight)["integrity"][
+                   "analysis_errors"])
+
+    # Queue mutation IDs use exact producer-defined reasons and joins.
+    queue_joins = []
+    add(queue_joins, 1, 100_000_000, [50, 501, 10, 34], text1="ping")
+    add(queue_joins, 21, 101_000_000, [50, 501, 10, 1, 0], text1="ping")
+    add(queue_joins, 22, 102_000_000, [50, 10, 1, 0, 1, 0])
+    add(queue_joins, 22, 103_000_000, [50, 0, 0, 0, 2, 501])
+    add(queue_joins, 23, 120_000_000, [50, 601, 0, 10, 10, 1, 0], text1="pong")
+    add(queue_joins, 31, 120_000_000, [50, 10, 1, 0, 1, 601])
+    add(queue_joins, 31, 121_000_000, [50, 0, 0, 0, 2, 0])
+    queue_joins_report = fixture_report(queue_joins)
+    assert queue_joins_report["integrity"]["valid"], queue_joins_report[
+        "integrity"]["analysis_errors"]
+
+    queue_mutations = (
+        (22, 1, 5, 501, "receive-append mutation has nonzero ID"),
+        (22, 2, 5, 0, "zero receive-pop causal ID"),
+        (22, 2, 5, 999, "receive-pop mutation without inbound lifecycle"),
+        (31, 1, 5, 0, "zero send-enqueue outbound ID"),
+        (31, 1, 5, 999, "send-enqueue mutation without outbound lifecycle"),
+        (31, 2, 5, 601, "non-enqueue send mutation has nonzero ID"),
+    )
+    for code, reason, index, mutation_id, expected in queue_mutations:
+        mutated = json.loads(json.dumps(queue_joins))
+        target = next(item for item in mutated
+                      if item["event_code"] == code and item["values"][4] == reason)
+        target["values"][index] = mutation_id
+        assert any(expected in error for error in
+                   fixture_report(mutated)["integrity"]["analysis_errors"]), expected
+    for code, reason, expected in (
+            (22, 2, "duplicate receive-pop join"),
+            (31, 1, "duplicate send-enqueue join")):
+        duplicated = json.loads(json.dumps(queue_joins))
+        original = next(item for item in duplicated
+                        if item["event_code"] == code and item["values"][4] == reason)
+        duplicated.insert(duplicated.index(original) + 1,
+                          json.loads(json.dumps(original)))
+        renumber(duplicated)
+        assert any(expected in error for error in
+                   fixture_report(duplicated)["integrity"]["analysis_errors"]), expected
+    impossible_send_join = json.loads(json.dumps(queue_joins))
+    next(item for item in impossible_send_join
+         if item["event_code"] == 31 and item["values"][4] == 1)["steady_ns"] += 1
+    assert any("impossible send-enqueue lifecycle join" in error for error in
+               fixture_report(impossible_send_join)["integrity"]["analysis_errors"])
+
     overlap = json.loads(json.dumps(valid))
     add(overlap, 5, 1_400_000_000, [5, 7, 1, 1],
         text1="standard", block_id="b6")
@@ -2383,10 +2667,6 @@ def run_self_tests():
     overlap_report = fixture_report(overlap)
     assert any("overlapping PNB intervals" in error
                for error in overlap_report["integrity"]["analysis_errors"])
-
-    def renumber(items):
-        for sequence, item in enumerate(items, 1):
-            item["sequence"] = sequence
 
     # Async lifecycle validation includes every producer stage. These cases
     # specifically fail logic that only knew submit/start/end/publication/
@@ -2526,6 +2806,31 @@ def run_self_tests():
     assert preattach_report["pnb"]["pre_attach_active_at_measured_start"] == 1
     assert preattach_report["pnb"]["busy_interval_count"] == 1
     assert preattach_report["pnb"]["time_seconds"] == 0.95
+    for dimension, label in (("process_epoch", str(epoch)),
+                             ("pnb_delivery_route", "full-block")):
+        entry = preattach_report["breakdowns"][dimension][label]
+        assert entry["pnb_count"] == 0
+        assert entry["pnb_time_seconds"] == preattach_report["pnb"]["time_seconds"]
+
+    phase_rpc = json.loads(json.dumps(rpc_fixture))
+    phase_rpc[0]["chain"]["initialblockdownload"] = True
+    phase_rpc.append({**json.loads(json.dumps(phase_rpc[0])),
+                      "monotonic_ns": 1_500_000_000,
+                      "wall_ns": 1_001_500_000_000,
+                      "chain": {**phase_rpc[0]["chain"],
+                                "initialblockdownload": False}})
+    phase_crossing_report = fixture_report(valid, rpc_rows=phase_rpc)
+    assert phase_crossing_report["integrity"]["valid"]
+    phase_breakdown = phase_crossing_report["breakdowns"]["phase"]
+    assert phase_breakdown["ibd"]["pnb_count"] == 1
+    assert phase_breakdown["transition"]["pnb_count"] == 0
+    assert phase_breakdown["ibd"]["pnb_time_seconds"] == 0.5
+    assert phase_breakdown["transition"]["pnb_time_seconds"] == 0.5
+    assert math.isclose(
+        sum(entry["pnb_time_seconds"] for entry in phase_breakdown.values()),
+        phase_crossing_report["pnb"]["time_seconds"])
+    assert (sum(entry["pnb_count"] for entry in phase_breakdown.values()) ==
+            phase_crossing_report["pnb"]["submitted_count"])
 
     active_cutoff = [item for item in json.loads(json.dumps(valid))
                      if item["event_code"] not in (9, 10, 11, 12, 13)]
@@ -2534,6 +2839,25 @@ def run_self_tests():
     assert active_report["integrity"]["valid"]
     assert active_report["pnb"]["active_at_collection_cutoff"] == 1
     assert active_report["pnb"]["time_seconds"] == 1.1
+
+    submit_cutoff = []
+    add(submit_cutoff, 5, 100_000_000,
+        [6, 70, 1, 3, 0, 100, 0, 0],
+        text1="standard", block_id="b7")
+    submit_cutoff_report = fixture_report(
+        submit_cutoff, end_mono=101_000_000)
+    assert submit_cutoff_report["integrity"]["valid"], submit_cutoff_report[
+        "integrity"]["analysis_errors"]
+    assert submit_cutoff_report["pnb"]["submitted_count"] == 1
+    assert submit_cutoff_report["pnb"]["time_seconds"] == 0
+    blocktxn_breakdown = submit_cutoff_report["breakdowns"][
+        "pnb_delivery_route"]["blocktxn"]
+    assert blocktxn_breakdown["pnb_count"] == 1
+    assert blocktxn_breakdown["pnb_time_seconds"] == 0
+    unknown_role_breakdown = submit_cutoff_report["breakdowns"][
+        "connection_role"]["unknown"]
+    assert unknown_role_breakdown["pnb_count"] == 1
+    assert unknown_role_breakdown["pnb_time_seconds"] == 0
 
     tied = json.loads(json.dumps(valid))
     pnb_end = next(item for item in tied if item["event_code"] == 9)

@@ -423,6 +423,8 @@ struct Peer {
     struct GetDataRequest {
         CInv inv;
         uint64_t causal_inbound_id{0};
+        /** Exact measurement-only decision for the current NOTFOUND batch. */
+        bool measurement_notfound{false};
     };
     /** Work queue of items requested by this peer **/
     std::deque<GetDataRequest> m_getdata_requests GUARDED_BY(m_getdata_requests_mutex);
@@ -2993,13 +2995,24 @@ void PeerManagerImpl::ProcessGetData(CNode& pfrom, Peer& peer, const std::atomic
     // possible, since they're common and it's efficient to batch process
     // them.
     while (it != peer.m_getdata_requests.end() && it->inv.IsGenTxMsg()) {
-        if (interruptMsgProc) return;
+        if (interruptMsgProc) {
+            // This batch is abandoned without erasing its processed prefix.
+            // Do not retain measurement decisions into a later call.
+            if (m_async_pnb_probe) {
+                for (auto request{peer.m_getdata_requests.begin()}; request != it;
+                     ++request) {
+                    request->measurement_notfound = false;
+                }
+            }
+            return;
+        }
         // The send buffer provides backpressure. If there's no space in
         // the buffer, pause processing until the next call.
         if (pfrom.fPauseSend) break;
 
-        const Peer::GetDataRequest& request = *it++;
+        Peer::GetDataRequest& request = *it++;
         const CInv& inv{request.inv};
+        if (m_async_pnb_probe) request.measurement_notfound = false;
 
         if (tx_relay == nullptr) {
             // Ignore GETDATA requests for transactions from block-relay-only
@@ -3022,6 +3035,7 @@ void PeerManagerImpl::ProcessGetData(CNode& pfrom, Peer& peer, const std::atomic
             m_mempool.RemoveUnbroadcastTx(tx->GetHash());
         } else {
             vNotFound.push_back(inv);
+            if (m_async_pnb_probe) request.measurement_notfound = true;
         }
     }
 
@@ -3045,25 +3059,23 @@ void PeerManagerImpl::ProcessGetData(CNode& pfrom, Peer& peer, const std::atomic
     }
 
     if (!vNotFound.empty()) {
-        // vNotFound is an ordered subsequence of the processed GETDATA range.
-        // Walk those existing containers directly so measurement introduces
-        // no allocation or copy in this hot path.
+        // Walk the exact per-request decisions in the processed range so equal
+        // inventory values cannot be associated with the wrong inbound ID.
         const auto for_each_notfound_request{[&](auto&& callback) {
-            auto notfound{vNotFound.cbegin()};
             for (auto request{peer.m_getdata_requests.cbegin()};
-                 request != it && notfound != vNotFound.cend(); ++request) {
-                if (request->inv.type != notfound->type ||
-                    request->inv.hash != notfound->hash) continue;
-                callback(request);
-                ++notfound;
+                 request != it; ++request) {
+                callback(*request);
             }
-            Assume(notfound == vNotFound.cend());
         }};
         uint64_t msg_id{0};
         if (m_async_pnb_probe) {
+            node::detail::GetDataNotFoundCausalTracker causal_ids;
             for_each_notfound_request([&](const auto& request) {
-                if (msg_id == 0) msg_id = request->causal_inbound_id;
+                causal_ids.Visit(request.measurement_notfound,
+                                 request.causal_inbound_id,
+                                 [](uint64_t) {});
             });
+            msg_id = causal_ids.Primary();
         }
 
         // Probe-off preserves the original erase-before-send order. Probe-on
@@ -3097,10 +3109,11 @@ void PeerManagerImpl::ProcessGetData(CNode& pfrom, Peer& peer, const std::atomic
                 // Each inbound GETDATA appends one contiguous FIFO group under
                 // this mutex (the deep-block fallback appends a one-item
                 // group), so an ID transition is exactly a new source group.
-                node::detail::ContiguousCausalIdTracker causal_ids{msg_id};
+                node::detail::GetDataNotFoundCausalTracker causal_ids{msg_id};
                 for_each_notfound_request([&](const auto& request) {
-                    const uint64_t causal_id{request->causal_inbound_id};
-                    causal_ids.Visit(causal_id, [&](uint64_t distinct_id) {
+                    causal_ids.Visit(request.measurement_notfound,
+                                     request.causal_inbound_id,
+                                     [&](uint64_t distinct_id) {
                         m_async_pnb_probe->Record(
                             node::AsyncPNBProbeEvent::CAUSAL_LINK,
                             SteadyClock::now(),
