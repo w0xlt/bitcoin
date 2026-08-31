@@ -140,6 +140,69 @@ BOOST_AUTO_TEST_CASE(cnode_simple_test)
     BOOST_CHECK_EQUAL(pnode4->ConnectedThroughNetwork(), Network::NET_ONION);
 }
 
+BOOST_AUTO_TEST_CASE(cnode_conditional_poll)
+{
+    auto& connman{static_cast<ConnmanTestMsg&>(*m_node.connman)};
+    const auto make_node{[](NodeId id, size_t recv_flood_size) {
+        return std::make_unique<CNode>(
+            id,
+            /*sock=*/nullptr,
+            /*addrIn=*/CAddress{},
+            /*nKeyedNetGroupIn=*/0,
+            /*nLocalHostNonceIn=*/0,
+            /*addrBindIn=*/CAddress{},
+            /*addrNameIn=*/std::string{},
+            /*conn_type_in=*/ConnectionType::INBOUND,
+            /*inbound_onion=*/false,
+            /*network_key=*/0,
+            CNodeOptions{.recv_flood_size = recv_flood_size});
+    }};
+
+    // Measure the exact remaining-message memory charge with the same receive
+    // path used below, then place the pause boundary on that value.
+    auto measure_node{make_node(/*id=*/0, /*recv_flood_size=*/0)};
+    BOOST_REQUIRE(connman.ReceiveMsgFrom(
+        *measure_node, NetMsg::Make(NetMsgType::PING, uint64_t{1})));
+    auto measured_ping{measure_node->PollMessage()};
+    BOOST_REQUIRE(measured_ping);
+    const size_t ping_memory{measured_ping->first.GetMemoryUsage()};
+
+    auto node{make_node(/*id=*/1, /*recv_flood_size=*/ping_memory)};
+    BOOST_REQUIRE(connman.ReceiveMsgFrom(*node, NetMsg::Make(NetMsgType::INV)));
+    BOOST_REQUIRE(connman.ReceiveMsgFrom(
+        *node, NetMsg::Make(NetMsgType::PING, uint64_t{2})));
+    BOOST_CHECK(node->fPauseRecv);
+
+    const auto is_inv{[](const CNetMessage& message) noexcept {
+        return message.m_type == NetMsgType::INV;
+    }};
+
+    // Rejection neither pops nor scans past the refused front and leaves the
+    // byte/depth/pause accounting unchanged.
+    const auto is_ping{[](const CNetMessage& message) noexcept {
+        return message.m_type == NetMsgType::PING;
+    }};
+    BOOST_CHECK(!node->PollMessage(is_ping));
+    BOOST_CHECK(node->fPauseRecv);
+
+    // The next front is refused by this predicate, so fMoreWork is false even
+    // though the PING remains queued. Removing INV subtracts exactly its memory
+    // charge, leaving PING at (not above) the receive-pause threshold.
+    auto inv{node->PollMessage(is_inv)};
+    BOOST_REQUIRE(inv);
+    BOOST_CHECK_EQUAL(inv->first.m_type, NetMsgType::INV);
+    BOOST_CHECK(!inv->second);
+    BOOST_CHECK(!node->fPauseRecv);
+    BOOST_CHECK(!node->PollMessage(is_inv));
+
+    auto ping{node->PollMessage()};
+    BOOST_REQUIRE(ping);
+    BOOST_CHECK_EQUAL(ping->first.m_type, NetMsgType::PING);
+    BOOST_CHECK(!ping->second);
+    BOOST_CHECK(!node->fPauseRecv);
+    BOOST_CHECK(!node->PollMessage());
+}
+
 BOOST_AUTO_TEST_CASE(cnetaddr_basic)
 {
     CNetAddr addr;
