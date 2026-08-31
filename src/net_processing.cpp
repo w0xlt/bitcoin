@@ -617,6 +617,21 @@ public:
     ServiceFlags GetDesirableServiceFlags(ServiceFlags services) const override;
 
 private:
+    /**
+     * Specifies whether remaining in-flight requests for the block must be
+     * removed after ProcessNewBlock().
+     *
+     * An optimistic compact-block reconstruction can race an existing
+     * download. Keep that fallback download active until the reconstructed
+     * block is known to be valid.
+     */
+    enum class PostValidationDownloadAction {
+        /** Do not perform an additional validity-based request removal. */
+        NONE,
+        /** Remove all remaining requests if the block is transaction-valid. */
+        REMOVE_IN_FLIGHT_IF_VALID,
+    };
+
     void ProcessMessage(Peer& peer, CNode& pfrom, const std::string& msg_type, DataStream& vRecv, NodeClock::time_point time_received,
                         const std::atomic<bool>& interruptMsgProc)
         EXCLUSIVE_LOCKS_REQUIRED(!m_peer_mutex, !m_most_recent_block_mutex, !m_headers_presync_mutex, g_msgproc_mutex, !m_tx_download_mutex, !m_inv_to_send_mutex);
@@ -1052,8 +1067,14 @@ private:
         EXCLUSIVE_LOCKS_REQUIRED(!m_most_recent_block_mutex, peer.m_getdata_requests_mutex, NetEventsInterface::g_msgproc_mutex)
         LOCKS_EXCLUDED(::cs_main);
 
-    /** Process a new block. Perform any post-processing housekeeping */
-    void ProcessBlock(CNode& node, const std::shared_ptr<const CBlock>& block, bool force_processing, bool min_pow_checked);
+    /** Process a new block and run its route-specific post-processing. */
+    void ProcessBlock(CNode& node, const std::shared_ptr<const CBlock>& block,
+                      bool force_processing, bool min_pow_checked,
+                      PostValidationDownloadAction download_action);
+
+    /** Apply P2P peer and block-download state updates after ProcessNewBlock(). */
+    void ProcessBlockCompletion(CNode& source, const uint256& hash, bool new_block,
+                                PostValidationDownloadAction download_action);
 
     /** Process compact block txns  */
     void ProcessCompactBlockTxns(CNode& pfrom, Peer& peer, const BlockTransactions& block_transactions)
@@ -3673,20 +3694,41 @@ void PeerManagerImpl::ProcessGetCFCheckPt(CNode& node, Peer& peer, DataStream& v
               headers);
 }
 
-void PeerManagerImpl::ProcessBlock(CNode& node, const std::shared_ptr<const CBlock>& block, bool force_processing, bool min_pow_checked)
+void PeerManagerImpl::ProcessBlock(CNode& node, const std::shared_ptr<const CBlock>& block,
+                                   bool force_processing, bool min_pow_checked,
+                                   PostValidationDownloadAction download_action)
 {
     bool new_block{false};
     m_chainman.ProcessNewBlock(block, force_processing, min_pow_checked, &new_block);
+    ProcessBlockCompletion(node, block->GetHash(), new_block, download_action);
+}
+
+void PeerManagerImpl::ProcessBlockCompletion(CNode& source, const uint256& hash,
+                                             bool new_block,
+                                             PostValidationDownloadAction download_action)
+{
+    AssertLockHeld(NetEventsInterface::g_msgproc_mutex);
     if (new_block) {
-        node.m_last_block_time = GetTime<std::chrono::seconds>();
+        source.m_last_block_time = GetTime<std::chrono::seconds>();
         // In case this block came from a different peer than we requested
         // from, we can erase the block request now anyway (as we just stored
         // this block to disk).
         LOCK(cs_main);
-        RemoveBlockRequest(block->GetHash(), std::nullopt);
+        RemoveBlockRequest(hash, std::nullopt);
     } else {
         LOCK(cs_main);
-        mapBlockSource.erase(block->GetHash());
+        mapBlockSource.erase(hash);
+    }
+
+    if (download_action == PostValidationDownloadAction::REMOVE_IN_FLIGHT_IF_VALID) {
+        LOCK(cs_main);
+        const CBlockIndex* index{Assert(m_chainman.m_blockman.LookupBlockIndex(hash))};
+        if (index->IsValid(BLOCK_VALID_TRANSACTIONS)) {
+            // Clear download state for this block, which is in process from
+            // some other peer. This remains after ProcessNewBlock so a
+            // malleated compact-block announcement cannot interfere with relay.
+            RemoveBlockRequest(hash, std::nullopt);
+        }
     }
 }
 
@@ -3772,7 +3814,8 @@ void PeerManagerImpl::ProcessCompactBlockTxns(CNode& pfrom, Peer& peer, const Bl
         // disk-space attacks), but this should be safe due to the
         // protections in the compact block handler -- see related comment
         // in compact block optimistic reconstruction handling.
-        ProcessBlock(pfrom, pblock, /*force_processing=*/true, /*min_pow_checked=*/true);
+        ProcessBlock(pfrom, pblock, /*force_processing=*/true, /*min_pow_checked=*/true,
+                     PostValidationDownloadAction::NONE);
     }
     return;
 }
@@ -5034,15 +5077,8 @@ void PeerManagerImpl::ProcessMessage(Peer& peer, CNode& pfrom, const std::string
             // we have a chain with at least the minimum chain work), and we ignore
             // compact blocks with less work than our tip, it is safe to treat
             // reconstructed compact blocks as having been requested.
-            ProcessBlock(pfrom, pblock, /*force_processing=*/true, /*min_pow_checked=*/true);
-            LOCK(cs_main); // hold cs_main for CBlockIndex::IsValid()
-            if (pindex->IsValid(BLOCK_VALID_TRANSACTIONS)) {
-                // Clear download state for this block, which is in
-                // process from some other peer.  We do this after calling
-                // ProcessNewBlock so that a malleated cmpctblock announcement
-                // can't be used to interfere with block relay.
-                RemoveBlockRequest(pblock->GetHash(), std::nullopt);
-            }
+            ProcessBlock(pfrom, pblock, /*force_processing=*/true, /*min_pow_checked=*/true,
+                         PostValidationDownloadAction::REMOVE_IN_FLIGHT_IF_VALID);
         }
         return;
     }
@@ -5145,7 +5181,8 @@ void PeerManagerImpl::ProcessMessage(Peer& peer, CNode& pfrom, const std::string
                 min_pow_checked = true;
             }
         }
-        ProcessBlock(pfrom, pblock, forceProcessing, min_pow_checked);
+        ProcessBlock(pfrom, pblock, forceProcessing, min_pow_checked,
+                     PostValidationDownloadAction::NONE);
         return;
     }
 
