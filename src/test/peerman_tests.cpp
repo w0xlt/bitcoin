@@ -2,9 +2,12 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or https://www.opensource.org/licenses/mit-license.php.
 
+#include <addresstype.h>
 #include <banman.h>
+#include <blockencodings.h>
 #include <chain.h>
 #include <chainparams.h>
+#include <consensus/merkle.h>
 #include <consensus/params.h>
 #include <interfaces/mining.h>
 #include <logging.h>
@@ -126,6 +129,7 @@ public:
     {
         int call;
         bool throw_exception;
+        std::optional<bool> new_block_override;
         {
             WAIT_LOCK(m_mutex, lock);
             call = ++m_calls;
@@ -136,11 +140,15 @@ public:
             m_cv.notify_all();
             m_cv.wait(lock, [&]() EXCLUSIVE_LOCKS_REQUIRED(m_mutex) { return m_released >= call; });
             throw_exception = m_throw_on == call;
+            if (m_new_block_override && m_new_block_override->first == call) {
+                new_block_override = m_new_block_override->second;
+            }
         }
         if (throw_exception) throw std::runtime_error{"test P2P block processor failure"};
         bool new_block{false};
         (void)m_chainman.ProcessNewBlock(
             block, force_processing, min_pow_checked, &new_block);
+        if (new_block_override) new_block = *new_block_override;
         return new_block;
     }
 
@@ -201,6 +209,12 @@ public:
         m_throw_on = call;
     }
 
+    void OverrideNewBlock(int call, bool new_block) EXCLUSIVE_LOCKS_REQUIRED(!m_mutex)
+    {
+        LOCK(m_mutex);
+        m_new_block_override = std::pair{call, new_block};
+    }
+
     void ResultReady() EXCLUSIVE_LOCKS_REQUIRED(!m_mutex)
     {
         {
@@ -233,6 +247,7 @@ private:
     int m_released GUARDED_BY(m_mutex){0};
     int m_ready GUARDED_BY(m_mutex){0};
     int m_throw_on GUARDED_BY(m_mutex){-1};
+    std::optional<std::pair<int, bool>> m_new_block_override GUARDED_BY(m_mutex);
 };
 
 struct P2PBlockProcessingSetup : TestChain100Setup {
@@ -317,6 +332,16 @@ struct P2PBlockProcessingSetup : TestChain100Setup {
     CBlock NextBlock(const std::vector<CMutableTransaction>& transactions = {})
     {
         return CreateBlock(transactions, CScript{} << OP_TRUE);
+    }
+
+    std::pair<CBlock, CTransactionRef> NextBlockWithMissingTransaction()
+    {
+        CMutableTransaction tx{CreateValidMempoolTransaction(
+            m_coinbase_txns.at(0), /*input_vout=*/0, /*input_height=*/1,
+            coinbaseKey, GetScriptForDestination(PKHash{coinbaseKey.GetPubKey()}),
+            /*output_amount=*/1 * COIN,
+            /*submit=*/false)};
+        return {NextBlock({tx}), MakeTransactionRef(std::move(tx))};
     }
 
     void Receive(CNode& node, CSerializedNetMsg message)
@@ -422,6 +447,124 @@ BOOST_AUTO_TEST_CASE(full_block_source_fence_and_unrelated_fifo)
     BOOST_REQUIRE(front);
     BOOST_CHECK_EQUAL(front->first.m_type, NetMsgType::BLOCK);
     BOOST_CHECK_EQUAL(m_gate.Calls(), 1);
+}
+
+BOOST_AUTO_TEST_CASE(zero_missing_compact_block_uses_worker)
+{
+    CNode& source{AddNode()};
+    const CBlock block{NextBlock()};
+    const int initial_height{Height()};
+    const auto initial_last_block_time{source.m_last_block_time.load()};
+    const CBlockHeaderAndShortTxIDs compact{block, /*nonce=*/0};
+
+    m_gate.Allow(1);
+    Receive(source, NetMsg::Make(NetMsgType::CMPCTBLOCK, TX_WITH_WITNESS(compact)));
+    BOOST_CHECK(!Process(source));
+    BOOST_REQUIRE(m_gate.WaitForEntry(1));
+    const auto call{m_gate.GetCall(1)};
+    BOOST_CHECK(call.hash == block.GetHash());
+    BOOST_CHECK(call.force_processing);
+    BOOST_CHECK(call.min_pow_checked);
+    BOOST_CHECK_EQUAL(Height(), initial_height);
+
+    m_gate.Release(1);
+    BOOST_REQUIRE(m_gate.WaitForReady(1));
+    BOOST_CHECK(Process(source));
+    BOOST_CHECK_EQUAL(Height(), initial_height + 1);
+    BOOST_CHECK_NE(source.m_last_block_time.load(), initial_last_block_time);
+    BOOST_CHECK_EQUAL(m_gate.Calls(), 1);
+}
+
+BOOST_AUTO_TEST_CASE(wire_blocktxn_uses_worker)
+{
+    CNode& source{AddNode()};
+    auto [block, missing_tx]{NextBlockWithMissingTransaction()};
+    const int initial_height{Height()};
+    const CBlockHeaderAndShortTxIDs compact{block, /*nonce=*/1};
+
+    Receive(source, NetMsg::Make(NetMsgType::CMPCTBLOCK, TX_WITH_WITNESS(compact)));
+    BOOST_CHECK(!Process(source));
+    BOOST_CHECK_EQUAL(m_gate.Calls(), 0);
+    BOOST_CHECK(HasSendMessage(source, NetMsgType::GETBLOCKTXN));
+
+    BlockTransactions response;
+    response.blockhash = block.GetHash();
+    response.txn.push_back(missing_tx);
+    m_gate.Allow(1);
+    Receive(source, NetMsg::Make(NetMsgType::BLOCKTXN, response));
+    BOOST_CHECK(!Process(source));
+    BOOST_REQUIRE(m_gate.WaitForEntry(1));
+    const auto call{m_gate.GetCall(1)};
+    BOOST_CHECK(call.hash == block.GetHash());
+    BOOST_CHECK(call.force_processing);
+    BOOST_CHECK(call.min_pow_checked);
+    BOOST_CHECK_EQUAL(Height(), initial_height);
+
+    m_gate.Release(1);
+    BOOST_REQUIRE(m_gate.WaitForReady(1));
+    BOOST_CHECK(Process(source));
+    BOOST_CHECK_EQUAL(Height(), initial_height + 1);
+    BOOST_CHECK_EQUAL(m_gate.Calls(), 1);
+}
+
+BOOST_AUTO_TEST_CASE(optimistic_compact_block_uses_worker_and_cleans_request)
+{
+    std::vector<CNode*> downloaders{
+        &AddNode(ConnectionType::OUTBOUND_FULL_RELAY),
+        &AddNode(),
+        &AddNode(),
+    };
+    CNode& source{AddNode()};
+    auto [block, missing_tx]{NextBlockWithMissingTransaction()};
+    const int initial_height{Height()};
+    const CBlockHeaderAndShortTxIDs compact{block, /*nonce=*/2};
+
+    BOOST_REQUIRE_EQUAL(downloaders.size(), MAX_CMPCTBLOCKS_INFLIGHT_PER_BLOCK);
+    for (CNode* downloader : downloaders) {
+        Receive(*downloader,
+                NetMsg::Make(NetMsgType::CMPCTBLOCK, TX_WITH_WITNESS(compact)));
+        BOOST_CHECK(!Process(*downloader));
+        BOOST_CHECK_EQUAL(m_gate.Calls(), 0);
+        BOOST_CHECK(HasSendMessage(*downloader, NetMsgType::GETBLOCKTXN));
+    }
+
+    {
+        LOCK(cs_main);
+        const MempoolAcceptResult result{m_node.chainman->ProcessTransaction(missing_tx)};
+        BOOST_REQUIRE_MESSAGE(
+            result.m_result_type == MempoolAcceptResult::ResultType::VALID,
+            result.m_state.ToString());
+    }
+
+    // Three real download attempts force this fourth high-bandwidth source
+    // through the optimistic reconstruction branch. Expose new_block=false
+    // after real validation so only that branch's validity-based removal can
+    // clear all three requests.
+    m_gate.OverrideNewBlock(1, false);
+    m_gate.Allow(1);
+    Receive(source, NetMsg::Make(NetMsgType::CMPCTBLOCK, TX_WITH_WITNESS(compact)));
+    BOOST_CHECK(!Process(source));
+    BOOST_REQUIRE(m_gate.WaitForEntry(1));
+    BOOST_CHECK(m_gate.GetCall(1).hash == block.GetHash());
+    BOOST_CHECK(m_gate.GetCall(1).force_processing);
+
+    m_gate.Release(1);
+    BOOST_REQUIRE(m_gate.WaitForReady(1));
+    BOOST_CHECK(Process(source));
+    BOOST_CHECK_EQUAL(Height(), initial_height + 1);
+
+    // A repeated full block reaches PNB without force processing only if the
+    // optimistic path removed every saturated request after validation.
+    m_gate.Allow(2);
+    Receive(*downloaders.front(),
+            NetMsg::Make(NetMsgType::BLOCK, TX_WITH_WITNESS(block)));
+    BOOST_CHECK(!Process(*downloaders.front()));
+    BOOST_REQUIRE(m_gate.WaitForEntry(2));
+    BOOST_CHECK(!m_gate.GetCall(2).force_processing);
+    m_gate.Release(2);
+    BOOST_REQUIRE(m_gate.WaitForReady(2));
+    BOOST_CHECK(Process(*downloaders.front()));
+    BOOST_CHECK_EQUAL(m_gate.Calls(), 2);
 }
 
 BOOST_AUTO_TEST_CASE(processor_exception_is_logged_collected_and_recoverable)

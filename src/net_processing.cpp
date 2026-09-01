@@ -1091,12 +1091,6 @@ private:
                       const CNetMessage& net_message)
         EXCLUSIVE_LOCKS_REQUIRED(NetEventsInterface::g_msgproc_mutex);
 
-    /** Process a compact-block result synchronously on b-msghand. */
-    void ProcessBlockSynchronously(CNode& node, const std::shared_ptr<const CBlock>& block,
-                                   bool force_processing, bool min_pow_checked,
-                                   PostValidationDownloadAction download_action)
-        EXCLUSIVE_LOCKS_REQUIRED(NetEventsInterface::g_msgproc_mutex);
-
     void StopP2PBlockValidationWorker();
     bool ProcessP2PBlockResult(std::optional<NodeId> collector = std::nullopt,
                                bool force = false)
@@ -1113,7 +1107,8 @@ private:
 
     /** Process compact block txns  */
     void ProcessCompactBlockTxns(CNode& pfrom, Peer& peer,
-                                 const BlockTransactions& block_transactions)
+                                 const BlockTransactions& block_transactions,
+                                 const CNetMessage& net_message)
         EXCLUSIVE_LOCKS_REQUIRED(g_msgproc_mutex, !m_most_recent_block_mutex);
 
     /**
@@ -3797,19 +3792,6 @@ void PeerManagerImpl::ProcessBlock(CNode& node, const std::shared_ptr<const CBlo
     Assert(status == node::P2PBlockValidationSubmit::ACCEPTED);
 }
 
-void PeerManagerImpl::ProcessBlockSynchronously(
-    CNode& node,
-    const std::shared_ptr<const CBlock>& block,
-    bool force_processing,
-    bool min_pow_checked,
-    PostValidationDownloadAction download_action)
-{
-    bool new_block{false};
-    (void)m_chainman.ProcessNewBlock(
-        block, force_processing, min_pow_checked, &new_block);
-    ProcessBlockCompletion(node.GetId(), block->GetHash(), new_block, download_action);
-}
-
 bool PeerManagerImpl::ProcessP2PBlockResult(std::optional<NodeId> collector, bool force)
 {
     AssertLockHeld(NetEventsInterface::g_msgproc_mutex);
@@ -3904,7 +3886,8 @@ void PeerManagerImpl::ProcessBlockCompletion(NodeId source, const uint256& hash,
 }
 
 void PeerManagerImpl::ProcessCompactBlockTxns(
-    CNode& pfrom, Peer& peer, const BlockTransactions& block_transactions)
+    CNode& pfrom, Peer& peer, const BlockTransactions& block_transactions,
+    const CNetMessage& net_message)
 {
     std::shared_ptr<CBlock> pblock = std::make_shared<CBlock>();
     bool fBlockRead{false};
@@ -3986,9 +3969,8 @@ void PeerManagerImpl::ProcessCompactBlockTxns(
         // disk-space attacks), but this should be safe due to the
         // protections in the compact block handler -- see related comment
         // in compact block optimistic reconstruction handling.
-        ProcessBlockSynchronously(
-            pfrom, pblock, /*force_processing=*/true, /*min_pow_checked=*/true,
-            PostValidationDownloadAction::NONE);
+        ProcessBlock(pfrom, pblock, /*force_processing=*/true, /*min_pow_checked=*/true,
+                     PostValidationDownloadAction::NONE, net_message);
     }
     return;
 }
@@ -5223,7 +5205,7 @@ void PeerManagerImpl::ProcessMessage(Peer& peer, CNode& pfrom, const CNetMessage
         if (fProcessBLOCKTXN) {
             BlockTransactions txn;
             txn.blockhash = blockhash;
-            return ProcessCompactBlockTxns(pfrom, peer, txn);
+            return ProcessCompactBlockTxns(pfrom, peer, txn, net_message);
         }
 
         if (fRevertToHeaderProcessing) {
@@ -5251,9 +5233,8 @@ void PeerManagerImpl::ProcessMessage(Peer& peer, CNode& pfrom, const CNetMessage
             // we have a chain with at least the minimum chain work), and we ignore
             // compact blocks with less work than our tip, it is safe to treat
             // reconstructed compact blocks as having been requested.
-            ProcessBlockSynchronously(
-                pfrom, pblock, /*force_processing=*/true, /*min_pow_checked=*/true,
-                PostValidationDownloadAction::REMOVE_IN_FLIGHT_IF_VALID);
+            ProcessBlock(pfrom, pblock, /*force_processing=*/true, /*min_pow_checked=*/true,
+                         PostValidationDownloadAction::REMOVE_IN_FLIGHT_IF_VALID, net_message);
         }
         return;
     }
@@ -5269,7 +5250,7 @@ void PeerManagerImpl::ProcessMessage(Peer& peer, CNode& pfrom, const CNetMessage
         BlockTransactions resp;
         vRecv >> resp;
 
-        return ProcessCompactBlockTxns(pfrom, peer, resp);
+        return ProcessCompactBlockTxns(pfrom, peer, resp, net_message);
     }
 
     if (msg_type == NetMsgType::HEADERS)
