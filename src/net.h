@@ -1056,6 +1056,9 @@ public:
      */
     virtual bool HasAllDesirableServiceFlags(ServiceFlags services) const = 0;
 
+    /** Process node-independent message-handler events. */
+    virtual void ProcessEvents() EXCLUSIVE_LOCKS_REQUIRED(g_msgproc_mutex) {}
+
     /**
      * Process protocol messages received from a given node
      *

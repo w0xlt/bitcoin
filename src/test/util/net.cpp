@@ -10,15 +10,76 @@
 #include <netmessagemaker.h>
 #include <node/connection_types.h>
 #include <node/eviction.h>
+#include <node/p2p_block_validation.h>
 #include <protocol.h>
 #include <random.h>
 #include <serialize.h>
 #include <span.h>
 #include <sync.h>
+#include <validation.h>
 
 #include <chrono>
+#include <exception>
+#include <memory>
 #include <optional>
+#include <utility>
 #include <vector>
+
+namespace {
+
+class ImmediateP2PBlockValidation final : public node::P2PBlockValidation
+{
+public:
+    explicit ImmediateP2PBlockValidation(ChainstateManager& chainman) : m_chainman{chainman} {}
+
+    void Start() override
+    {
+        Assert(!m_started);
+        Assert(!m_stopping);
+        m_started = true;
+    }
+
+    node::P2PBlockValidationSubmit Submit(node::P2PBlockValidationRequest request) override
+    {
+        if (m_stopping) return node::P2PBlockValidationSubmit::STOPPING;
+        Assert(m_started);
+        if (m_result) return node::P2PBlockValidationSubmit::FULL;
+
+        node::P2PBlockValidationResult result;
+        try {
+            (void)m_chainman.ProcessNewBlock(
+                request.block, request.force_processing,
+                request.min_pow_checked, &result.new_block);
+        } catch (...) {
+            result.error = std::current_exception();
+        }
+        m_result = std::move(result);
+        return node::P2PBlockValidationSubmit::ACCEPTED;
+    }
+
+    std::optional<node::P2PBlockValidationResult> TakeResult() override
+    {
+        auto result{std::move(m_result)};
+        m_result.reset();
+        return result;
+    }
+
+    void Interrupt() override { m_stopping = true; }
+    void Stop() override { Interrupt(); }
+
+private:
+    ChainstateManager& m_chainman;
+    std::optional<node::P2PBlockValidationResult> m_result;
+    bool m_started{false};
+    bool m_stopping{false};
+};
+
+} // namespace
+
+std::unique_ptr<node::P2PBlockValidation> MakeImmediateP2PBlockValidation(ChainstateManager& chainman)
+{
+    return std::make_unique<ImmediateP2PBlockValidation>(chainman);
+}
 
 void ConnmanTestMsg::Handshake(CNode& node,
                                bool successfully_connected,

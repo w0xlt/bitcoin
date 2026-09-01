@@ -337,10 +337,16 @@ void Shutdown(NodeContext& node)
     }
     StopMapPort();
 
-    // Because these depend on each-other, we make sure that neither can be
-    // using the other before destroying them.
-    if (node.peerman && node.validation_signals) node.validation_signals->UnregisterValidationInterface(node.peerman.get());
-    if (node.connman) node.connman->Stop();
+    // Join network producers first, then drain accepted block validation and
+    // collect its continuation while peers and validation subscribers live.
+    if (node.peerman) {
+        if (node.connman) node.connman->StopThreads();
+        node.peerman->StopP2PBlockValidation();
+        if (node.validation_signals) node.validation_signals->UnregisterValidationInterface(node.peerman.get());
+        if (node.connman) node.connman->StopNodes();
+    } else if (node.connman) {
+        node.connman->Stop();
+    }
 
     if (node.tor_controller) {
         node.tor_controller->Join();

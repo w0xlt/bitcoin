@@ -80,9 +80,10 @@ FUZZ_TARGET(process_message, .init = initialize_process_message)
     chainman.DisableNextWrite();
 
     // Reset, so that dangling pointers can be detected by sanitizers.
+    node.peerman->StopP2PBlockValidation();
+    node.peerman.reset();
     node.banman.reset();
     node.addrman.reset();
-    node.peerman.reset();
     node.addrman = std::make_unique<AddrMan>(*node.netgroupman, /*deterministic=*/true, /*consistency_check_ratio=*/0);
     node.peerman = PeerManager::make(connman, *node.addrman,
                                      /*banman=*/nullptr, chainman,
@@ -90,7 +91,8 @@ FUZZ_TARGET(process_message, .init = initialize_process_message)
                                      PeerManager::Options{
                                          .reconcile_txs = true,
                                          .deterministic_rng = true,
-                                     });
+                                     },
+                                     MakeImmediateP2PBlockValidation(chainman));
 
     connman.SetMsgProc(node.peerman.get());
     connman.SetAddrman(*node.addrman);
@@ -130,6 +132,12 @@ FUZZ_TARGET(process_message, .init = initialize_process_message)
         }
         node.peerman->SendMessages(p2p_node);
     }
+    connman.ProcessEventsOnce();
+    try {
+        (void)connman.ProcessMessagesOnce(p2p_node);
+    } catch (const std::ios_base::failure&) {
+    }
+    node.peerman->SendMessages(p2p_node);
     node.validation_signals->SyncWithValidationInterfaceQueue();
     node.validation_signals->UnregisterValidationInterface(node.peerman.get());
     node.connman->StopNodes();

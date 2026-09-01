@@ -45,9 +45,10 @@ FUZZ_TARGET(p2p_handshake, .init = ::initialize)
     FakeSteadyClock steady_clock;
     chainman.ResetIbd();
 
+    node.peerman->StopP2PBlockValidation();
+    node.peerman.reset();
     node.banman.reset();
     node.addrman.reset();
-    node.peerman.reset();
     node.addrman = std::make_unique<AddrMan>(
         *node.netgroupman, /*deterministic=*/true, /*consistency_check_ratio=*/0);
     node.peerman = PeerManager::make(connman, *node.addrman,
@@ -56,7 +57,8 @@ FUZZ_TARGET(p2p_handshake, .init = ::initialize)
                                      PeerManager::Options{
                                          .reconcile_txs = true,
                                          .deterministic_rng = true,
-                                     });
+                                     },
+                                     MakeImmediateP2PBlockValidation(chainman));
     connman.SetMsgProc(node.peerman.get());
     connman.SetAddrman(*node.addrman);
 

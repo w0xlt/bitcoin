@@ -139,7 +139,8 @@ FUZZ_TARGET(cmpctblock, .init = initialize_cmpctblock)
                                      mempool, *setup->m_node.warnings,
                                      PeerManager::Options{
                                          .deterministic_rng = true,
-                                     });
+                                     },
+                                     MakeImmediateP2PBlockValidation(chainman));
     connman.SetMsgProc(peerman.get());
 
     setup->m_node.validation_signals->RegisterValidationInterface(peerman.get());
@@ -436,6 +437,9 @@ FUZZ_TARGET(cmpctblock, .init = initialize_cmpctblock)
             more_work = connman.ProcessMessagesOnce(random_node);
             peerman->SendMessages(random_node);
         }
+        connman.ProcessEventsOnce();
+        (void)connman.ProcessMessagesOnce(random_node);
+        peerman->SendMessages(random_node);
 
         std::vector<CNodeStats> stats;
         connman.GetNodeStats(stats);

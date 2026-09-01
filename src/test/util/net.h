@@ -33,6 +33,9 @@
 
 class FastRandomContext;
 
+/** Deterministic synchronous block processor for message-processing tests. */
+std::unique_ptr<node::P2PBlockValidation> MakeImmediateP2PBlockValidation(ChainstateManager& chainman);
+
 struct ConnmanTestMsg : public CConnman {
     using CConnman::CConnman;
 
@@ -66,6 +69,8 @@ struct ConnmanTestMsg : public CConnman {
 
         if (node.IsManualOrFullOutboundConn()) ++m_network_conn_counts[node.addr.GetNetwork()];
     }
+
+    void DisconnectNodesPublic() { DisconnectNodes(); }
 
     void ClearTestNodes()
     {
@@ -105,6 +110,11 @@ struct ConnmanTestMsg : public CConnman {
     bool ProcessMessagesOnce(CNode& node) EXCLUSIVE_LOCKS_REQUIRED(NetEventsInterface::g_msgproc_mutex)
     {
         return m_msgproc->ProcessMessages(node, flagInterruptMsgProc);
+    }
+
+    void ProcessEventsOnce() EXCLUSIVE_LOCKS_REQUIRED(NetEventsInterface::g_msgproc_mutex)
+    {
+        m_msgproc->ProcessEvents();
     }
 
     void NodeReceiveMsgBytes(CNode& node, std::span<const uint8_t> msg_bytes, bool& complete) const;

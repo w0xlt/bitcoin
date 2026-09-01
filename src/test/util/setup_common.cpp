@@ -334,9 +334,11 @@ ChainTestingSetup::ChainTestingSetup(const ChainType chainType, TestOpts opts)
 
 ChainTestingSetup::~ChainTestingSetup()
 {
+    if (m_node.peerman) m_node.peerman->StopP2PBlockValidation();
     if (m_node.scheduler) m_node.scheduler->stop();
     if (m_node.validation_signals) m_node.validation_signals->FlushBackgroundCallbacks();
     m_node.connman.reset();
+    m_node.peerman.reset();
     m_node.banman.reset();
     m_node.addrman.reset();
     m_node.netgroupman.reset();
@@ -400,10 +402,14 @@ TestingSetup::TestingSetup(
     PeerManager::Options peerman_opts;
     ApplyArgsManOptions(*m_node.args, peerman_opts);
     peerman_opts.deterministic_rng = true;
+    std::unique_ptr<node::P2PBlockValidation> block_validation;
+    if (EnableFuzzDeterminism()) {
+        block_validation = MakeImmediateP2PBlockValidation(*m_node.chainman);
+    }
     m_node.peerman = PeerManager::make(*m_node.connman, *m_node.addrman,
                                        m_node.banman.get(), *m_node.chainman,
                                        *m_node.mempool, *m_node.warnings,
-                                       peerman_opts);
+                                       peerman_opts, std::move(block_validation));
 
     {
         CConnman::Options options;

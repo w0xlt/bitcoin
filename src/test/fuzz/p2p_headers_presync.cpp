@@ -40,9 +40,11 @@ public:
         // No txs are relayed. Disable irrelevant and possibly
         // non-deterministic code paths.
         peerman_opts.ignore_incoming_txs = true;
+        m_node.peerman->StopP2PBlockValidation();
         m_node.peerman = PeerManager::make(*m_node.connman, *m_node.addrman,
                                            m_node.banman.get(), *m_node.chainman,
-                                           *m_node.mempool, *m_node.warnings, peerman_opts);
+                                           *m_node.mempool, *m_node.warnings, peerman_opts,
+                                           MakeImmediateP2PBlockValidation(*m_node.chainman));
 
         CConnman::Options options;
         options.m_msgproc = m_node.peerman.get();
@@ -94,6 +96,12 @@ void HeadersSyncSetup::SendMessage(FuzzedDataProvider& fuzzed_data_provider, CSe
     connection.fPauseSend = false;
     try {
         connman.ProcessMessagesOnce(connection);
+    } catch (const std::ios_base::failure&) {
+    }
+    m_node.peerman->SendMessages(connection);
+    connman.ProcessEventsOnce();
+    try {
+        (void)connman.ProcessMessagesOnce(connection);
     } catch (const std::ios_base::failure&) {
     }
     m_node.peerman->SendMessages(connection);
