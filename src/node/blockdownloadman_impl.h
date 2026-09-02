@@ -19,7 +19,7 @@
 
 namespace node {
 
-class BlockDownloadManagerImpl {
+class BlockDownloadManagerImpl final : public BlockDownloadManager {
 private:
     /**
      * Lock order: callers may enter the manager while holding a validation
@@ -95,45 +95,45 @@ private:
 public:
     explicit BlockDownloadManagerImpl(std::unique_ptr<BlockDownloadChain> chain);
 
-    void ConnectedPeer(NodeId peer, const BlockDownloadConnectionInfo& info) EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
-    void DisconnectedPeer(NodeId peer) EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
-    void ProcessBlockAvailability(NodeId peer) EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
-    void UpdateBlockAvailability(NodeId peer, const uint256& hash) EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
-    bool PeerHasHeader(NodeId peer, const uint256& target_hash) const EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
-    void RecordBestHeaderSent(NodeId peer, const BlockDownloadBlock& block) EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
+    void ConnectedPeer(NodeId peer, const BlockDownloadConnectionInfo& info) override EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
+    void DisconnectedPeer(NodeId peer) override EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
+    void ProcessBlockAvailability(NodeId peer) override EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
+    void UpdateBlockAvailability(NodeId peer, const uint256& hash) override EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
+    bool PeerHasHeader(NodeId peer, const uint256& target_hash) const override EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
+    void RecordBestHeaderSent(NodeId peer, const BlockDownloadBlock& block) override EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
     BlockDownloadBatch PlanAndReserve(
         NodeId peer,
         unsigned int budget,
         std::chrono::microseconds now,
-        bool allow_historical) EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
+        bool allow_historical) override EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
     BlockRequestReservation ReserveBlockRequest(
         NodeId peer,
         const BlockDownloadBlock& block,
         std::chrono::microseconds now,
-        std::shared_ptr<PartiallyDownloadedBlock> proposed_partial) EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
+        std::shared_ptr<PartiallyDownloadedBlock> proposed_partial) override EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
     BlockRequestRemoval RemoveBlockRequest(
         const uint256& hash,
         std::optional<NodeId> from_peer,
-        std::chrono::microseconds now) EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
-    bool IsBlockRequested(const uint256& hash) const EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
-    bool IsBlockRequestedFromOutbound(const uint256& hash) const EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
-    BlockInFlightInfo GetBlockInFlightInfo(const uint256& hash, NodeId peer) const EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
-    std::optional<PeerBlockDownloadSnapshot> GetPeerSnapshot(NodeId peer) const EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
-    BlockDownloadGlobalSnapshot GetGlobalSnapshot() const EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
-    bool AllRequestsAreFor(const uint256& hash) const EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
-    bool StartStalling(NodeId peer, std::chrono::microseconds since) EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
-    bool ClearStalling(NodeId peer) EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
-    bool StartSync(NodeId peer) EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
-    bool ClearSync(NodeId peer) EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
-    bool RecordBlockSource(const uint256& hash, NodeId peer, bool punish_on_invalid) EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
-    std::optional<BlockSource> ConsumeBlockSource(const uint256& hash) EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
-    bool EraseBlockSource(const uint256& hash) EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
-    bool TipMayBeStale(std::chrono::seconds now, std::chrono::seconds stale_after) EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
-    void UpdatedBlockTip(std::chrono::seconds now) EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
-    std::optional<std::chrono::seconds> TryIncreaseBlockStallingTimeout(std::chrono::seconds expected) EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
-    std::optional<std::chrono::seconds> TryDecreaseBlockStallingTimeout(std::chrono::seconds expected) EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
-    bool CheckConsistency() const EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
-    void CheckIsEmpty() const EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
+        std::chrono::microseconds now) override EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
+    bool IsBlockRequested(const uint256& hash) const override EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
+    bool IsBlockRequestedFromOutbound(const uint256& hash) const override EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
+    BlockInFlightInfo GetBlockInFlightInfo(const uint256& hash, NodeId peer) const override EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
+    std::optional<PeerBlockDownloadSnapshot> GetPeerSnapshot(NodeId peer) const override EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
+    BlockDownloadGlobalSnapshot GetGlobalSnapshot() const override EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
+    bool AllRequestsAreFor(const uint256& hash) const override EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
+    bool StartStalling(NodeId peer, std::chrono::microseconds since) override EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
+    bool ClearStalling(NodeId peer) override EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
+    bool StartSync(NodeId peer) override EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
+    bool ClearSync(NodeId peer) override EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
+    bool RecordBlockSource(const uint256& hash, NodeId peer, bool punish_on_invalid) override EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
+    std::optional<BlockSource> ConsumeBlockSource(const uint256& hash) override EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
+    bool EraseBlockSource(const uint256& hash) override EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
+    bool TipMayBeStale(std::chrono::seconds now, std::chrono::seconds stale_after) override EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
+    void UpdatedBlockTip(std::chrono::seconds now) override EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
+    std::optional<std::chrono::seconds> TryIncreaseBlockStallingTimeout(std::chrono::seconds expected) override EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
+    std::optional<std::chrono::seconds> TryDecreaseBlockStallingTimeout(std::chrono::seconds expected) override EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
+    bool CheckConsistency() const override EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
+    void CheckIsEmpty() const override EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
 };
 
 } // namespace node

@@ -19,8 +19,6 @@
 class PartiallyDownloadedBlock;
 
 namespace node {
-class BlockDownloadManagerImpl;
-
 /** Maximum number of parallel requests for one block. Parallel requests are
  * used by compact-block download. */
 static constexpr size_t MAX_CMPCTBLOCKS_INFLIGHT_PER_BLOCK{3};
@@ -137,88 +135,89 @@ struct BlockSource {
  * outside the manager.
  */
 class BlockDownloadManager {
-    const std::unique_ptr<BlockDownloadManagerImpl> m_impl;
-
 public:
-    explicit BlockDownloadManager(std::unique_ptr<BlockDownloadChain> chain);
-    ~BlockDownloadManager();
+    BlockDownloadManager() = default;
+    virtual ~BlockDownloadManager() = default;
 
     BlockDownloadManager(const BlockDownloadManager&) = delete;
     BlockDownloadManager& operator=(const BlockDownloadManager&) = delete;
 
     /** Register or atomically update a peer without resetting its active state. */
-    void ConnectedPeer(NodeId peer, const BlockDownloadConnectionInfo& info);
+    virtual void ConnectedPeer(NodeId peer, const BlockDownloadConnectionInfo& info) = 0;
     /** Remove a peer and all bookkeeping owned by it. */
-    void DisconnectedPeer(NodeId peer);
+    virtual void DisconnectedPeer(NodeId peer) = 0;
 
     /** Resolve an existing pending announcement through one coherent snapshot. */
-    void ProcessBlockAvailability(NodeId peer);
+    virtual void ProcessBlockAvailability(NodeId peer) = 0;
     /** Process pending availability, then record the newest announcement. */
-    void UpdateBlockAvailability(NodeId peer, const uint256& hash);
+    virtual void UpdateBlockAvailability(NodeId peer, const uint256& hash) = 0;
     /** Query whether target is on either chain identity attributed to the peer. */
-    bool PeerHasHeader(NodeId peer, const uint256& target_hash) const;
+    virtual bool PeerHasHeader(NodeId peer, const uint256& target_hash) const = 0;
     /** Record the best header sent using an identity copied under chain synchronization. */
-    void RecordBestHeaderSent(NodeId peer, const BlockDownloadBlock& block);
+    virtual void RecordBestHeaderSent(NodeId peer, const BlockDownloadBlock& block) = 0;
 
     /** Purely plan, coherently revalidate, and atomically reserve automatic requests. */
-    BlockDownloadBatch PlanAndReserve(
+    virtual BlockDownloadBatch PlanAndReserve(
         NodeId peer,
         unsigned int budget,
         std::chrono::microseconds now,
-        bool allow_historical);
+        bool allow_historical) = 0;
 
     /**
      * Atomically reserve a request. A non-null proposed_partial requests
      * compact reconstruction or upgrades an existing full-block request.
      */
-    BlockRequestReservation ReserveBlockRequest(
+    virtual BlockRequestReservation ReserveBlockRequest(
         NodeId peer,
         const BlockDownloadBlock& block,
         std::chrono::microseconds now,
-        std::shared_ptr<PartiallyDownloadedBlock> proposed_partial = {});
+        std::shared_ptr<PartiallyDownloadedBlock> proposed_partial = {}) = 0;
 
     /** Remove requests for hash, optionally restricted to one peer. */
-    BlockRequestRemoval RemoveBlockRequest(
+    virtual BlockRequestRemoval RemoveBlockRequest(
         const uint256& hash,
         std::optional<NodeId> from_peer,
-        std::chrono::microseconds now);
+        std::chrono::microseconds now) = 0;
 
-    bool IsBlockRequested(const uint256& hash) const;
-    bool IsBlockRequestedFromOutbound(const uint256& hash) const;
-    BlockInFlightInfo GetBlockInFlightInfo(const uint256& hash, NodeId peer) const;
-    std::optional<PeerBlockDownloadSnapshot> GetPeerSnapshot(NodeId peer) const;
-    BlockDownloadGlobalSnapshot GetGlobalSnapshot() const;
+    virtual bool IsBlockRequested(const uint256& hash) const = 0;
+    virtual bool IsBlockRequestedFromOutbound(const uint256& hash) const = 0;
+    virtual BlockInFlightInfo GetBlockInFlightInfo(const uint256& hash, NodeId peer) const = 0;
+    virtual std::optional<PeerBlockDownloadSnapshot> GetPeerSnapshot(NodeId peer) const = 0;
+    virtual BlockDownloadGlobalSnapshot GetGlobalSnapshot() const = 0;
 
     /** Match the historical count(hash) == total-request-count query atomically. */
-    bool AllRequestsAreFor(const uint256& hash) const;
+    virtual bool AllRequestsAreFor(const uint256& hash) const = 0;
 
     /** Start stalling only if the peer is not already marked as stalling. */
-    bool StartStalling(NodeId peer, std::chrono::microseconds since);
+    virtual bool StartStalling(NodeId peer, std::chrono::microseconds since) = 0;
     /** Clear a peer's stalling timer, returning whether it was set. */
-    bool ClearStalling(NodeId peer);
+    virtual bool ClearStalling(NodeId peer) = 0;
 
     /** Start headers synchronization, keeping the peer flag and count together. */
-    bool StartSync(NodeId peer);
+    virtual bool StartSync(NodeId peer) = 0;
     /** Stop headers synchronization, keeping the peer flag and count together. */
-    bool ClearSync(NodeId peer);
+    virtual bool ClearSync(NodeId peer) = 0;
 
     /** Record the first connected source for a block hash. */
-    bool RecordBlockSource(const uint256& hash, NodeId peer, bool punish_on_invalid);
-    std::optional<BlockSource> ConsumeBlockSource(const uint256& hash);
-    bool EraseBlockSource(const uint256& hash);
+    virtual bool RecordBlockSource(const uint256& hash, NodeId peer, bool punish_on_invalid) = 0;
+    virtual std::optional<BlockSource> ConsumeBlockSource(const uint256& hash) = 0;
+    virtual bool EraseBlockSource(const uint256& hash) = 0;
 
     /** Initialize if needed and query the independent stale-tip state. */
-    bool TipMayBeStale(std::chrono::seconds now, std::chrono::seconds stale_after);
-    void UpdatedBlockTip(std::chrono::seconds now);
+    virtual bool TipMayBeStale(std::chrono::seconds now, std::chrono::seconds stale_after) = 0;
+    virtual void UpdatedBlockTip(std::chrono::seconds now) = 0;
     /** Increase the timeout once if it still equals expected. */
-    std::optional<std::chrono::seconds> TryIncreaseBlockStallingTimeout(std::chrono::seconds expected);
+    virtual std::optional<std::chrono::seconds> TryIncreaseBlockStallingTimeout(std::chrono::seconds expected) = 0;
     /** Decrease the timeout once if it still equals expected. */
-    std::optional<std::chrono::seconds> TryDecreaseBlockStallingTimeout(std::chrono::seconds expected);
+    virtual std::optional<std::chrono::seconds> TryDecreaseBlockStallingTimeout(std::chrono::seconds expected) = 0;
 
     /** Test/debug consistency checks that expose no container identity. */
-    bool CheckConsistency() const;
-    void CheckIsEmpty() const;
+    virtual bool CheckConsistency() const = 0;
+    virtual void CheckIsEmpty() const = 0;
 };
+
+/** Construct the production block-download manager over an owned chain view. */
+std::unique_ptr<BlockDownloadManager> MakeBlockDownloadManager(std::unique_ptr<BlockDownloadChain> chain);
 
 } // namespace node
 

@@ -5,6 +5,8 @@
 #include <banman.h>
 #include <net.h>
 #include <net_processing.h>
+#include <node/blockdownloadchain_impl.h>
+#include <node/blockdownloadman.h>
 #include <protocol.h>
 #include <sync.h>
 #include <test/fuzz/FuzzedDataProvider.h>
@@ -49,9 +51,12 @@ FUZZ_TARGET(p2p_handshake, .init = ::initialize)
     node.peerman.reset();
     node.addrman = std::make_unique<AddrMan>(
         *node.netgroupman, /*deterministic=*/true, /*consistency_check_ratio=*/0);
+    auto block_download_chain{node::MakeValidationBlockDownloadChain(chainman)};
+    auto block_downloadman{node::MakeBlockDownloadManager(std::move(block_download_chain))};
     node.peerman = PeerManager::make(connman, *node.addrman,
                                      /*banman=*/nullptr, chainman,
                                      *node.mempool, *node.warnings,
+                                     std::move(block_downloadman),
                                      PeerManager::Options{
                                          .reconcile_txs = true,
                                          .deterministic_rng = true,

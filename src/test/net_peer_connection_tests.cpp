@@ -9,6 +9,8 @@
 #include <netaddress.h>
 #include <netbase.h>
 #include <netgroup.h>
+#include <node/blockdownloadchain_impl.h>
+#include <node/blockdownloadman.h>
 #include <node/connection_types.h>
 #include <node/protocol_version.h>
 #include <protocol.h>
@@ -25,6 +27,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <boost/test/unit_test.hpp>
@@ -87,7 +90,11 @@ void AddPeer(NodeId& id, std::vector<CNode*>& nodes, PeerManager& peerman, Connm
 BOOST_FIXTURE_TEST_CASE(test_addnode_getaddednodeinfo_and_connection_detection, PeerTest)
 {
     auto connman = std::make_unique<ConnmanTestMsg>(0x1337, 0x1337, *m_node.addrman, *m_node.netgroupman, Params());
-    auto peerman = PeerManager::make(*connman, *m_node.addrman, nullptr, *m_node.chainman, *m_node.mempool, *m_node.warnings, {});
+    auto block_download_chain{node::MakeValidationBlockDownloadChain(*m_node.chainman)};
+    auto block_downloadman{node::MakeBlockDownloadManager(std::move(block_download_chain))};
+    auto peerman = PeerManager::make(
+        *connman, *m_node.addrman, nullptr, *m_node.chainman, *m_node.mempool, *m_node.warnings,
+        std::move(block_downloadman), {});
     NodeId id{0};
     std::vector<CNode*> nodes;
 

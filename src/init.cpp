@@ -53,6 +53,8 @@
 #include <netaddress.h>
 #include <netbase.h>
 #include <netgroup.h>
+#include <node/blockdownloadchain_impl.h>
+#include <node/blockdownloadman.h>
 #include <node/blockmanager_args.h>
 #include <node/blockstorage.h>
 #include <node/caches.h>
@@ -1911,9 +1913,12 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
     auto& kernel_notifications{*Assert(node.notifications)};
 
     assert(!node.peerman);
+    auto block_download_chain{node::MakeValidationBlockDownloadChain(chainman)};
+    auto block_downloadman{node::MakeBlockDownloadManager(std::move(block_download_chain))};
     node.peerman = PeerManager::make(*node.connman, *node.addrman,
                                      node.banman.get(), chainman,
                                      *node.mempool, *node.warnings,
+                                     std::move(block_downloadman),
                                      peerman_opts);
     validation_signals.RegisterValidationInterface(node.peerman.get());
 

@@ -13,6 +13,8 @@
 #include <net.h>
 #include <net_processing.h>
 #include <netmessagemaker.h>
+#include <node/blockdownloadchain_impl.h>
+#include <node/blockdownloadman.h>
 #include <node/blockstorage.h>
 #include <node/mining_types.h>
 #include <policy/truc_policy.h>
@@ -174,9 +176,12 @@ FUZZ_TARGET(cmpctblock, .init = initialize_cmpctblock)
 
     AddrMan addrman{*setup->m_node.netgroupman, /*deterministic=*/true, /*consistency_check_ratio=*/0};
     auto& connman = *static_cast<ConnmanTestMsg*>(setup->m_node.connman.get());
+    auto block_download_chain{node::MakeValidationBlockDownloadChain(chainman)};
+    auto block_downloadman{node::MakeBlockDownloadManager(std::move(block_download_chain))};
     auto peerman = PeerManager::make(connman, addrman,
                                      /*banman=*/nullptr, chainman,
                                      mempool, *setup->m_node.warnings,
+                                     std::move(block_downloadman),
                                      PeerManager::Options{
                                          .deterministic_rng = true,
                                      });

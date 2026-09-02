@@ -7,6 +7,8 @@
 #include <net.h>
 #include <net_processing.h>
 #include <netmessagemaker.h>
+#include <node/blockdownloadchain_impl.h>
+#include <node/blockdownloadman.h>
 #include <node/peerman_args.h>
 #include <test/fuzz/FuzzedDataProvider.h>
 #include <test/fuzz/fuzz.h>
@@ -40,9 +42,12 @@ public:
         // No txs are relayed. Disable irrelevant and possibly
         // non-deterministic code paths.
         peerman_opts.ignore_incoming_txs = true;
+        auto block_download_chain{node::MakeValidationBlockDownloadChain(*m_node.chainman)};
+        auto block_downloadman{node::MakeBlockDownloadManager(std::move(block_download_chain))};
         m_node.peerman = PeerManager::make(*m_node.connman, *m_node.addrman,
                                            m_node.banman.get(), *m_node.chainman,
-                                           *m_node.mempool, *m_node.warnings, peerman_opts);
+                                           *m_node.mempool, *m_node.warnings,
+                                           std::move(block_downloadman), peerman_opts);
 
         CConnman::Options options;
         options.m_msgproc = m_node.peerman.get();

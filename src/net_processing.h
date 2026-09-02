@@ -33,6 +33,7 @@ class DataStream;
 class uint256;
 
 namespace node {
+class BlockDownloadManager;
 class Warnings;
 } // namespace node
 
@@ -97,7 +98,9 @@ public:
 
     static std::unique_ptr<PeerManager> make(CConnman& connman, AddrMan& addrman,
                                              BanMan* banman, ChainstateManager& chainman,
-                                             CTxMemPool& pool, node::Warnings& warnings, Options opts);
+                                             CTxMemPool& pool, node::Warnings& warnings,
+                                             std::unique_ptr<node::BlockDownloadManager> block_downloadman,
+                                             Options opts);
     virtual ~PeerManager() = default;
 
     /**
