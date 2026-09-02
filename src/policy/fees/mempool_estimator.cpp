@@ -354,8 +354,9 @@ void MemPoolFeeRateEstimator::MempoolLoadCompleted(const node::MempoolLoadResult
             }
         } else {
             LogDebug(BCLog::ESTIMATEFEE,
-                     "%s: not reading persisted mined-block stats because mempool loading failed",
-                     FeeRateEstimatorTypeToString(FeeRateEstimatorType::MEMPOOL_POLICY));
+                     "%s: not reading persisted mined-block stats because mempool loading failed; error=%s",
+                     FeeRateEstimatorTypeToString(FeeRateEstimatorType::MEMPOOL_POLICY),
+                     node::MempoolLoadErrorString(load_result.error()));
         }
     }
 

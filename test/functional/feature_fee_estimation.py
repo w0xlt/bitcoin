@@ -628,7 +628,8 @@ class EstimateFeeTest(BitcoinTestFramework):
         self.stop_node(0)
 
         self.log.info("Discard persisted mined-block statistics when mempool.dat is missing")
-        start_from_snapshot(remove_mempool=True)
+        with node0.assert_debug_log(expected_msgs=["mempool loading failed; error=FILE_OPEN_FAILED"]):
+            start_from_snapshot(remove_mempool=True)
         assert_equal(node0.getmempoolinfo()["size"], 0)
         assert_mempool_estimator_unavailable()
         self.stop_node(0)

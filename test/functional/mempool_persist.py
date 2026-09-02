@@ -157,6 +157,16 @@ class MempoolPersistTest(BitcoinTestFramework):
         assert self.nodes[0].getmempoolinfo()["loaded"]
         assert_equal(len(self.nodes[0].getrawmempool()), 0)
 
+        self.log.debug("Verify importmempool reports the load error reason.")
+        missing_mempool = os.path.join(self.nodes[0].chain_path, "missing-mempool.dat")
+        assert not os.path.exists(missing_mempool)
+        assert_raises_rpc_error(
+            -1,
+            "Unable to import mempool file: FILE_OPEN_FAILED. See debug log for details.",
+            self.nodes[0].importmempool,
+            missing_mempool,
+        )
+
         self.log.debug("Import mempool at runtime to node0.")
         assert_equal({}, self.nodes[0].importmempool(mempooldat0))
         assert_equal(len(self.nodes[0].getrawmempool()), 7)
