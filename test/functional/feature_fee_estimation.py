@@ -431,6 +431,17 @@ class EstimateFeeTest(BitcoinTestFramework):
         assert_not_equal(block_policy_fees_dat_initial_content, block_policy_fees_dat_current_content)
         assert_not_equal(mempool_policy_dat_initial_content, mempool_policy_dat_current_content)
 
+        self.log.info("Do not read or write mempool estimator data when mempool persistence is disabled")
+        mempool_policy_dat_snapshot = mempool_policy_dat.read_bytes()
+        self.restart_node(0, extra_args=["-persistmempool=0"])
+        estimate = self.nodes[0].estimatesmartfee(1, "economical", {"verbosity": 2})
+        assert_equal(estimate["mempool_health_statistics"], [])
+        self.generate(self.nodes[0], 1, sync_fun=self.no_op)
+        self.nodes[0].mockscheduler(SECONDS_PER_HOUR)
+        self.stop_node(0)
+        assert_equal(mempool_policy_dat.read_bytes(), mempool_policy_dat_snapshot)
+        self.start_node(0)
+
 
     def test_acceptstalefeeestimates_option(self):
         # Get the initial fee rate while node is running
