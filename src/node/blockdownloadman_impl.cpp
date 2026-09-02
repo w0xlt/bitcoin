@@ -13,8 +13,8 @@
 
 namespace node {
 
-BlockDownloadManager::BlockDownloadManager()
-    : m_impl{std::make_unique<BlockDownloadManagerImpl>()}
+BlockDownloadManager::BlockDownloadManager(std::unique_ptr<BlockDownloadChain> chain)
+    : m_impl{std::make_unique<BlockDownloadManagerImpl>(std::move(chain))}
 {
 }
 
@@ -28,6 +28,26 @@ void BlockDownloadManager::ConnectedPeer(NodeId peer, const BlockDownloadConnect
 void BlockDownloadManager::DisconnectedPeer(NodeId peer)
 {
     m_impl->DisconnectedPeer(peer);
+}
+
+void BlockDownloadManager::ProcessBlockAvailability(NodeId peer)
+{
+    m_impl->ProcessBlockAvailability(peer);
+}
+
+void BlockDownloadManager::UpdateBlockAvailability(NodeId peer, const uint256& hash)
+{
+    m_impl->UpdateBlockAvailability(peer, hash);
+}
+
+bool BlockDownloadManager::PeerHasHeader(NodeId peer, const uint256& target_hash) const
+{
+    return m_impl->PeerHasHeader(peer, target_hash);
+}
+
+void BlockDownloadManager::RecordBestHeaderSent(NodeId peer, const BlockDownloadBlock& block)
+{
+    m_impl->RecordBestHeaderSent(peer, block);
 }
 
 BlockRequestReservation BlockDownloadManager::ReserveBlockRequest(
@@ -144,6 +164,12 @@ void BlockDownloadManager::CheckIsEmpty() const
     m_impl->CheckIsEmpty();
 }
 
+BlockDownloadManagerImpl::BlockDownloadManagerImpl(std::unique_ptr<BlockDownloadChain> chain)
+    : m_chain{std::move(chain)}
+{
+    Assume(m_chain != nullptr);
+}
+
 void BlockDownloadManagerImpl::ConnectedPeer(NodeId peer, const BlockDownloadConnectionInfo& info)
 {
     LOCK(m_mutex);
@@ -210,9 +236,132 @@ void BlockDownloadManagerImpl::DisconnectedPeer(NodeId peer)
     m_peer_states.erase(peer_it);
 }
 
+void BlockDownloadManagerImpl::ProcessBlockAvailability(NodeId peer)
+{
+    uint64_t availability_generation;
+    std::optional<uint256> pending;
+    std::optional<BlockDownloadBlock> best_known;
+    {
+        LOCK(m_mutex);
+        const auto it{m_peer_states.find(peer)};
+        if (it == m_peer_states.end() || !it->second.m_pending_block_hash) return;
+        availability_generation = it->second.m_availability_generation;
+        pending = it->second.m_pending_block_hash;
+        best_known = it->second.m_best_known_block;
+    }
+
+    BlockDownloadChainQuery query;
+    query.m_pending_hash = pending;
+    const auto snapshot{m_chain->Capture(query)};
+    if (!snapshot.m_pending_block || snapshot.m_pending_block->m_chain_work <= 0) return;
+
+    LOCK(m_mutex);
+    const auto it{m_peer_states.find(peer)};
+    if (it == m_peer_states.end() ||
+        it->second.m_availability_generation != availability_generation ||
+        it->second.m_pending_block_hash != pending ||
+        it->second.m_best_known_block != best_known) {
+        return;
+    }
+
+    auto& state{it->second};
+    if (!state.m_best_known_block ||
+        snapshot.m_pending_block->m_chain_work >= state.m_best_known_block->m_chain_work) {
+        state.m_best_known_block = snapshot.m_pending_block;
+    }
+    state.m_pending_block_hash.reset();
+    BumpAvailabilityGenerationLocked(state);
+}
+
+void BlockDownloadManagerImpl::UpdateBlockAvailability(NodeId peer, const uint256& hash)
+{
+    uint64_t availability_generation;
+    std::optional<uint256> pending;
+    std::optional<BlockDownloadBlock> best_known;
+    {
+        LOCK(m_mutex);
+        const auto it{m_peer_states.find(peer)};
+        if (it == m_peer_states.end()) return;
+        availability_generation = it->second.m_availability_generation;
+        pending = it->second.m_pending_block_hash;
+        best_known = it->second.m_best_known_block;
+    }
+
+    BlockDownloadChainQuery query;
+    query.m_pending_hash = pending;
+    query.m_announced_hash = hash;
+    const auto snapshot{m_chain->Capture(query)};
+
+    LOCK(m_mutex);
+    const auto it{m_peer_states.find(peer)};
+    if (it == m_peer_states.end() ||
+        it->second.m_availability_generation != availability_generation ||
+        it->second.m_pending_block_hash != pending ||
+        it->second.m_best_known_block != best_known) {
+        return;
+    }
+
+    auto& state{it->second};
+    auto new_best{state.m_best_known_block};
+    auto new_pending{state.m_pending_block_hash};
+    if (snapshot.m_pending_block && snapshot.m_pending_block->m_chain_work > 0) {
+        if (!new_best || snapshot.m_pending_block->m_chain_work >= new_best->m_chain_work) {
+            new_best = snapshot.m_pending_block;
+        }
+        new_pending.reset();
+    }
+    if (snapshot.m_announced_block && snapshot.m_announced_block->m_chain_work > 0) {
+        if (!new_best || snapshot.m_announced_block->m_chain_work >= new_best->m_chain_work) {
+            new_best = snapshot.m_announced_block;
+        }
+    } else {
+        new_pending = hash.IsNull() ? std::nullopt : std::optional{hash};
+    }
+
+    if (new_best == state.m_best_known_block && new_pending == state.m_pending_block_hash) return;
+    state.m_best_known_block = std::move(new_best);
+    state.m_pending_block_hash = std::move(new_pending);
+    BumpAvailabilityGenerationLocked(state);
+}
+
+bool BlockDownloadManagerImpl::PeerHasHeader(NodeId peer, const uint256& target_hash) const
+{
+    std::optional<BlockDownloadBlock> best_known;
+    std::optional<BlockDownloadBlock> best_header_sent;
+    {
+        LOCK(m_mutex);
+        const auto it{m_peer_states.find(peer)};
+        if (it == m_peer_states.end()) return false;
+        best_known = it->second.m_best_known_block;
+        best_header_sent = it->second.m_best_header_sent;
+    }
+
+    BlockDownloadChainQuery query;
+    query.m_ancestor_hash = target_hash;
+    query.m_best_known_hash = best_known ? std::optional{best_known->m_hash} : std::nullopt;
+    query.m_best_header_sent_hash = best_header_sent ? std::optional{best_header_sent->m_hash} : std::nullopt;
+    const auto snapshot{m_chain->Capture(query)};
+    return snapshot.m_ancestor_of_best_known || snapshot.m_ancestor_of_best_header_sent;
+}
+
+void BlockDownloadManagerImpl::RecordBestHeaderSent(NodeId peer, const BlockDownloadBlock& block)
+{
+    LOCK(m_mutex);
+    const auto it{m_peer_states.find(peer)};
+    if (it == m_peer_states.end() || it->second.m_best_header_sent == block) return;
+    it->second.m_best_header_sent = block;
+    BumpPeerGenerationLocked(it->second);
+}
+
 void BlockDownloadManagerImpl::BumpPeerGenerationLocked(PeerRequestState& state)
 {
     state.m_generation = ++m_next_peer_generation;
+}
+
+void BlockDownloadManagerImpl::BumpAvailabilityGenerationLocked(PeerRequestState& state)
+{
+    BumpPeerGenerationLocked(state);
+    state.m_availability_generation = state.m_generation;
 }
 
 BlockInFlightInfo BlockDownloadManagerImpl::GetBlockInFlightInfoLocked(const uint256& hash, NodeId peer) const
@@ -376,6 +525,7 @@ std::optional<PeerBlockDownloadSnapshot> BlockDownloadManagerImpl::GetPeerSnapsh
     result.m_can_serve_witness = it->second.m_connection_info.m_can_serve_witness;
     result.m_limited_peer = it->second.m_connection_info.m_limited_peer;
     result.m_sync_started = it->second.m_sync_started;
+    result.m_best_known_block = it->second.m_best_known_block;
     result.m_generation = it->second.m_generation;
     result.m_total_requests = m_requests_by_hash.size();
     result.m_peers_downloading_from = m_peers_downloading_from;
@@ -526,6 +676,7 @@ bool BlockDownloadManagerImpl::CheckConsistencyLocked() const
     std::set<std::pair<uint256, NodeId>> unique_requests;
 
     for (const auto& [peer, state] : m_peer_states) {
+        if (state.m_availability_generation == 0 || state.m_availability_generation > state.m_generation) return false;
         queue_size += state.m_requests.size();
         peers_downloading += !state.m_requests.empty();
         preferred_peers += state.m_connection_info.m_preferred_download;

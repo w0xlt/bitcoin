@@ -7,6 +7,7 @@
 #include <node/blockdownloadman.h>
 #include <test/fuzz/FuzzedDataProvider.h>
 #include <test/fuzz/fuzz.h>
+#include <test/util/blockdownloadchain.h>
 #include <uint256.h>
 #include <util/check.h>
 
@@ -38,6 +39,9 @@ struct PeerMirror {
     bool can_serve_witness{false};
     bool limited{false};
     bool sync_started{false};
+    std::optional<node::BlockDownloadBlock> best_known;
+    std::optional<node::BlockDownloadBlock> best_header_sent;
+    std::optional<uint256> pending_hash;
     std::vector<MirrorRequest> requests;
     std::chrono::microseconds downloading_since{0};
     std::chrono::microseconds stalling_since{0};
@@ -52,11 +56,16 @@ struct IndexedMirrorRequest {
 FUZZ_TARGET(blockdownloadman)
 {
     FuzzedDataProvider provider{buffer.data(), buffer.size()};
-    node::BlockDownloadManager manager;
+    auto chain{std::make_unique<node::test::FakeBlockDownloadChain>()};
+    auto* const fake_chain{chain.get()};
+    node::BlockDownloadManager manager{std::move(chain)};
+    (void)fake_chain;
     std::array<PeerMirror, NUM_PEERS> peers;
     std::array<uint64_t, NUM_PEERS> last_peer_generation{};
     std::vector<IndexedMirrorRequest> index;
     std::array<node::BlockDownloadBlock, NUM_BLOCKS> blocks;
+    std::array<node::BlockDownloadBlock, NUM_BLOCKS> chain_blocks;
+    std::array<bool, NUM_BLOCKS> chain_known{};
     std::array<std::optional<node::BlockSource>, NUM_BLOCKS> sources;
     uint64_t next_peer_generation{0};
     uint64_t in_flight_generation{0};
@@ -68,6 +77,9 @@ FUZZ_TARGET(blockdownloadman)
             .m_height = static_cast<int>(i),
             .m_chain_work = arith_uint256{(i + 1) * 100},
         };
+        chain_blocks[i] = blocks[i];
+        chain_known[i] = true;
+        fake_chain->SetBlock(chain_blocks[i], i == 0 ? std::nullopt : std::optional{chain_blocks[i - 1].m_hash});
     }
 
     auto random_peer = [&] {
@@ -90,12 +102,71 @@ FUZZ_TARGET(blockdownloadman)
             return request.hash == hash;
         }));
     };
+    auto resolve_chain = [&](const uint256& hash) -> std::optional<node::BlockDownloadBlock> {
+        for (size_t i{0}; i < chain_blocks.size(); ++i) {
+            if (chain_blocks[i].m_hash == hash && chain_known[i]) return chain_blocks[i];
+        }
+        return std::nullopt;
+    };
+    auto mirror_update_availability = [&](NodeId id, const uint256& hash) {
+        auto& mirror{peers[id]};
+        if (!mirror.registered) return;
+        auto best{mirror.best_known};
+        auto pending{mirror.pending_hash};
+        if (pending) {
+            const auto resolved{resolve_chain(*pending)};
+            if (resolved && resolved->m_chain_work > 0) {
+                if (!best || resolved->m_chain_work >= best->m_chain_work) best = resolved;
+                pending.reset();
+            }
+        }
+        const auto announced{resolve_chain(hash)};
+        if (announced && announced->m_chain_work > 0) {
+            if (!best || announced->m_chain_work >= best->m_chain_work) best = announced;
+        } else {
+            pending = hash.IsNull() ? std::nullopt : std::optional{hash};
+        }
+        if (best != mirror.best_known || pending != mirror.pending_hash) {
+            mirror.best_known = std::move(best);
+            mirror.pending_hash = std::move(pending);
+            mirror.generation = ++next_peer_generation;
+        }
+    };
+    auto mirror_process_availability = [&](NodeId id) {
+        auto& mirror{peers[id]};
+        if (!mirror.registered || !mirror.pending_hash) return;
+        const auto resolved{resolve_chain(*mirror.pending_hash)};
+        if (!resolved || resolved->m_chain_work <= 0) return;
+        if (!mirror.best_known || resolved->m_chain_work >= mirror.best_known->m_chain_work) {
+            mirror.best_known = resolved;
+        }
+        mirror.pending_hash.reset();
+        mirror.generation = ++next_peer_generation;
+    };
+    auto mirror_has_header = [&](NodeId id, const uint256& target) {
+        if (!peers[id].registered) return false;
+        const auto is_ancestor = [&](const std::optional<node::BlockDownloadBlock>& descendant) {
+            if (!descendant) return false;
+            std::optional<size_t> target_pos;
+            std::optional<size_t> descendant_pos;
+            for (size_t i{0}; i < chain_blocks.size(); ++i) {
+                if (chain_blocks[i].m_hash == target) target_pos = i;
+                if (chain_blocks[i].m_hash == descendant->m_hash) descendant_pos = i;
+            }
+            if (!target_pos || !descendant_pos || *target_pos > *descendant_pos) return false;
+            for (size_t i{*target_pos}; i <= *descendant_pos; ++i) {
+                if (!chain_known[i]) return false;
+            }
+            return true;
+        };
+        return is_ancestor(peers[id].best_known) || is_ancestor(peers[id].best_header_sent);
+    };
 
     LIMITED_WHILE(provider.ConsumeBool(), 500) {
         const NodeId peer{random_peer()};
         const auto& block{random_block()};
         const auto now{random_time()};
-        switch (provider.ConsumeIntegralInRange<unsigned>(0, 15)) {
+        switch (provider.ConsumeIntegralInRange<unsigned>(0, 21)) {
         case 0: {
             const bool inserted{!peers[peer].registered};
             const bool inbound{peers[peer].registered ? peers[peer].inbound : provider.ConsumeBool()};
@@ -303,6 +374,52 @@ FUZZ_TARGET(blockdownloadman)
             if (result) stalling_timeout = *result;
             break;
         }
+        case 16: {
+            const size_t pos{static_cast<size_t>(block.m_height)};
+            chain_known[pos] = provider.ConsumeBool();
+            chain_blocks[pos].m_chain_work = arith_uint256{static_cast<uint64_t>(provider.ConsumeIntegralInRange<uint16_t>(0, 4)) * 100};
+            if (chain_known[pos]) {
+                fake_chain->SetBlock(chain_blocks[pos], pos == 0 ? std::nullopt : std::optional{chain_blocks[pos - 1].m_hash});
+            } else {
+                fake_chain->RemoveBlock(chain_blocks[pos].m_hash);
+            }
+            break;
+        }
+        case 17:
+            manager.UpdateBlockAvailability(peer, block.m_hash);
+            mirror_update_availability(peer, block.m_hash);
+            break;
+        case 18:
+            manager.ProcessBlockAvailability(peer);
+            mirror_process_availability(peer);
+            break;
+        case 19:
+            Assert(manager.PeerHasHeader(peer, block.m_hash) == mirror_has_header(peer, block.m_hash));
+            break;
+        case 20: {
+            manager.RecordBestHeaderSent(peer, chain_blocks[static_cast<size_t>(block.m_height)]);
+            if (peers[peer].registered && peers[peer].best_header_sent != chain_blocks[static_cast<size_t>(block.m_height)]) {
+                peers[peer].best_header_sent = chain_blocks[static_cast<size_t>(block.m_height)];
+                peers[peer].generation = ++next_peer_generation;
+            }
+            break;
+        }
+        case 21: {
+            if (!peers[peer].registered) {
+                manager.UpdateBlockAvailability(peer, block.m_hash);
+                break;
+            }
+            uint256 interleaved_hash{ArithToUint256(arith_uint256{1000U + static_cast<uint64_t>(provider.ConsumeIntegral<uint16_t>())})};
+            if (peers[peer].pending_hash == interleaved_hash) {
+                interleaved_hash = ArithToUint256(UintToArith256(interleaved_hash) + 1);
+            }
+            fake_chain->SetCaptureHook([&manager, peer, interleaved_hash] {
+                manager.UpdateBlockAvailability(peer, interleaved_hash);
+            });
+            manager.UpdateBlockAvailability(peer, block.m_hash);
+            mirror_update_availability(peer, interleaved_hash);
+            break;
+        }
         }
 
         size_t total{0};
@@ -327,6 +444,7 @@ FUZZ_TARGET(blockdownloadman)
             Assert(actual->m_can_serve_witness == peers[id].can_serve_witness);
             Assert(actual->m_limited_peer == peers[id].limited);
             Assert(actual->m_sync_started == peers[id].sync_started);
+            Assert(actual->m_best_known_block == peers[id].best_known);
             Assert(actual->m_generation == peers[id].generation);
             last_peer_generation[id] = actual->m_generation;
             total += peers[id].requests.size();

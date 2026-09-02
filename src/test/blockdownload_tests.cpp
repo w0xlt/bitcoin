@@ -4,8 +4,13 @@
 
 #include <arith_uint256.h>
 #include <blockencodings.h>
+#include <chain.h>
+#include <node/blockdownloadchain_impl.h>
 #include <node/blockdownloadman.h>
+#include <test/util/blockdownloadchain.h>
+#include <test/util/setup_common.h>
 #include <uint256.h>
+#include <validation.h>
 
 #include <boost/test/unit_test.hpp>
 
@@ -21,6 +26,7 @@ using node::BlockDownloadBlock;
 using node::BlockDownloadConnectionInfo;
 using node::BlockDownloadManager;
 using node::BlockRequestStatus;
+using node::test::FakeBlockDownloadChain;
 
 namespace {
 
@@ -31,6 +37,11 @@ BlockDownloadBlock TestBlock(uint64_t value, int height)
         .m_height = height,
         .m_chain_work = arith_uint256{value * 100},
     };
+}
+
+BlockDownloadManager MakeManager()
+{
+    return BlockDownloadManager{std::make_unique<FakeBlockDownloadChain>()};
 }
 
 template <typename Callable1, typename Callable2>
@@ -58,9 +69,304 @@ void RunConcurrently(Callable1&& callable_1, Callable2&& callable_2)
 
 BOOST_AUTO_TEST_SUITE(blockdownload_tests)
 
+BOOST_AUTO_TEST_CASE(availability_resolution_comparison_and_owned_snapshots)
+{
+    auto fake{std::make_unique<FakeBlockDownloadChain>()};
+    auto* const chain{fake.get()};
+    BlockDownloadManager manager{std::move(fake)};
+    const NodeId peer{1};
+    manager.ConnectedPeer(peer, {.m_is_inbound = false});
+
+    const auto first{TestBlock(1, 1)};
+    auto equal_work{TestBlock(2, 2)};
+    equal_work.m_chain_work = first.m_chain_work;
+    auto lower_work{TestBlock(3, 3)};
+    lower_work.m_chain_work = first.m_chain_work - 1;
+    auto nonpositive{TestBlock(4, 4)};
+    nonpositive.m_chain_work = 0;
+    const auto unknown_1{TestBlock(5, 5)};
+    const auto unknown_2{TestBlock(6, 6)};
+
+    chain->SetBlock(first);
+    chain->SetBlock(equal_work);
+    chain->SetBlock(lower_work);
+    chain->SetBlock(nonpositive);
+
+    manager.UpdateBlockAvailability(peer, first.m_hash);
+    auto snapshot{*manager.GetPeerSnapshot(peer)};
+    BOOST_REQUIRE(snapshot.m_best_known_block);
+    BOOST_CHECK(*snapshot.m_best_known_block == first);
+    const uint64_t first_generation{snapshot.m_generation};
+
+    manager.UpdateBlockAvailability(peer, lower_work.m_hash);
+    BOOST_CHECK_EQUAL(manager.GetPeerSnapshot(peer)->m_generation, first_generation);
+    manager.UpdateBlockAvailability(peer, equal_work.m_hash);
+    snapshot = *manager.GetPeerSnapshot(peer);
+    BOOST_REQUIRE(snapshot.m_best_known_block);
+    BOOST_CHECK(*snapshot.m_best_known_block == equal_work); // Equal work replaces.
+    const auto owned_snapshot{snapshot};
+
+    manager.UpdateBlockAvailability(peer, unknown_1.m_hash);
+    manager.UpdateBlockAvailability(peer, unknown_2.m_hash); // Latest unknown replaces pending.
+    const uint64_t unknown_generation{manager.GetPeerSnapshot(peer)->m_generation};
+    manager.ProcessBlockAvailability(peer);
+    BOOST_CHECK_EQUAL(manager.GetPeerSnapshot(peer)->m_generation, unknown_generation);
+
+    auto now_known_1{unknown_1};
+    now_known_1.m_chain_work = equal_work.m_chain_work + 100;
+    chain->SetBlock(now_known_1);
+    manager.ProcessBlockAvailability(peer);
+    BOOST_CHECK(*manager.GetPeerSnapshot(peer)->m_best_known_block == equal_work);
+
+    auto now_known_2{unknown_2};
+    now_known_2.m_chain_work = equal_work.m_chain_work + 50;
+    chain->SetBlock(now_known_2);
+    manager.ProcessBlockAvailability(peer);
+    BOOST_CHECK(*manager.GetPeerSnapshot(peer)->m_best_known_block == now_known_2);
+
+    // A known nonpositive-work block remains pending until it becomes positive.
+    manager.UpdateBlockAvailability(peer, nonpositive.m_hash);
+    const uint64_t nonpositive_generation{manager.GetPeerSnapshot(peer)->m_generation};
+    manager.ProcessBlockAvailability(peer);
+    BOOST_CHECK_EQUAL(manager.GetPeerSnapshot(peer)->m_generation, nonpositive_generation);
+    nonpositive.m_chain_work = now_known_2.m_chain_work + 1;
+    chain->SetBlock(nonpositive);
+    manager.ProcessBlockAvailability(peer);
+    BOOST_CHECK(*manager.GetPeerSnapshot(peer)->m_best_known_block == nonpositive);
+    const uint64_t resolved_generation{manager.GetPeerSnapshot(peer)->m_generation};
+    manager.ProcessBlockAvailability(peer);
+    BOOST_CHECK_EQUAL(manager.GetPeerSnapshot(peer)->m_generation, resolved_generation);
+
+    // A null announcement retains the old null-sentinel/no-pending behavior.
+    manager.UpdateBlockAvailability(peer, uint256{});
+    BOOST_CHECK_EQUAL(manager.GetPeerSnapshot(peer)->m_generation, resolved_generation);
+
+    BOOST_REQUIRE(owned_snapshot.m_best_known_block);
+    BOOST_CHECK(*owned_snapshot.m_best_known_block == equal_work);
+    manager.DisconnectedPeer(peer);
+    manager.CheckIsEmpty();
+}
+
+BOOST_AUTO_TEST_CASE(peer_header_ancestry_on_competing_branches)
+{
+    auto fake{std::make_unique<FakeBlockDownloadChain>()};
+    auto* const chain{fake.get()};
+    BlockDownloadManager manager{std::move(fake)};
+    const NodeId peer{1};
+    manager.ConnectedPeer(peer, {.m_is_inbound = false});
+
+    const auto root{TestBlock(1, 0)};
+    const auto a1{TestBlock(2, 1)};
+    const auto a2{TestBlock(3, 2)};
+    const auto b1{TestBlock(4, 1)};
+    const auto b2{TestBlock(5, 2)};
+    chain->SetBlock(root);
+    chain->SetBlock(a1, root.m_hash);
+    chain->SetBlock(a2, a1.m_hash);
+    chain->SetBlock(b1, root.m_hash);
+    chain->SetBlock(b2, b1.m_hash);
+
+    manager.UpdateBlockAvailability(peer, a2.m_hash);
+    BOOST_CHECK(manager.PeerHasHeader(peer, root.m_hash));
+    BOOST_CHECK(manager.PeerHasHeader(peer, a1.m_hash));
+    BOOST_CHECK(manager.PeerHasHeader(peer, a2.m_hash));
+    BOOST_CHECK(!manager.PeerHasHeader(peer, b1.m_hash));
+
+    const uint64_t before_header{manager.GetPeerSnapshot(peer)->m_generation};
+    manager.RecordBestHeaderSent(peer, b2);
+    BOOST_CHECK(manager.GetPeerSnapshot(peer)->m_generation > before_header);
+    BOOST_CHECK(manager.PeerHasHeader(peer, b1.m_hash));
+    BOOST_CHECK(manager.PeerHasHeader(peer, b2.m_hash));
+    BOOST_CHECK(manager.PeerHasHeader(peer, a1.m_hash));
+
+    const uint64_t recorded_generation{manager.GetPeerSnapshot(peer)->m_generation};
+    manager.RecordBestHeaderSent(peer, b2);
+    BOOST_CHECK_EQUAL(manager.GetPeerSnapshot(peer)->m_generation, recorded_generation);
+
+    manager.DisconnectedPeer(peer);
+    manager.CheckIsEmpty();
+}
+
+BOOST_AUTO_TEST_CASE(stale_availability_capture_does_not_resurrect_or_overwrite)
+{
+    auto fake{std::make_unique<FakeBlockDownloadChain>()};
+    auto* const chain{fake.get()};
+    BlockDownloadManager manager{std::move(fake)};
+    const NodeId peer{1};
+    auto old_announcement{TestBlock(1, 1)};
+    old_announcement.m_chain_work = 300;
+    const auto new_announcement{TestBlock(2, 2)};
+    chain->SetBlock(old_announcement);
+    chain->SetBlock(new_announcement);
+    manager.ConnectedPeer(peer, {.m_is_inbound = false});
+
+    const uint64_t initial_generation{manager.GetPeerSnapshot(peer)->m_generation};
+    chain->SetCaptureHook([&] {
+        manager.DisconnectedPeer(peer);
+        manager.ConnectedPeer(peer, {.m_is_inbound = false});
+    });
+    manager.UpdateBlockAvailability(peer, old_announcement.m_hash);
+    auto snapshot{*manager.GetPeerSnapshot(peer)};
+    BOOST_CHECK(snapshot.m_generation > initial_generation);
+    BOOST_CHECK(!snapshot.m_best_known_block);
+
+    // A pending hash that becomes known during a later processing pass must
+    // not resurrect state across a disconnect/reconnect ABA transition.
+    const auto pending_announcement{TestBlock(3, 3)};
+    manager.UpdateBlockAvailability(peer, pending_announcement.m_hash);
+    chain->SetBlock(pending_announcement);
+    const uint64_t pending_generation{manager.GetPeerSnapshot(peer)->m_generation};
+    chain->SetCaptureHook([&] {
+        manager.DisconnectedPeer(peer);
+        manager.ConnectedPeer(peer, {.m_is_inbound = false});
+    });
+    manager.ProcessBlockAvailability(peer);
+    snapshot = *manager.GetPeerSnapshot(peer);
+    BOOST_CHECK(snapshot.m_generation > pending_generation);
+    BOOST_CHECK(!snapshot.m_best_known_block);
+
+    uint64_t interleaved_generation{0};
+    chain->SetCaptureHook([&] {
+        manager.UpdateBlockAvailability(peer, new_announcement.m_hash);
+        interleaved_generation = manager.GetPeerSnapshot(peer)->m_generation;
+    });
+    manager.UpdateBlockAvailability(peer, old_announcement.m_hash);
+    snapshot = *manager.GetPeerSnapshot(peer);
+    BOOST_REQUIRE(snapshot.m_best_known_block);
+    BOOST_CHECK(*snapshot.m_best_known_block == new_announcement);
+    BOOST_CHECK_EQUAL(snapshot.m_generation, interleaved_generation);
+
+    manager.DisconnectedPeer(peer);
+    manager.CheckIsEmpty();
+}
+
+BOOST_AUTO_TEST_CASE(unrelated_peer_mutation_does_not_discard_availability_capture)
+{
+    auto fake{std::make_unique<FakeBlockDownloadChain>()};
+    auto* const chain{fake.get()};
+    BlockDownloadManager manager{std::move(fake)};
+    const NodeId peer{1};
+    manager.ConnectedPeer(peer, {.m_is_inbound = false});
+
+    const auto root{TestBlock(1, 0)};
+    const auto announced{TestBlock(2, 1)};
+    const auto header_1{TestBlock(3, 1)};
+    const auto header_2{TestBlock(4, 2)};
+    const auto pending{TestBlock(5, 2)};
+    const auto later_header{TestBlock(6, 1)};
+    chain->SetBlock(root);
+    chain->SetBlock(announced, root.m_hash);
+    chain->SetBlock(header_1, root.m_hash);
+    chain->SetBlock(header_2, header_1.m_hash);
+    chain->SetBlock(later_header, root.m_hash);
+
+    uint64_t header_generation{0};
+    chain->SetCaptureHook([&] {
+        manager.RecordBestHeaderSent(peer, header_2);
+        header_generation = manager.GetPeerSnapshot(peer)->m_generation;
+    });
+    manager.UpdateBlockAvailability(peer, announced.m_hash);
+    auto snapshot{*manager.GetPeerSnapshot(peer)};
+    BOOST_REQUIRE(snapshot.m_best_known_block);
+    BOOST_CHECK(*snapshot.m_best_known_block == announced);
+    BOOST_CHECK_EQUAL(snapshot.m_generation, header_generation + 1);
+    BOOST_CHECK(manager.PeerHasHeader(peer, announced.m_hash));
+    BOOST_CHECK(manager.PeerHasHeader(peer, header_2.m_hash));
+
+    // ProcessBlockAvailability has the same independence from relay-header
+    // changes while retaining its pending/best availability stale checks.
+    manager.UpdateBlockAvailability(peer, pending.m_hash);
+    const uint64_t pending_generation{manager.GetPeerSnapshot(peer)->m_generation};
+    chain->SetBlock(pending, announced.m_hash);
+    uint64_t later_header_generation{0};
+    chain->SetCaptureHook([&] {
+        manager.RecordBestHeaderSent(peer, later_header);
+        later_header_generation = manager.GetPeerSnapshot(peer)->m_generation;
+    });
+    manager.ProcessBlockAvailability(peer);
+    snapshot = *manager.GetPeerSnapshot(peer);
+    BOOST_REQUIRE(snapshot.m_best_known_block);
+    BOOST_CHECK(*snapshot.m_best_known_block == pending);
+    BOOST_CHECK_EQUAL(later_header_generation, pending_generation + 1);
+    BOOST_CHECK_EQUAL(snapshot.m_generation, later_header_generation + 1);
+    BOOST_CHECK(manager.PeerHasHeader(peer, later_header.m_hash));
+
+    manager.DisconnectedPeer(peer);
+    manager.CheckIsEmpty();
+}
+
+BOOST_AUTO_TEST_CASE(newer_announcement_during_process_availability_wins)
+{
+    auto fake{std::make_unique<FakeBlockDownloadChain>()};
+    auto* const chain{fake.get()};
+    BlockDownloadManager manager{std::move(fake)};
+    const NodeId peer{1};
+    manager.ConnectedPeer(peer, {.m_is_inbound = false});
+
+    const auto old_announcement{TestBlock(1, 1)};
+    const auto new_announcement{TestBlock(2, 2)};
+    manager.UpdateBlockAvailability(peer, old_announcement.m_hash);
+    const uint64_t pending_generation{manager.GetPeerSnapshot(peer)->m_generation};
+    chain->SetBlock(old_announcement);
+
+    uint64_t interleaved_generation{0};
+    chain->SetCaptureHook([&] {
+        manager.UpdateBlockAvailability(peer, new_announcement.m_hash);
+        interleaved_generation = manager.GetPeerSnapshot(peer)->m_generation;
+    });
+    manager.ProcessBlockAvailability(peer);
+    auto snapshot{*manager.GetPeerSnapshot(peer)};
+    BOOST_REQUIRE(snapshot.m_best_known_block);
+    BOOST_CHECK(*snapshot.m_best_known_block == old_announcement);
+    BOOST_CHECK_EQUAL(interleaved_generation, pending_generation + 1);
+    BOOST_CHECK_EQUAL(snapshot.m_generation, interleaved_generation);
+
+    // Resolving the newer hash proves that the stale outer Process call did
+    // not clear the interleaved announcement's pending state.
+    chain->SetBlock(new_announcement, old_announcement.m_hash);
+    manager.ProcessBlockAvailability(peer);
+    snapshot = *manager.GetPeerSnapshot(peer);
+    BOOST_REQUIRE(snapshot.m_best_known_block);
+    BOOST_CHECK(*snapshot.m_best_known_block == new_announcement);
+    BOOST_CHECK_EQUAL(snapshot.m_generation, interleaved_generation + 1);
+
+    manager.DisconnectedPeer(peer);
+    manager.CheckIsEmpty();
+}
+
+BOOST_FIXTURE_TEST_CASE(validation_chain_snapshot_translation, TestChain100Setup)
+{
+    auto chain{node::MakeValidationBlockDownloadChain(*m_node.chainman)};
+    node::BlockDownloadBlock tip;
+    node::BlockDownloadBlock ancestor;
+    {
+        LOCK(cs_main);
+        const CBlockIndex* tip_index{m_node.chainman->ActiveChain().Tip()};
+        const CBlockIndex* ancestor_index{tip_index->GetAncestor(tip_index->nHeight - 2)};
+        tip = {tip_index->GetBlockHash(), tip_index->nHeight, tip_index->nChainWork};
+        ancestor = {ancestor_index->GetBlockHash(), ancestor_index->nHeight, ancestor_index->nChainWork};
+    }
+
+    node::BlockDownloadChainQuery query;
+    query.m_pending_hash = ArithToUint256(arith_uint256{999999});
+    query.m_announced_hash = tip.m_hash;
+    query.m_ancestor_hash = ancestor.m_hash;
+    query.m_best_known_hash = tip.m_hash;
+    query.m_best_header_sent_hash = query.m_pending_hash;
+    const auto snapshot{chain->Capture(query)};
+    BOOST_CHECK(!snapshot.m_pending_block);
+    BOOST_REQUIRE(snapshot.m_announced_block);
+    BOOST_CHECK(*snapshot.m_announced_block == tip);
+    BOOST_CHECK(snapshot.m_ancestor_of_best_known);
+    BOOST_CHECK(!snapshot.m_ancestor_of_best_header_sent);
+
+    chain.reset();
+    BOOST_CHECK(*snapshot.m_announced_block == tip); // Owned after adapter lifetime ends.
+}
+
 BOOST_AUTO_TEST_CASE(new_duplicate_parallel_and_removed_requests)
 {
-    BlockDownloadManager manager;
+    auto manager{MakeManager()};
     const NodeId peer_1{1}, peer_2{2}, peer_3{3}, peer_4{4};
     manager.ConnectedPeer(peer_1, BlockDownloadConnectionInfo{.m_is_inbound = false});
     manager.ConnectedPeer(peer_2, BlockDownloadConnectionInfo{.m_is_inbound = true});
@@ -128,7 +434,7 @@ BOOST_AUTO_TEST_CASE(new_duplicate_parallel_and_removed_requests)
 
 BOOST_AUTO_TEST_CASE(queue_timers_stalling_and_disconnect_cleanup)
 {
-    BlockDownloadManager manager;
+    auto manager{MakeManager()};
     const NodeId peer_1{1}, peer_2{2};
     manager.ConnectedPeer(peer_1, {.m_is_inbound = false});
     manager.ConnectedPeer(peer_2, {.m_is_inbound = true});
@@ -188,7 +494,7 @@ BOOST_AUTO_TEST_CASE(queue_timers_stalling_and_disconnect_cleanup)
 
 BOOST_AUTO_TEST_CASE(compact_upgrade_duplicate_and_handle_lifetime)
 {
-    BlockDownloadManager manager;
+    auto manager{MakeManager()};
     const NodeId peer{1};
     manager.ConnectedPeer(peer, {.m_is_inbound = false});
     const auto block{TestBlock(1, 1)};
@@ -223,7 +529,7 @@ BOOST_AUTO_TEST_CASE(compact_upgrade_duplicate_and_handle_lifetime)
 
 BOOST_AUTO_TEST_CASE(connection_origin_and_missing_peer)
 {
-    BlockDownloadManager manager;
+    auto manager{MakeManager()};
     const NodeId peer{1}, outbound_peer{2};
     const auto block{TestBlock(1, 1)};
 
@@ -250,7 +556,7 @@ BOOST_AUTO_TEST_CASE(connection_origin_and_missing_peer)
 
 BOOST_AUTO_TEST_CASE(connection_reregistration_reconnect_counters_and_owned_snapshots)
 {
-    BlockDownloadManager manager;
+    auto manager{MakeManager()};
     const NodeId peer{1}, other_peer{2};
     const auto block{TestBlock(1, 1)};
     manager.ConnectedPeer(peer, {
@@ -370,7 +676,7 @@ BOOST_AUTO_TEST_CASE(connection_reregistration_reconnect_counters_and_owned_snap
 
 BOOST_AUTO_TEST_CASE(sync_stale_tip_timeout_and_generations)
 {
-    BlockDownloadManager manager;
+    auto manager{MakeManager()};
     const NodeId peer{1};
     const auto block_1{TestBlock(1, 1)};
     const auto block_2{TestBlock(2, 2)};
@@ -432,7 +738,7 @@ BOOST_AUTO_TEST_CASE(sync_stale_tip_timeout_and_generations)
 
 BOOST_AUTO_TEST_CASE(block_source_first_writer_consume_erase_and_disconnect)
 {
-    BlockDownloadManager manager;
+    auto manager{MakeManager()};
     const NodeId peer_1{1}, peer_2{2};
     const auto hash_1{TestBlock(1, 1).m_hash};
     const auto hash_2{TestBlock(2, 2).m_hash};
@@ -460,7 +766,7 @@ BOOST_AUTO_TEST_CASE(block_source_first_writer_consume_erase_and_disconnect)
 
 BOOST_AUTO_TEST_CASE(all_requests_are_for_mixed_hash)
 {
-    BlockDownloadManager manager;
+    auto manager{MakeManager()};
     const NodeId peer{1};
     const auto block_1{TestBlock(1, 1)};
     const auto block_2{TestBlock(2, 2)};
@@ -480,7 +786,7 @@ BOOST_AUTO_TEST_CASE(concurrent_connect_disconnect_snapshot)
     static constexpr int iterations{32};
     const NodeId peer{1};
     for (int i{0}; i < iterations; ++i) {
-        BlockDownloadManager manager;
+        auto manager{MakeManager()};
         RunConcurrently(
             [&] {
                 manager.ConnectedPeer(peer, {
@@ -504,7 +810,7 @@ BOOST_AUTO_TEST_CASE(concurrent_connect_disconnect_snapshot)
 
 BOOST_AUTO_TEST_CASE(concurrent_snapshot_remove_and_owned_lifetime)
 {
-    BlockDownloadManager manager;
+    auto manager{MakeManager()};
     const NodeId peer{1};
     const auto block{TestBlock(1, 1)};
     manager.ConnectedPeer(peer, {.m_is_inbound = false});
@@ -539,7 +845,7 @@ BOOST_AUTO_TEST_CASE(concurrent_snapshot_remove_and_owned_lifetime)
 
 BOOST_AUTO_TEST_CASE(concurrent_source_first_writer_consume_and_disconnect)
 {
-    BlockDownloadManager manager;
+    auto manager{MakeManager()};
     const NodeId peer_1{1}, peer_2{2};
     const auto hash{TestBlock(1, 1).m_hash};
     const auto disconnect_hash{TestBlock(2, 2).m_hash};
@@ -574,7 +880,7 @@ BOOST_AUTO_TEST_CASE(concurrent_capability_and_sync_disconnect_linearization)
 {
     const NodeId peer{1};
     {
-        BlockDownloadManager manager;
+        auto manager{MakeManager()};
         manager.ConnectedPeer(peer, {
             .m_is_inbound = false,
             .m_preferred_download = false,
@@ -611,7 +917,7 @@ BOOST_AUTO_TEST_CASE(concurrent_capability_and_sync_disconnect_linearization)
         manager.CheckIsEmpty();
     }
     {
-        BlockDownloadManager manager;
+        auto manager{MakeManager()};
         manager.ConnectedPeer(peer, {.m_is_inbound = false});
         std::optional<bool> started;
         RunConcurrently(
@@ -624,7 +930,7 @@ BOOST_AUTO_TEST_CASE(concurrent_capability_and_sync_disconnect_linearization)
         manager.CheckIsEmpty();
     }
     {
-        BlockDownloadManager manager;
+        auto manager{MakeManager()};
         manager.ConnectedPeer(peer, {.m_is_inbound = false});
         BOOST_REQUIRE(manager.StartSync(peer));
         std::optional<bool> cleared;
@@ -642,7 +948,7 @@ BOOST_AUTO_TEST_CASE(concurrent_capability_and_sync_disconnect_linearization)
 BOOST_AUTO_TEST_CASE(concurrent_stale_tip_and_timeout_commands)
 {
     {
-        BlockDownloadManager manager;
+        auto manager{MakeManager()};
         manager.UpdatedBlockTip(100s);
         std::optional<std::pair<bool, node::BlockDownloadGlobalSnapshot>> observation;
         RunConcurrently(
@@ -661,7 +967,7 @@ BOOST_AUTO_TEST_CASE(concurrent_stale_tip_and_timeout_commands)
         BOOST_CHECK(manager.GetGlobalSnapshot().m_last_tip_update == 190s);
     }
     {
-        BlockDownloadManager manager;
+        auto manager{MakeManager()};
         const NodeId peer{1};
         const auto block{TestBlock(1, 1)};
         manager.ConnectedPeer(peer, {.m_is_inbound = false});
@@ -690,7 +996,7 @@ BOOST_AUTO_TEST_CASE(concurrent_stale_tip_and_timeout_commands)
         manager.CheckIsEmpty();
     }
     {
-        BlockDownloadManager manager;
+        auto manager{MakeManager()};
         BOOST_REQUIRE(manager.TryIncreaseBlockStallingTimeout(2s) == 4s);
         std::optional<std::chrono::seconds> increased;
         std::optional<std::chrono::seconds> decreased;
@@ -721,7 +1027,7 @@ BOOST_AUTO_TEST_CASE(concurrent_reserve_disconnect_and_remove)
     const auto block{TestBlock(1, 1)};
 
     for (int i{0}; i < iterations; ++i) {
-        BlockDownloadManager manager;
+        auto manager{MakeManager()};
         manager.ConnectedPeer(peer, {.m_is_inbound = false});
         std::optional<node::BlockRequestReservation> reservation;
         std::optional<node::PeerBlockDownloadSnapshot> copied_snapshot;
@@ -765,7 +1071,7 @@ BOOST_AUTO_TEST_CASE(concurrent_reserve_disconnect_and_remove)
     }
 
     for (int i{0}; i < iterations; ++i) {
-        BlockDownloadManager manager;
+        auto manager{MakeManager()};
         manager.ConnectedPeer(peer, {.m_is_inbound = false});
         std::optional<node::BlockRequestReservation> reservation;
         std::optional<node::BlockRequestRemoval> removal;

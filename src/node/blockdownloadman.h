@@ -5,8 +5,8 @@
 #ifndef BITCOIN_NODE_BLOCKDOWNLOADMAN_H
 #define BITCOIN_NODE_BLOCKDOWNLOADMAN_H
 
-#include <arith_uint256.h>
 #include <net.h>
+#include <node/blockdownloadchain.h>
 #include <uint256.h>
 
 #include <chrono>
@@ -26,15 +26,6 @@ class BlockDownloadManagerImpl;
 static constexpr size_t MAX_CMPCTBLOCKS_INFLIGHT_PER_BLOCK{3};
 /** Default time before a peer stalling block download is disconnected. */
 static constexpr std::chrono::seconds DEFAULT_BLOCK_STALLING_TIMEOUT{2};
-
-/** Validation-derived identity copied before crossing into request tracking. */
-struct BlockDownloadBlock {
-    uint256 m_hash;
-    int m_height;
-    arith_uint256 m_chain_work;
-
-    friend bool operator==(const BlockDownloadBlock&, const BlockDownloadBlock&) = default;
-};
 
 /** Connection properties needed to maintain request invariants. */
 struct BlockDownloadConnectionInfo {
@@ -95,6 +86,7 @@ struct PeerBlockDownloadSnapshot {
     bool m_can_serve_witness{false};
     bool m_limited_peer{false};
     bool m_sync_started{false};
+    std::optional<BlockDownloadBlock> m_best_known_block;
     uint64_t m_generation{0};
     /** Global values copied under the same lock as this peer's state. */
     size_t m_total_requests{0};
@@ -126,18 +118,18 @@ struct BlockSource {
 };
 
 /**
- * Internally synchronized owner of chain-independent block-download bookkeeping.
+ * Internally synchronized owner of block-download bookkeeping.
  *
  * The manager owns peer connection capabilities, request queues, source
- * attribution, compact reconstruction lifetime, counters, and timers. It
- * deliberately has no chain, validation, mempool, availability, or scheduling
- * dependency.
+ * attribution, compact reconstruction lifetime, availability identities,
+ * counters, and timers. Chain queries cross a narrow owned-value snapshot
+ * boundary; validation, mempool, and scheduling remain outside the manager.
  */
 class BlockDownloadManager {
     const std::unique_ptr<BlockDownloadManagerImpl> m_impl;
 
 public:
-    BlockDownloadManager();
+    explicit BlockDownloadManager(std::unique_ptr<BlockDownloadChain> chain);
     ~BlockDownloadManager();
 
     BlockDownloadManager(const BlockDownloadManager&) = delete;
@@ -147,6 +139,15 @@ public:
     void ConnectedPeer(NodeId peer, const BlockDownloadConnectionInfo& info);
     /** Remove a peer and all bookkeeping owned by it. */
     void DisconnectedPeer(NodeId peer);
+
+    /** Resolve an existing pending announcement through one coherent snapshot. */
+    void ProcessBlockAvailability(NodeId peer);
+    /** Process pending availability, then record the newest announcement. */
+    void UpdateBlockAvailability(NodeId peer, const uint256& hash);
+    /** Query whether target is on either chain identity attributed to the peer. */
+    bool PeerHasHeader(NodeId peer, const uint256& target_hash) const;
+    /** Record the best header sent using an identity copied under chain synchronization. */
+    void RecordBestHeaderSent(NodeId peer, const BlockDownloadBlock& block);
 
     /**
      * Atomically reserve a request. A non-null proposed_partial requests
