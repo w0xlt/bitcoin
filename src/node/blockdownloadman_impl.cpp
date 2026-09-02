@@ -8,10 +8,137 @@
 
 #include <algorithm>
 #include <iterator>
+#include <map>
 #include <set>
 #include <utility>
 
 namespace node {
+namespace {
+
+static constexpr unsigned int BLOCK_DOWNLOAD_WINDOW{1024};
+static constexpr unsigned int NODE_NETWORK_LIMITED_MIN_BLOCKS{288};
+static constexpr size_t MAX_BLOCKS_IN_TRANSIT_PER_PEER{16};
+/** One initial attempt followed by no more than two stale-view retries. */
+static constexpr int MAX_PLANNING_ATTEMPTS{3};
+
+struct PlanningInput {
+    NodeId m_peer;
+    uint64_t m_planning_generation;
+    uint64_t m_in_flight_generation;
+    BlockDownloadConnectionInfo m_connection_info;
+    std::optional<BlockDownloadBlock> m_best_known;
+    std::optional<BlockDownloadBlock> m_last_common;
+    size_t m_request_count;
+    size_t m_budget;
+    std::map<uint256, NodeId> m_in_flight;
+};
+
+struct PlanningResult {
+    std::vector<BlockDownloadBlock> m_blocks;
+    std::optional<BlockDownloadBlock> m_last_common;
+    std::optional<NodeId> m_staller;
+    std::optional<BlockDownloadBlock> m_staller_block;
+    bool m_assumeutxo_blocked{false};
+    bool m_last_common_evaluated{false};
+    bool m_revalidate_historical_identity{false};
+};
+
+void SelectPath(
+    const PlanningInput& input,
+    std::span<const BlockDownloadCandidate> path,
+    const BlockDownloadBlock& best_known,
+    int window_end,
+    bool update_last_common,
+    PlanningResult& result)
+{
+    NodeId waiting_for{-1};
+    for (const auto& candidate : path) {
+        if (!candidate.m_valid_tree) return;
+        if (!input.m_connection_info.m_can_serve_witness && candidate.m_segwit_active) return;
+
+        if (candidate.m_have_data || (update_last_common && candidate.m_in_active_chain)) {
+            // Linked downloaded side-chain blocks advance last-common too. This
+            // is what lets a reorg download move its bounded window forward.
+            if (update_last_common && candidate.m_have_chain_txs) {
+                result.m_last_common = candidate.m_block;
+            }
+            continue;
+        }
+
+        if (const auto it{input.m_in_flight.find(candidate.m_block.m_hash)}; it != input.m_in_flight.end()) {
+            if (waiting_for == -1) waiting_for = it->second;
+            continue;
+        }
+
+        if (candidate.m_block.m_height > window_end) {
+            if (update_last_common && result.m_blocks.empty() &&
+                waiting_for != -1 && waiting_for != input.m_peer) {
+                result.m_staller = waiting_for;
+                result.m_staller_block = candidate.m_block;
+            }
+            return;
+        }
+
+        if (input.m_connection_info.m_limited_peer &&
+            best_known.m_height - candidate.m_block.m_height >=
+                static_cast<int>(NODE_NETWORK_LIMITED_MIN_BLOCKS) - 2) {
+            continue;
+        }
+
+        result.m_blocks.push_back(candidate.m_block);
+        if (result.m_blocks.size() == input.m_budget) return;
+    }
+}
+
+PlanningResult PlanDownloads(const PlanningInput& input, const BlockDownloadChainSnapshot& snapshot)
+{
+    PlanningResult result;
+    result.m_last_common = input.m_last_common;
+    const auto& best_known{snapshot.m_resolved_best_known};
+
+    if (best_known && snapshot.m_active_tip &&
+        best_known->m_chain_work >= snapshot.m_active_tip->m_chain_work &&
+        best_known->m_chain_work >= snapshot.m_minimum_chain_work) {
+        if (snapshot.m_snapshot_base &&
+            snapshot.m_assumeutxo_state == BlockDownloadAssumeutxoState::UNVALIDATED &&
+            !snapshot.m_best_known_has_snapshot_base) {
+            result.m_assumeutxo_blocked = true;
+        } else if (snapshot.m_last_common_block) {
+            result.m_last_common_evaluated = true;
+            result.m_last_common = snapshot.m_last_common_block;
+            if (*snapshot.m_last_common_block != *best_known) {
+                SelectPath(
+                    input,
+                    snapshot.m_normal_path,
+                    *best_known,
+                    snapshot.m_normal_window_end,
+                    /*update_last_common=*/true,
+                    result);
+            }
+        }
+    }
+
+    // Preserve current-chainstate priority, then fill the remaining budget
+    // from the background chainstate when this peer can provide its target.
+    if (input.m_connection_info.m_limited_peer ||
+        !snapshot.m_historical_requested ||
+        result.m_blocks.size() >= input.m_budget ||
+        !best_known) {
+        return result;
+    }
+    result.m_revalidate_historical_identity = true;
+    if (!snapshot.m_best_known_has_historical_target) return result;
+    SelectPath(
+        input,
+        snapshot.m_historical_path,
+        *best_known,
+        snapshot.m_historical_window_end,
+        /*update_last_common=*/false,
+        result);
+    return result;
+}
+
+} // namespace
 
 BlockDownloadManager::BlockDownloadManager(std::unique_ptr<BlockDownloadChain> chain)
     : m_impl{std::make_unique<BlockDownloadManagerImpl>(std::move(chain))}
@@ -48,6 +175,15 @@ bool BlockDownloadManager::PeerHasHeader(NodeId peer, const uint256& target_hash
 void BlockDownloadManager::RecordBestHeaderSent(NodeId peer, const BlockDownloadBlock& block)
 {
     m_impl->RecordBestHeaderSent(peer, block);
+}
+
+BlockDownloadBatch BlockDownloadManager::PlanAndReserve(
+    NodeId peer,
+    unsigned int budget,
+    std::chrono::microseconds now,
+    bool allow_historical)
+{
+    return m_impl->PlanAndReserve(peer, budget, now, allow_historical);
 }
 
 BlockRequestReservation BlockDownloadManager::ReserveBlockRequest(
@@ -194,10 +330,17 @@ void BlockDownloadManagerImpl::ConnectedPeer(NodeId peer, const BlockDownloadCon
     m_num_preferred_download_peers +=
         static_cast<int>(info.m_preferred_download) - static_cast<int>(state.m_connection_info.m_preferred_download);
     Assume(m_num_preferred_download_peers >= 0);
+    const bool planning_changed{
+        state.m_connection_info.m_can_serve_witness != info.m_can_serve_witness ||
+        state.m_connection_info.m_limited_peer != info.m_limited_peer};
     state.m_connection_info.m_preferred_download = info.m_preferred_download;
     state.m_connection_info.m_can_serve_witness = info.m_can_serve_witness;
     state.m_connection_info.m_limited_peer = info.m_limited_peer;
-    BumpPeerGenerationLocked(state);
+    if (planning_changed) {
+        BumpPlanningGenerationLocked(state);
+    } else {
+        BumpPeerGenerationLocked(state);
+    }
 }
 
 void BlockDownloadManagerImpl::DisconnectedPeer(NodeId peer)
@@ -353,14 +496,149 @@ void BlockDownloadManagerImpl::RecordBestHeaderSent(NodeId peer, const BlockDown
     BumpPeerGenerationLocked(it->second);
 }
 
+BlockDownloadBatch BlockDownloadManagerImpl::PlanAndReserve(
+    NodeId peer,
+    unsigned int budget,
+    std::chrono::microseconds now,
+    bool allow_historical)
+{
+    if (budget == 0) return {};
+
+    // A pending availability lookup is itself generation-checked and never
+    // calls the provider while holding the manager mutex.
+    ProcessBlockAvailability(peer);
+
+    for (int attempt{0}; attempt < MAX_PLANNING_ATTEMPTS; ++attempt) {
+        std::optional<PlanningInput> input;
+        {
+            LOCK(m_mutex);
+            const auto peer_it{m_peer_states.find(peer)};
+            if (peer_it == m_peer_states.end()) return {};
+            const auto& state{peer_it->second};
+            const size_t remaining{
+                state.m_requests.size() < MAX_BLOCKS_IN_TRANSIT_PER_PEER
+                    ? MAX_BLOCKS_IN_TRANSIT_PER_PEER - state.m_requests.size()
+                    : 0};
+            if (remaining == 0) return {};
+
+            input.emplace(PlanningInput{
+                .m_peer = peer,
+                .m_planning_generation = state.m_planning_generation,
+                .m_in_flight_generation = m_in_flight_generation,
+                .m_connection_info = state.m_connection_info,
+                .m_best_known = state.m_best_known_block,
+                .m_last_common = state.m_last_common_block,
+                .m_request_count = state.m_requests.size(),
+                .m_budget = std::min<size_t>(budget, remaining),
+                .m_in_flight = {},
+            });
+            for (auto it{m_requests_by_hash.begin()}; it != m_requests_by_hash.end();) {
+                const auto range{m_requests_by_hash.equal_range(it->first)};
+                input->m_in_flight.emplace(it->first, it->second.m_peer);
+                it = range.second;
+            }
+        }
+
+        BlockDownloadChainQuery query;
+        query.m_best_known_hash = input->m_best_known ? std::optional{input->m_best_known->m_hash} : std::nullopt;
+        query.m_last_common_hash = input->m_last_common ? std::optional{input->m_last_common->m_hash} : std::nullopt;
+        query.m_plan_blocks = true;
+        query.m_include_historical = allow_historical && !input->m_connection_info.m_limited_peer;
+        query.m_download_window = BLOCK_DOWNLOAD_WINDOW;
+        BlockDownloadChainSnapshot snapshot{m_chain->Capture(query)};
+        const PlanningResult plan{PlanDownloads(*input, snapshot)};
+        snapshot.m_revalidate_historical_identity = plan.m_revalidate_historical_identity;
+        snapshot.m_revalidation_blocks = plan.m_blocks;
+        const auto add_revalidation_block = [&](const std::optional<BlockDownloadBlock>& block) {
+            if (block && std::ranges::none_of(snapshot.m_revalidation_blocks, [&](const auto& existing) {
+                    return existing.m_hash == block->m_hash;
+                })) {
+                snapshot.m_revalidation_blocks.push_back(*block);
+            }
+        };
+        if (plan.m_last_common_evaluated) add_revalidation_block(plan.m_last_common);
+        add_revalidation_block(plan.m_staller_block);
+
+        std::optional<NodeId> newly_stalling;
+        const auto commit = [&]() EXCLUSIVE_LOCKS_REQUIRED(!m_mutex) {
+            LOCK(m_mutex);
+            const auto peer_it{m_peer_states.find(peer)};
+            if (peer_it == m_peer_states.end()) return false;
+            auto& state{peer_it->second};
+            if (state.m_planning_generation != input->m_planning_generation ||
+                state.m_best_known_block != input->m_best_known ||
+                state.m_last_common_block != input->m_last_common ||
+                state.m_requests.size() != input->m_request_count ||
+                m_in_flight_generation != input->m_in_flight_generation ||
+                state.m_requests.size() + plan.m_blocks.size() > MAX_BLOCKS_IN_TRANSIT_PER_PEER ||
+                plan.m_blocks.size() > input->m_budget) {
+                return false;
+            }
+
+            std::set<uint256> proposal_hashes;
+            for (const auto& block : plan.m_blocks) {
+                if (!proposal_hashes.insert(block.m_hash).second || m_requests_by_hash.contains(block.m_hash)) {
+                    return false;
+                }
+            }
+
+            // All rejection checks precede every mutation. From here through
+            // the end of the callback the batch, last-common, and stalling
+            // transitions form one manager-mutex transaction.
+            if (state.m_last_common_block != plan.m_last_common) {
+                state.m_last_common_block = plan.m_last_common;
+                BumpPlanningGenerationLocked(state);
+            }
+            for (const auto& block : plan.m_blocks) {
+                state.m_requests.push_back({block, {}});
+                const auto queue_it{std::prev(state.m_requests.end())};
+                if (state.m_requests.size() == 1) {
+                    state.m_downloading_since = now;
+                    ++m_peers_downloading_from;
+                }
+                m_requests_by_hash.emplace(block.m_hash, IndexedRequest{peer, queue_it});
+                BumpPlanningGenerationLocked(state);
+                ++m_in_flight_generation;
+            }
+
+            if (plan.m_blocks.empty() && state.m_requests.empty() && plan.m_staller) {
+                const auto staller_it{m_peer_states.find(*plan.m_staller)};
+                if (staller_it != m_peer_states.end() &&
+                    staller_it->second.m_stalling_since == std::chrono::microseconds{0} &&
+                    now != std::chrono::microseconds{0}) {
+                    staller_it->second.m_stalling_since = now;
+                    BumpPeerGenerationLocked(staller_it->second);
+                    newly_stalling = *plan.m_staller;
+                }
+            }
+            return true;
+        };
+
+        if (m_chain->Revalidate(snapshot, plan.m_blocks, commit)) {
+            return {
+                .m_blocks = plan.m_blocks,
+                .m_staller = newly_stalling,
+                .m_assumeutxo_blocked = plan.m_assumeutxo_blocked,
+            };
+        }
+    }
+    return {};
+}
+
 void BlockDownloadManagerImpl::BumpPeerGenerationLocked(PeerRequestState& state)
 {
     state.m_generation = ++m_next_peer_generation;
 }
 
-void BlockDownloadManagerImpl::BumpAvailabilityGenerationLocked(PeerRequestState& state)
+void BlockDownloadManagerImpl::BumpPlanningGenerationLocked(PeerRequestState& state)
 {
     BumpPeerGenerationLocked(state);
+    state.m_planning_generation = state.m_generation;
+}
+
+void BlockDownloadManagerImpl::BumpAvailabilityGenerationLocked(PeerRequestState& state)
+{
+    BumpPlanningGenerationLocked(state);
     state.m_availability_generation = state.m_generation;
 }
 
@@ -440,7 +718,7 @@ BlockRequestReservation BlockDownloadManagerImpl::ReserveBlockRequest(
         ++m_peers_downloading_from;
     }
     m_requests_by_hash.emplace(block.m_hash, IndexedRequest{peer, queue_it});
-    BumpPeerGenerationLocked(state);
+    BumpPlanningGenerationLocked(state);
     ++m_in_flight_generation;
     result.m_partial_block = queue_it->m_partial_block;
     return result;
@@ -479,7 +757,7 @@ BlockRequestRemoval BlockDownloadManagerImpl::RemoveBlockRequest(
         }
         state.m_stalling_since = std::chrono::microseconds{0};
         range.first = m_requests_by_hash.erase(range.first);
-        BumpPeerGenerationLocked(state);
+        BumpPlanningGenerationLocked(state);
         ++result.m_removed;
     }
     if (result.m_removed != 0) ++m_in_flight_generation;
@@ -526,6 +804,7 @@ std::optional<PeerBlockDownloadSnapshot> BlockDownloadManagerImpl::GetPeerSnapsh
     result.m_limited_peer = it->second.m_connection_info.m_limited_peer;
     result.m_sync_started = it->second.m_sync_started;
     result.m_best_known_block = it->second.m_best_known_block;
+    result.m_last_common_block = it->second.m_last_common_block;
     result.m_generation = it->second.m_generation;
     result.m_total_requests = m_requests_by_hash.size();
     result.m_peers_downloading_from = m_peers_downloading_from;
@@ -676,7 +955,12 @@ bool BlockDownloadManagerImpl::CheckConsistencyLocked() const
     std::set<std::pair<uint256, NodeId>> unique_requests;
 
     for (const auto& [peer, state] : m_peer_states) {
-        if (state.m_availability_generation == 0 || state.m_availability_generation > state.m_generation) return false;
+        if (state.m_availability_generation == 0 ||
+            state.m_availability_generation > state.m_generation ||
+            state.m_planning_generation == 0 ||
+            state.m_planning_generation > state.m_generation) {
+            return false;
+        }
         queue_size += state.m_requests.size();
         peers_downloading += !state.m_requests.empty();
         preferred_peers += state.m_connection_info.m_preferred_download;

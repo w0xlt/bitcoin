@@ -3813,6 +3813,12 @@ void ChainstateManager::ReceivedBlockTransactions(const CBlock& block, CBlockInd
             m_blockman.m_blocks_unlinked.insert(std::make_pair(pindexNew->pprev, pindexNew));
         }
     }
+
+    // Publish only after BLOCK_HAVE_DATA and all resulting chain-transaction
+    // linkage are visible. The synchronous callback preserves cs_main ->
+    // block-download-manager lock order and closes planner commit races for
+    // blocks accepted outside net processing, including side-chain blocks.
+    if (m_options.signals) m_options.signals->BlockDataAvailable(pindexNew->GetBlockHash());
 }
 
 static bool CheckBlockHeader(const CBlockHeader& block, BlockValidationState& state, const Consensus::Params& consensusParams, bool fCheckPOW = true)

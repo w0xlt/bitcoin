@@ -9,6 +9,7 @@
 #include <kernel/cs_main.h>
 #include <primitives/transaction.h>
 #include <sync.h>
+#include <uint256.h>
 
 #include <cstddef>
 #include <cstdint>
@@ -154,6 +155,12 @@ protected:
      */
     virtual void BlockChecked(const std::shared_ptr<const CBlock>&, const BlockValidationState&) {}
     /**
+     * Notifies listeners synchronously after block data and transaction-link
+     * status have been published under cs_main. This includes side-chain data
+     * that may never produce BlockConnected.
+     */
+    virtual void BlockDataAvailable(const uint256&) EXCLUSIVE_LOCKS_REQUIRED(cs_main) {}
+    /**
      * Notifies listeners that a block which builds directly on our current tip
      * has been received and connected to the headers tree, though not validated yet.
      */
@@ -227,6 +234,7 @@ public:
     void BlockDisconnected(std::shared_ptr<const CBlock>, const CBlockIndex* pindex);
     void ChainStateFlushed(const kernel::ChainstateRole&, const CBlockLocator&);
     void BlockChecked(const std::shared_ptr<const CBlock>&, const BlockValidationState&);
+    void BlockDataAvailable(const uint256&) EXCLUSIVE_LOCKS_REQUIRED(cs_main);
     void NewPoWValidBlock(const CBlockIndex *, const std::shared_ptr<const CBlock>&);
 };
 

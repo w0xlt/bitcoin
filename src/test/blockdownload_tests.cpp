@@ -7,14 +7,18 @@
 #include <chain.h>
 #include <node/blockdownloadchain_impl.h>
 #include <node/blockdownloadman.h>
+#include <script/script.h>
 #include <test/util/blockdownloadchain.h>
 #include <test/util/setup_common.h>
 #include <uint256.h>
 #include <validation.h>
+#include <validationinterface.h>
 
 #include <boost/test/unit_test.hpp>
 
+#include <array>
 #include <chrono>
+#include <functional>
 #include <latch>
 #include <memory>
 #include <optional>
@@ -23,8 +27,10 @@
 
 using namespace std::chrono_literals;
 using node::BlockDownloadBlock;
+using node::BlockDownloadCandidate;
 using node::BlockDownloadConnectionInfo;
 using node::BlockDownloadManager;
+using node::BlockDownloadAssumeutxoState;
 using node::BlockRequestStatus;
 using node::test::FakeBlockDownloadChain;
 
@@ -39,10 +45,73 @@ BlockDownloadBlock TestBlock(uint64_t value, int height)
     };
 }
 
+BlockDownloadCandidate TestCandidate(
+    BlockDownloadBlock block,
+    bool valid_tree = true,
+    bool have_data = false,
+    bool in_active_chain = false,
+    bool have_chain_txs = false,
+    bool segwit_active = false)
+{
+    return {
+        .m_block = std::move(block),
+        .m_valid_tree = valid_tree,
+        .m_have_data = have_data,
+        .m_in_active_chain = in_active_chain,
+        .m_have_chain_txs = have_chain_txs,
+        .m_segwit_active = segwit_active,
+    };
+}
+
+void SetPlanningTip(FakeBlockDownloadChain& chain, const BlockDownloadBlock& tip)
+{
+    chain.SetActiveTip(tip.m_hash);
+    chain.SetCurrentChainstate(tip.m_hash);
+    chain.SetMinimumChainWork(0);
+}
+
 BlockDownloadManager MakeManager()
 {
     return BlockDownloadManager{std::make_unique<FakeBlockDownloadChain>()};
 }
+
+class BlockDataCleanupSubscriber final : public CValidationInterface
+{
+public:
+    BlockDataCleanupSubscriber(
+        BlockDownloadManager& manager,
+        ChainstateManager& chainman,
+        uint256 target,
+        NodeId peer)
+        : m_manager{manager}, m_chainman{chainman}, m_target{std::move(target)}, m_peer{peer}
+    {
+    }
+
+    void BlockDataAvailable(const uint256& hash) override EXCLUSIVE_LOCKS_REQUIRED(cs_main)
+    {
+        if (hash != m_target) return;
+
+        AssertLockHeld(cs_main);
+        const CBlockIndex* index{m_chainman.m_blockman.LookupBlockIndex(hash)};
+        m_called = true;
+        m_saw_have_data = index && (index->nStatus & BLOCK_HAVE_DATA);
+        m_saw_side_chain = index && !m_chainman.ActiveChain().Contains(*index);
+        m_saw_request = m_manager.IsBlockRequested(hash);
+        m_removed = m_manager.RemoveBlockRequest(hash, m_peer, 2us).m_removed;
+    }
+
+    bool m_called{false};
+    bool m_saw_have_data{false};
+    bool m_saw_side_chain{false};
+    bool m_saw_request{false};
+    size_t m_removed{0};
+
+private:
+    BlockDownloadManager& m_manager;
+    ChainstateManager& m_chainman;
+    const uint256 m_target;
+    const NodeId m_peer;
+};
 
 template <typename Callable1, typename Callable2>
 void RunConcurrently(Callable1&& callable_1, Callable2&& callable_2)
@@ -360,8 +429,582 @@ BOOST_FIXTURE_TEST_CASE(validation_chain_snapshot_translation, TestChain100Setup
     BOOST_CHECK(snapshot.m_ancestor_of_best_known);
     BOOST_CHECK(!snapshot.m_ancestor_of_best_header_sent);
 
+    node::BlockDownloadChainQuery planning_query;
+    planning_query.m_best_known_hash = tip.m_hash;
+    planning_query.m_last_common_hash = ancestor.m_hash;
+    planning_query.m_plan_blocks = true;
+    planning_query.m_download_window = 1024;
+    const auto planning_snapshot{chain->Capture(planning_query)};
+    bool committed{false};
+    BOOST_CHECK(chain->Revalidate(planning_snapshot, {}, [&] {
+        committed = true;
+        return true;
+    }));
+    BOOST_CHECK(committed);
+
     chain.reset();
     BOOST_CHECK(*snapshot.m_announced_block == tip); // Owned after adapter lifetime ends.
+}
+
+BOOST_FIXTURE_TEST_CASE(block_data_notification_cleans_side_chain_reservation, TestChain100Setup)
+{
+    // Both blocks build on the same tip. Storing the second one exercises the
+    // path that does not necessarily produce a BlockConnected notification.
+    const CBlock active_block{CreateBlock({}, CScript{} << OP_TRUE)};
+    const CBlock side_block{CreateBlock({}, CScript{} << OP_FALSE)};
+    BOOST_REQUIRE(active_block.GetHash() != side_block.GetHash());
+    BOOST_REQUIRE(m_node.chainman->ProcessNewBlock(
+        std::make_shared<const CBlock>(active_block), true, true, nullptr));
+
+    auto manager{BlockDownloadManager{node::MakeValidationBlockDownloadChain(*m_node.chainman)}};
+    const NodeId peer{1};
+    manager.ConnectedPeer(peer, {.m_is_inbound = false});
+    const BlockDownloadBlock request{
+        .m_hash = side_block.GetHash(),
+        .m_height = 101,
+        .m_chain_work = arith_uint256{1},
+    };
+    BOOST_REQUIRE(
+        manager.ReserveBlockRequest(peer, request, 1us).m_status == BlockRequestStatus::NEW);
+
+    auto subscriber{std::make_shared<BlockDataCleanupSubscriber>(
+        manager, *m_node.chainman, side_block.GetHash(), peer)};
+    m_node.validation_signals->RegisterSharedValidationInterface(subscriber);
+    bool new_block{false};
+    BOOST_REQUIRE(m_node.chainman->ProcessNewBlock(
+        std::make_shared<const CBlock>(side_block), true, true, &new_block));
+    BOOST_CHECK(new_block);
+
+    // BlockDataAvailable is synchronous, so all observations and cleanup are
+    // complete before ProcessNewBlock returns.
+    BOOST_CHECK(subscriber->m_called);
+    BOOST_CHECK(subscriber->m_saw_have_data);
+    BOOST_CHECK(subscriber->m_saw_side_chain);
+    BOOST_CHECK(subscriber->m_saw_request);
+    BOOST_CHECK_EQUAL(subscriber->m_removed, 1U);
+    BOOST_CHECK(!manager.IsBlockRequested(side_block.GetHash()));
+    m_node.validation_signals->UnregisterSharedValidationInterface(subscriber);
+
+    manager.DisconnectedPeer(peer);
+    manager.CheckIsEmpty();
+}
+
+BOOST_AUTO_TEST_CASE(normal_planning_policy_and_atomic_reservation)
+{
+    auto fake{std::make_unique<FakeBlockDownloadChain>()};
+    auto* const chain{fake.get()};
+    BlockDownloadManager manager{std::move(fake)};
+    const NodeId peer{1};
+    manager.ConnectedPeer(peer, {.m_is_inbound = false, .m_can_serve_witness = true});
+
+    const auto root{TestBlock(1, 0)};
+    const auto block_1{TestBlock(2, 1)};
+    const auto block_2{TestBlock(3, 2)};
+    const auto block_3{TestBlock(4, 3)};
+    const auto block_4{TestBlock(5, 4)};
+    chain->SetCandidate(TestCandidate(root, true, true, true, true));
+    chain->SetCandidate(TestCandidate(block_1), root.m_hash);
+    chain->SetCandidate(TestCandidate(block_2), block_1.m_hash);
+    chain->SetCandidate(TestCandidate(block_3), block_2.m_hash);
+    chain->SetCandidate(TestCandidate(block_4), block_3.m_hash);
+    SetPlanningTip(*chain, root);
+    manager.UpdateBlockAvailability(peer, block_4.m_hash);
+
+    const auto batch{manager.PlanAndReserve(peer, 3, 10us, /*allow_historical=*/false)};
+    BOOST_REQUIRE_EQUAL(batch.m_blocks.size(), 3U);
+    BOOST_CHECK(batch.m_blocks[0] == block_1);
+    BOOST_CHECK(batch.m_blocks[1] == block_2);
+    BOOST_CHECK(batch.m_blocks[2] == block_3);
+    BOOST_CHECK(!batch.m_staller);
+    const auto reserved{*manager.GetPeerSnapshot(peer)};
+    BOOST_CHECK(reserved.m_blocks == batch.m_blocks);
+    BOOST_REQUIRE(reserved.m_last_common_block);
+    BOOST_CHECK(*reserved.m_last_common_block == root);
+    for (const auto& block : batch.m_blocks) BOOST_CHECK(manager.IsBlockRequested(block.m_hash));
+
+    manager.RemoveBlockRequest(block_1.m_hash, peer, 20us);
+    manager.RemoveBlockRequest(block_2.m_hash, peer, 20us);
+    manager.RemoveBlockRequest(block_3.m_hash, peer, 20us);
+    chain->SetMinimumChainWork(block_4.m_chain_work + 1);
+    BOOST_CHECK(manager.PlanAndReserve(peer, 1, 21us, false).m_blocks.empty());
+    BOOST_CHECK(*manager.GetPeerSnapshot(peer)->m_last_common_block == root);
+
+    chain->SetMinimumChainWork(0);
+    chain->SetCandidate(TestCandidate(block_1, /*valid_tree=*/false), root.m_hash);
+    BOOST_CHECK(manager.PlanAndReserve(peer, 1, 22us, false).m_blocks.empty());
+    chain->SetCandidate(TestCandidate(block_1, true, false, false, false, /*segwit_active=*/true), root.m_hash);
+    manager.ConnectedPeer(peer, {.m_is_inbound = false, .m_can_serve_witness = false});
+    BOOST_CHECK(manager.PlanAndReserve(peer, 1, 23us, false).m_blocks.empty());
+    manager.ConnectedPeer(peer, {.m_is_inbound = false, .m_can_serve_witness = true});
+    const auto witness_batch{manager.PlanAndReserve(peer, 1, 24us, false)};
+    BOOST_REQUIRE_EQUAL(witness_batch.m_blocks.size(), 1U);
+    BOOST_CHECK(witness_batch.m_blocks.front() == block_1);
+
+    manager.RemoveBlockRequest(block_1.m_hash, peer, 25us);
+    chain->SetCandidate(
+        TestCandidate(block_1, true, true, /*in_active_chain=*/false, /*have_chain_txs=*/true),
+        root.m_hash);
+    const auto side_chain_batch{manager.PlanAndReserve(peer, 1, 26us, false)};
+    BOOST_REQUIRE_EQUAL(side_chain_batch.m_blocks.size(), 1U);
+    BOOST_CHECK(side_chain_batch.m_blocks.front() == block_2);
+    BOOST_CHECK(*manager.GetPeerSnapshot(peer)->m_last_common_block == block_1);
+
+    manager.DisconnectedPeer(peer);
+    manager.CheckIsEmpty();
+}
+
+BOOST_AUTO_TEST_CASE(historical_priority_data_and_chain_tx_policy)
+{
+    auto fake{std::make_unique<FakeBlockDownloadChain>()};
+    auto* const chain{fake.get()};
+    BlockDownloadManager manager{std::move(fake)};
+    const NodeId peer{1};
+    manager.ConnectedPeer(peer, {.m_is_inbound = false, .m_can_serve_witness = true});
+
+    const auto root{TestBlock(1, 0)};
+    const auto historical_1{TestBlock(2, 1)};
+    const auto historical_2{TestBlock(3, 2)};
+    const auto normal_1{TestBlock(4, 3)};
+    const auto normal_2{TestBlock(5, 4)};
+    chain->SetCandidate(TestCandidate(root, true, true, true, true));
+    // Active-but-pruned blocks advance normal last-common and remain eligible
+    // for historical download, which deliberately ignores active membership.
+    chain->SetCandidate(TestCandidate(historical_1, true, false, true, true), root.m_hash);
+    chain->SetCandidate(TestCandidate(historical_2, true, false, true, true), historical_1.m_hash);
+    chain->SetCandidate(TestCandidate(normal_1), historical_2.m_hash);
+    chain->SetCandidate(TestCandidate(normal_2), normal_1.m_hash);
+    SetPlanningTip(*chain, historical_2);
+    chain->SetHistoricalRange(std::pair{root.m_hash, historical_2.m_hash});
+    manager.UpdateBlockAvailability(peer, normal_2.m_hash);
+
+    const auto batch{manager.PlanAndReserve(peer, 3, 10us, /*allow_historical=*/true)};
+    BOOST_REQUIRE_EQUAL(batch.m_blocks.size(), 3U);
+    BOOST_CHECK(batch.m_blocks[0] == normal_1);
+    BOOST_CHECK(batch.m_blocks[1] == normal_2);
+    BOOST_CHECK(batch.m_blocks[2] == historical_1);
+    BOOST_CHECK(*manager.GetPeerSnapshot(peer)->m_last_common_block == historical_2);
+
+    manager.DisconnectedPeer(peer);
+    manager.CheckIsEmpty();
+}
+
+BOOST_AUTO_TEST_CASE(historical_revalidation_tracks_planner_consultation)
+{
+    // Filling the normal budget makes background-chain movement irrelevant to
+    // this proposal. Rearm the hook so checking it would exhaust all retries.
+    {
+        auto fake{std::make_unique<FakeBlockDownloadChain>()};
+        auto* const chain{fake.get()};
+        BlockDownloadManager manager{std::move(fake)};
+        const NodeId peer{1};
+        manager.ConnectedPeer(peer, {.m_is_inbound = false, .m_can_serve_witness = true});
+
+        const auto root{TestBlock(1, 0)};
+        const auto block_1{TestBlock(2, 1)};
+        const auto block_2{TestBlock(3, 2)};
+        const auto block_3{TestBlock(4, 3)};
+        const auto block_4{TestBlock(5, 4)};
+        chain->SetCandidate(TestCandidate(root, true, true, true, true));
+        chain->SetCandidate(TestCandidate(block_1), root.m_hash);
+        chain->SetCandidate(TestCandidate(block_2), block_1.m_hash);
+        chain->SetCandidate(TestCandidate(block_3), block_2.m_hash);
+        chain->SetCandidate(TestCandidate(block_4), block_3.m_hash);
+        SetPlanningTip(*chain, root);
+        chain->SetHistoricalRange(std::pair{root.m_hash, block_4.m_hash});
+        manager.UpdateBlockAvailability(peer, block_4.m_hash);
+
+        const std::array historical_starts{block_1.m_hash, block_2.m_hash, block_3.m_hash};
+        size_t next_start{0};
+        std::function<void()> advance_historical_start;
+        advance_historical_start = [&] {
+            chain->SetHistoricalRange(std::pair{historical_starts[next_start], block_4.m_hash});
+            ++next_start;
+            if (next_start < historical_starts.size()) {
+                chain->SetRevalidateHook(advance_historical_start);
+            }
+        };
+        chain->SetRevalidateHook(advance_historical_start);
+
+        const auto batch{manager.PlanAndReserve(peer, 1, 10us, /*allow_historical=*/true)};
+        BOOST_REQUIRE_EQUAL(batch.m_blocks.size(), 1U);
+        BOOST_CHECK(batch.m_blocks.front() == block_1);
+        BOOST_CHECK_EQUAL(chain->RevalidationCount(), 1);
+        BOOST_CHECK_EQUAL(next_start, 1U);
+        BOOST_CHECK(manager.IsBlockRequested(block_1.m_hash));
+
+        manager.DisconnectedPeer(peer);
+        manager.CheckIsEmpty();
+    }
+
+    // With budget remaining, the historical start determines the first block.
+    // Moving it rejects the old proposal and the retry uses the new range.
+    {
+        auto fake{std::make_unique<FakeBlockDownloadChain>()};
+        auto* const chain{fake.get()};
+        BlockDownloadManager manager{std::move(fake)};
+        const NodeId peer{1};
+        manager.ConnectedPeer(peer, {.m_is_inbound = false, .m_can_serve_witness = true});
+
+        const auto root{TestBlock(1, 0)};
+        const auto historical_1{TestBlock(2, 1)};
+        const auto historical_2{TestBlock(3, 2)};
+        chain->SetCandidate(TestCandidate(root, true, true, true, true));
+        chain->SetCandidate(TestCandidate(historical_1, true, false, true, true), root.m_hash);
+        chain->SetCandidate(TestCandidate(historical_2, true, false, true, true), historical_1.m_hash);
+        SetPlanningTip(*chain, historical_2);
+        chain->SetHistoricalRange(std::pair{root.m_hash, historical_2.m_hash});
+        manager.UpdateBlockAvailability(peer, historical_2.m_hash);
+        chain->SetRevalidateHook([&] {
+            chain->SetHistoricalRange(std::pair{historical_1.m_hash, historical_2.m_hash});
+        });
+
+        const auto batch{manager.PlanAndReserve(peer, 1, 10us, /*allow_historical=*/true)};
+        BOOST_REQUIRE_EQUAL(batch.m_blocks.size(), 1U);
+        BOOST_CHECK(batch.m_blocks.front() == historical_2);
+        BOOST_CHECK_EQUAL(chain->RevalidationCount(), 2);
+        BOOST_CHECK(!manager.IsBlockRequested(historical_1.m_hash));
+        BOOST_CHECK(manager.IsBlockRequested(historical_2.m_hash));
+
+        manager.DisconnectedPeer(peer);
+        manager.CheckIsEmpty();
+    }
+}
+
+BOOST_AUTO_TEST_CASE(last_common_revalidation_uses_role_specific_facts)
+{
+    const auto make_fixture = [] {
+        auto fake{std::make_unique<FakeBlockDownloadChain>()};
+        auto* const chain{fake.get()};
+        auto manager{std::make_unique<BlockDownloadManager>(std::move(fake))};
+        const auto root{TestBlock(1, 0)};
+        const auto block_1{TestBlock(2, 1)};
+        const auto block_2{TestBlock(3, 2)};
+        chain->SetCandidate(TestCandidate(root, true, true, true, true));
+        chain->SetCandidate(TestCandidate(block_1, true, true, false, true), root.m_hash);
+        chain->SetCandidate(TestCandidate(block_2), block_1.m_hash);
+        SetPlanningTip(*chain, root);
+        manager->ConnectedPeer(1, {.m_is_inbound = false, .m_can_serve_witness = true});
+        manager->UpdateBlockAvailability(1, block_2.m_hash);
+        return std::tuple{std::move(manager), chain, root, block_1, block_2};
+    };
+
+    // The initial effective last-common is only a topology/window identity.
+    // Planning advances beyond it, so its candidate flags are not relevant.
+    {
+        auto [manager, chain, root, block_1, block_2]{make_fixture()};
+        chain->SetRevalidateHook([&] {
+            chain->SetCandidate(
+                TestCandidate(root, true, false, true, true),
+                std::nullopt);
+        });
+        const auto batch{manager->PlanAndReserve(1, 1, 10us, false)};
+        BOOST_REQUIRE_EQUAL(batch.m_blocks.size(), 1U);
+        BOOST_CHECK(batch.m_blocks.front() == block_2);
+        BOOST_CHECK_EQUAL(chain->RevalidationCount(), 1);
+        BOOST_REQUIRE(manager->GetPeerSnapshot(1)->m_last_common_block);
+        BOOST_CHECK(*manager->GetPeerSnapshot(1)->m_last_common_block == block_1);
+        manager->DisconnectedPeer(1);
+        manager->CheckIsEmpty();
+    }
+
+    // The advanced final last-common remains a full candidate revalidation
+    // entry. Pruning it rejects the old successor proposal; retry requests the
+    // newly missing final entry instead.
+    {
+        auto [manager, chain, root, block_1, block_2]{make_fixture()};
+        chain->SetRevalidateHook([&] {
+            chain->SetCandidate(
+                TestCandidate(block_1, true, false, false, true),
+                root.m_hash);
+        });
+        const auto batch{manager->PlanAndReserve(1, 1, 10us, false)};
+        BOOST_REQUIRE_EQUAL(batch.m_blocks.size(), 1U);
+        BOOST_CHECK(batch.m_blocks.front() == block_1);
+        BOOST_CHECK_EQUAL(chain->RevalidationCount(), 2);
+        BOOST_REQUIRE(manager->GetPeerSnapshot(1)->m_last_common_block);
+        BOOST_CHECK(*manager->GetPeerSnapshot(1)->m_last_common_block == root);
+        BOOST_CHECK(!manager->IsBlockRequested(block_2.m_hash));
+        manager->DisconnectedPeer(1);
+        manager->CheckIsEmpty();
+    }
+}
+
+BOOST_AUTO_TEST_CASE(fork_reorg_and_assumeutxo_transitions)
+{
+    auto fake{std::make_unique<FakeBlockDownloadChain>()};
+    auto* const chain{fake.get()};
+    BlockDownloadManager manager{std::move(fake)};
+    const NodeId peer{1};
+    manager.ConnectedPeer(peer, {.m_is_inbound = false, .m_can_serve_witness = true});
+
+    const auto root{TestBlock(1, 0)};
+    const auto active_1{TestBlock(2, 1)};
+    const auto peer_1{TestBlock(3, 1)};
+    const auto peer_2{TestBlock(4, 2)};
+    chain->SetCandidate(TestCandidate(root, true, true, true, true));
+    chain->SetCandidate(TestCandidate(active_1, true, true, true, true), root.m_hash);
+    chain->SetCandidate(TestCandidate(peer_1), root.m_hash);
+    chain->SetCandidate(TestCandidate(peer_2), peer_1.m_hash);
+    SetPlanningTip(*chain, active_1);
+    manager.UpdateBlockAvailability(peer, peer_2.m_hash);
+
+    chain->SetCurrentChainstate(active_1.m_hash, active_1.m_hash, BlockDownloadAssumeutxoState::UNVALIDATED);
+    const auto blocked{manager.PlanAndReserve(peer, 1, 10us, false)};
+    BOOST_CHECK(blocked.m_blocks.empty());
+    BOOST_CHECK(blocked.m_assumeutxo_blocked);
+    BOOST_CHECK(!manager.GetPeerSnapshot(peer)->m_last_common_block);
+
+    chain->SetCurrentChainstate(active_1.m_hash, active_1.m_hash, BlockDownloadAssumeutxoState::VALIDATED);
+    const auto fork_batch{manager.PlanAndReserve(peer, 1, 11us, false)};
+    BOOST_REQUIRE_EQUAL(fork_batch.m_blocks.size(), 1U);
+    BOOST_CHECK(fork_batch.m_blocks.front() == peer_1);
+    BOOST_CHECK(*manager.GetPeerSnapshot(peer)->m_last_common_block == root);
+    manager.RemoveBlockRequest(peer_1.m_hash, peer, 12us);
+
+    chain->SetCandidate(TestCandidate(peer_1, true, true, true, true), root.m_hash);
+    chain->SetActiveTip(peer_1.m_hash);
+    chain->SetCurrentChainstate(peer_1.m_hash);
+    const auto reorg_batch{manager.PlanAndReserve(peer, 1, 13us, false)};
+    BOOST_REQUIRE_EQUAL(reorg_batch.m_blocks.size(), 1U);
+    BOOST_CHECK(reorg_batch.m_blocks.front() == peer_2);
+    BOOST_CHECK(*manager.GetPeerSnapshot(peer)->m_last_common_block == peer_1);
+
+    manager.DisconnectedPeer(peer);
+    manager.CheckIsEmpty();
+}
+
+BOOST_AUTO_TEST_CASE(limited_peer_distance_and_download_window_staller)
+{
+    {
+        auto fake{std::make_unique<FakeBlockDownloadChain>()};
+        auto* const chain{fake.get()};
+        BlockDownloadManager manager{std::move(fake)};
+        const NodeId peer{1};
+        manager.ConnectedPeer(peer, {
+            .m_is_inbound = false,
+            .m_can_serve_witness = true,
+            .m_limited_peer = true,
+        });
+        BlockDownloadBlock previous{TestBlock(1, 0)};
+        chain->SetCandidate(TestCandidate(previous, true, true, true, true));
+        const auto root{previous};
+        for (int height{1}; height <= 300; ++height) {
+            const auto block{TestBlock(static_cast<uint64_t>(height + 1), height)};
+            chain->SetCandidate(TestCandidate(block), previous.m_hash);
+            previous = block;
+        }
+        SetPlanningTip(*chain, root);
+        manager.UpdateBlockAvailability(peer, previous.m_hash);
+        const auto batch{manager.PlanAndReserve(peer, 2, 10us, true)};
+        BOOST_REQUIRE_EQUAL(batch.m_blocks.size(), 2U);
+        BOOST_CHECK_EQUAL(batch.m_blocks[0].m_height, 15);
+        BOOST_CHECK_EQUAL(batch.m_blocks[1].m_height, 16);
+        manager.DisconnectedPeer(peer);
+        manager.CheckIsEmpty();
+    }
+    {
+        auto fake{std::make_unique<FakeBlockDownloadChain>()};
+        auto* const chain{fake.get()};
+        BlockDownloadManager manager{std::move(fake)};
+        const NodeId peer{1}, staller{2};
+        manager.ConnectedPeer(peer, {.m_is_inbound = false, .m_can_serve_witness = true});
+        manager.ConnectedPeer(staller, {.m_is_inbound = false, .m_can_serve_witness = true});
+        BlockDownloadBlock previous{TestBlock(1, 0)};
+        chain->SetCandidate(TestCandidate(previous, true, true, true, true));
+        const auto root{previous};
+        BlockDownloadBlock first;
+        for (int height{1}; height <= 1025; ++height) {
+            const auto block{TestBlock(static_cast<uint64_t>(height + 1), height)};
+            const bool stored{height > 1 && height <= 1024};
+            chain->SetCandidate(TestCandidate(block, true, stored), previous.m_hash);
+            if (height == 1) first = block;
+            previous = block;
+        }
+        SetPlanningTip(*chain, root);
+        manager.UpdateBlockAvailability(peer, previous.m_hash);
+        BOOST_REQUIRE(manager.ReserveBlockRequest(staller, first, 5us).m_status == BlockRequestStatus::NEW);
+
+        chain->FailRevalidations(3);
+        const auto failed{manager.PlanAndReserve(peer, 1, 9us, false)};
+        BOOST_CHECK(failed.m_blocks.empty());
+        BOOST_CHECK(!failed.m_staller);
+        BOOST_CHECK(manager.GetPeerSnapshot(staller)->m_stalling_since == 0us);
+        BOOST_CHECK(!manager.GetPeerSnapshot(peer)->m_last_common_block);
+
+        const auto batch{manager.PlanAndReserve(peer, 1, 10us, false)};
+        BOOST_CHECK(batch.m_blocks.empty());
+        BOOST_REQUIRE(batch.m_staller);
+        BOOST_CHECK_EQUAL(*batch.m_staller, staller);
+        BOOST_CHECK(manager.GetPeerSnapshot(staller)->m_stalling_since == 10us);
+        manager.DisconnectedPeer(peer);
+        manager.DisconnectedPeer(staller);
+        manager.CheckIsEmpty();
+    }
+}
+
+BOOST_AUTO_TEST_CASE(planning_revalidation_manager_and_chain_races)
+{
+    const auto make_fixture = [] {
+        auto fake{std::make_unique<FakeBlockDownloadChain>()};
+        auto* const chain{fake.get()};
+        auto manager{std::make_unique<BlockDownloadManager>(std::move(fake))};
+        const auto root{TestBlock(1, 0)};
+        const auto block_1{TestBlock(2, 1)};
+        const auto block_2{TestBlock(3, 2)};
+        chain->SetCandidate(TestCandidate(root, true, true, true, true));
+        chain->SetCandidate(TestCandidate(block_1), root.m_hash);
+        chain->SetCandidate(TestCandidate(block_2), block_1.m_hash);
+        SetPlanningTip(*chain, root);
+        return std::tuple{std::move(manager), chain, root, block_1, block_2};
+    };
+
+    // Disconnect after capture: the commit cannot resurrect the peer.
+    {
+        auto [manager, chain, root, block_1, block_2]{make_fixture()};
+        manager->ConnectedPeer(1, {.m_is_inbound = false, .m_can_serve_witness = true});
+        manager->UpdateBlockAvailability(1, block_2.m_hash);
+        chain->SetRevalidateHook([&] { manager->DisconnectedPeer(1); });
+        BOOST_CHECK(manager->PlanAndReserve(1, 1, 10us, false).m_blocks.empty());
+        BOOST_CHECK(!manager->GetPeerSnapshot(1));
+        manager->CheckIsEmpty();
+    }
+
+    // A competing reservation invalidates the global in-flight generation;
+    // retry observes it and reserves no subset for the original peer.
+    {
+        auto [manager, chain, root, block_1, block_2]{make_fixture()};
+        manager->ConnectedPeer(1, {.m_is_inbound = false, .m_can_serve_witness = true});
+        manager->ConnectedPeer(2, {.m_is_inbound = false, .m_can_serve_witness = true});
+        manager->UpdateBlockAvailability(1, block_2.m_hash);
+        chain->SetRevalidateHook([&] {
+            BOOST_REQUIRE(manager->ReserveBlockRequest(2, block_1, 5us).m_status == BlockRequestStatus::NEW);
+        });
+        const auto batch{manager->PlanAndReserve(1, 1, 10us, false)};
+        BOOST_REQUIRE_EQUAL(batch.m_blocks.size(), 1U);
+        BOOST_CHECK(batch.m_blocks.front() == block_2);
+        BOOST_CHECK(!manager->GetBlockInFlightInfo(block_1.m_hash, 1).m_requested_from_peer);
+        BOOST_CHECK(manager->GetBlockInFlightInfo(block_1.m_hash, 2).m_requested_from_peer);
+        manager->DisconnectedPeer(1);
+        manager->DisconnectedPeer(2);
+        manager->CheckIsEmpty();
+    }
+
+    // Data availability after capture rejects the stale proposal; the retry
+    // sees the stored block and selects its successor.
+    {
+        auto [manager, chain, root, block_1, block_2]{make_fixture()};
+        manager->ConnectedPeer(1, {.m_is_inbound = false, .m_can_serve_witness = true});
+        manager->UpdateBlockAvailability(1, block_2.m_hash);
+        chain->SetRevalidateHook([&] {
+            chain->SetCandidate(TestCandidate(block_1, true, true), root.m_hash);
+        });
+        const auto batch{manager->PlanAndReserve(1, 1, 10us, false)};
+        BOOST_REQUIRE_EQUAL(batch.m_blocks.size(), 1U);
+        BOOST_CHECK(batch.m_blocks.front() == block_2);
+        BOOST_CHECK(!manager->IsBlockRequested(block_1.m_hash));
+        BOOST_CHECK(manager->IsBlockRequested(block_2.m_hash));
+        manager->DisconnectedPeer(1);
+        manager->CheckIsEmpty();
+    }
+
+    // Availability changes are peer-planning mutations and discard the old
+    // best-known proposal before the retry.
+    {
+        auto [manager, chain, root, block_1, block_2]{make_fixture()};
+        const auto alternate{TestBlock(4, 1)};
+        chain->SetCandidate(TestCandidate(alternate), root.m_hash);
+        manager->ConnectedPeer(1, {.m_is_inbound = false, .m_can_serve_witness = true});
+        manager->UpdateBlockAvailability(1, block_2.m_hash);
+        chain->SetRevalidateHook([&] { manager->UpdateBlockAvailability(1, alternate.m_hash); });
+        const auto batch{manager->PlanAndReserve(1, 1, 10us, false)};
+        BOOST_REQUIRE_EQUAL(batch.m_blocks.size(), 1U);
+        BOOST_CHECK(batch.m_blocks.front() == alternate);
+        BOOST_CHECK(!manager->IsBlockRequested(block_1.m_hash));
+        manager->DisconnectedPeer(1);
+        manager->CheckIsEmpty();
+    }
+}
+
+BOOST_AUTO_TEST_CASE(planning_revalidation_tip_assumeutxo_and_retry_boundaries)
+{
+    auto make_fixture = [] {
+        auto fake{std::make_unique<FakeBlockDownloadChain>()};
+        auto* const chain{fake.get()};
+        auto manager{std::make_unique<BlockDownloadManager>(std::move(fake))};
+        const auto root{TestBlock(1, 0)};
+        const auto block_1{TestBlock(2, 1)};
+        const auto block_2{TestBlock(3, 2)};
+        chain->SetCandidate(TestCandidate(root, true, true, true, true));
+        chain->SetCandidate(TestCandidate(block_1), root.m_hash);
+        chain->SetCandidate(TestCandidate(block_2), block_1.m_hash);
+        SetPlanningTip(*chain, root);
+        manager->ConnectedPeer(1, {.m_is_inbound = false, .m_can_serve_witness = true});
+        manager->UpdateBlockAvailability(1, block_2.m_hash);
+        return std::tuple{std::move(manager), chain, root, block_1, block_2};
+    };
+
+    // Reorg between capture and validation changes both active-tip identity
+    // and the effective last-common before the retry commits.
+    {
+        auto [manager, chain, root, block_1, block_2]{make_fixture()};
+        chain->SetRevalidateHook([&] {
+            chain->SetCandidate(TestCandidate(block_1, true, true, true, true), root.m_hash);
+            chain->SetActiveTip(block_1.m_hash);
+            chain->SetCurrentChainstate(block_1.m_hash);
+        });
+        const auto batch{manager->PlanAndReserve(1, 1, 10us, false)};
+        BOOST_REQUIRE_EQUAL(batch.m_blocks.size(), 1U);
+        BOOST_CHECK(batch.m_blocks.front() == block_2);
+        BOOST_CHECK(*manager->GetPeerSnapshot(1)->m_last_common_block == block_1);
+        manager->DisconnectedPeer(1);
+        manager->CheckIsEmpty();
+    }
+
+    // An AssumeUTXO transition between capture and revalidation rejects the
+    // old view; retry applies the new gate without a reservation.
+    {
+        auto [manager, chain, root, block_1, block_2]{make_fixture()};
+        const auto snapshot_base{TestBlock(4, 1)};
+        chain->SetCandidate(TestCandidate(snapshot_base, true, true, true, true), root.m_hash);
+        chain->SetRevalidateHook([&] {
+            chain->SetCurrentChainstate(root.m_hash, snapshot_base.m_hash, BlockDownloadAssumeutxoState::UNVALIDATED);
+        });
+        const auto batch{manager->PlanAndReserve(1, 1, 10us, false)};
+        BOOST_CHECK(batch.m_blocks.empty());
+        BOOST_CHECK(batch.m_assumeutxo_blocked);
+        BOOST_CHECK(!manager->IsBlockRequested(block_1.m_hash));
+        manager->DisconnectedPeer(1);
+        manager->CheckIsEmpty();
+    }
+
+    // Two stale attempts may use the final allowed retry and return an
+    // already-visible reservation.
+    {
+        auto [manager, chain, root, block_1, block_2]{make_fixture()};
+        chain->FailRevalidations(2);
+        const auto batch{manager->PlanAndReserve(1, 1, 10us, false)};
+        BOOST_REQUIRE_EQUAL(batch.m_blocks.size(), 1U);
+        BOOST_CHECK_EQUAL(chain->RevalidationCount(), 3);
+        BOOST_CHECK(manager->IsBlockRequested(batch.m_blocks.front().m_hash));
+        manager->DisconnectedPeer(1);
+        manager->CheckIsEmpty();
+    }
+
+    // Initial attempt plus both retries failing returns empty and commits
+    // neither a request nor the proposed last-common update.
+    {
+        auto [manager, chain, root, block_1, block_2]{make_fixture()};
+        chain->FailRevalidations(3);
+        const auto batch{manager->PlanAndReserve(1, 2, 10us, false)};
+        BOOST_CHECK(batch.m_blocks.empty());
+        BOOST_CHECK(!batch.m_staller);
+        BOOST_CHECK_EQUAL(chain->RevalidationCount(), 3);
+        const auto peer{*manager->GetPeerSnapshot(1)};
+        BOOST_CHECK(peer.m_blocks.empty());
+        BOOST_CHECK(!peer.m_last_common_block);
+        manager->DisconnectedPeer(1);
+        manager->CheckIsEmpty();
+    }
 }
 
 BOOST_AUTO_TEST_CASE(new_duplicate_parallel_and_removed_requests)

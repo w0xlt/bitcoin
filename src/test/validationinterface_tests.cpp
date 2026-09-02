@@ -19,6 +19,28 @@ struct TestSubscriberNoop final : public CValidationInterface {
     void BlockChecked(const std::shared_ptr<const CBlock>&, const BlockValidationState&) override {}
 };
 
+struct BlockDataSubscriber final : public CValidationInterface {
+    bool m_called{false};
+    uint256 m_hash;
+
+    void BlockDataAvailable(const uint256& hash) override EXCLUSIVE_LOCKS_REQUIRED(cs_main)
+    {
+        m_called = true;
+        m_hash = hash;
+    }
+};
+
+BOOST_AUTO_TEST_CASE(block_data_available_is_synchronous)
+{
+    auto subscriber{std::make_shared<BlockDataSubscriber>()};
+    m_node.validation_signals->RegisterSharedValidationInterface(subscriber);
+    const uint256 hash{uint256::ONE};
+    WITH_LOCK(cs_main, m_node.validation_signals->BlockDataAvailable(hash));
+    BOOST_CHECK(subscriber->m_called);
+    BOOST_CHECK(subscriber->m_hash == hash);
+    m_node.validation_signals->UnregisterSharedValidationInterface(subscriber);
+}
+
 BOOST_AUTO_TEST_CASE(unregister_validation_interface_race)
 {
     std::atomic<bool> generate{true};

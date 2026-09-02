@@ -40,6 +40,7 @@ struct PeerMirror {
     bool limited{false};
     bool sync_started{false};
     std::optional<node::BlockDownloadBlock> best_known;
+    std::optional<node::BlockDownloadBlock> last_common;
     std::optional<node::BlockDownloadBlock> best_header_sent;
     std::optional<uint256> pending_hash;
     std::vector<MirrorRequest> requests;
@@ -66,6 +67,12 @@ FUZZ_TARGET(blockdownloadman)
     std::array<node::BlockDownloadBlock, NUM_BLOCKS> blocks;
     std::array<node::BlockDownloadBlock, NUM_BLOCKS> chain_blocks;
     std::array<bool, NUM_BLOCKS> chain_known{};
+    std::array<std::optional<size_t>, NUM_BLOCKS> chain_parent{};
+    std::array<bool, NUM_BLOCKS> chain_valid{};
+    std::array<bool, NUM_BLOCKS> chain_data{};
+    std::array<bool, NUM_BLOCKS> chain_active{};
+    std::array<bool, NUM_BLOCKS> chain_txs{};
+    std::array<bool, NUM_BLOCKS> chain_segwit{};
     std::array<std::optional<node::BlockSource>, NUM_BLOCKS> sources;
     uint64_t next_peer_generation{0};
     uint64_t in_flight_generation{0};
@@ -79,8 +86,23 @@ FUZZ_TARGET(blockdownloadman)
         };
         chain_blocks[i] = blocks[i];
         chain_known[i] = true;
-        fake_chain->SetBlock(chain_blocks[i], i == 0 ? std::nullopt : std::optional{chain_blocks[i - 1].m_hash});
+        chain_parent[i] = i == 0 ? std::nullopt : std::optional{i - 1};
+        chain_valid[i] = true;
+        chain_data[i] = i == 0;
+        chain_active[i] = i == 0;
+        chain_txs[i] = i == 0;
+        fake_chain->SetCandidate({
+            .m_block = chain_blocks[i],
+            .m_valid_tree = chain_valid[i],
+            .m_have_data = chain_data[i],
+            .m_in_active_chain = chain_active[i],
+            .m_have_chain_txs = chain_txs[i],
+            .m_segwit_active = chain_segwit[i],
+        }, chain_parent[i] ? std::optional{chain_blocks[*chain_parent[i]].m_hash} : std::nullopt);
     }
+    fake_chain->SetActiveTip(chain_blocks[0].m_hash);
+    fake_chain->SetCurrentChainstate(chain_blocks[0].m_hash);
+    fake_chain->SetMinimumChainWork(0);
 
     auto random_peer = [&] {
         return provider.ConsumeIntegralInRange<NodeId>(0, NUM_PEERS - 1);
@@ -153,11 +175,13 @@ FUZZ_TARGET(blockdownloadman)
                 if (chain_blocks[i].m_hash == target) target_pos = i;
                 if (chain_blocks[i].m_hash == descendant->m_hash) descendant_pos = i;
             }
-            if (!target_pos || !descendant_pos || *target_pos > *descendant_pos) return false;
-            for (size_t i{*target_pos}; i <= *descendant_pos; ++i) {
-                if (!chain_known[i]) return false;
+            if (!target_pos || !descendant_pos) return false;
+            std::optional<size_t> walk{descendant_pos};
+            while (walk && *walk != *target_pos) {
+                if (!chain_known[*walk]) return false;
+                walk = chain_parent[*walk];
             }
-            return true;
+            return walk == target_pos && chain_known[*target_pos];
         };
         return is_ancestor(peers[id].best_known) || is_ancestor(peers[id].best_header_sent);
     };
@@ -166,7 +190,7 @@ FUZZ_TARGET(blockdownloadman)
         const NodeId peer{random_peer()};
         const auto& block{random_block()};
         const auto now{random_time()};
-        switch (provider.ConsumeIntegralInRange<unsigned>(0, 21)) {
+        switch (provider.ConsumeIntegralInRange<unsigned>(0, 24)) {
         case 0: {
             const bool inserted{!peers[peer].registered};
             const bool inbound{peers[peer].registered ? peers[peer].inbound : provider.ConsumeBool()};
@@ -379,7 +403,14 @@ FUZZ_TARGET(blockdownloadman)
             chain_known[pos] = provider.ConsumeBool();
             chain_blocks[pos].m_chain_work = arith_uint256{static_cast<uint64_t>(provider.ConsumeIntegralInRange<uint16_t>(0, 4)) * 100};
             if (chain_known[pos]) {
-                fake_chain->SetBlock(chain_blocks[pos], pos == 0 ? std::nullopt : std::optional{chain_blocks[pos - 1].m_hash});
+                fake_chain->SetCandidate({
+                    .m_block = chain_blocks[pos],
+                    .m_valid_tree = chain_valid[pos],
+                    .m_have_data = chain_data[pos],
+                    .m_in_active_chain = chain_active[pos],
+                    .m_have_chain_txs = chain_txs[pos],
+                    .m_segwit_active = chain_segwit[pos],
+                }, chain_parent[pos] ? std::optional{chain_blocks[*chain_parent[pos]].m_hash} : std::nullopt);
             } else {
                 fake_chain->RemoveBlock(chain_blocks[pos].m_hash);
             }
@@ -420,6 +451,114 @@ FUZZ_TARGET(blockdownloadman)
             mirror_update_availability(peer, interleaved_hash);
             break;
         }
+        case 22: {
+            // Mutate the fake's owned planning facts: topology/forks,
+            // pruning/data, invalidation, active-tip identity, and SegWit.
+            const size_t pos{static_cast<size_t>(block.m_height)};
+            chain_known[pos] = true;
+            chain_valid[pos] = provider.ConsumeBool();
+            chain_data[pos] = provider.ConsumeBool();
+            chain_active[pos] = provider.ConsumeBool();
+            chain_txs[pos] = provider.ConsumeBool();
+            chain_segwit[pos] = provider.ConsumeBool();
+            if (pos == 0) {
+                chain_parent[pos].reset();
+            } else {
+                chain_parent[pos] = provider.ConsumeIntegralInRange<size_t>(0, pos - 1);
+            }
+            fake_chain->SetCandidate({
+                .m_block = chain_blocks[pos],
+                .m_valid_tree = chain_valid[pos],
+                .m_have_data = chain_data[pos],
+                .m_in_active_chain = chain_active[pos],
+                .m_have_chain_txs = chain_txs[pos],
+                .m_segwit_active = chain_segwit[pos],
+            }, chain_parent[pos] ? std::optional{chain_blocks[*chain_parent[pos]].m_hash} : std::nullopt);
+            const size_t tip_pos{provider.ConsumeIntegralInRange<size_t>(0, NUM_BLOCKS - 1)};
+            fake_chain->SetActiveTip(chain_known[tip_pos] ? std::optional{chain_blocks[tip_pos].m_hash} : std::nullopt);
+            fake_chain->SetMinimumChainWork(arith_uint256{provider.ConsumeIntegral<uint16_t>()});
+            const bool use_snapshot{provider.ConsumeBool()};
+            const auto assume_state{provider.ConsumeBool()
+                ? node::BlockDownloadAssumeutxoState::UNVALIDATED
+                : node::BlockDownloadAssumeutxoState::VALIDATED};
+            fake_chain->SetCurrentChainstate(
+                chain_known[tip_pos] ? std::optional{chain_blocks[tip_pos].m_hash} : std::nullopt,
+                use_snapshot ? std::optional{chain_blocks[provider.ConsumeIntegralInRange<size_t>(0, NUM_BLOCKS - 1)].m_hash} : std::nullopt,
+                use_snapshot ? assume_state : node::BlockDownloadAssumeutxoState::NONE);
+            if (provider.ConsumeBool()) {
+                const size_t start{provider.ConsumeIntegralInRange<size_t>(0, NUM_BLOCKS - 1)};
+                const size_t target{provider.ConsumeIntegralInRange<size_t>(0, NUM_BLOCKS - 1)};
+                fake_chain->SetHistoricalRange(std::pair{chain_blocks[start].m_hash, chain_blocks[target].m_hash});
+            } else {
+                fake_chain->SetHistoricalRange(std::nullopt);
+            }
+            break;
+        }
+        case 23:
+        case 24: {
+            if (!peers[peer].registered) break;
+            // Resolve pending availability at the same linearization point
+            // before recording the failed-commit baseline.
+            manager.ProcessBlockAvailability(peer);
+            mirror_process_availability(peer);
+            const auto before_peer{*manager.GetPeerSnapshot(peer)};
+            const auto before_global{manager.GetGlobalSnapshot()};
+            const int failures{provider.ConsumeIntegralInRange<int>(0, 3)};
+            const unsigned budget{provider.ConsumeIntegralInRange<unsigned>(0, 4)};
+            fake_chain->FailRevalidations(failures);
+            if (budget != 0 && provider.ConsumeBool()) {
+                const size_t pos{provider.ConsumeIntegralInRange<size_t>(0, NUM_BLOCKS - 1)};
+                fake_chain->SetRevalidateHook([&, pos] {
+                    chain_data[pos] = !chain_data[pos];
+                    fake_chain->SetCandidate({
+                        .m_block = chain_blocks[pos],
+                        .m_valid_tree = chain_valid[pos],
+                        .m_have_data = chain_data[pos],
+                        .m_in_active_chain = chain_active[pos],
+                        .m_have_chain_txs = chain_txs[pos],
+                        .m_segwit_active = chain_segwit[pos],
+                    }, chain_parent[pos] ? std::optional{chain_blocks[*chain_parent[pos]].m_hash} : std::nullopt);
+                });
+            }
+            const auto batch{manager.PlanAndReserve(
+                peer,
+                budget,
+                now,
+                provider.ConsumeBool())};
+            const auto actual{*manager.GetPeerSnapshot(peer)};
+            for (const auto& requested : batch.m_blocks) {
+                Assert(manager.GetBlockInFlightInfo(requested.m_hash, peer).m_requested_from_peer);
+            }
+
+            if (failures == 3) {
+                Assert(batch.m_blocks.empty());
+                Assert(!batch.m_staller);
+                Assert(actual.m_blocks == before_peer.m_blocks);
+                Assert(actual.m_last_common_block == before_peer.m_last_common_block);
+                Assert(manager.GetGlobalSnapshot().m_in_flight_generation == before_global.m_in_flight_generation);
+            }
+
+            if (actual.m_last_common_block != peers[peer].last_common) {
+                peers[peer].last_common = actual.m_last_common_block;
+                peers[peer].generation = ++next_peer_generation;
+            }
+            for (const auto& requested : batch.m_blocks) {
+                Assert(find_request(peer, requested.m_hash) == peers[peer].requests.end());
+                if (peers[peer].requests.empty()) peers[peer].downloading_since = now;
+                peers[peer].requests.push_back({requested, {}});
+                index.push_back({requested.m_hash, peer});
+                peers[peer].generation = ++next_peer_generation;
+                ++in_flight_generation;
+            }
+            if (batch.m_staller) {
+                auto& stalled{peers[*batch.m_staller]};
+                Assert(stalled.registered);
+                Assert(stalled.stalling_since == std::chrono::microseconds{0});
+                stalled.stalling_since = now;
+                stalled.generation = ++next_peer_generation;
+            }
+            break;
+        }
         }
 
         size_t total{0};
@@ -445,6 +584,7 @@ FUZZ_TARGET(blockdownloadman)
             Assert(actual->m_limited_peer == peers[id].limited);
             Assert(actual->m_sync_started == peers[id].sync_started);
             Assert(actual->m_best_known_block == peers[id].best_known);
+            Assert(actual->m_last_common_block == peers[id].last_common);
             Assert(actual->m_generation == peers[id].generation);
             last_peer_generation[id] = actual->m_generation;
             total += peers[id].requests.size();

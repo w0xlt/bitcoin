@@ -15,6 +15,7 @@
 #include <map>
 #include <memory>
 #include <optional>
+#include <vector>
 
 namespace node {
 
@@ -40,14 +41,18 @@ private:
         std::chrono::microseconds m_stalling_since{0};
         bool m_sync_started{false};
         std::optional<BlockDownloadBlock> m_best_known_block;
+        std::optional<BlockDownloadBlock> m_last_common_block;
         std::optional<BlockDownloadBlock> m_best_header_sent;
         std::optional<uint256> m_pending_block_hash;
         /** Incarnation and availability-state token for snapshot commits. */
         uint64_t m_availability_generation{0};
+        /** Changes only when a field consumed by automatic planning changes. */
+        uint64_t m_planning_generation{0};
         uint64_t m_generation{0};
 
         PeerRequestState(const BlockDownloadConnectionInfo& info, uint64_t generation)
-            : m_connection_info{info}, m_availability_generation{generation}, m_generation{generation}
+            : m_connection_info{info}, m_availability_generation{generation},
+              m_planning_generation{generation}, m_generation{generation}
         {
         }
     };
@@ -83,6 +88,7 @@ private:
     BlockInFlightInfo GetBlockInFlightInfoLocked(const uint256& hash, NodeId peer) const
         EXCLUSIVE_LOCKS_REQUIRED(m_mutex);
     void BumpPeerGenerationLocked(PeerRequestState& state) EXCLUSIVE_LOCKS_REQUIRED(m_mutex);
+    void BumpPlanningGenerationLocked(PeerRequestState& state) EXCLUSIVE_LOCKS_REQUIRED(m_mutex);
     void BumpAvailabilityGenerationLocked(PeerRequestState& state) EXCLUSIVE_LOCKS_REQUIRED(m_mutex);
     bool CheckConsistencyLocked() const EXCLUSIVE_LOCKS_REQUIRED(m_mutex);
 
@@ -95,6 +101,11 @@ public:
     void UpdateBlockAvailability(NodeId peer, const uint256& hash) EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
     bool PeerHasHeader(NodeId peer, const uint256& target_hash) const EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
     void RecordBestHeaderSent(NodeId peer, const BlockDownloadBlock& block) EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
+    BlockDownloadBatch PlanAndReserve(
+        NodeId peer,
+        unsigned int budget,
+        std::chrono::microseconds now,
+        bool allow_historical) EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
     BlockRequestReservation ReserveBlockRequest(
         NodeId peer,
         const BlockDownloadBlock& block,

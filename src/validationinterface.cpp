@@ -269,6 +269,17 @@ void ValidationSignals::BlockChecked(const std::shared_ptr<const CBlock>& block,
     m_internals->Iterate([&](CValidationInterface& callbacks) { callbacks.BlockChecked(block, state); });
 }
 
+void ValidationSignals::BlockDataAvailable(const uint256& hash) EXCLUSIVE_LOCKS_REQUIRED(cs_main)
+{
+    LOG_EVENT("%s: block hash=%s", __func__, hash.ToString());
+    m_internals->Iterate([&](CValidationInterface& callbacks) {
+        // The caller already holds this recursive mutex. Express that fact in
+        // the type-erased callback scope for Clang's lock analysis too.
+        LOCK(cs_main);
+        callbacks.BlockDataAvailable(hash);
+    });
+}
+
 void ValidationSignals::NewPoWValidBlock(const CBlockIndex *pindex, const std::shared_ptr<const CBlock> &block) {
     LOG_EVENT("%s: block hash=%s", __func__, block->GetHash().ToString());
     m_internals->Iterate([&](CValidationInterface& callbacks) { callbacks.NewPoWValidBlock(pindex, block); });

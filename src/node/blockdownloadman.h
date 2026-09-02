@@ -87,12 +87,22 @@ struct PeerBlockDownloadSnapshot {
     bool m_limited_peer{false};
     bool m_sync_started{false};
     std::optional<BlockDownloadBlock> m_best_known_block;
+    std::optional<BlockDownloadBlock> m_last_common_block;
     uint64_t m_generation{0};
     /** Global values copied under the same lock as this peer's state. */
     size_t m_total_requests{0};
     int m_peers_downloading_from{0};
     int m_num_preferred_download_peers{0};
     int m_num_sync_started{0};
+};
+
+/** Automatic requests are reserved before this value is returned. */
+struct BlockDownloadBatch {
+    std::vector<BlockDownloadBlock> m_blocks;
+    /** Set only when this attempt newly started the peer's stalling timer. */
+    std::optional<NodeId> m_staller;
+    /** Logging fact for the existing AssumeUTXO rejection diagnostic. */
+    bool m_assumeutxo_blocked{false};
 };
 
 /**
@@ -122,8 +132,9 @@ struct BlockSource {
  *
  * The manager owns peer connection capabilities, request queues, source
  * attribution, compact reconstruction lifetime, availability identities,
- * counters, and timers. Chain queries cross a narrow owned-value snapshot
- * boundary; validation, mempool, and scheduling remain outside the manager.
+ * counters, timers, and automatic scheduling. Chain queries cross a narrow
+ * owned-value snapshot boundary; validation, mempool, and network work remain
+ * outside the manager.
  */
 class BlockDownloadManager {
     const std::unique_ptr<BlockDownloadManagerImpl> m_impl;
@@ -148,6 +159,13 @@ public:
     bool PeerHasHeader(NodeId peer, const uint256& target_hash) const;
     /** Record the best header sent using an identity copied under chain synchronization. */
     void RecordBestHeaderSent(NodeId peer, const BlockDownloadBlock& block);
+
+    /** Purely plan, coherently revalidate, and atomically reserve automatic requests. */
+    BlockDownloadBatch PlanAndReserve(
+        NodeId peer,
+        unsigned int budget,
+        std::chrono::microseconds now,
+        bool allow_historical);
 
     /**
      * Atomically reserve a request. A non-null proposed_partial requests
