@@ -5,6 +5,7 @@
 // Unit tests for denial-of-service detection/prevention code
 
 #include <banman.h>
+#include <chain.h>
 #include <chainparams.h>
 #include <common/args.h>
 #include <net.h>
@@ -15,6 +16,7 @@
 #include <script/sign.h>
 #include <script/signingprovider.h>
 #include <serialize.h>
+#include <test/util/logging.h>
 #include <test/util/net.h>
 #include <test/util/random.h>
 #include <test/util/setup_common.h>
@@ -25,6 +27,8 @@
 
 #include <array>
 #include <cstdint>
+#include <optional>
+#include <span>
 #include <utility>
 
 #include <boost/test/unit_test.hpp>
@@ -77,11 +81,16 @@ BOOST_AUTO_TEST_CASE(outbound_slow_chain_eviction)
         /*version=*/PROTOCOL_VERSION,
         /*relay_txs=*/true);
 
-    // This test requires that we have a chain with non-zero work.
+    // This test requires that we have a chain with non-zero work. Capture the
+    // exact locator when the chain-sync benchmark will be established.
+    CBlockIndex* benchmark_tip;
+    CBlockLocator expected_timeout_locator;
     {
         LOCK(cs_main);
-        BOOST_CHECK(m_node.chainman->ActiveChain().Tip() != nullptr);
-        BOOST_CHECK(m_node.chainman->ActiveChain().Tip()->nChainWork > 0);
+        benchmark_tip = m_node.chainman->ActiveChain().Tip();
+        BOOST_REQUIRE(benchmark_tip != nullptr);
+        BOOST_REQUIRE(benchmark_tip->nChainWork > 0);
+        expected_timeout_locator = GetLocator(benchmark_tip->pprev);
     }
 
     // Test starts here
@@ -94,15 +103,70 @@ BOOST_AUTO_TEST_CASE(outbound_slow_chain_eviction)
     }
     connman.FlushSendBuffer(dummyNode1);
 
+    // Advance the active tip after the benchmark is stored. Recomputing the
+    // timeout locator from the new tip would now include benchmark_tip, while
+    // the stored locator is still the one captured from benchmark_tip->pprev.
+    const CBlockLocator recomputed_timeout_locator{GetLocator(benchmark_tip)};
+    BOOST_REQUIRE(recomputed_timeout_locator.vHave != expected_timeout_locator.vHave);
+    const uint256 advanced_hash{m_rng.rand256()};
+    CBlockIndex advanced_tip;
+    {
+        LOCK(cs_main);
+        advanced_tip.phashBlock = &advanced_hash;
+        advanced_tip.pprev = benchmark_tip;
+        advanced_tip.nHeight = benchmark_tip->nHeight + 1;
+        advanced_tip.nChainWork = benchmark_tip->nChainWork + 1;
+        advanced_tip.nTime = benchmark_tip->nTime + 1;
+        advanced_tip.nTimeMax = advanced_tip.nTime;
+        advanced_tip.BuildSkip();
+        m_node.chainman->ActiveChain().SetTip(advanced_tip);
+        BOOST_CHECK(GetLocator(m_node.chainman->ActiveChain().Tip()->pprev).vHave == recomputed_timeout_locator.vHave);
+    }
+
     FakeNodeClock clock{};
     clock += 21min;
 
-    BOOST_CHECK(peerman.SendMessages(dummyNode1)); // should result in getheaders
+    bool timeout_send_result;
+    {
+        ASSERT_DEBUG_LOG("sending getheaders to outbound peer=0 to verify chain work");
+        timeout_send_result = peerman.SendMessages(dummyNode1); // should result in getheaders
+        // Restore the real active tip before inspecting the wire or making any
+        // fatal assertions. The timeout send above observed advanced_tip.
+        LOCK(cs_main);
+        m_node.chainman->ActiveChain().SetTip(*benchmark_tip);
+    }
+    BOOST_REQUIRE(timeout_send_result);
+
+    std::optional<CNetMessage> timeout_message;
     {
         LOCK(dummyNode1.cs_vSend);
-        const auto& [to_send, _more, _msg_type] = dummyNode1.m_transport->GetBytesToSend(false);
-        BOOST_CHECK(!to_send.empty());
+        V1Transport decoder{dummyNode1.GetId()};
+        while (true) {
+            const auto& [to_send, _more, _msg_type] = dummyNode1.m_transport->GetBytesToSend(false);
+            if (to_send.empty()) break;
+            std::span<const uint8_t> unread{to_send};
+            while (!unread.empty()) {
+                BOOST_REQUIRE(decoder.ReceivedBytes(unread));
+                if (decoder.ReceivedMessageComplete()) {
+                    bool reject_message;
+                    CNetMessage message{decoder.GetReceivedMessage(NodeClock::time_point{}, reject_message)};
+                    BOOST_REQUIRE(!reject_message);
+                    if (message.m_type == NetMsgType::GETHEADERS) {
+                        BOOST_REQUIRE(!timeout_message);
+                        timeout_message.emplace(std::move(message));
+                    }
+                }
+            }
+            dummyNode1.m_transport->MarkBytesSent(to_send.size());
+        }
     }
+    BOOST_REQUIRE(timeout_message);
+    CBlockLocator timeout_locator;
+    uint256 stop_hash;
+    timeout_message->m_recv >> timeout_locator >> stop_hash;
+    BOOST_CHECK(timeout_message->m_recv.empty());
+    BOOST_CHECK(timeout_locator.vHave == expected_timeout_locator.vHave);
+    BOOST_CHECK(stop_hash.IsNull());
 
     clock += 3min;
     BOOST_CHECK(peerman.SendMessages(dummyNode1)); // should result in disconnect
