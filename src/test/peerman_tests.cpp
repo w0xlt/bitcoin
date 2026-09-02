@@ -51,9 +51,17 @@ struct FakeBlockDownloadManagerState {
     std::optional<node::PeerBlockDownloadSnapshot> m_peer_snapshot;
     std::function<void(NodeId)> m_before_peer_snapshot;
     std::function<void(NodeId)> m_process_block_availability;
+    std::function<bool(NodeId, const uint256&)> m_peer_has_header;
+    std::function<void(NodeId, const node::BlockDownloadBlock&)> m_record_best_header_sent;
+    std::function<node::BlockDownloadBatch(NodeId, unsigned int, std::chrono::microseconds, bool)> m_plan_and_reserve;
+    std::function<node::BlockDownloadGlobalSnapshot()> m_get_global_snapshot;
+    std::function<std::optional<std::chrono::seconds>(std::chrono::seconds)> m_increase_stalling_timeout;
     int m_peer_snapshot_calls{0};
+    int m_plan_and_reserve_calls{0};
+    int m_reserve_block_calls{0};
     std::optional<node::BlockSource> m_block_source;
     bool m_all_requests_are_for{false};
+    bool m_remove_snapshot_on_disconnect{false};
 };
 
 class FakeBlockDownloadManager final : public node::BlockDownloadManager
@@ -67,21 +75,37 @@ public:
         m_state.m_connected_peer = peer;
         m_state.m_connected_inbound = info.m_is_inbound;
     }
-    void DisconnectedPeer(NodeId peer) override { m_state.m_disconnected_peer = peer; }
+    void DisconnectedPeer(NodeId peer) override
+    {
+        m_state.m_disconnected_peer = peer;
+        if (m_state.m_remove_snapshot_on_disconnect) m_state.m_peer_snapshot.reset();
+    }
     void ProcessBlockAvailability(NodeId peer) override
     {
         if (m_state.m_process_block_availability) m_state.m_process_block_availability(peer);
     }
     void UpdateBlockAvailability(NodeId, const uint256&) override {}
-    bool PeerHasHeader(NodeId, const uint256&) const override { return false; }
-    void RecordBestHeaderSent(NodeId, const node::BlockDownloadBlock&) override {}
-    node::BlockDownloadBatch PlanAndReserve(NodeId, unsigned int, std::chrono::microseconds, bool) override { return {}; }
+    bool PeerHasHeader(NodeId peer, const uint256& hash) const override
+    {
+        return m_state.m_peer_has_header ? m_state.m_peer_has_header(peer, hash) : false;
+    }
+    void RecordBestHeaderSent(NodeId peer, const node::BlockDownloadBlock& block) override
+    {
+        if (m_state.m_record_best_header_sent) m_state.m_record_best_header_sent(peer, block);
+    }
+    node::BlockDownloadBatch PlanAndReserve(
+        NodeId peer, unsigned int budget, std::chrono::microseconds now, bool allow_historical) override
+    {
+        ++m_state.m_plan_and_reserve_calls;
+        return m_state.m_plan_and_reserve ? m_state.m_plan_and_reserve(peer, budget, now, allow_historical) : node::BlockDownloadBatch{};
+    }
     node::BlockRequestReservation ReserveBlockRequest(
         NodeId,
         const node::BlockDownloadBlock&,
         std::chrono::microseconds,
         std::shared_ptr<PartiallyDownloadedBlock>) override
     {
+        ++m_state.m_reserve_block_calls;
         return {
             .m_status = node::BlockRequestStatus::PEER_NOT_FOUND,
             .m_requests_before = 0,
@@ -103,7 +127,10 @@ public:
         if (m_state.m_before_peer_snapshot) m_state.m_before_peer_snapshot(peer);
         return m_state.m_peer_snapshot;
     }
-    node::BlockDownloadGlobalSnapshot GetGlobalSnapshot() const override { return {}; }
+    node::BlockDownloadGlobalSnapshot GetGlobalSnapshot() const override
+    {
+        return m_state.m_get_global_snapshot ? m_state.m_get_global_snapshot() : node::BlockDownloadGlobalSnapshot{};
+    }
     bool AllRequestsAreFor(const uint256&) const override { return m_state.m_all_requests_are_for; }
     bool StartStalling(NodeId, std::chrono::microseconds) override { return false; }
     bool ClearStalling(NodeId) override { return false; }
@@ -114,7 +141,10 @@ public:
     bool EraseBlockSource(const uint256&) override { return false; }
     bool TipMayBeStale(std::chrono::seconds, std::chrono::seconds) override { return false; }
     void UpdatedBlockTip(std::chrono::seconds) override {}
-    std::optional<std::chrono::seconds> TryIncreaseBlockStallingTimeout(std::chrono::seconds) override { return std::nullopt; }
+    std::optional<std::chrono::seconds> TryIncreaseBlockStallingTimeout(std::chrono::seconds expected) override
+    {
+        return m_state.m_increase_stalling_timeout ? m_state.m_increase_stalling_timeout(expected) : std::nullopt;
+    }
     std::optional<std::chrono::seconds> TryDecreaseBlockStallingTimeout(std::chrono::seconds) override { return std::nullopt; }
     bool CheckConsistency() const override { return true; }
     void CheckIsEmpty() const override { ++m_state.m_empty_checks; }
@@ -355,6 +385,7 @@ BOOST_AUTO_TEST_CASE(compact_block_relay_negotiation)
     state.m_peer_snapshot.emplace();
     int availability_calls{0};
     state.m_process_block_availability = [&](NodeId id) {
+        AssertLockNotHeld(cs_main);
         peerman->UpdateLastBlockAnnounceTime(id, ++availability_calls);
     };
     BOOST_CHECK(peerman->SendMessages(*peer));
@@ -430,8 +461,16 @@ BOOST_AUTO_TEST_CASE(compact_block_relay_claim_failure_preserves_rng)
         m_node.validation_signals->SyncWithValidationInterfaceQueue();
 
         int invalidated_claims{0};
+        int recorded_headers{0};
+        state.m_record_best_header_sent = [&](NodeId id, const node::BlockDownloadBlock& block) {
+            AssertLockNotHeld(cs_main);
+            BOOST_CHECK_EQUAL(id, peer->GetId());
+            BOOST_CHECK(block.m_hash == tip->GetBlockHash());
+            ++recorded_headers;
+        };
         if (fail_claims) {
             state.m_process_block_availability = [&](NodeId id) {
+                AssertLockNotHeld(cs_main);
                 peerman->UpdateLastBlockAnnounceTime(id, ++invalidated_claims);
             };
             BOOST_REQUIRE(peerman->SendMessages(*peer));
@@ -446,6 +485,7 @@ BOOST_AUTO_TEST_CASE(compact_block_relay_claim_failure_preserves_rng)
         // No block is re-enqueued here. A compact announcement therefore also
         // proves that both rejected attempts retained the original queue entry.
         BOOST_REQUIRE(peerman->SendMessages(*peer));
+        BOOST_CHECK_EQUAL(recorded_headers, 1);
         std::vector<uint8_t> compact_payload;
         {
             LOCK(peer->cs_vSend);
@@ -462,6 +502,401 @@ BOOST_AUTO_TEST_CASE(compact_block_relay_claim_failure_preserves_rng)
     const std::vector<uint8_t> raced_payload{run_announcement(/*fail_claims=*/true)};
     const std::vector<uint8_t> control_payload{run_announcement(/*fail_claims=*/false)};
     BOOST_CHECK(raced_payload == control_payload);
+}
+
+BOOST_AUTO_TEST_CASE(block_announcement_chain_revalidation)
+{
+    LOCK(NetEventsInterface::g_msgproc_mutex);
+    FakeNodeClock clock{};
+    mineBlock(m_node, clock, GetTime<std::chrono::seconds>());
+
+    auto connman{std::make_unique<ConnmanTestMsg>(0x1337, 0x1337, *m_node.addrman, *m_node.netgroupman, Params())};
+    FakeBlockDownloadManagerState state;
+    state.m_peer_snapshot.emplace();
+    state.m_peer_snapshot->m_sync_started = true;
+    auto peerman{PeerManager::make(
+        *connman, *m_node.addrman, nullptr, *m_node.chainman, *m_node.mempool,
+        *m_node.warnings, std::make_unique<FakeBlockDownloadManager>(state), {})};
+    connman->SetMsgProc(peerman.get());
+
+    auto peer{std::make_unique<CNode>(
+        /*id=*/123,
+        /*sock=*/nullptr,
+        CAddress{},
+        /*nKeyedNetGroupIn=*/0,
+        /*nLocalHostNonceIn=*/0,
+        CAddress{},
+        /*addrNameIn=*/"",
+        ConnectionType::INBOUND,
+        /*inbound_onion=*/false,
+        /*network_key=*/0)};
+    connman->Handshake(
+        *peer, /*successfully_connected=*/true,
+        /*remote_services=*/ServiceFlags(NODE_NETWORK | NODE_WITNESS),
+        /*local_services=*/ServiceFlags(NODE_NETWORK | NODE_WITNESS),
+        /*version=*/PROTOCOL_VERSION, /*relay_txs=*/true);
+
+    CBlockIndex* tip;
+    CBlockIndex* previous;
+    {
+        LOCK(cs_main);
+        tip = Assert(m_node.chainman->ActiveChain().Tip());
+        previous = Assert(tip->pprev);
+    }
+    m_node.validation_signals->RegisterValidationInterface(peerman.get());
+    m_node.validation_signals->UpdatedBlockTip(tip, previous, /*fInitialDownload=*/false);
+    m_node.validation_signals->SyncWithValidationInterfaceQueue();
+    {
+        LOCK(peer->cs_vSend);
+        peer->vSendMsg.clear();
+    }
+
+    // Change the active tip after each bounded chain snapshot. Both attempts
+    // must fail revalidation and retain the copied announcement prefix.
+    int invalidations{0};
+    state.m_peer_has_header = [&](NodeId, const uint256&) {
+        AssertLockNotHeld(cs_main);
+        LOCK(cs_main);
+        if (m_node.chainman->ActiveChain().Tip() == tip) {
+            m_node.chainman->ActiveChain().SetTip(*previous);
+        } else {
+            m_node.chainman->ActiveChain().SetTip(*tip);
+        }
+        ++invalidations;
+        return true;
+    };
+    BOOST_REQUIRE(peerman->SendMessages(*peer));
+    BOOST_CHECK_EQUAL(invalidations, 2);
+    {
+        LOCK(cs_main);
+        BOOST_CHECK(m_node.chainman->ActiveChain().Tip() == tip);
+    }
+    {
+        LOCK(peer->cs_vSend);
+        BOOST_CHECK(std::ranges::none_of(peer->vSendMsg, [](const CSerializedNetMsg& message) {
+            return message.m_type == NetMsgType::HEADERS || message.m_type == NetMsgType::INV;
+        }));
+    }
+
+    // Invalidate the availability generation after planning the fallback INV.
+    // The final manager query must run under the same cs_main transaction as
+    // chain revalidation and the relay-generation claim. Both attempts reject
+    // the mixed view and retain the announcement prefix.
+    const std::function<void()> assert_cs_main_held{[]() EXCLUSIVE_LOCKS_REQUIRED(::cs_main) {
+        AssertLockHeld(cs_main);
+    }};
+    bool awaiting_generation_recheck{false};
+    int generation_invalidations{0};
+    int generation_rechecks{0};
+    state.m_peer_has_header = [&](NodeId, const uint256&) {
+        AssertLockNotHeld(cs_main);
+        ++state.m_peer_snapshot->m_generation;
+        ++generation_invalidations;
+        awaiting_generation_recheck = true;
+        return false;
+    };
+    state.m_before_peer_snapshot = [&](NodeId) {
+        if (!awaiting_generation_recheck) return;
+        assert_cs_main_held();
+        awaiting_generation_recheck = false;
+        ++generation_rechecks;
+    };
+    BOOST_REQUIRE(peerman->SendMessages(*peer));
+    BOOST_CHECK_EQUAL(generation_invalidations, 2);
+    BOOST_CHECK_EQUAL(generation_rechecks, 2);
+    BOOST_CHECK(!awaiting_generation_recheck);
+    {
+        LOCK(peer->cs_vSend);
+        BOOST_CHECK(std::ranges::none_of(peer->vSendMsg, [](const CSerializedNetMsg& message) {
+            return message.m_type == NetMsgType::HEADERS || message.m_type == NetMsgType::INV;
+        }));
+    }
+
+    // A stable manager/chain/relay view sends the retained entry as inventory.
+    state.m_before_peer_snapshot = {};
+    state.m_peer_has_header = [&](NodeId, const uint256&) {
+        AssertLockNotHeld(cs_main);
+        return false;
+    };
+    BOOST_REQUIRE(peerman->SendMessages(*peer));
+    {
+        LOCK(peer->cs_vSend);
+        BOOST_CHECK_EQUAL(std::ranges::count_if(peer->vSendMsg, [](const CSerializedNetMsg& message) {
+                              return message.m_type == NetMsgType::INV;
+                          }),
+                          1);
+    }
+
+    m_node.validation_signals->UnregisterValidationInterface(peerman.get());
+    peerman->FinalizeNode(*peer);
+}
+
+BOOST_AUTO_TEST_CASE(sendmessages_manager_peer_disappearance)
+{
+    LOCK(NetEventsInterface::g_msgproc_mutex);
+
+    auto connman{std::make_unique<ConnmanTestMsg>(0x1337, 0x1337, *m_node.addrman, *m_node.netgroupman, Params())};
+    FakeBlockDownloadManagerState state;
+    state.m_peer_snapshot.emplace();
+    state.m_remove_snapshot_on_disconnect = true;
+    auto peerman{PeerManager::make(
+        *connman, *m_node.addrman, nullptr, *m_node.chainman, *m_node.mempool,
+        *m_node.warnings, std::make_unique<FakeBlockDownloadManager>(state), {})};
+    connman->SetMsgProc(peerman.get());
+
+    auto peer{std::make_unique<CNode>(
+        /*id=*/123,
+        /*sock=*/nullptr,
+        CAddress{},
+        /*nKeyedNetGroupIn=*/0,
+        /*nLocalHostNonceIn=*/0,
+        CAddress{},
+        /*addrNameIn=*/"",
+        ConnectionType::INBOUND,
+        /*inbound_onion=*/false,
+        /*network_key=*/0)};
+    peer->nVersion = PROTOCOL_VERSION;
+    peer->SetCommonVersion(PROTOCOL_VERSION);
+    peerman->InitializeNode(*peer, ServiceFlags(NODE_NETWORK | NODE_WITNESS));
+    peer->fSuccessfullyConnected = true;
+
+    bool finalized{false};
+    state.m_before_peer_snapshot = [&](NodeId id) {
+        AssertLockNotHeld(cs_main);
+        BOOST_CHECK_EQUAL(id, peer->GetId());
+        if (finalized) return;
+        finalized = true;
+        peerman->FinalizeNode(*peer);
+    };
+    BOOST_CHECK(!peerman->SendMessages(*peer));
+    BOOST_CHECK(finalized);
+    BOOST_CHECK(state.m_disconnected_peer == peer->GetId());
+    BOOST_CHECK_EQUAL(state.m_empty_checks, 1);
+}
+
+BOOST_AUTO_TEST_CASE(sendmessages_uses_already_reserved_block_batch)
+{
+    LOCK(NetEventsInterface::g_msgproc_mutex);
+
+    auto connman{std::make_unique<ConnmanTestMsg>(0x1337, 0x1337, *m_node.addrman, *m_node.netgroupman, Params())};
+    FakeBlockDownloadManagerState state;
+    state.m_peer_snapshot.emplace();
+    state.m_peer_snapshot->m_sync_started = true;
+    state.m_peer_snapshot->m_preferred_download = true;
+    auto peerman{PeerManager::make(
+        *connman, *m_node.addrman, nullptr, *m_node.chainman, *m_node.mempool,
+        *m_node.warnings, std::make_unique<FakeBlockDownloadManager>(state), {})};
+    connman->SetMsgProc(peerman.get());
+
+    auto peer{std::make_unique<CNode>(
+        /*id=*/123,
+        /*sock=*/nullptr,
+        CAddress{},
+        /*nKeyedNetGroupIn=*/0,
+        /*nLocalHostNonceIn=*/0,
+        CAddress{},
+        /*addrNameIn=*/"",
+        ConnectionType::INBOUND,
+        /*inbound_onion=*/false,
+        /*network_key=*/0)};
+    connman->Handshake(
+        *peer, /*successfully_connected=*/true,
+        /*remote_services=*/ServiceFlags(NODE_NETWORK | NODE_WITNESS),
+        /*local_services=*/ServiceFlags(NODE_NETWORK | NODE_WITNESS),
+        /*version=*/PROTOCOL_VERSION, /*relay_txs=*/true);
+    state.m_plan_and_reserve_calls = 0;
+    state.m_reserve_block_calls = 0;
+    {
+        LOCK(peer->cs_vSend);
+        peer->vSendMsg.clear();
+    }
+
+    const std::vector<node::BlockDownloadBlock> reserved{
+        {.m_hash = m_rng.rand256(), .m_height = 1, .m_chain_work = arith_uint256{1}},
+        {.m_hash = m_rng.rand256(), .m_height = 2, .m_chain_work = arith_uint256{2}},
+    };
+    state.m_plan_and_reserve = [&](NodeId id, unsigned int budget, std::chrono::microseconds, bool allow_historical) {
+        AssertLockNotHeld(cs_main);
+        BOOST_CHECK_EQUAL(id, peer->GetId());
+        BOOST_CHECK_EQUAL(budget, 16);
+        BOOST_CHECK(allow_historical);
+        state.m_peer_snapshot->m_blocks = reserved; // Model the reservations made before return.
+        return node::BlockDownloadBatch{
+            .m_blocks = reserved,
+            .m_staller = std::nullopt,
+            .m_assumeutxo_blocked = false,
+        };
+    };
+    BOOST_REQUIRE(peerman->SendMessages(*peer));
+    BOOST_CHECK_EQUAL(state.m_plan_and_reserve_calls, 1);
+    BOOST_CHECK_EQUAL(state.m_reserve_block_calls, 0);
+
+    std::vector<CInv> getdata;
+    {
+        LOCK(peer->cs_vSend);
+        for (const CSerializedNetMsg& message : peer->vSendMsg) {
+            if (message.m_type != NetMsgType::GETDATA) continue;
+            DataStream stream{std::span<const uint8_t>{message.data.data(), message.data.size()}};
+            std::vector<CInv> batch;
+            stream >> batch;
+            BOOST_CHECK(stream.empty());
+            getdata.insert(getdata.end(), batch.begin(), batch.end());
+        }
+    }
+    BOOST_REQUIRE_EQUAL(getdata.size(), reserved.size());
+    for (size_t i{0}; i < reserved.size(); ++i) {
+        BOOST_CHECK_EQUAL(getdata[i].type, MSG_WITNESS_BLOCK);
+        BOOST_CHECK(getdata[i].hash == reserved[i].m_hash);
+    }
+
+    peerman->FinalizeNode(*peer);
+}
+
+BOOST_AUTO_TEST_CASE(sendmessages_stalling_timeout_is_unlocked)
+{
+    LOCK(NetEventsInterface::g_msgproc_mutex);
+
+    auto connman{std::make_unique<ConnmanTestMsg>(0x1337, 0x1337, *m_node.addrman, *m_node.netgroupman, Params())};
+    FakeBlockDownloadManagerState state;
+    state.m_peer_snapshot.emplace();
+    state.m_peer_snapshot->m_sync_started = true;
+    auto peerman{PeerManager::make(
+        *connman, *m_node.addrman, nullptr, *m_node.chainman, *m_node.mempool,
+        *m_node.warnings, std::make_unique<FakeBlockDownloadManager>(state), {})};
+    connman->SetMsgProc(peerman.get());
+
+    auto peer{std::make_unique<CNode>(
+        /*id=*/123,
+        /*sock=*/nullptr,
+        CAddress{},
+        /*nKeyedNetGroupIn=*/0,
+        /*nLocalHostNonceIn=*/0,
+        CAddress{},
+        /*addrNameIn=*/"",
+        ConnectionType::INBOUND,
+        /*inbound_onion=*/false,
+        /*network_key=*/0)};
+    connman->Handshake(
+        *peer, /*successfully_connected=*/true,
+        /*remote_services=*/ServiceFlags(NODE_NETWORK | NODE_WITNESS),
+        /*local_services=*/ServiceFlags(NODE_NETWORK | NODE_WITNESS),
+        /*version=*/PROTOCOL_VERSION, /*relay_txs=*/true);
+
+    state.m_peer_snapshot->m_stalling_since = 1us;
+    state.m_get_global_snapshot = [&] {
+        AssertLockNotHeld(cs_main);
+        return node::BlockDownloadGlobalSnapshot{
+            .m_block_stalling_timeout = node::DEFAULT_BLOCK_STALLING_TIMEOUT,
+        };
+    };
+    bool increased{false};
+    state.m_increase_stalling_timeout = [&](std::chrono::seconds expected) {
+        AssertLockNotHeld(cs_main);
+        BOOST_CHECK(expected == node::DEFAULT_BLOCK_STALLING_TIMEOUT);
+        increased = true;
+        return std::optional{expected * 2};
+    };
+    BOOST_REQUIRE(peerman->SendMessages(*peer));
+    BOOST_CHECK(peer->fDisconnect);
+    BOOST_CHECK(increased);
+
+    peerman->FinalizeNode(*peer);
+}
+
+BOOST_AUTO_TEST_CASE(chain_sync_timeout_rechecks_manager_generation_under_cs_main)
+{
+    LOCK(NetEventsInterface::g_msgproc_mutex);
+    FakeNodeClock clock{};
+
+    auto connman{std::make_unique<ConnmanTestMsg>(0x1337, 0x1337, *m_node.addrman, *m_node.netgroupman, Params())};
+    connman->SetPeerConnectTimeout(99999s);
+    FakeBlockDownloadManagerState state;
+    state.m_peer_snapshot.emplace();
+    state.m_peer_snapshot->m_sync_started = true;
+    // Keep the separate initial-headers timeout path ineligible so this test
+    // exercises only ConsiderEviction's chain-sync timeout.
+    state.m_peer_snapshot->m_num_sync_started = 2;
+    auto peerman{PeerManager::make(
+        *connman, *m_node.addrman, nullptr, *m_node.chainman, *m_node.mempool,
+        *m_node.warnings, std::make_unique<FakeBlockDownloadManager>(state), {})};
+    connman->SetMsgProc(peerman.get());
+
+    auto peer{std::make_unique<CNode>(
+        /*id=*/123,
+        /*sock=*/nullptr,
+        CAddress{},
+        /*nKeyedNetGroupIn=*/0,
+        /*nLocalHostNonceIn=*/0,
+        CAddress{},
+        /*addrNameIn=*/"",
+        ConnectionType::OUTBOUND_FULL_RELAY,
+        /*inbound_onion=*/false,
+        /*network_key=*/0)};
+    peer->nVersion = PROTOCOL_VERSION;
+    peer->SetCommonVersion(SENDHEADERS_VERSION - 1);
+    peerman->InitializeNode(*peer, ServiceFlags(NODE_NETWORK | NODE_WITNESS));
+    peer->fSuccessfullyConnected = true;
+
+    bool invalidate_timeout{true};
+    int snapshots_after_availability{0};
+    int generation_invalidations{0};
+    const std::function<void()> assert_cs_main_held{[]() EXCLUSIVE_LOCKS_REQUIRED(::cs_main) {
+        AssertLockHeld(cs_main);
+    }};
+    state.m_process_block_availability = [&](NodeId id) {
+        BOOST_CHECK_EQUAL(id, peer->GetId());
+        if (invalidate_timeout) snapshots_after_availability = 0;
+    };
+    state.m_before_peer_snapshot = [&](NodeId id) {
+        BOOST_CHECK_EQUAL(id, peer->GetId());
+        if (!invalidate_timeout) return;
+        ++snapshots_after_availability;
+        // After availability processing, SendMessages takes its timeout input,
+        // then ConsiderEviction takes the attempt input and its final recheck.
+        // The retry repeats the latter pair, so calls 3 and 5 are the two final
+        // manager rechecks.
+        if (snapshots_after_availability != 3 && snapshots_after_availability != 5) return;
+        assert_cs_main_held();
+        ++state.m_peer_snapshot->m_generation;
+        ++generation_invalidations;
+    };
+
+    BOOST_REQUIRE(peerman->SendMessages(*peer));
+    BOOST_CHECK_EQUAL(snapshots_after_availability, 5);
+    BOOST_CHECK_EQUAL(generation_invalidations, 2);
+    BOOST_CHECK(!peer->fDisconnect);
+
+    // Neither rejected attempt may start a stale timeout. After advancing past
+    // CHAIN_SYNC_TIMEOUT, a stable pass therefore only starts a fresh timeout
+    // and does not send the verification GETHEADERS yet.
+    invalidate_timeout = false;
+    clock += 21min;
+    {
+        LOCK(peer->cs_vSend);
+        peer->vSendMsg.clear();
+    }
+    BOOST_REQUIRE(peerman->SendMessages(*peer));
+    {
+        LOCK(peer->cs_vSend);
+        BOOST_CHECK(std::ranges::none_of(peer->vSendMsg, [](const CSerializedNetMsg& message) {
+            return message.m_type == NetMsgType::GETHEADERS;
+        }));
+    }
+
+    // Once that fresh timeout expires, the unchanged manager/chain/relay view
+    // follows the normal path and sends exactly one verification request.
+    clock += 21min;
+    BOOST_REQUIRE(peerman->SendMessages(*peer));
+    {
+        LOCK(peer->cs_vSend);
+        BOOST_CHECK_EQUAL(std::ranges::count_if(peer->vSendMsg, [](const CSerializedNetMsg& message) {
+                              return message.m_type == NetMsgType::GETHEADERS;
+                          }),
+                          1);
+    }
+    BOOST_CHECK(!peer->fDisconnect);
+
+    peerman->FinalizeNode(*peer);
 }
 
 BOOST_AUTO_TEST_CASE(block_relay_generation_invalidates_eviction)
