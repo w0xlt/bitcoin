@@ -92,7 +92,9 @@ MempoolLoadResult LoadMempool(CTxMemPool& pool, const fs::path& load_path, Chain
             file >> TX_WITH_WITNESS(tx);
             file >> nTime;
             file >> nFeeDelta;
-            snapshot_weight += static_cast<uint64_t>(GetTransactionWeight(*tx));
+            if (opts.calculate_snapshot_weight) {
+                snapshot_weight += static_cast<uint64_t>(GetTransactionWeight(*tx));
+            }
 
             if (opts.use_current_time) {
                 nTime = TicksSinceEpoch<std::chrono::seconds>(now);

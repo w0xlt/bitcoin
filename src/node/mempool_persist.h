@@ -25,6 +25,7 @@ struct ImportMempoolOptions {
     bool use_current_time{false};
     bool apply_fee_delta_priority{true};
     bool apply_unbroadcast_set{true};
+    bool calculate_snapshot_weight{false};
 };
 
 enum class MempoolLoadError {
@@ -35,7 +36,8 @@ enum class MempoolLoadError {
     DESERIALIZATION_FAILED,
 };
 
-//! On success, contains the total weight of transactions in the persisted snapshot.
+//! On success, contains the total weight of transactions in the persisted
+//! snapshot when requested through ImportMempoolOptions, otherwise zero.
 using MempoolLoadResult = util::Expected<uint64_t, MempoolLoadError>;
 
 /** Import the file and attempt to add its contents to the mempool. */

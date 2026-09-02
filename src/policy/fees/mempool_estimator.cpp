@@ -167,7 +167,6 @@ MemPoolFeeRateEstimator::MemPoolFeeRateEstimator(fs::path mempool_estimator_file
       m_chainman(chainman),
       m_mempool_estimator_file_path(std::move(mempool_estimator_file_path))
 {
-    ReadFromDisk();
 }
 
 void MemPoolFeeRateEstimator::ReadFromDisk()
@@ -262,6 +261,10 @@ bool MemPoolFeeRateEstimator::Write(AutoFile& file) const
 void MemPoolFeeRateEstimator::FlushMinedBlockStats()
 {
     if (m_mempool_estimator_file_path.empty()) return;
+    {
+        LOCK(cs);
+        if (!m_load_completed) return;
+    }
     if (!m_mempool_estimator_file_path.parent_path().empty()) {
         std::error_code error;
         fs::create_directories(m_mempool_estimator_file_path.parent_path(), error);
@@ -300,6 +303,7 @@ void MemPoolFeeRateEstimator::MempoolTxsRemovedForBlock(const std::shared_ptr<co
                                                         unsigned int block_height)
 {
     LOCK(cs);
+    if (!m_load_completed) return;
     Assert(!block->vtx.empty());
     // Accumulate total block weight and removed mempool tx weight, both excluding the coinbase.
     const auto get_tx_weight = [](const CTransactionRef& tx) {
@@ -318,6 +322,45 @@ void MemPoolFeeRateEstimator::MempoolTxsRemovedForBlock(const std::shared_ptr<co
     AddMinedBlockStats(m_prev_mined_blocks, {block_height, removed_weight, block_weight});
     m_mined_blocks_tip_hash = block->GetHash();
     m_cache.Clear();
+}
+
+void MemPoolFeeRateEstimator::MempoolLoadCompleted(const node::MempoolLoadResult& load_result)
+{
+    if (!load_result && load_result.error() == node::MempoolLoadError::INTERRUPTED) return;
+    {
+        LOCK(cs);
+        if (m_load_completed) return;
+    }
+
+    if (!m_mempool_estimator_file_path.empty()) {
+        if (load_result) {
+            const uint64_t snapshot_weight{*load_result};
+            const uint64_t post_load_mempool_weight{
+                WITH_LOCK(m_mempool.cs, return m_mempool.GetTotalTxWeight())};
+            const double retention_ratio{snapshot_weight == 0
+                                             ? 1.0
+                                             : static_cast<double>(post_load_mempool_weight) / snapshot_weight};
+            if (retention_ratio >= MEMPOOL_SNAPSHOT_RETENTION_THRESHOLD) {
+                ReadFromDisk();
+            } else {
+                LogDebug(BCLog::ESTIMATEFEE,
+                         "%s: not reading persisted mined-block stats because post-load mempool weight was insufficient; "
+                         "post_load_mempool_weight=%s snapshot_weight=%s retention_ratio=%.2f required_retention=%.2f",
+                         FeeRateEstimatorTypeToString(FeeRateEstimatorType::MEMPOOL_POLICY),
+                         post_load_mempool_weight,
+                         snapshot_weight,
+                         retention_ratio,
+                         MEMPOOL_SNAPSHOT_RETENTION_THRESHOLD);
+            }
+        } else {
+            LogDebug(BCLog::ESTIMATEFEE,
+                     "%s: not reading persisted mined-block stats because mempool loading failed",
+                     FeeRateEstimatorTypeToString(FeeRateEstimatorType::MEMPOOL_POLICY));
+        }
+    }
+
+    LOCK(cs);
+    m_load_completed = true;
 }
 
 // Require at least one block worth of activity across the window before using

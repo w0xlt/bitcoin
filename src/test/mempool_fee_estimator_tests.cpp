@@ -2,8 +2,11 @@
 // Distributed under the MIT software license. See the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
+#include <chainparams.h>
 #include <kernel/mempool_entry.h>
+#include <node/mempool_persist.h>
 #include <policy/fees/estimator_args.h>
+#include <policy/fees/estimator_man.h>
 #include <policy/fees/mempool_estimator.h>
 #include <policy/policy.h>
 #include <primitives/block.h>
@@ -128,6 +131,151 @@ BOOST_AUTO_TEST_CASE(mempool_fee_rate_estimator_cache)
     BOOST_CHECK(!cache.GetCachedEstimate(tip_hash));
 }
 
+BOOST_AUTO_TEST_CASE(mempool_post_load_weight_retention)
+{
+    const fs::path estimator_path{MempoolPolicyEstimatorPath(*m_node.args)};
+    const node::MempoolLoadResult empty_snapshot{uint64_t{0}};
+    const auto write_valid_persisted_data{[&] {
+        MemPoolFeeRateEstimator writer{estimator_path, *m_node.mempool, *m_node.chainman};
+        writer.MempoolLoadCompleted(empty_snapshot);
+        const auto tip_block{std::make_shared<CBlock>(Params().GenesisBlock())};
+        writer.MempoolTxsRemovedForBlock(tip_block, /*txs_removed_for_block=*/{}, /*block_height=*/0);
+        writer.FlushMinedBlockStats();
+        BOOST_REQUIRE(fs::exists(estimator_path));
+    }};
+    const auto persisted_data_size{[&] {
+        MemPoolFeeRateEstimator estimator{estimator_path, *m_node.mempool, *m_node.chainman};
+        estimator.MempoolLoadCompleted(empty_snapshot);
+        return estimator.GetPrevBlockData().size();
+    }};
+
+    // Create valid persisted data tied to the active chain tip.
+    write_valid_persisted_data();
+
+    // Construction does not expose persisted data, and a pre-completion flush
+    // must not overwrite the existing file with an empty window.
+    {
+        MemPoolFeeRateEstimator estimator{estimator_path, *m_node.mempool, *m_node.chainman};
+        BOOST_CHECK(estimator.GetPrevBlockData().empty());
+        estimator.FlushMinedBlockStats();
+        estimator.MempoolLoadCompleted(empty_snapshot);
+        BOOST_CHECK_EQUAL(estimator.GetPrevBlockData().size(), 1);
+    }
+
+    // A failed load never reads persisted health.
+    {
+        MemPoolFeeRateEstimator estimator{estimator_path, *m_node.mempool, *m_node.chainman};
+        estimator.MempoolLoadCompleted(util::Unexpected{node::MempoolLoadError::FILE_OPEN_FAILED});
+        BOOST_CHECK(estimator.GetPrevBlockData().empty());
+        // A later completion notification cannot reconsider the failed load.
+        estimator.MempoolLoadCompleted(empty_snapshot);
+        BOOST_CHECK(estimator.GetPrevBlockData().empty());
+    }
+
+    // A successful load with insufficient post-load weight also skips it.
+    {
+        LOCK(m_node.mempool->cs);
+        BOOST_REQUIRE_EQUAL(m_node.mempool->GetTotalTxWeight(), 0);
+    }
+    {
+        MemPoolFeeRateEstimator estimator{estimator_path, *m_node.mempool, *m_node.chainman};
+        estimator.MempoolLoadCompleted(node::MempoolLoadResult{uint64_t{1}});
+        BOOST_CHECK(estimator.GetPrevBlockData().empty());
+    }
+
+    // Three equal-weight transactions make the exact 75% boundary easy to
+    // exercise without passing a separately calculated post-load weight.
+    uint64_t post_load_weight{0};
+    {
+        LOCK2(cs_main, m_node.mempool->cs);
+        TestMemPoolEntryHelper entry;
+        for (int i{0}; i < 3; ++i) {
+            const auto tx{MakeRandomTx()};
+            TryAddToMempool(*m_node.mempool, entry.FromTx(tx));
+        }
+        post_load_weight = m_node.mempool->GetTotalTxWeight();
+    }
+    BOOST_REQUIRE_EQUAL(post_load_weight % 3, 0);
+    const uint64_t threshold_snapshot_weight{post_load_weight / 3 * 4};
+    {
+        MemPoolFeeRateEstimator estimator{estimator_path, *m_node.mempool, *m_node.chainman};
+        estimator.MempoolLoadCompleted(node::MempoolLoadResult{threshold_snapshot_weight});
+        BOOST_CHECK_EQUAL(estimator.GetPrevBlockData().size(), 1);
+    }
+    {
+        MemPoolFeeRateEstimator estimator{estimator_path, *m_node.mempool, *m_node.chainman};
+        estimator.MempoolLoadCompleted(node::MempoolLoadResult{threshold_snapshot_weight + 1});
+        BOOST_CHECK(estimator.GetPrevBlockData().empty());
+    }
+
+    // An interrupted load keeps persistence uninitialized so shutdown flushing
+    // cannot destroy the file. A later valid load can still read it.
+    {
+        MemPoolFeeRateEstimator estimator{estimator_path, *m_node.mempool, *m_node.chainman};
+        estimator.MempoolLoadCompleted(util::Unexpected{node::MempoolLoadError::INTERRUPTED});
+        estimator.FlushMinedBlockStats();
+    }
+    {
+        MemPoolFeeRateEstimator estimator{estimator_path, *m_node.mempool, *m_node.chainman};
+        estimator.MempoolLoadCompleted(empty_snapshot);
+        BOOST_CHECK_EQUAL(estimator.GetPrevBlockData().size(), 1);
+    }
+
+    // A rejected retention decision allows the old window to be replaced on disk.
+    {
+        MemPoolFeeRateEstimator estimator{estimator_path, *m_node.mempool, *m_node.chainman};
+        estimator.MempoolLoadCompleted(node::MempoolLoadResult{threshold_snapshot_weight + 1});
+        estimator.FlushMinedBlockStats();
+    }
+    BOOST_CHECK_EQUAL(persisted_data_size(), 0);
+
+    // A definitive load failure has the same replacement semantics.
+    write_valid_persisted_data();
+    {
+        MemPoolFeeRateEstimator estimator{estimator_path, *m_node.mempool, *m_node.chainman};
+        estimator.MempoolLoadCompleted(util::Unexpected{node::MempoolLoadError::FILE_OPEN_FAILED});
+        estimator.FlushMinedBlockStats();
+    }
+    BOOST_CHECK_EQUAL(persisted_data_size(), 0);
+
+    // An empty path disables persistence and cannot overwrite an existing file.
+    write_valid_persisted_data();
+    {
+        MemPoolFeeRateEstimator estimator{/*mempool_estimator_file_path=*/{}, *m_node.mempool, *m_node.chainman};
+        estimator.MempoolLoadCompleted(empty_snapshot);
+        estimator.FlushMinedBlockStats();
+    }
+    BOOST_CHECK_EQUAL(persisted_data_size(), 1);
+}
+
+class TestFeeRateEstimatorManager : public FeeRateEstimatorManager
+{
+public:
+    using FeeRateEstimatorManager::FeeRateEstimatorManager;
+
+    void ProcessMempoolBlock(const std::shared_ptr<const CBlock>& block, unsigned int height)
+    {
+        MempoolTransactionsRemovedForBlock(block, /*txs_removed_for_block=*/{}, height);
+    }
+};
+
+BOOST_AUTO_TEST_CASE(mempool_block_notifications_wait_for_load)
+{
+    TestFeeRateEstimatorManager manager{
+        /*block_policy_path=*/{}, /*read_stale_estimates=*/false,
+        /*mempool_estimator_path=*/{}, *m_node.mempool, *m_node.chainman};
+    const auto block{std::make_shared<CBlock>(Params().GenesisBlock())};
+
+    manager.ProcessMempoolBlock(block, /*height=*/1);
+    BOOST_CHECK(manager.MempoolPolicyEstimatorBlocksStats().empty());
+
+    manager.MempoolLoadCompleted(util::Unexpected{node::MempoolLoadError::NO_LOAD_PATH});
+    manager.ProcessMempoolBlock(block, /*height=*/2);
+    const auto stats{manager.MempoolPolicyEstimatorBlocksStats()};
+    BOOST_REQUIRE_EQUAL(stats.size(), 1);
+    BOOST_CHECK_EQUAL(stats.front().m_height, 2);
+}
+
 BOOST_AUTO_TEST_CASE(MempoolFeeRateEstimator)
 {
     auto mempool_estimator = MemPoolFeeRateEstimator(MempoolPolicyEstimatorPath(*m_node.args), *m_node.mempool, *m_node.chainman);
@@ -141,6 +289,7 @@ BOOST_AUTO_TEST_CASE(MempoolFeeRateEstimator)
         BOOST_CHECK_EQUAL(result.error().reason, unloaded_err);
     }
     m_node.mempool->SetLoadTried(true);
+    mempool_estimator.MempoolLoadCompleted(node::MempoolLoadResult{uint64_t{0}});
 
     BOOST_CHECK(!mempool_estimator.IsMempoolHealthy());
     BOOST_CHECK(mempool_estimator.GetMempoolHealth() == MemPoolFeeRateEstimator::MempoolHealth::INSUFFICIENT_DATA);
@@ -154,6 +303,7 @@ BOOST_AUTO_TEST_CASE(MempoolFeeRateEstimator)
     {
         MemPoolFeeRateEstimator custom_mempool_estimator{
             MempoolPolicyEstimatorPath(*m_node.args), *m_node.mempool, *m_node.chainman};
+        custom_mempool_estimator.MempoolLoadCompleted(node::MempoolLoadResult{uint64_t{0}});
         unsigned int custom_height{100};
         for (size_t block_count{1}; block_count < MEMPOOL_HEALTH_WINDOW_BLOCKS; ++block_count) {
             AddRemovedBlock(custom_mempool_estimator,

@@ -5,6 +5,7 @@
 #ifndef BITCOIN_POLICY_FEES_ESTIMATOR_MAN_H
 #define BITCOIN_POLICY_FEES_ESTIMATOR_MAN_H
 
+#include <node/mempool_persist.h>
 #include <policy/fees/block_policy_estimator.h>
 #include <policy/fees/mempool_estimator.h>
 #include <primitives/transaction.h>
@@ -67,6 +68,9 @@ public:
 
     /** Flush recorded data to disk as part of shutdown sequence. */
     void ShutdownFlush();
+
+    /** Forward the mempool load result to the mempool-policy estimator. */
+    void MempoolLoadCompleted(const node::MempoolLoadResult& load_result);
 
     /**
      * @brief Returns the maximum supported confirmation target from all fee rate estimators.
