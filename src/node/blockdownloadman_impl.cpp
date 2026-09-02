@@ -62,14 +62,14 @@ BlockInFlightInfo BlockDownloadManager::GetBlockInFlightInfo(const uint256& hash
     return m_impl->GetBlockInFlightInfo(hash, peer);
 }
 
-std::optional<PeerBlockRequestInfo> BlockDownloadManager::GetPeerRequestInfo(NodeId peer) const
+std::optional<PeerBlockDownloadSnapshot> BlockDownloadManager::GetPeerSnapshot(NodeId peer) const
 {
-    return m_impl->GetPeerRequestInfo(peer);
+    return m_impl->GetPeerSnapshot(peer);
 }
 
-BlockRequestSummary BlockDownloadManager::GetRequestSummary() const
+BlockDownloadGlobalSnapshot BlockDownloadManager::GetGlobalSnapshot() const
 {
-    return m_impl->GetRequestSummary();
+    return m_impl->GetGlobalSnapshot();
 }
 
 bool BlockDownloadManager::AllRequestsAreFor(const uint256& hash) const
@@ -87,6 +87,53 @@ bool BlockDownloadManager::ClearStalling(NodeId peer)
     return m_impl->ClearStalling(peer);
 }
 
+bool BlockDownloadManager::StartSync(NodeId peer)
+{
+    return m_impl->StartSync(peer);
+}
+
+bool BlockDownloadManager::ClearSync(NodeId peer)
+{
+    return m_impl->ClearSync(peer);
+}
+
+bool BlockDownloadManager::RecordBlockSource(const uint256& hash, NodeId peer, bool punish_on_invalid)
+{
+    return m_impl->RecordBlockSource(hash, peer, punish_on_invalid);
+}
+
+std::optional<BlockSource> BlockDownloadManager::ConsumeBlockSource(const uint256& hash)
+{
+    return m_impl->ConsumeBlockSource(hash);
+}
+
+bool BlockDownloadManager::EraseBlockSource(const uint256& hash)
+{
+    return m_impl->EraseBlockSource(hash);
+}
+
+bool BlockDownloadManager::TipMayBeStale(std::chrono::seconds now, std::chrono::seconds stale_after)
+{
+    return m_impl->TipMayBeStale(now, stale_after);
+}
+
+void BlockDownloadManager::UpdatedBlockTip(std::chrono::seconds now)
+{
+    m_impl->UpdatedBlockTip(now);
+}
+
+std::optional<std::chrono::seconds> BlockDownloadManager::TryIncreaseBlockStallingTimeout(
+    std::chrono::seconds expected)
+{
+    return m_impl->TryIncreaseBlockStallingTimeout(expected);
+}
+
+std::optional<std::chrono::seconds> BlockDownloadManager::TryDecreaseBlockStallingTimeout(
+    std::chrono::seconds expected)
+{
+    return m_impl->TryDecreaseBlockStallingTimeout(expected);
+}
+
 bool BlockDownloadManager::CheckConsistency() const
 {
     return m_impl->CheckConsistency();
@@ -100,8 +147,31 @@ void BlockDownloadManager::CheckIsEmpty() const
 void BlockDownloadManagerImpl::ConnectedPeer(NodeId peer, const BlockDownloadConnectionInfo& info)
 {
     LOCK(m_mutex);
-    auto [it, inserted]{m_peer_states.try_emplace(peer, info)};
-    if (!inserted) Assume(it->second.m_connection_info.m_is_inbound == info.m_is_inbound);
+    auto it{m_peer_states.find(peer)};
+    const bool inserted{it == m_peer_states.end()};
+    if (inserted) {
+        it = m_peer_states.try_emplace(peer, info, ++m_next_peer_generation).first;
+    }
+    auto& state{it->second};
+    if (inserted) {
+        m_num_preferred_download_peers += info.m_preferred_download;
+        return;
+    }
+
+    Assume(state.m_connection_info.m_is_inbound == info.m_is_inbound);
+    if (state.m_connection_info.m_preferred_download == info.m_preferred_download &&
+        state.m_connection_info.m_can_serve_witness == info.m_can_serve_witness &&
+        state.m_connection_info.m_limited_peer == info.m_limited_peer) {
+        return;
+    }
+
+    m_num_preferred_download_peers +=
+        static_cast<int>(info.m_preferred_download) - static_cast<int>(state.m_connection_info.m_preferred_download);
+    Assume(m_num_preferred_download_peers >= 0);
+    state.m_connection_info.m_preferred_download = info.m_preferred_download;
+    state.m_connection_info.m_can_serve_witness = info.m_can_serve_witness;
+    state.m_connection_info.m_limited_peer = info.m_limited_peer;
+    BumpPeerGenerationLocked(state);
 }
 
 void BlockDownloadManagerImpl::DisconnectedPeer(NodeId peer)
@@ -124,8 +194,25 @@ void BlockDownloadManagerImpl::DisconnectedPeer(NodeId peer)
     if (!state.m_requests.empty()) {
         --m_peers_downloading_from;
         Assume(m_peers_downloading_from >= 0);
+        ++m_in_flight_generation;
+    }
+    m_num_preferred_download_peers -= state.m_connection_info.m_preferred_download;
+    m_num_sync_started -= state.m_sync_started;
+    Assume(m_num_preferred_download_peers >= 0);
+    Assume(m_num_sync_started >= 0);
+    for (auto it{m_block_sources.begin()}; it != m_block_sources.end();) {
+        if (it->second.m_peer == peer) {
+            it = m_block_sources.erase(it);
+        } else {
+            ++it;
+        }
     }
     m_peer_states.erase(peer_it);
+}
+
+void BlockDownloadManagerImpl::BumpPeerGenerationLocked(PeerRequestState& state)
+{
+    state.m_generation = ++m_next_peer_generation;
 }
 
 BlockInFlightInfo BlockDownloadManagerImpl::GetBlockInFlightInfoLocked(const uint256& hash, NodeId peer) const
@@ -204,6 +291,8 @@ BlockRequestReservation BlockDownloadManagerImpl::ReserveBlockRequest(
         ++m_peers_downloading_from;
     }
     m_requests_by_hash.emplace(block.m_hash, IndexedRequest{peer, queue_it});
+    BumpPeerGenerationLocked(state);
+    ++m_in_flight_generation;
     result.m_partial_block = queue_it->m_partial_block;
     return result;
 }
@@ -241,8 +330,10 @@ BlockRequestRemoval BlockDownloadManagerImpl::RemoveBlockRequest(
         }
         state.m_stalling_since = std::chrono::microseconds{0};
         range.first = m_requests_by_hash.erase(range.first);
+        BumpPeerGenerationLocked(state);
         ++result.m_removed;
     }
+    if (result.m_removed != 0) ++m_in_flight_generation;
     return result;
 }
 
@@ -269,25 +360,42 @@ BlockInFlightInfo BlockDownloadManagerImpl::GetBlockInFlightInfo(const uint256& 
     return GetBlockInFlightInfoLocked(hash, peer);
 }
 
-std::optional<PeerBlockRequestInfo> BlockDownloadManagerImpl::GetPeerRequestInfo(NodeId peer) const
+std::optional<PeerBlockDownloadSnapshot> BlockDownloadManagerImpl::GetPeerSnapshot(NodeId peer) const
 {
     LOCK(m_mutex);
     const auto it{m_peer_states.find(peer)};
     if (it == m_peer_states.end()) return std::nullopt;
 
-    PeerBlockRequestInfo result;
+    PeerBlockDownloadSnapshot result;
     result.m_blocks.reserve(it->second.m_requests.size());
     for (const auto& queued : it->second.m_requests) result.m_blocks.push_back(queued.m_block);
     result.m_downloading_since = it->second.m_downloading_since;
     result.m_stalling_since = it->second.m_stalling_since;
+    result.m_is_inbound = it->second.m_connection_info.m_is_inbound;
+    result.m_preferred_download = it->second.m_connection_info.m_preferred_download;
+    result.m_can_serve_witness = it->second.m_connection_info.m_can_serve_witness;
+    result.m_limited_peer = it->second.m_connection_info.m_limited_peer;
+    result.m_sync_started = it->second.m_sync_started;
+    result.m_generation = it->second.m_generation;
+    result.m_total_requests = m_requests_by_hash.size();
     result.m_peers_downloading_from = m_peers_downloading_from;
+    result.m_num_preferred_download_peers = m_num_preferred_download_peers;
+    result.m_num_sync_started = m_num_sync_started;
     return result;
 }
 
-BlockRequestSummary BlockDownloadManagerImpl::GetRequestSummary() const
+BlockDownloadGlobalSnapshot BlockDownloadManagerImpl::GetGlobalSnapshot() const
 {
     LOCK(m_mutex);
-    return {m_requests_by_hash.size(), m_peers_downloading_from};
+    return {
+        .m_total_requests = m_requests_by_hash.size(),
+        .m_peers_downloading_from = m_peers_downloading_from,
+        .m_num_preferred_download_peers = m_num_preferred_download_peers,
+        .m_num_sync_started = m_num_sync_started,
+        .m_in_flight_generation = m_in_flight_generation,
+        .m_last_tip_update = m_last_tip_update,
+        .m_block_stalling_timeout = m_block_stalling_timeout,
+    };
 }
 
 bool BlockDownloadManagerImpl::AllRequestsAreFor(const uint256& hash) const
@@ -300,10 +408,13 @@ bool BlockDownloadManagerImpl::StartStalling(NodeId peer, std::chrono::microseco
 {
     LOCK(m_mutex);
     const auto it{m_peer_states.find(peer)};
-    if (it == m_peer_states.end() || it->second.m_stalling_since != std::chrono::microseconds{0}) {
+    if (since == std::chrono::microseconds{0} ||
+        it == m_peer_states.end() ||
+        it->second.m_stalling_since != std::chrono::microseconds{0}) {
         return false;
     }
     it->second.m_stalling_since = since;
+    BumpPeerGenerationLocked(it->second);
     return true;
 }
 
@@ -313,18 +424,112 @@ bool BlockDownloadManagerImpl::ClearStalling(NodeId peer)
     const auto it{m_peer_states.find(peer)};
     if (it == m_peer_states.end() || it->second.m_stalling_since == std::chrono::microseconds{0}) return false;
     it->second.m_stalling_since = std::chrono::microseconds{0};
+    BumpPeerGenerationLocked(it->second);
     return true;
+}
+
+bool BlockDownloadManagerImpl::StartSync(NodeId peer)
+{
+    LOCK(m_mutex);
+    const auto it{m_peer_states.find(peer)};
+    if (it == m_peer_states.end() || it->second.m_sync_started) return false;
+    it->second.m_sync_started = true;
+    ++m_num_sync_started;
+    BumpPeerGenerationLocked(it->second);
+    return true;
+}
+
+bool BlockDownloadManagerImpl::ClearSync(NodeId peer)
+{
+    LOCK(m_mutex);
+    const auto it{m_peer_states.find(peer)};
+    if (it == m_peer_states.end() || !it->second.m_sync_started) return false;
+    it->second.m_sync_started = false;
+    --m_num_sync_started;
+    Assume(m_num_sync_started >= 0);
+    BumpPeerGenerationLocked(it->second);
+    return true;
+}
+
+bool BlockDownloadManagerImpl::RecordBlockSource(const uint256& hash, NodeId peer, bool punish_on_invalid)
+{
+    LOCK(m_mutex);
+    if (!m_peer_states.contains(peer)) return false;
+    return m_block_sources.emplace(hash, BlockSource{peer, punish_on_invalid}).second;
+}
+
+std::optional<BlockSource> BlockDownloadManagerImpl::ConsumeBlockSource(const uint256& hash)
+{
+    LOCK(m_mutex);
+    const auto it{m_block_sources.find(hash)};
+    if (it == m_block_sources.end()) return std::nullopt;
+    const BlockSource source{it->second};
+    m_block_sources.erase(it);
+    return source;
+}
+
+bool BlockDownloadManagerImpl::EraseBlockSource(const uint256& hash)
+{
+    LOCK(m_mutex);
+    return m_block_sources.erase(hash) != 0;
+}
+
+bool BlockDownloadManagerImpl::TipMayBeStale(std::chrono::seconds now, std::chrono::seconds stale_after)
+{
+    LOCK(m_mutex);
+    if (m_last_tip_update == std::chrono::seconds{0}) m_last_tip_update = now;
+    return m_last_tip_update < now - stale_after && m_requests_by_hash.empty();
+}
+
+void BlockDownloadManagerImpl::UpdatedBlockTip(std::chrono::seconds now)
+{
+    LOCK(m_mutex);
+    m_last_tip_update = now;
+}
+
+std::optional<std::chrono::seconds> BlockDownloadManagerImpl::TryIncreaseBlockStallingTimeout(
+    std::chrono::seconds expected)
+{
+    static constexpr std::chrono::seconds MAX_BLOCK_STALLING_TIMEOUT{64};
+    LOCK(m_mutex);
+    if (expected < DEFAULT_BLOCK_STALLING_TIMEOUT ||
+        expected >= MAX_BLOCK_STALLING_TIMEOUT ||
+        m_block_stalling_timeout != expected) {
+        return std::nullopt;
+    }
+    m_block_stalling_timeout = std::min(2 * expected, MAX_BLOCK_STALLING_TIMEOUT);
+    return m_block_stalling_timeout;
+}
+
+std::optional<std::chrono::seconds> BlockDownloadManagerImpl::TryDecreaseBlockStallingTimeout(
+    std::chrono::seconds expected)
+{
+    static constexpr std::chrono::seconds MAX_BLOCK_STALLING_TIMEOUT{64};
+    LOCK(m_mutex);
+    if (expected <= DEFAULT_BLOCK_STALLING_TIMEOUT ||
+        expected > MAX_BLOCK_STALLING_TIMEOUT ||
+        m_block_stalling_timeout != expected) {
+        return std::nullopt;
+    }
+    m_block_stalling_timeout = std::max(
+        std::chrono::duration_cast<std::chrono::seconds>(expected * 0.85),
+        DEFAULT_BLOCK_STALLING_TIMEOUT);
+    return m_block_stalling_timeout;
 }
 
 bool BlockDownloadManagerImpl::CheckConsistencyLocked() const
 {
     size_t queue_size{0};
     int peers_downloading{0};
+    int preferred_peers{0};
+    int sync_started{0};
     std::set<std::pair<uint256, NodeId>> unique_requests;
 
     for (const auto& [peer, state] : m_peer_states) {
         queue_size += state.m_requests.size();
         peers_downloading += !state.m_requests.empty();
+        preferred_peers += state.m_connection_info.m_preferred_download;
+        sync_started += state.m_sync_started;
         for (auto queue_it{state.m_requests.begin()}; queue_it != state.m_requests.end(); ++queue_it) {
             if (!unique_requests.emplace(queue_it->m_block.m_hash, peer).second) return false;
             const auto range{m_requests_by_hash.equal_range(queue_it->m_block.m_hash)};
@@ -335,7 +540,16 @@ bool BlockDownloadManagerImpl::CheckConsistencyLocked() const
             if (matches != 1) return false;
         }
     }
-    if (queue_size != m_requests_by_hash.size() || peers_downloading != m_peers_downloading_from) return false;
+    if (queue_size != m_requests_by_hash.size() ||
+        peers_downloading != m_peers_downloading_from ||
+        preferred_peers != m_num_preferred_download_peers ||
+        sync_started != m_num_sync_started) {
+        return false;
+    }
+
+    for (const auto& [_, source] : m_block_sources) {
+        if (!m_peer_states.contains(source.m_peer)) return false;
+    }
 
     for (auto it{m_requests_by_hash.begin()}; it != m_requests_by_hash.end();) {
         const auto range{m_requests_by_hash.equal_range(it->first)};
@@ -362,6 +576,9 @@ void BlockDownloadManagerImpl::CheckIsEmpty() const
     Assume(m_peer_states.empty());
     Assume(m_requests_by_hash.empty());
     Assume(m_peers_downloading_from == 0);
+    Assume(m_num_preferred_download_peers == 0);
+    Assume(m_num_sync_started == 0);
+    Assume(m_block_sources.empty());
 }
 
 } // namespace node

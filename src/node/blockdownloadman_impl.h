@@ -10,6 +10,7 @@
 #include <sync.h>
 
 #include <chrono>
+#include <cstdint>
 #include <list>
 #include <map>
 #include <memory>
@@ -36,9 +37,11 @@ private:
         std::list<QueuedBlock> m_requests;
         std::chrono::microseconds m_downloading_since{0};
         std::chrono::microseconds m_stalling_since{0};
+        bool m_sync_started{false};
+        uint64_t m_generation{0};
 
-        explicit PeerRequestState(const BlockDownloadConnectionInfo& info)
-            : m_connection_info{info}
+        PeerRequestState(const BlockDownloadConnectionInfo& info, uint64_t generation)
+            : m_connection_info{info}, m_generation{generation}
         {
         }
     };
@@ -56,9 +59,24 @@ private:
     RequestIndex m_requests_by_hash GUARDED_BY(m_mutex);
     /** Number of peers whose request queue is non-empty. */
     int m_peers_downloading_from GUARDED_BY(m_mutex){0};
+    /** Number of peers selected as preferred download peers. */
+    int m_num_preferred_download_peers GUARDED_BY(m_mutex){0};
+    /** Number of peers with headers synchronization started. */
+    int m_num_sync_started GUARDED_BY(m_mutex){0};
+    /** First-writer block source attribution. */
+    std::map<uint256, BlockSource> m_block_sources GUARDED_BY(m_mutex);
+    /** Monotonic source for unique peer-state generations. */
+    uint64_t m_next_peer_generation GUARDED_BY(m_mutex){0};
+    /** Monotonic generation for the global in-flight request set. */
+    uint64_t m_in_flight_generation GUARDED_BY(m_mutex){0};
+
+    /** Timing state included in the manager's coherent global snapshots. */
+    std::chrono::seconds m_last_tip_update GUARDED_BY(m_mutex){0};
+    std::chrono::seconds m_block_stalling_timeout GUARDED_BY(m_mutex){DEFAULT_BLOCK_STALLING_TIMEOUT};
 
     BlockInFlightInfo GetBlockInFlightInfoLocked(const uint256& hash, NodeId peer) const
         EXCLUSIVE_LOCKS_REQUIRED(m_mutex);
+    void BumpPeerGenerationLocked(PeerRequestState& state) EXCLUSIVE_LOCKS_REQUIRED(m_mutex);
     bool CheckConsistencyLocked() const EXCLUSIVE_LOCKS_REQUIRED(m_mutex);
 
 public:
@@ -78,11 +96,20 @@ public:
     bool IsBlockRequested(const uint256& hash) const EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
     bool IsBlockRequestedFromOutbound(const uint256& hash) const EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
     BlockInFlightInfo GetBlockInFlightInfo(const uint256& hash, NodeId peer) const EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
-    std::optional<PeerBlockRequestInfo> GetPeerRequestInfo(NodeId peer) const EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
-    BlockRequestSummary GetRequestSummary() const EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
+    std::optional<PeerBlockDownloadSnapshot> GetPeerSnapshot(NodeId peer) const EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
+    BlockDownloadGlobalSnapshot GetGlobalSnapshot() const EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
     bool AllRequestsAreFor(const uint256& hash) const EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
     bool StartStalling(NodeId peer, std::chrono::microseconds since) EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
     bool ClearStalling(NodeId peer) EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
+    bool StartSync(NodeId peer) EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
+    bool ClearSync(NodeId peer) EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
+    bool RecordBlockSource(const uint256& hash, NodeId peer, bool punish_on_invalid) EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
+    std::optional<BlockSource> ConsumeBlockSource(const uint256& hash) EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
+    bool EraseBlockSource(const uint256& hash) EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
+    bool TipMayBeStale(std::chrono::seconds now, std::chrono::seconds stale_after) EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
+    void UpdatedBlockTip(std::chrono::seconds now) EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
+    std::optional<std::chrono::seconds> TryIncreaseBlockStallingTimeout(std::chrono::seconds expected) EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
+    std::optional<std::chrono::seconds> TryDecreaseBlockStallingTimeout(std::chrono::seconds expected) EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
     bool CheckConsistency() const EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
     void CheckIsEmpty() const EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
 };

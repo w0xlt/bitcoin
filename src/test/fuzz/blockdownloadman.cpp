@@ -24,6 +24,7 @@ namespace {
 
 constexpr size_t NUM_PEERS{6};
 constexpr size_t NUM_BLOCKS{8};
+constexpr std::chrono::seconds MAX_BLOCK_STALLING_TIMEOUT{64};
 
 struct MirrorRequest {
     node::BlockDownloadBlock block;
@@ -33,9 +34,14 @@ struct MirrorRequest {
 struct PeerMirror {
     bool registered{false};
     bool inbound{false};
+    bool preferred{false};
+    bool can_serve_witness{false};
+    bool limited{false};
+    bool sync_started{false};
     std::vector<MirrorRequest> requests;
     std::chrono::microseconds downloading_since{0};
     std::chrono::microseconds stalling_since{0};
+    uint64_t generation{0};
 };
 
 struct IndexedMirrorRequest {
@@ -48,8 +54,14 @@ FUZZ_TARGET(blockdownloadman)
     FuzzedDataProvider provider{buffer.data(), buffer.size()};
     node::BlockDownloadManager manager;
     std::array<PeerMirror, NUM_PEERS> peers;
+    std::array<uint64_t, NUM_PEERS> last_peer_generation{};
     std::vector<IndexedMirrorRequest> index;
     std::array<node::BlockDownloadBlock, NUM_BLOCKS> blocks;
+    std::array<std::optional<node::BlockSource>, NUM_BLOCKS> sources;
+    uint64_t next_peer_generation{0};
+    uint64_t in_flight_generation{0};
+    std::chrono::seconds last_tip_update{0};
+    std::chrono::seconds stalling_timeout{node::DEFAULT_BLOCK_STALLING_TIMEOUT};
     for (size_t i{0}; i < blocks.size(); ++i) {
         blocks[i] = {
             .m_hash = ArithToUint256(arith_uint256{i + 1}),
@@ -83,20 +95,43 @@ FUZZ_TARGET(blockdownloadman)
         const NodeId peer{random_peer()};
         const auto& block{random_block()};
         const auto now{random_time()};
-        switch (provider.ConsumeIntegralInRange<unsigned>(0, 7)) {
+        switch (provider.ConsumeIntegralInRange<unsigned>(0, 15)) {
         case 0: {
+            const bool inserted{!peers[peer].registered};
             const bool inbound{peers[peer].registered ? peers[peer].inbound : provider.ConsumeBool()};
-            manager.ConnectedPeer(peer, {.m_is_inbound = inbound});
+            const bool preferred{provider.ConsumeBool()};
+            const bool can_serve_witness{provider.ConsumeBool()};
+            const bool limited{provider.ConsumeBool()};
+            const bool changed{inserted ||
+                               peers[peer].preferred != preferred ||
+                               peers[peer].can_serve_witness != can_serve_witness ||
+                               peers[peer].limited != limited};
+            manager.ConnectedPeer(peer, {
+                .m_is_inbound = inbound,
+                .m_preferred_download = preferred,
+                .m_can_serve_witness = can_serve_witness,
+                .m_limited_peer = limited,
+            });
             peers[peer].registered = true;
             peers[peer].inbound = inbound;
+            peers[peer].preferred = preferred;
+            peers[peer].can_serve_witness = can_serve_witness;
+            peers[peer].limited = limited;
+            if (changed) peers[peer].generation = ++next_peer_generation;
+            if (inserted) Assert(peers[peer].generation > last_peer_generation[peer]);
             break;
         }
         case 1: {
+            const bool had_requests{!peers[peer].requests.empty()};
             manager.DisconnectedPeer(peer);
             index.erase(std::remove_if(index.begin(), index.end(), [&](const IndexedMirrorRequest& request) {
                 return request.peer == peer;
             }), index.end());
+            for (auto& source : sources) {
+                if (source && source->m_peer == peer) source.reset();
+            }
             peers[peer] = {};
+            in_flight_generation += had_requests;
             break;
         }
         case 2: {
@@ -133,6 +168,8 @@ FUZZ_TARGET(blockdownloadman)
                 if (peers[peer].requests.empty()) peers[peer].downloading_since = now;
                 peers[peer].requests.push_back({block, std::move(proposed_copy)});
                 index.push_back({block.m_hash, peer});
+                peers[peer].generation = ++next_peer_generation;
+                ++in_flight_generation;
             }
             break;
         }
@@ -154,24 +191,34 @@ FUZZ_TARGET(blockdownloadman)
                 }
                 mirror.requests.erase(queue_it);
                 mirror.stalling_since = std::chrono::microseconds{0};
+                mirror.generation = ++next_peer_generation;
                 it = index.erase(it);
                 ++removed;
             }
             const auto result{manager.RemoveBlockRequest(block.m_hash, from_peer, now)};
             Assert(result.m_requests_before == count_before);
             Assert(result.m_removed == removed);
+            in_flight_generation += removed != 0;
             break;
         }
         case 4: {
-            const bool expected{peers[peer].registered && peers[peer].stalling_since == std::chrono::microseconds{0}};
+            const bool expected{now != std::chrono::microseconds{0} &&
+                                peers[peer].registered &&
+                                peers[peer].stalling_since == std::chrono::microseconds{0}};
             Assert(manager.StartStalling(peer, now) == expected);
-            if (expected) peers[peer].stalling_since = now;
+            if (expected) {
+                peers[peer].stalling_since = now;
+                peers[peer].generation = ++next_peer_generation;
+            }
             break;
         }
         case 5: {
             const bool expected{peers[peer].registered && peers[peer].stalling_since != std::chrono::microseconds{0}};
             Assert(manager.ClearStalling(peer) == expected);
-            if (expected) peers[peer].stalling_since = std::chrono::microseconds{0};
+            if (expected) {
+                peers[peer].stalling_since = std::chrono::microseconds{0};
+                peers[peer].generation = ++next_peer_generation;
+            }
             break;
         }
         case 6: {
@@ -183,14 +230,87 @@ FUZZ_TARGET(blockdownloadman)
             break;
         }
         case 7:
-            (void)manager.GetRequestSummary();
+            (void)manager.GetGlobalSnapshot();
             break;
+        case 8: {
+            const bool expected{peers[peer].registered && !peers[peer].sync_started};
+            Assert(manager.StartSync(peer) == expected);
+            if (expected) {
+                peers[peer].sync_started = true;
+                peers[peer].generation = ++next_peer_generation;
+            }
+            break;
+        }
+        case 9: {
+            const bool expected{peers[peer].registered && peers[peer].sync_started};
+            Assert(manager.ClearSync(peer) == expected);
+            if (expected) {
+                peers[peer].sync_started = false;
+                peers[peer].generation = ++next_peer_generation;
+            }
+            break;
+        }
+        case 10: {
+            const size_t block_pos{static_cast<size_t>(block.m_height)};
+            const bool punish{provider.ConsumeBool()};
+            const bool expected{peers[peer].registered && !sources[block_pos]};
+            Assert(manager.RecordBlockSource(block.m_hash, peer, punish) == expected);
+            if (expected) sources[block_pos] = node::BlockSource{peer, punish};
+            break;
+        }
+        case 11: {
+            const size_t block_pos{static_cast<size_t>(block.m_height)};
+            Assert(manager.ConsumeBlockSource(block.m_hash) == sources[block_pos]);
+            sources[block_pos].reset();
+            break;
+        }
+        case 12: {
+            const size_t block_pos{static_cast<size_t>(block.m_height)};
+            Assert(manager.EraseBlockSource(block.m_hash) == sources[block_pos].has_value());
+            sources[block_pos].reset();
+            break;
+        }
+        case 13: {
+            const auto now_seconds{std::chrono::seconds{provider.ConsumeIntegral<uint32_t>()}};
+            const auto stale_after{std::chrono::seconds{provider.ConsumeIntegral<uint16_t>()}};
+            if (last_tip_update == std::chrono::seconds{0}) last_tip_update = now_seconds;
+            const bool expected{last_tip_update < now_seconds - stale_after && index.empty()};
+            Assert(manager.TipMayBeStale(now_seconds, stale_after) == expected);
+            break;
+        }
+        case 14:
+            last_tip_update = std::chrono::seconds{provider.ConsumeIntegral<uint32_t>()};
+            manager.UpdatedBlockTip(last_tip_update);
+            break;
+        case 15: {
+            const auto expected{provider.ConsumeBool() ? stalling_timeout : std::chrono::seconds{provider.ConsumeIntegral<uint16_t>()}};
+            std::optional<std::chrono::seconds> expected_result;
+            std::optional<std::chrono::seconds> result;
+            if (provider.ConsumeBool()) {
+                if (expected == stalling_timeout && expected >= node::DEFAULT_BLOCK_STALLING_TIMEOUT && expected < MAX_BLOCK_STALLING_TIMEOUT) {
+                    expected_result = std::min(2 * expected, MAX_BLOCK_STALLING_TIMEOUT);
+                }
+                result = manager.TryIncreaseBlockStallingTimeout(expected);
+            } else {
+                if (expected == stalling_timeout && expected > node::DEFAULT_BLOCK_STALLING_TIMEOUT && expected <= MAX_BLOCK_STALLING_TIMEOUT) {
+                    expected_result = std::max(
+                        std::chrono::duration_cast<std::chrono::seconds>(expected * 0.85),
+                        node::DEFAULT_BLOCK_STALLING_TIMEOUT);
+                }
+                result = manager.TryDecreaseBlockStallingTimeout(expected);
+            }
+            Assert(result == expected_result);
+            if (result) stalling_timeout = *result;
+            break;
+        }
         }
 
         size_t total{0};
         int downloading_peers{0};
+        int preferred_peers{0};
+        int sync_started{0};
         for (NodeId id{0}; id < static_cast<NodeId>(NUM_PEERS); ++id) {
-            const auto actual{manager.GetPeerRequestInfo(id)};
+            const auto actual{manager.GetPeerSnapshot(id)};
             if (!peers[id].registered) {
                 Assert(!actual);
                 continue;
@@ -202,13 +322,27 @@ FUZZ_TARGET(blockdownloadman)
             }
             Assert(actual->m_downloading_since == peers[id].downloading_since);
             Assert(actual->m_stalling_since == peers[id].stalling_since);
+            Assert(actual->m_is_inbound == peers[id].inbound);
+            Assert(actual->m_preferred_download == peers[id].preferred);
+            Assert(actual->m_can_serve_witness == peers[id].can_serve_witness);
+            Assert(actual->m_limited_peer == peers[id].limited);
+            Assert(actual->m_sync_started == peers[id].sync_started);
+            Assert(actual->m_generation == peers[id].generation);
+            last_peer_generation[id] = actual->m_generation;
             total += peers[id].requests.size();
             downloading_peers += !peers[id].requests.empty();
+            preferred_peers += peers[id].preferred;
+            sync_started += peers[id].sync_started;
         }
-        const auto summary{manager.GetRequestSummary()};
+        const auto summary{manager.GetGlobalSnapshot()};
         Assert(summary.m_total_requests == total);
         Assert(summary.m_total_requests == index.size());
         Assert(summary.m_peers_downloading_from == downloading_peers);
+        Assert(summary.m_num_preferred_download_peers == preferred_peers);
+        Assert(summary.m_num_sync_started == sync_started);
+        Assert(summary.m_in_flight_generation == in_flight_generation);
+        Assert(summary.m_last_tip_update == last_tip_update);
+        Assert(summary.m_block_stalling_timeout == stalling_timeout);
         Assert(manager.CheckConsistency());
 
         for (const auto& candidate : blocks) {
@@ -218,6 +352,13 @@ FUZZ_TARGET(blockdownloadman)
             }
             Assert(manager.IsBlockRequested(candidate.m_hash) == (count_hash(candidate.m_hash) != 0));
             Assert(manager.IsBlockRequestedFromOutbound(candidate.m_hash) == outbound);
+            const size_t block_pos{static_cast<size_t>(candidate.m_height)};
+            const auto source{manager.ConsumeBlockSource(candidate.m_hash)};
+            Assert(source == sources[block_pos]);
+            if (source) {
+                Assert(manager.RecordBlockSource(
+                    candidate.m_hash, source->m_peer, source->m_punish_on_invalid));
+            }
         }
     }
 
