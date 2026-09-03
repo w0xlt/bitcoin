@@ -4343,6 +4343,15 @@ bool ChainstateManager::ShouldMaybeWrite(const CBlockIndex* pindex, bool fReques
     return true;
 }
 
+bool ChainstateManager::PreWriteCheckBlock(const CBlock& block, BlockValidationState& state, const CBlockIndex* pindex) const
+{
+    AssertLockHeld(cs_main);
+
+    const CChainParams& params{GetParams()};
+    return CheckBlock(block, state, params.GetConsensus()) &&
+           ContextualCheckBlock(block, state, *this, pindex->pprev);
+}
+
 /** Store block on disk. If dbp is non-nullptr, the file is known to already reside on disk */
 bool ChainstateManager::AcceptBlock(const std::shared_ptr<const CBlock>& pblock, BlockValidationState& state, CBlockIndex** ppindex, bool fRequested, const FlatFilePos* dbp, bool* fNewBlock, bool min_pow_checked)
 {
@@ -4362,10 +4371,7 @@ bool ChainstateManager::AcceptBlock(const std::shared_ptr<const CBlock>& pblock,
 
     if (!ShouldMaybeWrite(pindex, fRequested)) return true;
 
-    const CChainParams& params{GetParams()};
-
-    if (!CheckBlock(block, state, params.GetConsensus()) ||
-        !ContextualCheckBlock(block, state, *this, pindex->pprev)) {
+    if (!PreWriteCheckBlock(block, state, pindex)) {
         if (Assume(state.IsInvalid())) {
             ActiveChainstate().InvalidBlockFound(pindex, state);
         }
