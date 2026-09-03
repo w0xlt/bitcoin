@@ -976,6 +976,9 @@ private:
      * persistence under the current requested/unrequested anti-DoS policy.
      */
     bool ShouldMaybeWrite(const CBlockIndex* pindex, bool fRequested) const EXCLUSIVE_LOCKS_REQUIRED(cs_main);
+
+    /** Check block validity immediately before persistence. */
+    bool PreWriteCheckBlock(const CBlock& block, BlockValidationState& state, const CBlockIndex* pindex) const EXCLUSIVE_LOCKS_REQUIRED(cs_main);
     friend Chainstate;
 
     /** Most recent headers presync progress update, for rate-limiting. */
