@@ -9,19 +9,23 @@
 #include <consensus/validation.h>
 #include <interfaces/mining.h>
 #include <node/blockstorage.h>
+#include <node/kernel_notifications.h>
 #include <pow.h>
 #include <primitives/block.h>
 #include <primitives/transaction.h>
 #include <random.h>
 #include <script/script.h>
+#include <streams.h>
 #include <sync.h>
 #include <test/util/common.h>
+#include <test/util/mining.h>
 #include <test/util/script.h>
 #include <test/util/setup_common.h>
 #include <test/util/validation.h>
 #include <txmempool.h>
 #include <uint256.h>
 #include <util/check.h>
+#include <util/fs.h>
 #include <validation.h>
 #include <validationinterface.h>
 
@@ -31,6 +35,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <latch>
+#include <map>
 #include <memory>
 #include <span>
 #include <thread>
@@ -413,6 +418,187 @@ BOOST_AUTO_TEST_CASE(acceptblock_concurrent_same_block)
     const auto blocks_before{block_pos.nFile == initial_file ? file_info_before.nBlocks : 0U};
     BOOST_CHECK_EQUAL(file_info_after.nBlocks, blocks_before + 1);
 
+    LOCK(cs_main);
+    chainman.CheckBlockIndex();
+}
+
+BOOST_AUTO_TEST_CASE(acceptblock_invalidation_during_write)
+{
+    auto& chainman{*m_node.chainman};
+    const auto block{GoodBlock(Params().GenesisBlock().GetHash())};
+    auto* index{WITH_LOCK(cs_main, return chainman.m_blockman.LookupBlockIndex(block->GetHash()))};
+    BOOST_REQUIRE(index);
+
+    PausedAcceptance pending{chainman, block};
+    BlockValidationState invalidation_state;
+    const bool invalidated{chainman.ActiveChainstate().InvalidateBlock(invalidation_state, index)};
+    pending.Finish();
+
+    BOOST_CHECK(invalidated);
+    BOOST_CHECK(!pending.m_accepted);
+    BOOST_CHECK(pending.m_state.GetResult() == BlockValidationResult::BLOCK_CACHED_INVALID);
+    {
+        LOCK(cs_main);
+        BOOST_CHECK(index->nStatus & BLOCK_FAILED_VALID);
+        BOOST_CHECK(!(index->nStatus & BLOCK_HAVE_DATA));
+        BOOST_CHECK_EQUAL(index->nTx, 0U);
+        chainman.CheckBlockIndex();
+    }
+    BlockValidationState duplicate_state;
+    BOOST_CHECK(!static_cast<TestChainstateManager&>(chainman).AcceptBlock(block, duplicate_state, nullptr));
+    BOOST_CHECK(duplicate_state.GetResult() == BlockValidationResult::BLOCK_CACHED_INVALID);
+}
+
+/** Enable pruning before loading chainstate; no network users hold the manager. */
+struct PruningAcceptanceSetup : ChainTestingSetup {
+    PruningAcceptanceSetup() : ChainTestingSetup{ChainType::REGTEST, {.setup_validation_interface = false}}
+    {
+        auto chainman_opts{m_node.chainman->m_options};
+        const node::BlockManager::Options blockman_opts{
+            .chainparams = Params(),
+            .prune_target = 1,
+            .blocks_dir = m_args.GetBlocksDirPath(),
+            .block_tree_db_params = DBParams{
+                .path = m_args.GetDataDirNet() / "blocks" / "index",
+                .cache_bytes = 0,
+                .memory_only = true,
+            },
+        };
+        m_node.chainman.reset();
+        m_node.chainman = std::make_unique<ChainstateManager>(*m_node.shutdown_signal, chainman_opts, blockman_opts);
+        LoadVerifyActivateChainstate();
+    }
+};
+
+BOOST_FIXTURE_TEST_CASE(acceptblock_pruning_during_write, PruningAcceptanceSetup)
+{
+    auto& chainman{*m_node.chainman};
+    auto& blockman{static_cast<TestBlockManager&>(chainman.m_blockman)};
+    const auto blocks{CreateBlockChain(1002, Params())};
+    BOOST_REQUIRE(chainman.ProcessNewBlock(blocks[0], true, true, nullptr));
+    blockman.SetBlockFileSize(0, node::MAX_BLOCKFILE_SIZE);
+    for (size_t i{1}; i < blocks.size() - 1; ++i) {
+        BOOST_REQUIRE(chainman.ProcessNewBlock(blocks[i], true, true, nullptr));
+    }
+    // Make file zero eligible for automatic pruning without writing hundreds
+    // of megabytes. Its last block is below the retention window.
+    blockman.SetBlockFileSize(0, MIN_DISK_SPACE_FOR_BLOCK_FILES);
+    const auto path{blockman.GetBlockPosFilename(FlatFilePos{0, 0})};
+    BOOST_REQUIRE(fs::exists(path));
+    // Allocate another chunk through storage alone, leaving its automatic
+    // pruning request for acceptance to handle. The pending write below fits
+    // in this chunk, so it cannot replace an incorrectly cleared request.
+    blockman.SetBlockFileSize(1, node::BLOCKFILE_CHUNK_SIZE);
+    const auto allocation{blockman.WriteBlock(*blocks[1000], 1001)};
+    BOOST_REQUIRE(!allocation.value.IsNull());
+    BOOST_REQUIRE(allocation.notifications.empty());
+
+    PausedAcceptance pending{chainman, blocks.back()};
+    BlockValidationState automatic_state, manual_state;
+    const bool automatic{chainman.ActiveChainstate().FlushStateToDisk(automatic_state, FlushStateMode::NONE)};
+    const bool manual{chainman.ActiveChainstate().FlushStateToDisk(manual_state, FlushStateMode::NONE, 1000)};
+    const bool retained{fs::exists(path)};
+    pending.Finish();
+
+    BOOST_CHECK(automatic);
+    BOOST_CHECK(manual);
+    BOOST_CHECK(retained);
+    BOOST_REQUIRE(pending.m_accepted);
+    // Publication clears the barrier before the acceptance tail retries pruning.
+    BOOST_CHECK(!fs::exists(path));
+    CBlock readback;
+    const auto pos{WITH_LOCK(cs_main, return pending.m_index->GetBlockPos())};
+    BOOST_CHECK(blockman.ReadBlock(readback, pos, blocks.back()->GetHash()));
+    LOCK(cs_main);
+    BOOST_CHECK(pending.m_index->nStatus & BLOCK_HAVE_DATA);
+    BOOST_CHECK(!(chainman.ActiveChain().Genesis()->nStatus & BLOCK_HAVE_DATA));
+    chainman.CheckBlockIndex();
+}
+
+BOOST_FIXTURE_TEST_CASE(acceptblock_write_failure_cleanup, PruningAcceptanceSetup)
+{
+    auto& chainman{*m_node.chainman};
+    auto& blockman{chainman.m_blockman};
+    const auto block{CreateBlockChain(1, Params()).front()};
+    const auto path{blockman.GetBlockPosFilename(FlatFilePos{0, 0})};
+    const auto saved_path{path.parent_path() / "blk00000.saved"};
+    // Only replace a file in this fixture's temporary directory. The real
+    // WriteBlock open failure must release both locks and the pruning barrier.
+    fs::rename(path, saved_path);
+    BOOST_REQUIRE(fs::create_directory(path));
+    m_node.notifications->m_shutdown_on_fatal_error = false;
+
+    PausedAcceptance pending{chainman, block};
+    pending.Finish();
+    BOOST_CHECK(!pending.m_accepted);
+    BOOST_CHECK(pending.m_state.IsError());
+    BOOST_REQUIRE(pending.m_index);
+    {
+        LOCK(cs_main);
+        BOOST_CHECK(!(pending.m_index->nStatus & BLOCK_HAVE_DATA));
+        BOOST_CHECK_EQUAL(pending.m_index->nTx, 0U);
+        chainman.CheckBlockIndex();
+    }
+    BOOST_REQUIRE(fs::remove(path));
+    fs::rename(saved_path, path);
+
+    BlockValidationState retry_state;
+    bool new_block{false};
+    BOOST_REQUIRE(static_cast<TestChainstateManager&>(chainman).AcceptBlock(block, retry_state, nullptr, nullptr, &new_block));
+    BOOST_CHECK(new_block);
+    CBlock readback;
+    const auto pos{WITH_LOCK(cs_main, return pending.m_index->GetBlockPos())};
+    BOOST_CHECK(blockman.ReadBlock(readback, pos, block->GetHash()));
+    LOCK(cs_main);
+    chainman.CheckBlockIndex();
+}
+
+BOOST_AUTO_TEST_CASE(acceptblock_import_during_write)
+{
+    auto& chainman{*m_node.chainman};
+    auto& blockman{static_cast<TestBlockManager&>(chainman.m_blockman)};
+    const auto blocks{CreateBlockChain(3, Params())};
+    // Import includes a duplicate of the pending write and an out-of-order
+    // child. Use the real reindex path, including recursive child acceptance.
+    AutoFile output{blockman.OpenBlockFile(FlatFilePos{1, 0}, false)};
+    BOOST_REQUIRE(!output.IsNull());
+    for (const auto i : {2, 0, 1}) {
+        output << Params().MessageStart() << static_cast<uint32_t>(GetSerializeSize(TX_WITH_WITNESS(*blocks[i])))
+               << TX_WITH_WITNESS(*blocks[i]);
+    }
+    BOOST_REQUIRE_EQUAL(output.fclose(), 0);
+    AutoFile input{blockman.OpenBlockFile(FlatFilePos{1, 0}, true)};
+    BOOST_REQUIRE(!input.IsNull());
+    FlatFilePos import_pos{1, 0};
+    std::multimap<uint256, FlatFilePos> unknown_parents;
+    std::latch importer_started{1};
+    PausedAcceptance pending{chainman, blocks[0]};
+    std::thread importer{[&] {
+        importer_started.count_down();
+        chainman.LoadExternalBlockFile(input, &import_pos, &unknown_parents);
+    }};
+    importer_started.wait();
+    pending.Finish();
+    importer.join();
+
+    BOOST_REQUIRE(pending.m_accepted);
+    BOOST_CHECK(unknown_parents.empty());
+    BOOST_CHECK_EQUAL(blockman.GetBlockFileInfo(0).nBlocks, 2U);
+    BOOST_CHECK_EQUAL(blockman.GetBlockFileInfo(1).nBlocks, 2U);
+    for (size_t i{0}; i < blocks.size(); ++i) {
+        FlatFilePos pos;
+        {
+            LOCK(cs_main);
+            const auto* index{blockman.LookupBlockIndex(blocks[i]->GetHash())};
+            BOOST_REQUIRE(index);
+            BOOST_CHECK(index->nStatus & BLOCK_HAVE_DATA);
+            BOOST_CHECK_EQUAL(index->nTx, blocks[i]->vtx.size());
+            pos = index->GetBlockPos();
+        }
+        BOOST_CHECK_EQUAL(pos.nFile, i == 0 ? 0 : 1);
+        CBlock readback;
+        BOOST_CHECK(blockman.ReadBlock(readback, pos, blocks[i]->GetHash()));
+    }
     LOCK(cs_main);
     chainman.CheckBlockIndex();
 }

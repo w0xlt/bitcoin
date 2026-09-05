@@ -63,6 +63,32 @@ bool TestChainstateManager::AcceptBlock(const std::shared_ptr<const CBlock>& blo
     return ChainstateManager::AcceptBlock(block, lock, state, index, /*fRequested=*/true, pos, new_block, /*min_pow_checked=*/true);
 }
 
+PausedAcceptance::PausedAcceptance(ChainstateManager& chainman, std::shared_ptr<const CBlock> block)
+{
+    m_gate = std::thread{[&] {
+        static_cast<TestBlockManager&>(chainman.m_blockman).BlockFileWrites(m_locked, m_release);
+    }};
+    m_locked.wait();
+    m_writer = std::thread{[&, block = std::move(block)] {
+        m_accepted = static_cast<TestChainstateManager&>(chainman).AcceptBlock(
+                block, m_state, &m_index, nullptr, nullptr, &m_entered);
+    }};
+    m_entered.wait();
+    // The writer signaled with cs_main held. Reacquiring it proves that
+    // acceptance has reached the released region, not merely started.
+    LOCK(cs_main);
+}
+
+void PausedAcceptance::Finish()
+{
+    if (!m_writer.joinable()) return;
+    m_release.count_down();
+    m_gate.join();
+    m_writer.join();
+}
+
+PausedAcceptance::~PausedAcceptance() { Finish(); }
+
 void TestChainstateManager::DisableNextWrite()
 {
     struct TestChainstate : public Chainstate {

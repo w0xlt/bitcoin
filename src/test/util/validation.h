@@ -64,6 +64,19 @@ struct TestChainstateManager : public ChainstateManager {
     void ResetBestInvalid() EXCLUSIVE_LOCKS_REQUIRED(cs_main);
 };
 
+/** Hold a writer at the storage mutex, after it has released cs_main. */
+struct PausedAcceptance {
+    std::latch m_locked{1}, m_release{1}, m_entered{1};
+    std::thread m_gate, m_writer;
+    BlockValidationState m_state;
+    CBlockIndex* m_index{nullptr};
+    bool m_accepted{false};
+
+    PausedAcceptance(ChainstateManager& chainman, std::shared_ptr<const CBlock> block) LOCKS_EXCLUDED(cs_main);
+    void Finish() LOCKS_EXCLUDED(cs_main);
+    ~PausedAcceptance();
+};
+
 class ValidationInterfaceTest
 {
 public:
