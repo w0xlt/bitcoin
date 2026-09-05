@@ -14,7 +14,10 @@
 
 #include <boost/test/unit_test.hpp>
 
+#include <cstddef>
 #include <cstdint>
+#include <ios>
+#include <span>
 #include <stdexcept>
 
 using namespace std::string_literals;
@@ -745,6 +748,7 @@ BOOST_AUTO_TEST_CASE(buffered_writer_matches_autofile_random_content)
 
                 total_written += write_size;
             }
+            buffered.flush();
         }
         BOOST_REQUIRE_EQUAL(buffered_file.fclose(), 0);
         BOOST_REQUIRE_EQUAL(direct_file.fclose(), 0);
@@ -778,6 +782,48 @@ BOOST_AUTO_TEST_CASE(buffered_writer_matches_autofile_random_content)
     fs::remove(test_buffered.FileName(pos));
 }
 
+BOOST_AUTO_TEST_CASE(buffered_writer_exception_cleanup)
+{
+    struct FailingStream {
+        size_t writes{0};
+        size_t fail_at{0};
+
+        void write_buffer(std::span<std::byte>)
+        {
+            if (++writes == fail_at) {
+                throw std::ios_base::failure{"write failed"};
+            }
+        }
+    };
+
+    constexpr size_t BUFFER_SIZE{4};
+    for (const size_t fail_at : {1, 2}) {
+        // Fail either an automatic full-buffer flush or the final partial flush,
+        // with and without an earlier successful write. A retry would succeed,
+        // but must not happen after a potentially partial or obfuscated write.
+        for (const size_t final_size : {BUFFER_SIZE, BUFFER_SIZE - 1}) {
+            FailingStream stream{.fail_at = fail_at};
+            const auto fail = [&] {
+                BufferedWriter writer{stream, BUFFER_SIZE};
+                writer.write(DataBuffer((fail_at - 1) * BUFFER_SIZE + final_size));
+                writer.flush();
+            };
+            BOOST_CHECK_EXCEPTION(fail(), std::ios_base::failure, HasReason{"write failed"});
+            BOOST_CHECK_EQUAL(stream.writes, fail_at);
+        }
+    }
+
+    // A serialization exception must also discard pending data without a write.
+    FailingStream stream{.fail_at = 1};
+    const auto fail = [&] {
+        BufferedWriter writer{stream, BUFFER_SIZE};
+        writer << uint8_t{42};
+        throw std::runtime_error{"serialization failed"};
+    };
+    BOOST_CHECK_EXCEPTION(fail(), std::runtime_error, HasReason{"serialization failed"});
+    BOOST_CHECK_EQUAL(stream.writes, 0U);
+}
+
 BOOST_AUTO_TEST_CASE(buffered_writer_reader)
 {
     const uint32_t v1{m_rng.rand32()}, v2{m_rng.rand32()}, v3{m_rng.rand32()};
@@ -789,6 +835,7 @@ BOOST_AUTO_TEST_CASE(buffered_writer_reader)
         BufferedWriter f(file, sizeof(v1) + sizeof(v2) + sizeof(v3));
         f << v1 << v2;
         f.write(std::as_bytes(std::span{&v3, 1}));
+        f.flush();
     }
     BOOST_REQUIRE_EQUAL(file.fclose(), 0);
 

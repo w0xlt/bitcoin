@@ -690,6 +690,9 @@ public:
  * Wrapper that buffers writes to an underlying stream.
  * Requires underlying stream to support write_buffer() method
  * for efficient buffer flushing and obfuscation.
+ * Call flush() before destruction so write errors can propagate to the caller.
+ * After a write or serialization error, unwind past the writer without retrying
+ * its buffer, which may have been partially written or obfuscated in-place.
  */
 template <typename S>
 class BufferedWriter
@@ -701,7 +704,11 @@ class BufferedWriter
 public:
     explicit BufferedWriter(S& stream LIFETIMEBOUND, size_t size = 1 << 16) : m_dst{stream}, m_buf(size) {}
 
-    ~BufferedWriter() { flush(); }
+    ~BufferedWriter()
+    {
+        // Never write during destruction, including when unwinding an error.
+        assert(m_buf_pos == 0 || std::uncaught_exceptions() > 0);
+    }
 
     void flush()
     {
