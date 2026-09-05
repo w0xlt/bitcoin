@@ -1291,6 +1291,8 @@ public:
      * Sufficiently validate a block for disk storage (and store on disk).
      *
      * @param[in]   pblock          The block we want to process.
+     * @param[in]   lock            The caller's lock on cs_main. AcceptBlock may
+     *                              release it temporarily around block file I/O.
      * @param[in]   fRequested      Whether we requested this block from a
      *                              peer.
      * @param[in]   dbp             The location on disk, if we are importing
@@ -1306,7 +1308,7 @@ public:
      *
      * @returns   False if the block or header is invalid, or if saving to disk fails (likely a fatal error); true otherwise.
      */
-    bool AcceptBlock(const std::shared_ptr<const CBlock>& pblock, BlockValidationState& state, CBlockIndex** ppindex, bool fRequested, const FlatFilePos* dbp, bool* fNewBlock, bool min_pow_checked) EXCLUSIVE_LOCKS_REQUIRED(cs_main);
+    bool AcceptBlock(const std::shared_ptr<const CBlock>& pblock, UniqueLock<RecursiveMutex>& lock, BlockValidationState& state, CBlockIndex** ppindex, bool fRequested, const FlatFilePos* dbp, bool* fNewBlock, bool min_pow_checked) EXCLUSIVE_LOCKS_REQUIRED(cs_main);
 
     void ReceivedBlockTransactions(const CBlock& block, CBlockIndex* pindexNew, const FlatFilePos& pos) EXCLUSIVE_LOCKS_REQUIRED(cs_main);
 
