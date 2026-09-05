@@ -230,7 +230,7 @@ private:
      * collections like m_dirty_blockindex.
      */
     BlockStorageOutcome<bool> LoadBlockIndex(const std::optional<uint256>& snapshot_blockhash)
-        EXCLUSIVE_LOCKS_REQUIRED(cs_main);
+        EXCLUSIVE_LOCKS_REQUIRED(cs_main, m_blockfile_mutex);
 
     /** Return false if block file or undo file flushing fails. */
     [[nodiscard]] BlockStorageOutcome<bool> FlushBlockFile(int blockfile_num, bool fFinalize, bool finalize_undo) EXCLUSIVE_LOCKS_REQUIRED(m_blockfile_mutex);
@@ -311,7 +311,7 @@ private:
      *  block/undo files that should be deleted.  Set on startup
      *  or if we allocate more file space when we're in prune mode
      */
-    bool m_check_for_pruning = false;
+    std::atomic<bool> m_check_for_pruning{false};
 
     const bool m_prune_mode;
 
@@ -325,7 +325,7 @@ private:
      */
     std::unordered_map<std::string, PruneLockInfo> m_prune_locks GUARDED_BY(::cs_main);
 
-    BlockfileType BlockfileTypeForHeight(int height);
+    BlockfileType BlockfileTypeForHeight(int height) EXCLUSIVE_LOCKS_REQUIRED(m_blockfile_mutex);
 
     const kernel::BlockManagerOpts m_opts;
 
@@ -375,7 +375,7 @@ public:
      * had been previously loaded. After the snapshot is validated, this is unset to
      * restore normal LoadBlockIndex behavior.
      */
-    std::optional<int> m_snapshot_height;
+    std::optional<int> m_snapshot_height GUARDED_BY(m_blockfile_mutex);
 
     std::vector<CBlockIndex*> GetAllBlockIndices() EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
 
@@ -437,6 +437,9 @@ public:
     static constexpr auto PRUNE_TARGET_MANUAL{std::numeric_limits<uint64_t>::max()};
 
     [[nodiscard]] bool LoadingBlocks() const { return m_importing || !m_blockfiles_indexed; }
+
+    //! Record the snapshot base height used to select block files for assumed-valid blocks.
+    void SetSnapshotHeight(int height) EXCLUSIVE_LOCKS_REQUIRED(!m_blockfile_mutex);
 
     /** Calculate the amount of disk space the block & undo files currently use */
     uint64_t CalculateCurrentUsage() EXCLUSIVE_LOCKS_REQUIRED(!m_blockfile_mutex);

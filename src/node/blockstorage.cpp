@@ -461,6 +461,8 @@ CBlockIndex* BlockManager::InsertBlockIndex(const uint256& hash)
 
 BlockStorageOutcome<bool> BlockManager::LoadBlockIndex(const std::optional<uint256>& snapshot_blockhash)
 {
+    AssertLockHeld(cs_main);
+    AssertLockHeld(m_blockfile_mutex);
     BlockStorageOutcome<bool> outcome{false, {}};
     if (!m_block_tree_db->LoadBlockIndexGuts(
             GetConsensus(), [this](const uint256& hash) EXCLUSIVE_LOCKS_REQUIRED(cs_main) { return this->InsertBlockIndex(hash); }, m_interrupt)) {
@@ -813,10 +815,17 @@ BlockStorageOutcome<bool> BlockManager::FlushBlockFile(int blockfile_num, bool f
 
 BlockfileType BlockManager::BlockfileTypeForHeight(int height)
 {
+    AssertLockHeld(m_blockfile_mutex);
     if (!m_snapshot_height) {
         return BlockfileType::NORMAL;
     }
     return (height >= *m_snapshot_height) ? BlockfileType::ASSUMED : BlockfileType::NORMAL;
+}
+
+void BlockManager::SetSnapshotHeight(int height)
+{
+    LOCK(m_blockfile_mutex);
+    m_snapshot_height = height;
 }
 
 BlockStorageOutcome<bool> BlockManager::FlushChainstateBlockFile(int tip_height)

@@ -5770,7 +5770,7 @@ util::Result<CBlockIndex*> ChainstateManager::ActivateSnapshot(
     }
 
     Chainstate& chainstate{AddChainstate(std::move(snapshot_chainstate))};
-    m_blockman.m_snapshot_height = Assert(chainstate.SnapshotBase())->nHeight;
+    m_blockman.SetSnapshotHeight(Assert(chainstate.SnapshotBase())->nHeight);
 
     chainstate.PopulateBlockIndexCandidates();
 
