@@ -135,10 +135,13 @@ BOOST_FIXTURE_TEST_CASE(index_unclean_shutdown, TestChain100Setup)
 
                 new_block = std::make_shared<CBlock>(block);
 
-                WAIT_LOCK(cs_main, lock);
                 BlockValidationState state;
-                BOOST_CHECK(CheckBlock(block, state, params.GetConsensus()));
-                BOOST_CHECK(m_node.chainman->AcceptBlock(new_block, lock, state, &new_block_index, true, nullptr, nullptr, true));
+                {
+                    LOCK(cs_main);
+                    BOOST_CHECK(CheckBlock(block, state, params.GetConsensus()));
+                }
+                BOOST_CHECK(static_cast<TestChainstateManager&>(*m_node.chainman).AcceptBlock(new_block, state, &new_block_index));
+                LOCK(cs_main);
                 CCoinsViewCache view(&chainstate.CoinsTip());
                 BOOST_CHECK(chainstate.ConnectBlock(block, state, new_block_index, view));
             }

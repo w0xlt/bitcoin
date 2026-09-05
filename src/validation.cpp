@@ -4376,6 +4376,7 @@ bool ChainstateManager::AcceptBlock(const std::shared_ptr<const CBlock>& pblock,
 
     if (fNewBlock) *fNewBlock = false;
     AssertLockHeld(cs_main);
+    AssertLockHeld(m_accept_block_mutex);
 
     CBlockIndex *pindexDummy = nullptr;
     CBlockIndex *&pindex = ppindex ? *ppindex : pindexDummy;
@@ -4455,6 +4456,7 @@ bool ChainstateManager::ProcessNewBlock(const std::shared_ptr<const CBlock>& blo
 
         // CheckBlock() does not support multi-threaded block validation because CBlock::fChecked can cause data race.
         // Therefore, the following critical section must include the CheckBlock() call as well.
+        LOCK(m_accept_block_mutex);
         WAIT_LOCK(cs_main, lock);
 
         // Skipping AcceptBlock() for CheckBlock() failures means that we will never mark a block as invalid if
@@ -5014,6 +5016,9 @@ void ChainstateManager::LoadExternalBlockFile(
     FlatFilePos* dbp,
     std::multimap<uint256, FlatFilePos>* blocks_with_unknown_parent)
 {
+    AssertLockNotHeld(cs_main);
+    AssertLockNotHeld(m_accept_block_mutex);
+
     // Either both should be specified (-reindex), or neither (-loadblock).
     assert(!dbp == !blocks_with_unknown_parent);
 
@@ -5068,6 +5073,7 @@ void ChainstateManager::LoadExternalBlockFile(
                 std::shared_ptr<CBlock> pblock{}; // needs to remain available after the cs_main lock is released to avoid duplicate reads from disk
 
                 {
+                    LOCK(m_accept_block_mutex);
                     WAIT_LOCK(cs_main, lock);
                     // detect out of order blocks, and store them for later
                     if (hash != params.GetConsensus().hashGenesisBlock && !m_blockman.LookupBlockIndex(header.hashPrevBlock)) {
@@ -5145,6 +5151,7 @@ void ChainstateManager::LoadExternalBlockFile(
                         if (m_blockman.ReadBlock(*pblockrecursive, it->second, {})) {
                             const auto& block_hash{pblockrecursive->GetHash()};
                             LogDebug(BCLog::REINDEX, "%s: Processing out of order child %s of %s", __func__, block_hash.ToString(), head.ToString());
+                            LOCK(m_accept_block_mutex);
                             WAIT_LOCK(cs_main, lock);
                             BlockValidationState dummy;
                             if (AcceptBlock(pblockrecursive, lock, dummy, nullptr, true, &it->second, nullptr, true)) {

@@ -18,6 +18,7 @@
 #include <test/util/coins.h>
 #include <test/util/common.h>
 #include <test/util/setup_common.h>
+#include <test/util/validation.h>
 #include <tinyformat.h>
 #include <uint256.h>
 #include <util/check.h>
@@ -153,13 +154,12 @@ BOOST_FIXTURE_TEST_CASE(chainstate_update_tip, TestChain100Setup)
     // TODO: much of this is inlined from ProcessNewBlock(); just reuse PNB()
     // once it is changed to support multiple chainstates.
     {
-        WAIT_LOCK(::cs_main, lock);
+        LOCK(::cs_main);
         bool checked = CheckBlock(*pblockone, state, chainparams.GetConsensus());
         BOOST_CHECK(checked);
-        bool accepted = chainman.AcceptBlock(
-            pblockone, lock, state, &pindex, true, nullptr, &newblock, true);
-        BOOST_CHECK(accepted);
     }
+    bool accepted = static_cast<TestChainstateManager&>(chainman).AcceptBlock(pblockone, state, &pindex, nullptr, &newblock);
+    BOOST_CHECK(accepted);
 
     // UpdateTip is called here
     bool block_added = background_cs.ActivateBestChain(state, pblockone);

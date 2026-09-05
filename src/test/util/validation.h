@@ -13,6 +13,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -43,6 +44,10 @@ struct TestBlockManager : public node::BlockManager {
 };
 
 struct TestChainstateManager : public ChainstateManager {
+    /** Accept a block with both locks held. */
+    bool AcceptBlock(const std::shared_ptr<const CBlock>& block, BlockValidationState& state, CBlockIndex** index,
+                     const FlatFilePos* pos = nullptr, bool* new_block = nullptr)
+        EXCLUSIVE_LOCKS_REQUIRED(!m_accept_block_mutex) LOCKS_EXCLUDED(cs_main);
     /** Disable the next write of all chainstates */
     void DisableNextWrite();
     /** Reset the ibd cache to its initial state */

@@ -1005,6 +1005,33 @@ private:
 protected:
     CBlockIndex* m_best_invalid GUARDED_BY(::cs_main){nullptr};
 
+    /** Serialize block acceptance, including while cs_main is released for I/O.
+     *  Lock order: m_accept_block_mutex before cs_main before the storage mutex. */
+    Mutex m_accept_block_mutex;
+
+    /**
+     * Sufficiently validate a block for disk storage (and store on disk).
+     *
+     * @param[in]   pblock          The block we want to process.
+     * @param[in]   lock            The caller's lock on cs_main. AcceptBlock may
+     *                              release it temporarily around block file I/O.
+     * @param[in]   fRequested      Whether we requested this block from a
+     *                              peer.
+     * @param[in]   dbp             The location on disk, if we are importing
+     *                              this block from prior storage.
+     * @param[in]   min_pow_checked True if proof-of-work anti-DoS checks have
+     *                              been done by caller for headers chain
+     *
+     * @param[out]  state       The state of the block validation.
+     * @param[out]  ppindex     Optional return parameter to get the
+     *                          CBlockIndex pointer for this block.
+     * @param[out]  fNewBlock   Optional return parameter to indicate if the
+     *                          block is new to our storage.
+     *
+     * @returns   False if the block or header is invalid, or if saving to disk fails (likely a fatal error); true otherwise.
+     */
+    bool AcceptBlock(const std::shared_ptr<const CBlock>& pblock, UniqueLock<RecursiveMutex>& lock, BlockValidationState& state, CBlockIndex** ppindex, bool fRequested, const FlatFilePos* dbp, bool* fNewBlock, bool min_pow_checked) EXCLUSIVE_LOCKS_REQUIRED(cs_main, m_accept_block_mutex);
+
 public:
     using Options = kernel::ChainstateManagerOpts;
 
@@ -1245,7 +1272,8 @@ public:
     void LoadExternalBlockFile(
         AutoFile& file_in,
         FlatFilePos* dbp = nullptr,
-        std::multimap<uint256, FlatFilePos>* blocks_with_unknown_parent = nullptr);
+        std::multimap<uint256, FlatFilePos>* blocks_with_unknown_parent = nullptr)
+        EXCLUSIVE_LOCKS_REQUIRED(!m_accept_block_mutex) LOCKS_EXCLUDED(cs_main);
 
     /**
      * Process an incoming block. This only returns after the best known valid
@@ -1271,7 +1299,8 @@ public:
      * @param[out]  new_block A boolean which is set to indicate if the block was first received via this call
      * @returns     If the block was processed, independently of block validity
      */
-    bool ProcessNewBlock(const std::shared_ptr<const CBlock>& block, bool force_processing, bool min_pow_checked, bool* new_block) LOCKS_EXCLUDED(cs_main);
+    bool ProcessNewBlock(const std::shared_ptr<const CBlock>& block, bool force_processing, bool min_pow_checked, bool* new_block)
+        EXCLUSIVE_LOCKS_REQUIRED(!m_accept_block_mutex) LOCKS_EXCLUDED(cs_main);
 
     /**
      * Process incoming block headers.
@@ -1286,29 +1315,6 @@ public:
      * @returns false if AcceptBlockHeader fails on any of the headers, true otherwise (including if headers were already known)
      */
     bool ProcessNewBlockHeaders(std::span<const CBlockHeader> headers, bool min_pow_checked, BlockValidationState& state, const CBlockIndex** ppindex = nullptr) LOCKS_EXCLUDED(cs_main);
-
-    /**
-     * Sufficiently validate a block for disk storage (and store on disk).
-     *
-     * @param[in]   pblock          The block we want to process.
-     * @param[in]   lock            The caller's lock on cs_main. AcceptBlock may
-     *                              release it temporarily around block file I/O.
-     * @param[in]   fRequested      Whether we requested this block from a
-     *                              peer.
-     * @param[in]   dbp             The location on disk, if we are importing
-     *                              this block from prior storage.
-     * @param[in]   min_pow_checked True if proof-of-work anti-DoS checks have
-     *                              been done by caller for headers chain
-     *
-     * @param[out]  state       The state of the block validation.
-     * @param[out]  ppindex     Optional return parameter to get the
-     *                          CBlockIndex pointer for this block.
-     * @param[out]  fNewBlock   Optional return parameter to indicate if the
-     *                          block is new to our storage.
-     *
-     * @returns   False if the block or header is invalid, or if saving to disk fails (likely a fatal error); true otherwise.
-     */
-    bool AcceptBlock(const std::shared_ptr<const CBlock>& pblock, UniqueLock<RecursiveMutex>& lock, BlockValidationState& state, CBlockIndex** ppindex, bool fRequested, const FlatFilePos* dbp, bool* fNewBlock, bool min_pow_checked) EXCLUSIVE_LOCKS_REQUIRED(cs_main);
 
     void ReceivedBlockTransactions(const CBlock& block, CBlockIndex* pindexNew, const FlatFilePos& pos) EXCLUSIVE_LOCKS_REQUIRED(cs_main);
 
