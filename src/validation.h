@@ -944,6 +944,9 @@ private:
     /** The last header for which a headerTip notification was issued. */
     CBlockIndex* m_last_notified_header GUARDED_BY(GetMutex()){nullptr};
 
+    /** Block awaiting publication after an acceptance write; prevents pruning while set. */
+    const CBlockIndex* m_block_write_pending GUARDED_BY(GetMutex()){nullptr};
+
     bool NotifyHeaderTip() LOCKS_EXCLUDED(GetMutex());
 
     //! Internal helper for ActivateSnapshot().
@@ -1067,6 +1070,13 @@ public:
      *   get consistent results.
      */
     RecursiveMutex& GetMutex() const LOCK_RETURNED(::cs_main) { return ::cs_main; }
+
+    /** Whether a block's acceptance write is still awaiting publication or failure. */
+    bool IsBlockWritePending(const CBlockIndex& block) const EXCLUSIVE_LOCKS_REQUIRED(GetMutex())
+    {
+        AssertLockHeld(GetMutex());
+        return m_block_write_pending == &block;
+    }
 
     const util::SignalInterrupt& m_interrupt;
     const Options m_options;

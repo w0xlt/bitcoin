@@ -13,6 +13,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <latch>
 #include <memory>
 #include <thread>
 #include <utility>
@@ -41,12 +42,14 @@ struct TestBlockManager : public node::BlockManager {
     kernel::CBlockFileInfo GetBlockFileInfo(size_t n) const EXCLUSIVE_LOCKS_REQUIRED(!m_blockfile_mutex);
     /** Set the recorded block-file size to force rollover in tests. */
     void SetBlockFileSize(size_t n, uint32_t size) EXCLUSIVE_LOCKS_REQUIRED(!m_blockfile_mutex);
+    /** Hold the block-file mutex until release is signaled, for concurrency tests. */
+    void BlockFileWrites(std::latch& locked, std::latch& release) EXCLUSIVE_LOCKS_REQUIRED(!m_blockfile_mutex);
 };
 
 struct TestChainstateManager : public ChainstateManager {
-    /** Accept a block with both locks held. */
+    /** Accept a block with both locks held, optionally signaling entry under cs_main. */
     bool AcceptBlock(const std::shared_ptr<const CBlock>& block, BlockValidationState& state, CBlockIndex** index,
-                     const FlatFilePos* pos = nullptr, bool* new_block = nullptr)
+                     const FlatFilePos* pos = nullptr, bool* new_block = nullptr, std::latch* entered_cs = nullptr)
         EXCLUSIVE_LOCKS_REQUIRED(!m_accept_block_mutex) LOCKS_EXCLUDED(cs_main);
     /** Disable the next write of all chainstates */
     void DisableNextWrite();

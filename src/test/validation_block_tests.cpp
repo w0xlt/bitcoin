@@ -18,6 +18,7 @@
 #include <test/util/common.h>
 #include <test/util/script.h>
 #include <test/util/setup_common.h>
+#include <test/util/validation.h>
 #include <txmempool.h>
 #include <uint256.h>
 #include <util/check.h>
@@ -26,8 +27,10 @@
 
 #include <boost/test/unit_test.hpp>
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <latch>
 #include <memory>
 #include <span>
 #include <thread>
@@ -47,6 +50,25 @@ struct MinerTestingSetup : public RegTestingSetup {
 } // namespace validation_block_tests
 
 BOOST_FIXTURE_TEST_SUITE(validation_block_tests, MinerTestingSetup)
+
+struct AcceptResult {
+    bool ok;
+    bool new_block;
+    CBlockIndex* pindex;
+};
+
+static AcceptResult AcceptInThread(
+    ChainstateManager& chainman,
+    const std::shared_ptr<const CBlock>& block,
+    std::latch* entered_cs,
+    std::atomic<unsigned>& completed)
+{
+    BlockValidationState state;
+    AcceptResult r{false, false, nullptr};
+    r.ok = static_cast<TestChainstateManager&>(chainman).AcceptBlock(block, state, &r.pindex, /*pos=*/nullptr, &r.new_block, entered_cs);
+    completed.fetch_add(1, std::memory_order_relaxed);
+    return r;
+}
 
 struct TestSubscriber final : public CValidationInterface {
     uint256 m_expected_tip;
@@ -224,6 +246,175 @@ BOOST_AUTO_TEST_CASE(processnewblock_signals_ordering)
 
     LOCK(cs_main);
     BOOST_CHECK_EQUAL(sub->m_expected_tip, m_node.chainman->ActiveChain().Tip()->GetBlockHash());
+}
+
+BOOST_AUTO_TEST_CASE(acceptblock_concurrent_distinct_blocks)
+{
+    auto& chainman{*Assert(m_node.chainman)};
+
+    bool ignored;
+    BOOST_CHECK(chainman.ProcessNewBlock(std::make_shared<CBlock>(Params().GenesisBlock()), true, true, &ignored));
+    m_node.validation_signals->SyncWithValidationInterfaceQueue();
+
+    auto& test_blockman{static_cast<TestBlockManager&>(chainman.m_blockman)};
+    const int initial_file{WITH_LOCK(cs_main, return chainman.ActiveChain().Tip()->GetBlockPos().nFile)};
+    const auto file_info_before{test_blockman.GetBlockFileInfo(initial_file)};
+    const auto first_block{GoodBlock(Params().GenesisBlock().GetHash())};
+    const auto second_block{GoodBlock(Params().GenesisBlock().GetHash())};
+
+    std::latch blockfile_locked{1};
+    std::latch release_blockfile{1};
+    std::latch entered_cs{1};
+    std::latch second_started{1};
+    std::atomic<unsigned> completed{0};
+    std::thread blockfile_gate{[&] {
+        test_blockman.BlockFileWrites(blockfile_locked, release_blockfile);
+    }};
+    blockfile_locked.wait();
+
+    AcceptResult first_result{};
+    AcceptResult second_result{};
+    std::thread first_worker{[&] {
+        first_result = AcceptInThread(chainman, first_block, &entered_cs, completed);
+    }};
+    entered_cs.wait();
+    std::thread second_worker{[&] {
+        second_started.count_down();
+        second_result = AcceptInThread(chainman, second_block, nullptr, completed);
+    }};
+
+    second_started.wait();
+    bool accept_completed_before_release;
+    {
+        // The writer owned cs_main when it decremented entered_cs. Acquiring
+        // it here proves the write releases cs_main despite retaining the
+        // acceptance mutex. The other caller waits before acquiring cs_main.
+        WAIT_LOCK(cs_main, rendezvous);
+        accept_completed_before_release = completed.load(std::memory_order_relaxed) != 0;
+    }
+
+    release_blockfile.count_down();
+    blockfile_gate.join();
+    first_worker.join();
+    second_worker.join();
+
+    BOOST_CHECK(!accept_completed_before_release);
+    BOOST_CHECK(first_result.ok);
+    BOOST_CHECK(second_result.ok);
+    BOOST_CHECK(first_result.new_block);
+    BOOST_CHECK(second_result.new_block);
+
+    FlatFilePos first_pos;
+    FlatFilePos second_pos;
+    {
+        LOCK(cs_main);
+        BOOST_REQUIRE(first_result.pindex);
+        BOOST_REQUIRE(second_result.pindex);
+        BOOST_CHECK(first_result.pindex->nStatus & BLOCK_HAVE_DATA);
+        BOOST_CHECK(second_result.pindex->nStatus & BLOCK_HAVE_DATA);
+        first_pos = first_result.pindex->GetBlockPos();
+        second_pos = second_result.pindex->GetBlockPos();
+    }
+    BOOST_CHECK(first_pos != second_pos);
+    BOOST_REQUIRE_GE(first_pos.nFile, initial_file);
+    BOOST_REQUIRE_GE(second_pos.nFile, initial_file);
+
+    CBlock first_read;
+    BOOST_REQUIRE(chainman.m_blockman.ReadBlock(first_read, first_pos, first_block->GetHash()));
+    BOOST_CHECK_EQUAL(first_read.GetHash(), first_block->GetHash());
+    CBlock second_read;
+    BOOST_REQUIRE(chainman.m_blockman.ReadBlock(second_read, second_pos, second_block->GetHash()));
+    BOOST_CHECK_EQUAL(second_read.GetHash(), second_block->GetHash());
+
+    const auto first_file_info_after{test_blockman.GetBlockFileInfo(first_pos.nFile)};
+    const auto second_file_info_after{test_blockman.GetBlockFileInfo(second_pos.nFile)};
+    // A higher-numbered file was created after file_info_before and initially had no blocks.
+    const auto blocks_before{(first_pos.nFile == initial_file ? file_info_before.nBlocks : 0U) +
+                             (second_pos.nFile != first_pos.nFile && second_pos.nFile == initial_file ? file_info_before.nBlocks : 0U)};
+    const auto blocks_after{first_file_info_after.nBlocks + (first_pos.nFile == second_pos.nFile ? 0U : second_file_info_after.nBlocks)};
+    BOOST_CHECK_EQUAL(blocks_after, blocks_before + 2);
+
+    LOCK(cs_main);
+    chainman.CheckBlockIndex();
+}
+
+BOOST_AUTO_TEST_CASE(acceptblock_concurrent_same_block)
+{
+    auto& chainman{*Assert(m_node.chainman)};
+
+    bool ignored;
+    BOOST_CHECK(chainman.ProcessNewBlock(std::make_shared<CBlock>(Params().GenesisBlock()), true, true, &ignored));
+    m_node.validation_signals->SyncWithValidationInterfaceQueue();
+
+    auto& test_blockman{static_cast<TestBlockManager&>(chainman.m_blockman)};
+    const int initial_file{WITH_LOCK(cs_main, return chainman.ActiveChain().Tip()->GetBlockPos().nFile)};
+    const auto file_info_before{test_blockman.GetBlockFileInfo(initial_file)};
+    const auto block{GoodBlock(Params().GenesisBlock().GetHash())};
+
+    std::latch blockfile_locked{1};
+    std::latch release_blockfile{1};
+    std::latch entered_cs{1};
+    std::latch second_started{1};
+    std::atomic<unsigned> completed{0};
+    std::thread blockfile_gate{[&] {
+        test_blockman.BlockFileWrites(blockfile_locked, release_blockfile);
+    }};
+    blockfile_locked.wait();
+
+    AcceptResult first_result{};
+    AcceptResult second_result{};
+    std::thread first_worker{[&] {
+        first_result = AcceptInThread(chainman, block, &entered_cs, completed);
+    }};
+    entered_cs.wait();
+    std::thread second_worker{[&] {
+        second_started.count_down();
+        second_result = AcceptInThread(chainman, block, nullptr, completed);
+    }};
+
+    second_started.wait();
+    bool accept_completed_before_release;
+    {
+        // The writer owned cs_main when it decremented entered_cs. Acquiring
+        // it here proves the write releases cs_main despite retaining the
+        // acceptance mutex. The duplicate waits before acquiring cs_main.
+        WAIT_LOCK(cs_main, rendezvous);
+        accept_completed_before_release = completed.load(std::memory_order_relaxed) != 0;
+    }
+
+    release_blockfile.count_down();
+    blockfile_gate.join();
+    first_worker.join();
+    second_worker.join();
+
+    BOOST_CHECK(!accept_completed_before_release);
+    BOOST_CHECK(first_result.ok);
+    BOOST_CHECK(second_result.ok);
+    BOOST_CHECK_EQUAL(first_result.new_block + second_result.new_block, 1);
+
+    FlatFilePos block_pos;
+    {
+        LOCK(cs_main);
+        BOOST_REQUIRE(first_result.pindex);
+        BOOST_REQUIRE(second_result.pindex);
+        BOOST_CHECK_EQUAL(first_result.pindex, second_result.pindex);
+        BOOST_CHECK(first_result.pindex->nStatus & BLOCK_HAVE_DATA);
+        BOOST_CHECK(second_result.pindex->nStatus & BLOCK_HAVE_DATA);
+        block_pos = first_result.pindex->GetBlockPos();
+    }
+    BOOST_REQUIRE_GE(block_pos.nFile, initial_file);
+
+    CBlock block_read;
+    BOOST_REQUIRE(chainman.m_blockman.ReadBlock(block_read, block_pos, block->GetHash()));
+    BOOST_CHECK_EQUAL(block_read.GetHash(), block->GetHash());
+
+    const auto file_info_after{test_blockman.GetBlockFileInfo(block_pos.nFile)};
+    // A higher-numbered file was created after file_info_before and initially had no blocks.
+    const auto blocks_before{block_pos.nFile == initial_file ? file_info_before.nBlocks : 0U};
+    BOOST_CHECK_EQUAL(file_info_after.nBlocks, blocks_before + 1);
+
+    LOCK(cs_main);
+    chainman.CheckBlockIndex();
 }
 
 /**

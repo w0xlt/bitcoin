@@ -46,12 +46,20 @@ void TestBlockManager::SetBlockFileSize(size_t n, uint32_t size)
     m_blockfile_info.at(n).nSize = size;
 }
 
+void TestBlockManager::BlockFileWrites(std::latch& locked, std::latch& release)
+{
+    LOCK(m_blockfile_mutex);
+    locked.count_down();
+    release.wait();
+}
+
 bool TestChainstateManager::AcceptBlock(const std::shared_ptr<const CBlock>& block, BlockValidationState& state,
-                                      CBlockIndex** index, const FlatFilePos* pos, bool* new_block)
+                                      CBlockIndex** index, const FlatFilePos* pos, bool* new_block, std::latch* entered_cs)
 {
     AssertLockNotHeld(cs_main);
     LOCK(m_accept_block_mutex);
     WAIT_LOCK(cs_main, lock);
+    if (entered_cs) entered_cs->count_down();
     return ChainstateManager::AcceptBlock(block, lock, state, index, /*fRequested=*/true, pos, new_block, /*min_pow_checked=*/true);
 }
 

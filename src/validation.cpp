@@ -2730,7 +2730,12 @@ bool Chainstate::FlushStateToDisk(
         bool fFlushForPrune = false;
 
         CoinsCacheSizeState cache_state = GetCoinsCacheSizeState();
-        if (m_blockman.IsPruneMode() && (m_blockman.m_check_for_pruning || nManualPruneHeight > 0) && m_chainman.m_blockman.m_blockfiles_indexed) {
+        // A block file write is published to its CBlockIndex only after WriteBlock
+        // returns. Do not prune while a write is between those operations.
+        if (m_blockman.IsPruneMode() &&
+            (m_blockman.m_check_for_pruning || nManualPruneHeight > 0) &&
+            m_chainman.m_blockman.m_blockfiles_indexed &&
+            !m_chainman.m_block_write_pending) {
             // make sure we don't prune above any of the prune locks bestblocks
             // pruning is height-based
             int last_prune{m_chain.Height()}; // last height we can prune
@@ -4319,6 +4324,29 @@ void ChainstateManager::ReportHeadersPresync(int64_t height, int64_t timestamp)
     }
 }
 
+namespace {
+/** Track the pending block and prevent pruning through block-index publication.
+ *  Both construction and destruction happen with cs_main held. */
+class BlockWriteInProgress
+{
+    const CBlockIndex*& m_pending;
+public:
+    BlockWriteInProgress(const CBlockIndex*& pending, const CBlockIndex& block) EXCLUSIVE_LOCKS_REQUIRED(cs_main) : m_pending{pending}
+    {
+        AssertLockHeld(cs_main);
+        Assume(!m_pending);
+        m_pending = &block;
+    }
+    ~BlockWriteInProgress() EXCLUSIVE_LOCKS_REQUIRED(cs_main)
+    {
+        AssertLockHeld(cs_main);
+        m_pending = nullptr;
+    }
+    BlockWriteInProgress(const BlockWriteInProgress&) = delete;
+    BlockWriteInProgress& operator=(const BlockWriteInProgress&) = delete;
+};
+} // namespace
+
 bool ChainstateManager::ShouldMaybeWrite(const CBlockIndex* pindex, bool fRequested) const
 {
     AssertLockHeld(cs_main);
@@ -4405,24 +4433,43 @@ bool ChainstateManager::AcceptBlock(const std::shared_ptr<const CBlock>& pblock,
 
     // Write block to history file
     if (fNewBlock) *fNewBlock = true;
-    try {
-        FlatFilePos blockPos{};
-        if (dbp) {
-            blockPos = *dbp;
-            m_blockman.UpdateBlockInfo(block, pindex->nHeight, blockPos);
-        } else {
-            auto write_outcome{m_blockman.WriteBlock(block, pindex->nHeight)};
-            NotifyBlockStorageErrors(GetNotifications(), std::move(write_outcome.notifications));
-            blockPos = write_outcome.value;
-            if (blockPos.IsNull()) {
-                state.Error(strprintf("%s: Failed to find position to write new block to disk", __func__));
-                return false;
+    {
+        const BlockWriteInProgress write_in_progress{m_block_write_pending, *pindex};
+        try {
+            FlatFilePos blockPos{};
+            if (dbp) {
+                blockPos = *dbp;
+                m_blockman.UpdateBlockInfo(block, pindex->nHeight, blockPos);
+            } else {
+                node::BlockStorageOutcome<FlatFilePos> write_outcome{};
+                {
+                    // Block file allocation state is protected by m_blockfile_mutex,
+                    // so the write does not need cs_main. Everything below runs
+                    // with cs_main re-acquired.
+                    REVERSE_LOCK(lock, cs_main);
+                    write_outcome = m_blockman.WriteBlock(block, pindex->nHeight);
+                }
+                NotifyBlockStorageErrors(GetNotifications(), std::move(write_outcome.notifications));
+                blockPos = write_outcome.value;
+                if (blockPos.IsNull()) {
+                    state.Error(strprintf("%s: Failed to find position to write new block to disk", __func__));
+                    return false;
+                }
+                // cs_main was released above: the index entry may have been marked
+                // invalid meanwhile (e.g. by invalidateblock). Recording data for it
+                // would leave nTx set without BLOCK_VALID_TRANSACTIONS, which
+                // CheckBlockIndex rejects. The written bytes stay on disk unreferenced.
+                if (pindex->nStatus & BLOCK_FAILED_VALID) {
+                    return state.Invalid(BlockValidationResult::BLOCK_CACHED_INVALID, "duplicate-invalid",
+                                         strprintf("block %s was marked invalid while its data was being written", pindex->GetBlockHash().ToString()));
+                }
+                Assume(!(pindex->nStatus & BLOCK_HAVE_DATA));
             }
+            ReceivedBlockTransactions(block, pindex, blockPos);
+        } catch (const std::runtime_error& e) {
+            return FatalError(GetNotifications(), state, strprintf(_("System error while saving block to disk: %s"), e.what()));
         }
-        ReceivedBlockTransactions(block, pindex, blockPos);
-    } catch (const std::runtime_error& e) {
-        return FatalError(GetNotifications(), state, strprintf(_("System error while saving block to disk: %s"), e.what()));
-    }
+    } // Allow pruning only after publication, and before FlushStateToDisk.
 
     // TODO: FlushStateToDisk() handles flushing of both block and chainstate
     // data, so we should move this to ChainstateManager so that we can be more
