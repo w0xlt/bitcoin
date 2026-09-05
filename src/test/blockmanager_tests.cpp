@@ -18,8 +18,8 @@
 #include <test/util/common.h>
 #include <test/util/logging.h>
 #include <test/util/setup_common.h>
+#include <test/util/validation.h>
 
-using kernel::CBlockFileInfo;
 using node::STORAGE_HEADER_BYTES;
 using node::BlockManager;
 using node::MAX_BLOCKFILE_SIZE;
@@ -84,7 +84,7 @@ BOOST_AUTO_TEST_CASE(blockmanager_returns_flush_errors)
 
     // Force a rollover, and make both files from the previous sequence entry
     // impossible to open. The new block write itself can still succeed.
-    blockman.GetBlockFileInfo(first_pos.nFile)->nSize = MAX_BLOCKFILE_SIZE;
+    static_cast<TestBlockManager&>(blockman).SetBlockFileSize(first_pos.nFile, MAX_BLOCKFILE_SIZE);
     const fs::path block_path{blockman.GetBlockPosFilename(FlatFilePos{first_pos.nFile, 0})};
     BOOST_REQUIRE(fs::remove(block_path));
     BOOST_REQUIRE(fs::create_directory(block_path));
@@ -128,8 +128,9 @@ BOOST_FIXTURE_TEST_CASE(blockmanager_scan_unlink_already_pruned_files, TestChain
     // Cap last block file size, and mine new block in a new block file.
     auto& chainman{*Assert(m_node.chainman)};
     auto& blockman{chainman.m_blockman};
+    auto& test_blockman{static_cast<TestBlockManager&>(blockman)};
     const CBlockIndex* old_tip{WITH_LOCK(chainman.GetMutex(), return chainman.ActiveChain().Tip())};
-    WITH_LOCK(chainman.GetMutex(), blockman.GetBlockFileInfo(old_tip->GetBlockPos().nFile)->nSize = MAX_BLOCKFILE_SIZE);
+    WITH_LOCK(chainman.GetMutex(), test_blockman.SetBlockFileSize(old_tip->GetBlockPos().nFile, MAX_BLOCKFILE_SIZE));
     CreateAndProcessBlock({}, GetScriptForRawPubKey(coinbaseKey.GetPubKey()));
 
     // Prune the older block file, but don't unlink it
@@ -306,6 +307,7 @@ BOOST_AUTO_TEST_CASE(blockmanager_flush_block_file)
         },
     };
     BlockManager blockman{*Assert(m_node.shutdown_signal), blockman_opts};
+    auto& test_blockman{static_cast<TestBlockManager&>(blockman)};
 
     // Test blocks with no transactions, not even a coinbase
     CBlock block1;
@@ -354,11 +356,10 @@ BOOST_AUTO_TEST_CASE(blockmanager_flush_block_file)
     // UpdateBlockInfo will, however, update the blockfile metadata.
     // Verify this behavior by attempting (and failing) to write block 3 data
     // to block 2 location.
-    CBlockFileInfo* block_data = blockman.GetBlockFileInfo(0);
-    BOOST_CHECK_EQUAL(block_data->nBlocks, 2);
+    BOOST_CHECK_EQUAL(test_blockman.GetBlockFileInfo(0).nBlocks, 2);
     blockman.UpdateBlockInfo(block3, /*nHeight=*/3, /*pos=*/pos2);
     // Metadata is updated...
-    BOOST_CHECK_EQUAL(block_data->nBlocks, 3);
+    BOOST_CHECK_EQUAL(test_blockman.GetBlockFileInfo(0).nBlocks, 3);
     // ...but there are still only two blocks in the file
     BOOST_CHECK_EQUAL(blockman.CalculateCurrentUsage(), (TEST_BLOCK_SIZE + STORAGE_HEADER_BYTES) * 2);
 

@@ -11,6 +11,7 @@
 #include <validation.h>
 
 #include <cstddef>
+#include <cstdint>
 #include <functional>
 #include <thread>
 #include <utility>
@@ -34,7 +35,11 @@ public:
 
 struct TestBlockManager : public node::BlockManager {
     /** Test-only method to clear internal state for fuzzing */
-    void CleanupForFuzzing();
+    void CleanupForFuzzing() EXCLUSIVE_LOCKS_REQUIRED(!m_blockfile_mutex);
+    /** Return a snapshot of one block-file metadata entry. */
+    kernel::CBlockFileInfo GetBlockFileInfo(size_t n) const EXCLUSIVE_LOCKS_REQUIRED(!m_blockfile_mutex);
+    /** Set the recorded block-file size to force rollover in tests. */
+    void SetBlockFileSize(size_t n, uint32_t size) EXCLUSIVE_LOCKS_REQUIRED(!m_blockfile_mutex);
 };
 
 struct TestChainstateManager : public ChainstateManager {

@@ -279,9 +279,10 @@ void BlockManager::AddUnlinkedBlock(CBlockIndex* block)
     m_blocks_unlinked.emplace(block->pprev, block);
 }
 
-void BlockManager::PruneOneBlockFile(const int fileNumber)
+void BlockManager::PruneOneBlockFile_(const int fileNumber)
 {
     AssertLockHeld(cs_main);
+    AssertLockHeld(m_blockfile_mutex);
 
     for (auto& entry : m_block_index) {
         CBlockIndex* pindex = &entry.second;
@@ -312,6 +313,13 @@ void BlockManager::PruneOneBlockFile(const int fileNumber)
     m_dirty_fileinfo.insert(fileNumber);
 }
 
+void BlockManager::PruneOneBlockFile(const int fileNumber)
+{
+    AssertLockHeld(cs_main);
+    LOCK(m_blockfile_mutex);
+    PruneOneBlockFile_(fileNumber);
+}
+
 void BlockManager::FindFilesToPruneManual(
     std::set<int>& setFilesToPrune,
     int nManualPruneHeight,
@@ -320,6 +328,7 @@ void BlockManager::FindFilesToPruneManual(
     assert(IsPruneMode() && nManualPruneHeight > 0);
 
     LOCK(::cs_main);
+    LOCK(m_blockfile_mutex);
     if (chain.m_chain.Height() < 0) {
         return;
     }
@@ -333,7 +342,7 @@ void BlockManager::FindFilesToPruneManual(
             continue;
         }
 
-        PruneOneBlockFile(fileNumber);
+        PruneOneBlockFile_(fileNumber);
         setFilesToPrune.insert(fileNumber);
         count++;
     }
@@ -348,6 +357,7 @@ void BlockManager::FindFilesToPrune(
     ChainstateManager& chainman)
 {
     LOCK(::cs_main);
+    LOCK(m_blockfile_mutex);
     // Compute `target` value with maximum size (in bytes) of blocks below the
     // `last_prune` height which should be preserved and not pruned. The
     // `target` value will be derived from the -prune preference provided by the
@@ -369,7 +379,7 @@ void BlockManager::FindFilesToPrune(
 
     const auto [min_block_to_prune, last_block_can_prune] = chain.GetPruneRange(last_prune);
 
-    uint64_t nCurrentUsage = CalculateCurrentUsage();
+    uint64_t nCurrentUsage = CalculateCurrentUsage_();
     // We don't check to prune until after we've allocated new space for files
     // So we should leave a buffer under our target to account for another allocation
     // before the next pruning.
@@ -408,7 +418,7 @@ void BlockManager::FindFilesToPrune(
                 continue;
             }
 
-            PruneOneBlockFile(fileNumber);
+            PruneOneBlockFile_(fileNumber);
             // Queue up the files for removal
             setFilesToPrune.insert(fileNumber);
             nCurrentUsage -= nBytesToPrune;
@@ -543,6 +553,7 @@ BlockStorageOutcome<bool> BlockManager::LoadBlockIndex(const std::optional<uint2
 void BlockManager::WriteBlockIndexDB()
 {
     AssertLockHeld(::cs_main);
+    LOCK(m_blockfile_mutex);
     std::vector<std::pair<int, const CBlockFileInfo*>> vFiles;
     vFiles.reserve(m_dirty_fileinfo.size());
     for (std::set<int>::iterator it = m_dirty_fileinfo.begin(); it != m_dirty_fileinfo.end();) {
@@ -562,6 +573,7 @@ void BlockManager::WriteBlockIndexDB()
 BlockStorageOutcome<bool> BlockManager::LoadBlockIndexDB(const std::optional<uint256>& snapshot_blockhash)
 {
     AssertLockHeld(::cs_main);
+    LOCK(m_blockfile_mutex);
     auto outcome{LoadBlockIndex(snapshot_blockhash)};
     if (!outcome.value) return outcome;
     int max_blockfile_num{0};
@@ -624,15 +636,18 @@ BlockStorageOutcome<bool> BlockManager::LoadBlockIndexDB(const std::optional<uin
 void BlockManager::ScanAndUnlinkAlreadyPrunedFiles()
 {
     AssertLockHeld(::cs_main);
-    int max_blockfile{this->MaxBlockfileNum()};
-    if (!m_have_pruned) {
-        return;
-    }
-
     std::set<int> block_files_to_prune;
-    for (int file_number = 0; file_number < max_blockfile; file_number++) {
-        if (m_blockfile_info[file_number].nSize == 0) {
-            block_files_to_prune.insert(file_number);
+    {
+        LOCK(m_blockfile_mutex);
+        int max_blockfile{this->MaxBlockfileNum()};
+        if (!m_have_pruned) {
+            return;
+        }
+
+        for (int file_number = 0; file_number < max_blockfile; file_number++) {
+            if (m_blockfile_info[file_number].nSize == 0) {
+                block_files_to_prune.insert(file_number);
+            }
         }
     }
 
@@ -720,12 +735,6 @@ void BlockManager::CleanupBlockRevFiles() const
     }
 }
 
-CBlockFileInfo* BlockManager::GetBlockFileInfo(size_t n)
-{
-    AssertLockHeld(::cs_main);
-    return &m_blockfile_info.at(n);
-}
-
 bool BlockManager::ReadBlockUndo(CBlockUndo& blockundo, const CBlockIndex& index) const
 {
     const FlatFilePos pos{WITH_LOCK(::cs_main, return index.GetUndoPos())};
@@ -763,6 +772,7 @@ bool BlockManager::ReadBlockUndo(CBlockUndo& blockundo, const CBlockIndex& index
 
 BlockStorageOutcome<bool> BlockManager::FlushUndoFile(int block_file, bool finalize)
 {
+    AssertLockHeld(m_blockfile_mutex);
     BlockStorageOutcome<bool> outcome{true, {}};
     FlatFilePos undo_pos_old(block_file, m_blockfile_info[block_file].nUndoSize);
     if (!m_undo_file_seq.Flush(undo_pos_old, finalize)) {
@@ -774,7 +784,7 @@ BlockStorageOutcome<bool> BlockManager::FlushUndoFile(int block_file, bool final
 
 BlockStorageOutcome<bool> BlockManager::FlushBlockFile(int blockfile_num, bool fFinalize, bool finalize_undo)
 {
-    AssertLockHeld(::cs_main);
+    AssertLockHeld(m_blockfile_mutex);
     BlockStorageOutcome<bool> outcome{true, {}};
 
     if (m_blockfile_info.size() < 1) {
@@ -811,7 +821,7 @@ BlockfileType BlockManager::BlockfileTypeForHeight(int height)
 
 BlockStorageOutcome<bool> BlockManager::FlushChainstateBlockFile(int tip_height)
 {
-    AssertLockHeld(::cs_main);
+    LOCK(m_blockfile_mutex);
     auto& cursor = m_blockfile_cursors[BlockfileTypeForHeight(tip_height)];
     // If the cursor does not exist, it means an assumeutxo snapshot is loaded,
     // but no blocks past the snapshot height have been written yet, so there
@@ -823,9 +833,9 @@ BlockStorageOutcome<bool> BlockManager::FlushChainstateBlockFile(int tip_height)
     return {true, {}};
 }
 
-uint64_t BlockManager::CalculateCurrentUsage()
+uint64_t BlockManager::CalculateCurrentUsage_() const
 {
-    AssertLockHeld(::cs_main);
+    AssertLockHeld(m_blockfile_mutex);
     uint64_t retval = 0;
     for (const CBlockFileInfo& file : m_blockfile_info) {
         retval += file.nSize + file.nUndoSize;
@@ -833,8 +843,15 @@ uint64_t BlockManager::CalculateCurrentUsage()
     return retval;
 }
 
+uint64_t BlockManager::CalculateCurrentUsage()
+{
+    LOCK(m_blockfile_mutex);
+    return CalculateCurrentUsage_();
+}
+
 void BlockManager::UnlinkPrunedFiles(const std::set<int>& setFilesToPrune) const
 {
+    LOCK(m_blockfile_mutex);
     std::error_code ec;
     for (std::set<int>::iterator it = setFilesToPrune.begin(); it != setFilesToPrune.end(); ++it) {
         FlatFilePos pos(*it, 0);
@@ -864,7 +881,7 @@ fs::path BlockManager::GetBlockPosFilename(const FlatFilePos& pos) const
 
 BlockStorageOutcome<FlatFilePos> BlockManager::FindNextBlockPos(unsigned int nAddSize, unsigned int nHeight, uint64_t nTime)
 {
-    AssertLockHeld(::cs_main);
+    AssertLockHeld(m_blockfile_mutex);
     const BlockfileType chain_type = BlockfileTypeForHeight(nHeight);
 
     if (!m_blockfile_cursors[chain_type]) {
@@ -955,7 +972,7 @@ BlockStorageOutcome<FlatFilePos> BlockManager::FindNextBlockPos(unsigned int nAd
 
 void BlockManager::UpdateBlockInfo(const CBlock& block, unsigned int nHeight, const FlatFilePos& pos)
 {
-    AssertLockHeld(::cs_main);
+    LOCK(m_blockfile_mutex);
     // Update the cursor so it points to the last file.
     const BlockfileType chain_type{BlockfileTypeForHeight(nHeight)};
     auto& cursor{m_blockfile_cursors[chain_type]};
@@ -976,7 +993,7 @@ void BlockManager::UpdateBlockInfo(const CBlock& block, unsigned int nHeight, co
 
 BlockStorageOutcome<bool> BlockManager::FindUndoPos(BlockValidationState& state, int nFile, FlatFilePos& pos, unsigned int nAddSize)
 {
-    AssertLockHeld(::cs_main);
+    AssertLockHeld(m_blockfile_mutex);
     BlockStorageOutcome<bool> outcome{true, {}};
     pos.nFile = nFile;
 
@@ -1002,6 +1019,7 @@ BlockStorageOutcome<bool> BlockManager::FindUndoPos(BlockValidationState& state,
 BlockStorageOutcome<bool> BlockManager::WriteBlockUndo(const CBlockUndo& blockundo, BlockValidationState& state, CBlockIndex& block)
 {
     AssertLockHeld(::cs_main);
+    LOCK(m_blockfile_mutex);
     BlockStorageOutcome<bool> outcome{true, {}};
     const BlockfileType type = BlockfileTypeForHeight(block.nHeight);
     auto& cursor = *Assert(m_blockfile_cursors[type]);
@@ -1178,7 +1196,7 @@ BlockManager::ReadRawBlockResult BlockManager::ReadRawBlock(const FlatFilePos& p
 
 BlockStorageOutcome<FlatFilePos> BlockManager::WriteBlock(const CBlock& block, int nHeight)
 {
-    AssertLockHeld(::cs_main);
+    LOCK(m_blockfile_mutex);
     const unsigned int block_size{static_cast<unsigned int>(GetSerializeSize(TX_WITH_WITNESS(block)))};
     auto outcome{FindNextBlockPos(block_size + STORAGE_HEADER_BYTES, nHeight, block.GetBlockTime())};
     FlatFilePos& pos{outcome.value};

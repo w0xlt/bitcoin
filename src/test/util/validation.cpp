@@ -8,6 +8,7 @@
 #include <consensus/consensus.h>
 #include <node/blockstorage.h>
 #include <node/mining_types.h>
+#include <sync.h>
 #include <test/util/mining.h>
 #include <test/util/script.h>
 #include <test/util/setup_common.h>
@@ -28,8 +29,21 @@ using kernel::ChainstateRole;
 void TestBlockManager::CleanupForFuzzing()
 {
     m_dirty_blockindex.clear();
+    LOCK(m_blockfile_mutex);
     m_dirty_fileinfo.clear();
     m_blockfile_info.resize(1);
+}
+
+kernel::CBlockFileInfo TestBlockManager::GetBlockFileInfo(size_t n) const
+{
+    LOCK(m_blockfile_mutex);
+    return m_blockfile_info.at(n);
+}
+
+void TestBlockManager::SetBlockFileSize(size_t n, uint32_t size)
+{
+    LOCK(m_blockfile_mutex);
+    m_blockfile_info.at(n).nSize = size;
 }
 
 void TestChainstateManager::DisableNextWrite()

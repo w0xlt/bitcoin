@@ -21,6 +21,7 @@
 #include <test/util/logging.h>
 #include <test/util/random.h>
 #include <test/util/setup_common.h>
+#include <test/util/validation.h>
 #include <util/translation.h>
 #include <validation.h>
 #include <validationinterface.h>
@@ -94,7 +95,8 @@ BOOST_FIXTURE_TEST_CASE(scan_for_wallet_transactions, TestChain100Setup)
 {
     // Cap last block file size, and mine new block in a new block file.
     CBlockIndex* oldTip = WITH_LOCK(Assert(m_node.chainman)->GetMutex(), return m_node.chainman->ActiveChain().Tip());
-    WITH_LOCK(::cs_main, m_node.chainman->m_blockman.GetBlockFileInfo(oldTip->GetBlockPos().nFile)->nSize = MAX_BLOCKFILE_SIZE);
+    auto& test_blockman{static_cast<TestBlockManager&>(m_node.chainman->m_blockman)};
+    WITH_LOCK(::cs_main, test_blockman.SetBlockFileSize(oldTip->GetBlockPos().nFile, MAX_BLOCKFILE_SIZE));
     CreateAndProcessBlock({}, GetScriptForRawPubKey(coinbaseKey.GetPubKey()));
     CBlockIndex* newTip = WITH_LOCK(Assert(m_node.chainman)->GetMutex(), return m_node.chainman->ActiveChain().Tip());
 
