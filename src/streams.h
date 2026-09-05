@@ -21,6 +21,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <exception>
 #include <ios>
 #include <limits>
 #include <optional>
@@ -389,7 +390,8 @@ public:
  * explicitly with the `fclose()` method, check if it returns an error and treat
  * such an error as if the `write()` method failed. The OS's `fclose(3)` may
  * fail to flush to disk data that has been previously written, rendering the
- * file corrupt.
+ * file corrupt. During exception unwinding, the destructor closes the file
+ * instead, allowing the original exception to propagate.
  */
 class AutoFile
 {
@@ -404,7 +406,7 @@ public:
 
     ~AutoFile()
     {
-        if (m_was_written) {
+        if (m_was_written && std::uncaught_exceptions() == 0) {
             // Callers that wrote to the file must have closed it explicitly
             // with the fclose() method and checked that the close succeeded.
             // This is because here in the destructor we have no way to signal

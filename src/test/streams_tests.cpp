@@ -14,6 +14,9 @@
 
 #include <boost/test/unit_test.hpp>
 
+#include <cstdint>
+#include <stdexcept>
+
 using namespace std::string_literals;
 using namespace util::hex_literals;
 
@@ -166,6 +169,24 @@ BOOST_AUTO_TEST_CASE(xor_file)
         BOOST_CHECK_EXCEPTION(xor_file >> std::byte{}, std::ios_base::failure, HasReason{"AutoFile::read: end of file"});
         BOOST_CHECK_EQUAL(xor_file.size(), 7);
     }
+}
+
+BOOST_AUTO_TEST_CASE(autofile_exception_cleanup)
+{
+    const auto path{m_args.GetDataDirBase() / "autofile_exception.bin"};
+    const auto fail = [&] {
+        AutoFile file{fsbridge::fopen(path, "wb")};
+        BOOST_REQUIRE(!file.IsNull());
+        file << uint8_t{42};
+        // Simulate a serialization error after an earlier successful write.
+        throw std::runtime_error{"serialization failed"};
+    };
+    BOOST_CHECK_EXCEPTION(fail(), std::runtime_error, HasReason{"serialization failed"});
+
+    AutoFile file{fsbridge::fopen(path, "rb")};
+    uint8_t value{};
+    file >> value;
+    BOOST_CHECK_EQUAL(value, 42);
 }
 
 BOOST_AUTO_TEST_CASE(streams_vector_writer)
