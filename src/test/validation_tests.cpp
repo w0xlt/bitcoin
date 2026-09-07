@@ -8,12 +8,18 @@
 #include <core_io.h>
 #include <hash.h>
 #include <net.h>
+#include <pow.h>
+#include <primitives/block.h>
 #include <signet.h>
+#include <streams.h>
 #include <uint256.h>
 #include <util/chaintype.h>
 #include <validation.h>
 
+#include <cstddef>
 #include <string>
+#include <utility>
+#include <vector>
 
 #include <test/util/setup_common.h>
 
@@ -148,6 +154,143 @@ BOOST_AUTO_TEST_CASE(test_assumeutxo)
     const auto out110_2 = *params->AssumeutxoForBlockhash(uint256{"135eec25a6fb277884e5824e7aa7d052c4868161c99a5122170b5266f86c273d"});
     BOOST_CHECK_EQUAL(out110_2.hash_serialized.ToString(), "86e9a1205b418b16dde3a18a78c730e30137e28466bda5dbf6b33ab8fc05447c");
     BOOST_CHECK_EQUAL(out110_2.m_chain_tx_count, 111U);
+}
+
+static void CheckBlockCache(const CBlock& block, bool checked, bool merkle, bool witness)
+{
+    BOOST_CHECK_EQUAL(block.fChecked, checked);
+    BOOST_CHECK_EQUAL(block.m_checked_merkle_root, merkle);
+    BOOST_CHECK_EQUAL(block.m_checked_witness_commitment, witness);
+}
+
+static std::vector<std::byte> BlockBytes(const CBlock& block)
+{
+    DataStream stream;
+    stream << TX_WITH_WITNESS(block);
+    return {stream.begin(), stream.end()};
+}
+
+BOOST_AUTO_TEST_CASE(block_validation_cache)
+{
+    const auto params{CreateChainParams(*m_node.args, ChainType::REGTEST)};
+    const auto& consensus{params->GetConsensus()};
+    CheckBlockCache(CBlock{}, false, false, false);
+    CheckBlockCache(CBlock{static_cast<const CBlockHeader&>(params->GenesisBlock())}, false, false, false);
+
+    for (bool check_pow : {false, true}) {
+        for (bool check_merkle : {false, true}) {
+            CBlock block{params->GenesisBlock()};
+            CheckBlockCache(block, false, false, false);
+            const auto bytes{BlockBytes(block)};
+            const auto hash{block.GetHash()};
+
+            // Only enabling both optional checks can cache full success.
+            for (int repeat = 0; repeat < 2; ++repeat) {
+                BlockValidationState state;
+                BOOST_CHECK(CheckBlock(block, state, consensus, check_pow, check_merkle));
+                BOOST_CHECK(state.IsValid());
+                CheckBlockCache(block, check_pow && check_merkle, check_merkle, false);
+            }
+            BlockValidationState state;
+            BOOST_CHECK(CheckBlock(block, state, consensus));
+            BOOST_CHECK(state.IsValid());
+            CheckBlockCache(block, true, true, false);
+            BOOST_CHECK(BlockBytes(block) == bytes);
+            BOOST_CHECK(block.GetHash() == hash);
+
+            // Serialized blocks do not carry any of the memory-only success flags.
+            CBlock decoded;
+            SpanReader{bytes} >> TX_WITH_WITNESS(decoded);
+            CheckBlockCache(decoded, false, false, false);
+            BOOST_CHECK(BlockBytes(decoded) == bytes);
+            BOOST_CHECK(decoded.GetHash() == hash);
+        }
+    }
+
+    // A successful merkle check remains cached when a later body check fails.
+    CBlock invalid{params->GenesisBlock()};
+    CMutableTransaction coinbase{*invalid.vtx[0]};
+    coinbase.vin[0].scriptSig.clear();
+    invalid.vtx[0] = MakeTransactionRef(std::move(coinbase));
+    invalid.hashMerkleRoot = BlockMerkleRoot(invalid);
+    while (!CheckProofOfWork(invalid.GetHash(), invalid.nBits, consensus)) {
+        ++invalid.nNonce;
+    }
+
+    BlockValidationState state;
+    BOOST_CHECK(!CheckBlock(invalid, state, consensus));
+    BOOST_CHECK(state.GetResult() == BlockValidationResult::BLOCK_CONSENSUS);
+    BOOST_CHECK_EQUAL(state.GetRejectReason(), "bad-cb-length");
+    CheckBlockCache(invalid, false, true, false);
+    BlockValidationState repeated_state;
+    BOOST_CHECK(!CheckBlock(invalid, repeated_state, consensus));
+    BOOST_CHECK(repeated_state.GetResult() == state.GetResult());
+    BOOST_CHECK_EQUAL(repeated_state.GetRejectReason(), state.GetRejectReason());
+    BOOST_CHECK_EQUAL(repeated_state.GetDebugMessage(), state.GetDebugMessage());
+    CheckBlockCache(invalid, false, true, false);
+}
+
+BOOST_AUTO_TEST_CASE(block_validation_cache_copy)
+{
+    const auto params{CreateChainParams(*m_node.args, ChainType::REGTEST)};
+    const auto& consensus{params->GetConsensus()};
+    CBlock block{params->GenesisBlock()};
+    CMutableTransaction coinbase{*block.vtx[0]};
+    coinbase.vin[0].scriptWitness.stack = {std::vector<unsigned char>(32, 0)};
+    uint256 commitment;
+    CHash256().Write(BlockWitnessMerkleRoot(block)).Write(coinbase.vin[0].scriptWitness.stack[0]).Finalize(commitment);
+    std::vector<unsigned char> commitment_bytes{0xaa, 0x21, 0xa9, 0xed};
+    commitment_bytes.insert(commitment_bytes.end(), commitment.begin(), commitment.end());
+    coinbase.vout.emplace_back(0, CScript{} << OP_RETURN << commitment_bytes);
+    block.vtx[0] = MakeTransactionRef(std::move(coinbase));
+    block.hashMerkleRoot = BlockMerkleRoot(block);
+    while (!CheckProofOfWork(block.GetHash(), block.nBits, consensus)) {
+        ++block.nNonce;
+    }
+    const auto bytes{BlockBytes(block)};
+    const auto hash{block.GetHash()};
+
+    CheckBlockCache(block, false, false, false);
+    BOOST_CHECK(!IsBlockMutated(block, /*check_witness_root=*/true));
+    CheckBlockCache(block, false, true, true);
+    // A cached commitment must not allow witness data when none is expected.
+    BOOST_CHECK(IsBlockMutated(block, /*check_witness_root=*/false));
+    CheckBlockCache(block, false, true, true);
+
+    for (bool check_all : {false, true}) {
+        if (check_all) {
+            BlockValidationState state;
+            BOOST_CHECK(CheckBlock(block, state, consensus));
+            BOOST_CHECK(state.IsValid());
+        }
+        CheckBlockCache(block, check_all, true, true);
+        BOOST_CHECK(BlockBytes(block) == bytes);
+        BOOST_CHECK(block.GetHash() == hash);
+
+        CBlock copied{block};
+        CBlock assigned;
+        assigned = block;
+        CheckBlockCache(copied, check_all, true, true);
+        CheckBlockCache(assigned, check_all, true, true);
+        BOOST_CHECK(BlockBytes(copied) == bytes);
+        BOOST_CHECK(BlockBytes(assigned) == bytes);
+
+        CBlock moved{std::move(copied)};
+        copied = std::move(assigned);
+        CheckBlockCache(moved, check_all, true, true);
+        CheckBlockCache(copied, check_all, true, true);
+        BOOST_CHECK(BlockBytes(moved) == bytes);
+        BOOST_CHECK(BlockBytes(copied) == bytes);
+
+        // Assignment must copy false bits too, not retain the destination cache.
+        copied = params->GenesisBlock();
+        CheckBlockCache(copied, false, false, false);
+        BOOST_CHECK(copied.GetHash() == params->GenesisBlock().GetHash());
+        moved.SetNull();
+        CheckBlockCache(moved, false, false, false);
+        BOOST_CHECK(moved.IsNull());
+        BOOST_CHECK(moved.vtx.empty());
+    }
 }
 
 BOOST_AUTO_TEST_CASE(block_malleation)
