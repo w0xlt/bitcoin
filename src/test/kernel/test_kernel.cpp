@@ -18,10 +18,12 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <barrier>
 #include <charconv>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <exception>
 #include <iostream>
 #include <latch>
 #include <memory>
@@ -1182,14 +1184,18 @@ void chainman_mainnet_validation_test(TestDirectory& test_directory)
     BOOST_CHECK(!new_block);
 }
 
+static std::vector<std::byte> MainnetBlock1()
+{
+    return hex_string_to_byte_vec("010000006fe28c0ab6f1b372c1a6a246ae63f74f931e8365e15a089c68d6190000000000982051fd1e4ba744bbbe680e1fee14677ba1a3c3540bf7b1cdb606e857233e0e61bc6649ffff001d01e362990101000000010000000000000000000000000000000000000000000000000000000000000000ffffffff0704ffff001d0104ffffffff0100f2052a0100000043410496b538e853519c726a2c91e61ec11600ae1390813a627c66fb8be7947be63c52da7589379515d4e0a604f8141781e62294721166bf621e73a82cbf2342c858eeac00000000");
+}
+
 BOOST_AUTO_TEST_CASE(btck_check_block_context_free)
 {
     constexpr size_t MERKLE_ROOT_OFFSET{4 + 32};
     constexpr size_t NBITS_OFFSET{4 + 32 + 32 + 4};
     constexpr size_t COINBASE_PREVOUT_N_OFFSET{4 + 32 + 32 + 4 + 4 + 4 + 1 + 4 + 1 + 32};
 
-    // Mainnet block 1
-    auto raw_block = hex_string_to_byte_vec("010000006fe28c0ab6f1b372c1a6a246ae63f74f931e8365e15a089c68d6190000000000982051fd1e4ba744bbbe680e1fee14677ba1a3c3540bf7b1cdb606e857233e0e61bc6649ffff001d01e362990101000000010000000000000000000000000000000000000000000000000000000000000000ffffffff0704ffff001d0104ffffffff0100f2052a0100000043410496b538e853519c726a2c91e61ec11600ae1390813a627c66fb8be7947be63c52da7589379515d4e0a604f8141781e62294721166bf621e73a82cbf2342c858eeac00000000");
+    auto raw_block{MainnetBlock1()};
 
     // Context-free block checks still need consensus params for the optional
     // proof-of-work validation path.
@@ -1239,6 +1245,130 @@ BOOST_AUTO_TEST_CASE(btck_check_block_context_free)
     auto truncated_block_data = hex_string_to_byte_vec("010000006fe28c0ab6f1b372c1a6a246ae63f74f931e8365e15a089c68d6190000000000982051fd1e4ba744bbbe680e1fee14677ba1a3c3540bf7b1cdb606e857233e0e61bc6649ffff001d01e36299");
     BOOST_CHECK_EXCEPTION(Block{truncated_block_data}, std::runtime_error,
                           HasReason{"failed to instantiate btck object"});
+}
+
+BOOST_AUTO_TEST_CASE(btck_check_block_concurrent)
+{
+    const auto raw_block{hex_string_to_byte_vec(REGTEST_BLOCK_DATA[0])};
+    const ChainParams params{ChainType::REGTEST};
+    const auto consensus{params.GetConsensusParams()};
+    constexpr size_t ROUNDS{16};
+
+    for (size_t worker_count : {8U, 20U}) {
+        for (bool shared : {true, false}) {
+            std::vector<Block> blocks;
+            blocks.reserve(ROUNDS * worker_count);
+            for (size_t round = 0; round < ROUNDS; ++round) {
+                const Block block{raw_block};
+                for (size_t i = 0; i < worker_count; ++i) {
+                    // Copying a kernel handle aliases its block, unlike decoding fresh bytes.
+                    blocks.push_back(shared ? Block{block} : Block{raw_block});
+                }
+            }
+            struct Result {
+                bool valid{true};
+                std::exception_ptr exception;
+            };
+            std::vector<Result> results(worker_count);
+            std::vector<BlockValidationState> states(worker_count);
+            std::barrier start{static_cast<std::ptrdiff_t>(worker_count)};
+            std::vector<std::thread> workers;
+            for (size_t i = 0; i < worker_count; ++i) {
+                workers.emplace_back([&, i] {
+                    for (size_t round = 0; round < ROUNDS; ++round) {
+                        start.arrive_and_wait();
+                        try {
+                            const auto& block{blocks[round * worker_count + i]};
+                            auto& state{states[i]};
+                            auto& valid{results[i].valid};
+                            valid &= block.Check(consensus, i % 2 ? BlockCheckFlags::MERKLE : BlockCheckFlags::ALL, state);
+                            valid &= state.GetValidationMode() == ValidationMode::VALID;
+                            valid &= block.Check(consensus, BlockCheckFlags::ALL, state);
+                            valid &= state.GetValidationMode() == ValidationMode::VALID;
+                        } catch (...) {
+                            results[i].exception = std::current_exception();
+                        }
+                    }
+                });
+            }
+            for (auto& worker : workers) {
+                worker.join();
+            }
+            for (const auto& result : results) {
+                BOOST_CHECK(!result.exception);
+                BOOST_CHECK(result.valid);
+            }
+            for (const auto& block : blocks) {
+                check_equal(block.ToBytes(), raw_block);
+            }
+        }
+    }
+}
+
+BOOST_FIXTURE_TEST_CASE(btck_check_block_signet_logging, LoggingSetup)
+{
+    logging_enable_category(LogCategory::VALIDATION);
+    logging_set_level_category(LogCategory::VALIDATION, LogLevel::DEBUG_LEVEL);
+    const ChainParams params{ChainType::SIGNET};
+    const auto consensus{params.GetConsensusParams()};
+    // This fresh block has valid PoW but no signet solution. Never warm it under other params.
+    const Block block{MainnetBlock1()};
+    BlockValidationState state;
+    Logger logger;
+    logger.Drain();
+    constexpr size_t CHECKS{128};
+    bool valid{true};
+    std::array<std::exception_ptr, 2> exceptions;
+    std::vector<LogMessages> batches;
+    std::barrier start{3};
+    {
+        LoggingThreads threads;
+        threads.m_threads.emplace_back([&] {
+            start.arrive_and_wait();
+            try {
+                for (size_t i = 0; i < CHECKS; ++i) {
+                    valid &= !block.Check(consensus, BlockCheckFlags::ALL, state);
+                    valid &= state.GetValidationMode() == ValidationMode::INVALID;
+                    valid &= state.GetBlockValidationResult() == BlockValidationResult::CONSENSUS;
+                }
+            } catch (...) {
+                exceptions[0] = std::current_exception();
+            }
+        });
+        threads.m_threads.emplace_back([&] {
+            start.arrive_and_wait();
+            try {
+                while (!threads.m_stop) {
+                    auto batch{logger.Drain()};
+                    if (batch.Count() != 0 || batch.GetDiscarded() != 0) {
+                        batches.push_back(std::move(batch));
+                    }
+                    std::this_thread::yield();
+                }
+            } catch (...) {
+                exceptions[1] = std::current_exception();
+            }
+        });
+        start.arrive_and_wait();
+        for (size_t i = 0; i < CHECKS; ++i) {
+            Logger transient;
+            transient.Drain();
+        }
+    }
+    batches.push_back(logger.Drain());
+    logging_disable_category(LogCategory::VALIDATION);
+    BOOST_CHECK(valid);
+    for (const auto& exception : exceptions) {
+        BOOST_CHECK(!exception);
+    }
+    size_t received{0};
+    for (const auto& batch : batches) {
+        BOOST_CHECK_EQUAL(batch.GetDiscarded(), 0);
+        for (const auto message : batch.Messages()) {
+            if (message.find("block solution parse failure") != std::string_view::npos) ++received;
+        }
+    }
+    BOOST_CHECK_EQUAL(received, CHECKS);
 }
 
 BOOST_AUTO_TEST_CASE(btck_chainman_mainnet_tests)

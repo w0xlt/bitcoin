@@ -12,18 +12,21 @@
 #include <primitives/block.h>
 #include <signet.h>
 #include <streams.h>
+#include <test/util/setup_common.h>
 #include <uint256.h>
 #include <util/chaintype.h>
 #include <validation.h>
 
+#include <boost/test/unit_test.hpp>
+
+#include <barrier>
 #include <cstddef>
+#include <exception>
 #include <string>
+#include <thread>
+#include <type_traits>
 #include <utility>
 #include <vector>
-
-#include <test/util/setup_common.h>
-
-#include <boost/test/unit_test.hpp>
 
 BOOST_FIXTURE_TEST_SUITE(validation_tests, BasicTestingSetup)
 
@@ -158,9 +161,9 @@ BOOST_AUTO_TEST_CASE(test_assumeutxo)
 
 static void CheckBlockCache(const CBlock& block, bool checked, bool merkle, bool witness)
 {
-    BOOST_CHECK_EQUAL(block.fChecked, checked);
-    BOOST_CHECK_EQUAL(block.m_checked_merkle_root, merkle);
-    BOOST_CHECK_EQUAL(block.m_checked_witness_commitment, witness);
+    BOOST_CHECK_EQUAL(block.m_validation_cache.m_checked.load(), checked);
+    BOOST_CHECK_EQUAL(block.m_validation_cache.m_checked_merkle_root.load(), merkle);
+    BOOST_CHECK_EQUAL(block.m_validation_cache.m_checked_witness_commitment.load(), witness);
 }
 
 static std::vector<std::byte> BlockBytes(const CBlock& block)
@@ -230,11 +233,10 @@ BOOST_AUTO_TEST_CASE(block_validation_cache)
     CheckBlockCache(invalid, false, true, false);
 }
 
-BOOST_AUTO_TEST_CASE(block_validation_cache_copy)
+static CBlock WitnessBlock(const CChainParams& params)
 {
-    const auto params{CreateChainParams(*m_node.args, ChainType::REGTEST)};
-    const auto& consensus{params->GetConsensus()};
-    CBlock block{params->GenesisBlock()};
+    const auto& consensus{params.GetConsensus()};
+    CBlock block{params.GenesisBlock()};
     CMutableTransaction coinbase{*block.vtx[0]};
     coinbase.vin[0].scriptWitness.stack = {std::vector<unsigned char>(32, 0)};
     uint256 commitment;
@@ -247,6 +249,14 @@ BOOST_AUTO_TEST_CASE(block_validation_cache_copy)
     while (!CheckProofOfWork(block.GetHash(), block.nBits, consensus)) {
         ++block.nNonce;
     }
+    return block;
+}
+
+BOOST_AUTO_TEST_CASE(block_validation_cache_copy)
+{
+    const auto params{CreateChainParams(*m_node.args, ChainType::REGTEST)};
+    const auto& consensus{params->GetConsensus()};
+    CBlock block{WitnessBlock(*params)};
     const auto bytes{BlockBytes(block)};
     const auto hash{block.GetHash()};
 
@@ -293,15 +303,84 @@ BOOST_AUTO_TEST_CASE(block_validation_cache_copy)
     }
 }
 
+BOOST_AUTO_TEST_CASE(block_validation_cache_concurrent)
+{
+    static_assert(std::is_nothrow_move_constructible_v<CBlock>);
+    static_assert(std::is_nothrow_move_assignable_v<CBlock>);
+    const auto params{CreateChainParams(*m_node.args, ChainType::REGTEST)};
+    const CBlock original{WitnessBlock(*params)};
+    CheckBlockCache(original, false, false, false);
+    const auto bytes{BlockBytes(original)};
+    const auto check = [&](const CBlock& block) {
+        BlockValidationState state;
+        return CheckBlock(block, state, params->GetConsensus()) && state.IsValid();
+    };
+    constexpr size_t ROUNDS{16};
+
+    for (size_t worker_count : {8U, 20U}) {
+        for (bool shared : {true, false}) {
+            // Build every cold fixture before workers start; never reset a shared cache.
+            const std::vector<CBlock> blocks(shared ? ROUNDS : ROUNDS * worker_count, original);
+            struct Result {
+                bool valid{true};
+                std::exception_ptr exception;
+            };
+            std::vector<Result> results(worker_count);
+            std::barrier start{static_cast<std::ptrdiff_t>(worker_count)};
+            std::vector<std::thread> workers;
+            for (size_t i = 0; i < worker_count; ++i) {
+                workers.emplace_back([&, i] {
+                    for (size_t round = 0; round < ROUNDS; ++round) {
+                        start.arrive_and_wait();
+                        try {
+                            const CBlock& block{blocks[shared ? round : round * worker_count + i]};
+                            auto& valid{results[i].valid};
+                            if (i % 3 == 0) {
+                                valid &= check(block);
+                            } else if (i % 3 == 1) {
+                                valid &= !IsBlockMutated(block, /*check_witness_root=*/true);
+                            } else {
+                                // Copy while other callers may be caching successful checks.
+                                CBlock copied{block};
+                                CBlock assigned;
+                                assigned = block;
+                                valid &= BlockBytes(copied) == bytes && BlockBytes(assigned) == bytes;
+                                valid &= check(copied) && check(assigned);
+                                valid &= !IsBlockMutated(copied, /*check_witness_root=*/true);
+                                valid &= !IsBlockMutated(assigned, /*check_witness_root=*/true);
+                            }
+                            valid &= check(block);
+                            valid &= !IsBlockMutated(block, /*check_witness_root=*/true);
+                        } catch (...) {
+                            results[i].exception = std::current_exception();
+                        }
+                    }
+                });
+            }
+            for (auto& worker : workers) {
+                worker.join();
+            }
+            for (const auto& result : results) {
+                BOOST_CHECK(!result.exception);
+                BOOST_CHECK(result.valid);
+            }
+            for (const auto& block : blocks) {
+                CheckBlockCache(block, true, true, true);
+                BOOST_CHECK(BlockBytes(block) == bytes);
+            }
+        }
+    }
+}
+
 BOOST_AUTO_TEST_CASE(block_malleation)
 {
     // Test utilities that calls `IsBlockMutated` and then clears the validity
     // cache flags on `CBlock`.
     auto is_mutated = [](CBlock& block, bool check_witness_root) {
         bool mutated{IsBlockMutated(block, check_witness_root)};
-        block.fChecked = false;
-        block.m_checked_witness_commitment = false;
-        block.m_checked_merkle_root = false;
+        block.m_validation_cache.m_checked.store(false);
+        block.m_validation_cache.m_checked_witness_commitment.store(false);
+        block.m_validation_cache.m_checked_merkle_root.store(false);
         return mutated;
     };
     auto is_not_mutated = [&is_mutated](CBlock& block, bool check_witness_root) {
