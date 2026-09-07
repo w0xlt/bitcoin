@@ -8,15 +8,21 @@
 #include <node/chainstatemanager_args.h>
 #include <node/kernel_notifications.h>
 #include <node/utxo_snapshot.h>
+#include <pow.h>
 #include <random.h>
 #include <rpc/blockchain.h>
+#include <scheduler.h>
 #include <sync.h>
 #include <test/util/chainstate.h>
 #include <test/util/common.h>
 #include <test/util/logging.h>
+#include <test/util/mining.h>
 #include <test/util/random.h>
 #include <test/util/setup_common.h>
+#include <test/util/txmempool.h>
 #include <test/util/validation.h>
+#include <tinyformat.h>
+#include <txmempool.h>
 #include <uint256.h>
 #include <util/byte_units.h>
 #include <util/result.h>
@@ -24,11 +30,16 @@
 #include <validation.h>
 #include <validationinterface.h>
 
-#include <tinyformat.h>
-
-#include <vector>
-
 #include <boost/test/unit_test.hpp>
+
+#include <array>
+#include <chrono>
+#include <condition_variable>
+#include <exception>
+#include <mutex>
+#include <optional>
+#include <thread>
+#include <vector>
 
 using node::BlockManager;
 using node::KernelNotifications;
@@ -714,6 +725,210 @@ BOOST_FIXTURE_TEST_CASE(invalidate_block_and_reconsider_fork, TestChain100Setup)
         BOOST_CHECK(fork_block99->nStatus & BLOCK_FAILED_VALID);
         BOOST_CHECK(fork_block100->nStatus & BLOCK_FAILED_VALID);
     }
+}
+
+namespace {
+
+/** Pause only the invalidator's first two queue-limit checks, without changing callback delivery. */
+class InvalidationTaskRunner final : public SerialTaskRunner
+{
+    std::mutex m_mutex;
+    std::condition_variable m_cv;
+    std::thread::id m_thread;
+    unsigned int m_paused{0};
+    unsigned int m_released{0};
+    bool m_finished{false};
+
+public:
+    using SerialTaskRunner::SerialTaskRunner;
+
+    void Arm()
+    {
+        std::lock_guard lock{m_mutex};
+        m_thread = std::this_thread::get_id();
+    }
+
+    size_t size() override
+    {
+        {
+            std::unique_lock lock{m_mutex};
+            if (m_thread == std::this_thread::get_id() && m_paused < 2) {
+                const auto pause{++m_paused};
+                m_cv.notify_all();
+                m_cv.wait(lock, [&] { return m_released >= pause; });
+            }
+        }
+        return SerialTaskRunner::size();
+    }
+
+    bool WaitForPause(unsigned int pause)
+    {
+        std::unique_lock lock{m_mutex};
+        return m_cv.wait_for(lock, std::chrono::seconds{30}, [&] { return m_paused >= pause || m_finished; }) && m_paused >= pause;
+    }
+
+    void Release(unsigned int pause)
+    {
+        std::lock_guard lock{m_mutex};
+        m_released = pause;
+        m_cv.notify_all();
+    }
+
+    void Finish()
+    {
+        std::lock_guard lock{m_mutex};
+        m_finished = true;
+        m_cv.notify_all();
+    }
+};
+
+struct InvalidationTestSetup : ChainTestingSetup {
+    InvalidationTaskRunner* m_runner;
+    std::vector<std::shared_ptr<CBlock>> m_blocks;
+
+    InvalidationTestSetup() : ChainTestingSetup{ChainType::REGTEST}
+    {
+        // Neither consumer has loaded chainstate yet. Recreate both because they
+        // retain the signals pointer; keep the existing scheduler alive.
+        m_node.chainman.reset();
+        m_node.mempool.reset();
+        auto runner{std::make_unique<InvalidationTaskRunner>(*m_node.scheduler)};
+        m_runner = runner.get();
+        m_node.validation_signals = std::make_unique<ValidationSignals>(std::move(runner));
+        bilingual_str error;
+        m_node.mempool = std::make_unique<CTxMemPool>(MemPoolOptionsForTest(m_node), error);
+        BOOST_REQUIRE(error.empty());
+        m_make_chainman();
+        LoadVerifyActivateChainstate();
+
+        m_blocks = CreateBlockChain(5, m_node.chainman->GetParams());
+        for (size_t i{0}; i < 3; ++i) {
+            BOOST_REQUIRE(m_node.chainman->ProcessNewBlock(m_blocks[i], true, true, nullptr));
+        }
+    }
+
+    struct Boundary {
+        uint32_t root_status;
+        std::array<uint32_t, 2> header_status;
+        uint256 tip_hash;
+        uint256 best_header_hash;
+    };
+
+    Boundary InvalidateWithNewHeaders(const std::array<CBlockHeader, 2>& headers)
+    {
+        auto& chainman{*m_node.chainman};
+        auto& chainstate{chainman.ActiveChainstate()};
+        const std::array<uint256, 2> hashes{headers[0].GetHash(), headers[1].GetHash()};
+        CBlockIndex* root;
+        {
+            LOCK(cs_main);
+            root = chainman.ActiveChain().Tip();
+            for (const auto& hash : hashes)
+                BOOST_REQUIRE(!chainman.m_blockman.LookupBlockIndex(hash));
+        }
+
+        BlockValidationState invalidation_state;
+        bool invalidated{false};
+        std::exception_ptr worker_error;
+        std::thread worker{[&] {
+            try {
+                m_runner->Arm();
+                invalidated = chainstate.InvalidateBlock(invalidation_state, root);
+            } catch (...) {
+                worker_error = std::current_exception();
+            }
+            m_runner->Finish();
+        }};
+
+        bool paused_before{false}, paused_after{false}, accepted{false};
+        BlockValidationState header_state;
+        std::optional<Boundary> result;
+        try {
+            // The old implementation has already cached its view of the index,
+            // but still has to disconnect the active tip. Header admission does
+            // not need the chainstate mutex held by the paused invalidator.
+            paused_before = m_runner->WaitForPause(1);
+            if (paused_before) accepted = chainman.ProcessNewBlockHeaders(headers, true, header_state);
+            m_runner->Release(1);
+            paused_after = m_runner->WaitForPause(2);
+            if (paused_after) {
+                LOCK(cs_main);
+                const auto* first{chainman.m_blockman.LookupBlockIndex(hashes[0])};
+                const auto* second{chainman.m_blockman.LookupBlockIndex(hashes[1])};
+                if (first && second) {
+                    const Boundary observed{
+                        root->nStatus,
+                        {first->nStatus, second->nStatus},
+                        chainman.ActiveChain().Tip()->GetBlockHash(),
+                        chainman.m_best_header->GetBlockHash(),
+                    };
+                    result = observed;
+                }
+
+                // Test-only cleanup AFTER copying the observable state. This
+                // lets a broken implementation return instead of aborting in
+                // CheckBlockIndex. Only the pre-cleanup copies are asserted.
+                chainstate.SetBlockFailureFlags(root);
+                chainman.RecalculateBestHeader();
+            }
+        } catch (...) {
+            m_runner->Release(2);
+            worker.join();
+            throw;
+        }
+        m_runner->Release(2);
+        worker.join();
+
+        if (worker_error) std::rethrow_exception(worker_error);
+        BOOST_REQUIRE(paused_before);
+        BOOST_REQUIRE(accepted);
+        BOOST_REQUIRE(header_state.IsValid());
+        BOOST_REQUIRE(paused_after);
+        BOOST_REQUIRE(invalidated);
+        BOOST_REQUIRE(invalidation_state.IsValid());
+        BOOST_REQUIRE(result.has_value());
+        return *result;
+    }
+};
+
+} // namespace
+
+BOOST_FIXTURE_TEST_CASE(invalidate_block_new_descendants, InvalidationTestSetup)
+{
+    // These two headers are not known when invalidation starts. They become
+    // descendants of a failed block at its first unlocked boundary.
+    const auto observed{InvalidateWithNewHeaders({*m_blocks[3], *m_blocks[4]})};
+    BOOST_CHECK(observed.tip_hash == m_blocks[1]->GetHash());
+    BOOST_CHECK(observed.root_status & BLOCK_FAILED_VALID);
+    BOOST_CHECK(observed.header_status[0] & BLOCK_FAILED_VALID);
+    BOOST_CHECK(observed.header_status[1] & BLOCK_FAILED_VALID);
+}
+
+BOOST_FIXTURE_TEST_CASE(invalidate_block_new_best_header, InvalidationTestSetup)
+{
+    auto& chainman{*m_node.chainman};
+    BlockValidationState state;
+    const std::array<CBlockHeader, 2> old_best{*m_blocks[3], *m_blocks[4]};
+    BOOST_REQUIRE(chainman.ProcessNewBlockHeaders(old_best, true, state));
+    BOOST_REQUIRE(WITH_LOCK(cs_main, return chainman.m_best_header->GetBlockHash()) == m_blocks[4]->GetHash());
+
+    // A fork at heights 3 and 4 survives invalidation of the active tip at 3.
+    // Its work is below the old best header at 5, but above the new tip at 2.
+    std::array<CBlockHeader, 2> fork{*m_blocks[2], *m_blocks[3]};
+    fork[0].hashMerkleRoot = uint256::ONE;
+    for (size_t i{0}; i < fork.size(); ++i) {
+        if (i) fork[i].hashPrevBlock = fork[i - 1].GetHash();
+        fork[i].nNonce = 0;
+        while (!CheckProofOfWork(fork[i].GetHash(), fork[i].nBits, chainman.GetConsensus()))
+            ++fork[i].nNonce;
+    }
+
+    const auto observed{InvalidateWithNewHeaders(fork)};
+    BOOST_CHECK(observed.tip_hash == m_blocks[1]->GetHash());
+    BOOST_CHECK(observed.root_status & BLOCK_FAILED_VALID);
+    BOOST_CHECK(!(observed.header_status[0] & BLOCK_FAILED_VALID));
+    BOOST_CHECK(!(observed.header_status[1] & BLOCK_FAILED_VALID));
+    BOOST_CHECK(observed.best_header_hash == fork.back().GetHash());
 }
 
 //! Ensure that snapshot chainstate can be loaded when found on disk after a

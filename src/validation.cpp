@@ -3540,32 +3540,6 @@ bool Chainstate::InvalidateBlock(BlockValidationState& state, CBlockIndex* const
     // blocks.
     LOCK(m_chainstate_mutex);
 
-    // We'll be acquiring and releasing cs_main below, to allow the validation
-    // callbacks to run. However, we should keep the block index in a
-    // consistent state as we disconnect blocks -- in particular we need to
-    // add equal-work blocks to setBlockIndexCandidates as we disconnect.
-    // To avoid walking the block index repeatedly in search of candidates,
-    // build a map once so that we can look up candidate blocks by chain
-    // work as we go.
-    std::multimap<const arith_uint256, CBlockIndex*> highpow_outofchain_headers;
-
-    {
-        LOCK(cs_main);
-        for (auto& entry : m_blockman.m_block_index) {
-            CBlockIndex& candidate = entry.second;
-            // We don't need to put anything in our active chain into the
-            // multimap, because those candidates will be found and considered
-            // as we disconnect.
-            // Instead, consider only non-active-chain blocks that score
-            // at least as good with CBlockIndexWorkComparator as the new tip.
-            if (!m_chain.Contains(candidate) &&
-                !CBlockIndexWorkComparator()(&candidate, pindex->pprev) &&
-                !(candidate.nStatus & BLOCK_FAILED_VALID)) {
-                highpow_outofchain_headers.insert({candidate.nChainWork, &candidate});
-            }
-        }
-    }
-
     CBlockIndex* to_mark_failed = pindex;
     bool pindex_was_in_chain = false;
     int disconnected = 0;
@@ -3609,40 +3583,33 @@ bool Chainstate::InvalidateBlock(BlockValidationState& state, CBlockIndex* const
         setBlockIndexCandidates.erase(disconnected_tip);
         setBlockIndexCandidates.insert(new_tip);
 
-        // Mark out-of-chain descendants of the invalidated block as invalid
-        // Add any equal or more work headers that are not invalidated to setBlockIndexCandidates
-        // Recalculate m_best_header if it became invalid.
-        auto candidate_it = highpow_outofchain_headers.lower_bound(new_tip->nChainWork);
-
+        // Headers and validity can change while cs_main is released. Use the
+        // current index to update failure flags, candidates and the best header
+        // before releasing it again, so each disconnection leaves a consistent
+        // view for other threads and validation callbacks.
         const bool best_header_needs_update{m_chainman.m_best_header->GetAncestor(disconnected_tip->nHeight) == disconnected_tip};
         if (best_header_needs_update) {
             // new_tip is definitely still valid at this point, but there may be better ones
             m_chainman.m_best_header = new_tip;
         }
 
-        while (candidate_it != highpow_outofchain_headers.end()) {
-            CBlockIndex* candidate{candidate_it->second};
-            if (candidate->GetAncestor(disconnected_tip->nHeight) == disconnected_tip) {
-                // Children of failed blocks are marked as BLOCK_FAILED_VALID.
-                candidate->nStatus |= BLOCK_FAILED_VALID;
-                m_blockman.m_dirty_blockindex.insert(candidate);
-                // If invalidated, the block is irrelevant for setBlockIndexCandidates
-                // and for m_best_header and can be removed from the cache.
-                candidate_it = highpow_outofchain_headers.erase(candidate_it);
+        for (auto& [_, candidate] : m_blockman.m_block_index) {
+            if (candidate.GetAncestor(disconnected_tip->nHeight) == disconnected_tip) {
+                // Test ancestry directly; iteration need not visit parents first.
+                candidate.nStatus |= BLOCK_FAILED_VALID;
+                m_blockman.m_dirty_blockindex.insert(&candidate);
                 continue;
             }
-            if (!CBlockIndexWorkComparator()(candidate, new_tip) &&
-                candidate->IsValid(BLOCK_VALID_TRANSACTIONS) &&
-                candidate->HaveNumChainTxs()) {
-                setBlockIndexCandidates.insert(candidate);
-                // Do not remove candidate from the highpow_outofchain_headers cache, because it might be a descendant of the block being invalidated
-                // which needs to be marked failed later.
+            if (candidate.nStatus & BLOCK_FAILED_VALID) continue;
+            if (!CBlockIndexWorkComparator()(&candidate, new_tip) &&
+                candidate.IsValid(BLOCK_VALID_TRANSACTIONS) &&
+                candidate.HaveNumChainTxs()) {
+                setBlockIndexCandidates.insert(&candidate);
             }
             if (best_header_needs_update &&
-                m_chainman.m_best_header->nChainWork < candidate->nChainWork) {
-                m_chainman.m_best_header = candidate;
+                m_chainman.m_best_header->nChainWork < candidate.nChainWork) {
+                m_chainman.m_best_header = &candidate;
             }
-            ++candidate_it;
         }
 
         // Track the last disconnected block to call InvalidChainFound on it.
@@ -3658,20 +3625,13 @@ bool Chainstate::InvalidateBlock(BlockValidationState& state, CBlockIndex* const
             return false;
         }
 
-        // Mark pindex as invalid if it never was in the main chain
-        if (!pindex_was_in_chain && !(pindex->nStatus & BLOCK_FAILED_VALID)) {
-            pindex->nStatus |= BLOCK_FAILED_VALID;
-            m_blockman.m_dirty_blockindex.insert(pindex);
-            setBlockIndexCandidates.erase(pindex);
-        }
+        // Reconsideration may have cleared an earlier failure flag while cs_main
+        // was released. This also handles blocks that were never in the chain.
+        to_mark_failed->nStatus |= BLOCK_FAILED_VALID;
+        m_blockman.m_dirty_blockindex.insert(to_mark_failed);
+        setBlockIndexCandidates.erase(to_mark_failed);
 
-        // If any new blocks somehow arrived while we were disconnecting
-        // (above), then the pre-calculation of what should go into
-        // setBlockIndexCandidates may have missed entries. This would
-        // technically be an inconsistency in the block index, but if we clean
-        // it up here, this should be an essentially unobservable error.
-        // Loop back over all block index entries and add any missing entries
-        // to setBlockIndexCandidates.
+        // Reconcile candidates with any changes since the last disconnection.
         for (auto& [_, block_index] : m_blockman.m_block_index) {
             if (block_index.IsValid(BLOCK_VALID_TRANSACTIONS) && block_index.HaveNumChainTxs() && !setBlockIndexCandidates.value_comp()(&block_index, m_chain.Tip())) {
                 setBlockIndexCandidates.insert(&block_index);
