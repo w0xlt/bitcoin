@@ -720,6 +720,54 @@ BOOST_FIXTURE_TEST_CASE(CreateWalletWithoutChain, BasicTestingSetup)
     WaitForDeleteWallet(std::move(wallet));
 }
 
+//! Check that the context-level CreateWallet/LoadWallet/RemoveWallet functions
+//! work when WalletContext::chain is null, i.e. when there is no node.
+BOOST_FIXTURE_TEST_CASE(CreateLoadRemoveWalletWithoutChain, BasicTestingSetup)
+{
+    WalletContext context;
+    context.args = &m_args;
+    // context.chain is deliberately left null.
+
+    const std::string name{"chainless"};
+    DatabaseStatus status{DatabaseStatus::FAILED_CREATE};
+    bilingual_str error;
+    std::vector<bilingual_str> warnings;
+
+    DatabaseOptions create_options;
+    create_options.require_create = true;
+    create_options.create_flags = WALLET_FLAG_DESCRIPTORS;
+    create_options.use_unsafe_sync = true;
+
+    // load_on_start is passed on purpose: without a chain there is no node
+    // settings file, so updating the load on startup setting is skipped.
+    auto wallet = wallet::CreateWallet(context, name, /*load_on_start=*/true, create_options, status, error, warnings);
+    BOOST_REQUIRE_MESSAGE(wallet, error.original);
+    BOOST_CHECK(status == DatabaseStatus::SUCCESS);
+    BOOST_CHECK(error.empty());
+    BOOST_CHECK(warnings.empty());
+    BOOST_CHECK_EQUAL(GetWallet(context, name).get(), wallet.get());
+
+    BOOST_CHECK(RemoveWallet(context, wallet, /*load_on_start=*/false));
+    BOOST_CHECK(!GetWallet(context, name));
+    WaitForDeleteWallet(std::move(wallet));
+
+    DatabaseOptions load_options;
+    load_options.require_existing = true;
+    load_options.use_unsafe_sync = true;
+
+    status = DatabaseStatus::FAILED_LOAD;
+    wallet = LoadWallet(context, name, /*load_on_start=*/true, load_options, status, error, warnings);
+    BOOST_REQUIRE_MESSAGE(wallet, error.original);
+    BOOST_CHECK(status == DatabaseStatus::SUCCESS);
+    BOOST_CHECK(error.empty());
+    BOOST_CHECK(warnings.empty());
+    BOOST_CHECK_EQUAL(GetWallet(context, name).get(), wallet.get());
+
+    BOOST_CHECK(RemoveWallet(context, wallet, /*load_on_start=*/false));
+    BOOST_CHECK(!GetWallet(context, name));
+    WaitForDeleteWallet(std::move(wallet));
+}
+
 BOOST_FIXTURE_TEST_CASE(RemoveTxs, TestChain100Setup)
 {
     m_args.ForceSetArg("-unsafesqlitesync", "1");
