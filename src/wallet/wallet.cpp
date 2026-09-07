@@ -174,7 +174,7 @@ bool RemoveWallet(WalletContext& context, const std::shared_ptr<CWallet>& wallet
 {
     assert(wallet);
 
-    interfaces::Chain& chain = wallet->chain();
+    interfaces::Chain* chain = wallet->HaveChain() ? &wallet->chain() : nullptr;
     std::string name = wallet->GetName();
     WITH_LOCK(wallet->cs_wallet, wallet->WriteBestBlock());
 
@@ -189,8 +189,9 @@ bool RemoveWallet(WalletContext& context, const std::shared_ptr<CWallet>& wallet
     // Notify unload so that upper layers release the shared pointer.
     wallet->NotifyUnload();
 
-    // Write the wallet setting
-    UpdateWalletSetting(chain, name, load_on_start, warnings);
+    // Write the wallet setting. Without a chain there is no node settings file
+    // to update, so skip it.
+    if (chain) UpdateWalletSetting(*chain, name, load_on_start, warnings);
 
     return true;
 }
@@ -292,7 +293,7 @@ std::shared_ptr<CWallet> LoadWalletInternal(WalletContext& context, const std::s
             return nullptr;
         }
 
-        context.chain->initMessage(_("Loading wallet…"));
+        if (context.chain) context.chain->initMessage(_("Loading wallet…"));
         std::shared_ptr<CWallet> wallet = CWallet::LoadExisting(context, name, std::move(database), error, warnings);
         if (!wallet) {
             error = Untranslated("Wallet loading failed.") + Untranslated(" ") + error;
@@ -302,10 +303,11 @@ std::shared_ptr<CWallet> LoadWalletInternal(WalletContext& context, const std::s
 
         NotifyWalletLoaded(context, wallet);
         AddWallet(context, wallet);
-        wallet->postInitProcess();
+        if (context.chain) wallet->postInitProcess();
 
-        // Write the wallet setting
-        UpdateWalletSetting(*context.chain, name, load_on_start, warnings);
+        // Write the wallet setting. Without a chain there is no node settings
+        // file to update, so skip it.
+        if (context.chain) UpdateWalletSetting(*context.chain, name, load_on_start, warnings);
 
         return wallet;
     } catch (const std::runtime_error& e) {
@@ -425,7 +427,7 @@ std::shared_ptr<CWallet> CreateWallet(WalletContext& context, const std::string&
     }
 
     // Make the wallet
-    context.chain->initMessage(_("Creating wallet…"));
+    if (context.chain) context.chain->initMessage(_("Creating wallet…"));
     std::shared_ptr<CWallet> wallet = CWallet::CreateNew(context, name, std::move(database), wallet_creation_flags, born_encrypted, error, warnings);
     if (!wallet) {
         error = Untranslated("Wallet creation failed.") + Untranslated(" ") + error;
@@ -445,10 +447,11 @@ std::shared_ptr<CWallet> CreateWallet(WalletContext& context, const std::string&
     WITH_LOCK(wallet->cs_wallet, wallet->LogStats());
     NotifyWalletLoaded(context, wallet);
     AddWallet(context, wallet);
-    wallet->postInitProcess();
+    if (context.chain) wallet->postInitProcess();
 
-    // Write the wallet settings
-    UpdateWalletSetting(*context.chain, name, load_on_start, warnings);
+    // Write the wallet settings. Without a chain there is no node settings file
+    // to update, so skip it.
+    if (context.chain) UpdateWalletSetting(*context.chain, name, load_on_start, warnings);
 
     status = DatabaseStatus::SUCCESS;
     return wallet;
