@@ -144,9 +144,7 @@ typedef struct btck_ScriptPubkey btck_ScriptPubkey;
 typedef struct btck_TransactionOutput btck_TransactionOutput;
 
 /**
- * Opaque data structure for holding a logging connection.
- *
- * The logging connection can be used to manually stop logging.
+ * Opaque data structure for a bounded stream of log messages.
  *
  * Messages that were logged before a connection is created are buffered in a
  * 1MB buffer. Logging can alternatively be permanently disabled by calling
@@ -155,6 +153,9 @@ typedef struct btck_TransactionOutput btck_TransactionOutput;
  * instances.
  */
 typedef struct btck_LoggingConnection btck_LoggingConnection;
+
+/** An owned log message, independent of the logging connection it was read from. */
+typedef struct btck_LogMessage btck_LogMessage;
 
 /**
  * Opaque data structure for holding the chain parameters.
@@ -352,12 +353,6 @@ typedef uint8_t btck_Warning;
 /** Callback function types */
 
 /**
- * Function signature for the global logging callback. All bitcoin kernel
- * internal logs will pass through this callback.
- */
-typedef void (*btck_LogCallback)(void* user_data, const char* message, size_t message_len);
-
-/**
  * Function signature for freeing user data.
  */
 typedef void (*btck_DestroyCallback)(void* user_data);
@@ -498,6 +493,12 @@ typedef uint8_t btck_LogLevel;
 #define btck_LogLevel_TRACE ((btck_LogLevel)(0))
 #define btck_LogLevel_DEBUG ((btck_LogLevel)(1))
 #define btck_LogLevel_INFO ((btck_LogLevel)(2))
+
+/** Result of reading a logging connection. */
+typedef uint8_t btck_LogReadStatus;
+#define btck_LogReadStatus_OK ((btck_LogReadStatus)(0))
+#define btck_LogReadStatus_INTERRUPTED ((btck_LogReadStatus)(1))
+#define btck_LogReadStatus_ERROR ((btck_LogReadStatus)(2))
 
 /**
  * Options controlling the format of log messages.
@@ -926,27 +927,71 @@ BITCOINKERNEL_API void btck_logging_enable_category(btck_LogCategory category);
 BITCOINKERNEL_API void btck_logging_disable_category(btck_LogCategory category);
 
 /**
- * @brief Start logging messages through the provided callback. Log messages
- * produced before this function is first called are buffered and on calling this
- * function are logged immediately.
+ * @brief Start capturing formatted messages in a native buffer. Log production
+ * only queues data; applications read and handle messages on their own threads.
+ * The first connection also receives messages retained in the early logging buffer.
  *
- * @param[in] log_callback               Non-null, function through which messages will be logged.
- * @param[in] user_data                  Nullable, holds a user-defined opaque structure. Is passed back
- *                                       to the user through the callback. If the user_data_destroy_callback
- *                                       is also defined it is assumed that ownership of the user_data is passed
- *                                       to the created logging connection.
- * @param[in] user_data_destroy_callback Nullable, function for freeing the user data.
- * @return                               A new kernel logging connection, or null on error.
+ * Each connection has its own buffer. The capacity limits pending message bytes,
+ * excluding container overhead and messages already read. Producers never wait
+ * for buffer space: the oldest pending messages are discarded to make room.
+ * A message larger than the capacity is discarded without evicting pending messages.
+ * Discarded messages, including buffer allocation failures, are reported by subsequent reads.
+ * This must not be called after btck_logging_disable.
+ *
+ * @param[in] max_buffer_bytes Maximum pending message bytes; zero discards all messages.
+ * @return                     A new kernel logging connection, or null on error.
  */
 BITCOINKERNEL_API btck_LoggingConnection* BITCOINKERNEL_WARN_UNUSED_RESULT btck_logging_connection_create(
-    btck_LogCallback log_callback,
-    void* user_data,
-    btck_DestroyCallback user_data_destroy_callback) BITCOINKERNEL_ARG_NONNULL(1);
+    size_t max_buffer_bytes);
 
 /**
- * Stop logging and destroy the logging connection.
+ * @brief Wait for and read one owned message, or a report of discarded messages.
+ * An empty message reports losses when no message survived. Each read also reports
+ * the number of messages discarded since the previous read on this connection.
+ * Multiple readers may share a connection; each message is returned to only one.
+ *
+ * @param[in]  logging_connection Non-null.
+ * @param[out] status             Non-null. Always set: OK for a returned message,
+ *                                INTERRUPTED once interrupted and empty, or ERROR on failure.
+ *                                An error consumes neither pending messages nor loss counts.
+ * @return                        An owned message, or null on interruption or error.
+ */
+BITCOINKERNEL_API btck_LogMessage* BITCOINKERNEL_WARN_UNUSED_RESULT btck_logging_connection_read(
+    btck_LoggingConnection* logging_connection,
+    btck_LogReadStatus* status) BITCOINKERNEL_ARG_NONNULL(1, 2);
+
+/**
+ * Permanently stop accepting messages and wake all readers. Pending messages and
+ * losses remain readable; once these are consumed, reads return INTERRUPTED.
+ * May be called concurrently with reads and logging. Repeated calls are harmless.
+ *
+ * @param[in] logging_connection Non-null.
+ */
+BITCOINKERNEL_API void btck_logging_connection_interrupt(
+    btck_LoggingConnection* logging_connection) BITCOINKERNEL_ARG_NONNULL(1);
+
+/**
+ * Stop logging and destroy the connection. No reads may be running: interrupt the
+ * connection and wait for its readers to finish first. Messages already read remain valid.
  */
 BITCOINKERNEL_API void btck_logging_connection_destroy(btck_LoggingConnection* logging_connection);
+
+/**
+ * Get the message text, valid until the message is destroyed. The length is zero
+ * for a loss-only report.
+ *
+ * @param[in]  message     Non-null.
+ * @param[out] message_len Non-null, receives the number of bytes in the text.
+ */
+BITCOINKERNEL_API const char* btck_log_message_get_text(
+    const btck_LogMessage* message, size_t* message_len) BITCOINKERNEL_ARG_NONNULL(1, 2);
+
+/** Get the number of discarded messages reported by this read. */
+BITCOINKERNEL_API size_t btck_log_message_get_discarded(
+    const btck_LogMessage* message) BITCOINKERNEL_ARG_NONNULL(1);
+
+/** Destroy a log message. */
+BITCOINKERNEL_API void btck_log_message_destroy(btck_LogMessage* message);
 
 ///@}
 

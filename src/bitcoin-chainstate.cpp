@@ -20,6 +20,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 using namespace btck;
@@ -43,10 +44,25 @@ std::vector<std::byte> hex_string_to_byte_vec(std::string_view hex)
 
 class KernelLog
 {
+    Logger m_logger;
+    std::thread m_reader{[this] {
+        try {
+            while (auto message = m_logger.Read()) {
+                if (message->GetDiscarded() > 0) {
+                    std::cerr << "kernel: " << message->GetDiscarded() << " log messages discarded\n";
+                }
+                if (!message->GetText().empty()) std::cout << "kernel: " << message->GetText();
+            }
+        } catch (const std::exception& error) {
+            std::cerr << "Failed to read kernel log messages: " << error.what() << '\n';
+        }
+    }};
+
 public:
-    void LogMessage(std::string_view message)
+    ~KernelLog()
     {
-        std::cout << "kernel: " << message;
+        m_logger.Interrupt();
+        m_reader.join();
     }
 };
 
@@ -168,7 +184,7 @@ int main(int argc, char* argv[])
 
     logging_set_options(logging_options);
 
-    Logger logger{std::make_unique<KernelLog>()};
+    KernelLog logger;
 
     ContextOptions options{};
     ChainParams params{has_regtest_flag ? ChainType::REGTEST : ChainType::MAINNET};

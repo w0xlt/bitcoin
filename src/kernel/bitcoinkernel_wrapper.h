@@ -943,22 +943,37 @@ inline void logging_disable_category(LogCategory category)
     btck_logging_disable_category(static_cast<btck_LogCategory>(category));
 }
 
-template <typename T>
-concept Log = requires(T a, std::string_view message) {
-    { a.LogMessage(message) } -> std::same_as<void>;
-};
-
-template <Log T>
-class Logger : UniqueHandle<btck_LoggingConnection, btck_logging_connection_destroy>
+class LogMessage : public UniqueHandle<btck_LogMessage, btck_log_message_destroy>
 {
 public:
-    Logger(std::unique_ptr<T> log)
-        : UniqueHandle{btck_logging_connection_create(
-              +[](void* user_data, const char* message, size_t message_len) { static_cast<T*>(user_data)->LogMessage({message, message_len}); },
-              log.release(),
-              +[](void* user_data) { delete static_cast<T*>(user_data); })}
+    using UniqueHandle::UniqueHandle;
+
+    std::string_view GetText() const
     {
+        size_t len;
+        const char* text{btck_log_message_get_text(get(), &len)};
+        return {text, len};
     }
+
+    size_t GetDiscarded() const { return btck_log_message_get_discarded(get()); }
+};
+
+class Logger : public UniqueHandle<btck_LoggingConnection, btck_logging_connection_destroy>
+{
+public:
+    explicit Logger(size_t max_buffer_bytes = 1'000'000)
+        : UniqueHandle{btck_logging_connection_create(max_buffer_bytes)} {}
+
+    std::optional<LogMessage> Read()
+    {
+        btck_LogReadStatus status;
+        auto* message{btck_logging_connection_read(get(), &status)};
+        if (status == btck_LogReadStatus_INTERRUPTED) return std::nullopt;
+        if (status == btck_LogReadStatus_ERROR) throw std::runtime_error("Failed to read log message");
+        return LogMessage{message};
+    }
+
+    void Interrupt() { btck_logging_connection_interrupt(get()); }
 };
 
 class BlockTreeEntry : public View<btck_BlockTreeEntry>

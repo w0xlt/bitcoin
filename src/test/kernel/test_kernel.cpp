@@ -16,8 +16,10 @@
 #include <test/util/common.h>
 
 #include <charconv>
+#include <chrono>
 #include <cstdint>
 #include <cstdlib>
+#include <future>
 #include <iostream>
 #include <memory>
 #include <optional>
@@ -29,6 +31,7 @@
 #include <vector>
 
 using namespace btck;
+using namespace std::chrono_literals;
 
 std::string random_string(uint32_t length)
 {
@@ -92,13 +95,26 @@ void check_equal(std::span<const std::byte> _actual, std::span<const std::byte> 
         expected.begin(), expected.end());
 }
 
-class TestLog
-{
-public:
-    void LogMessage(std::string_view message)
+struct LoggingSetup {
+    LoggingSetup()
     {
-        std::cout << "kernel: " << message;
+        logging_set_options({});
+        logging_disable_category(LogCategory::ALL);
+        Logger clear; // Discard startup messages left by earlier tests.
     }
+};
+
+// Creating custom signet parameters emits an Info message containing the challenge.
+void LogTestMessage(uint8_t value)
+{
+    const std::byte challenge{value};
+    ChainParams params{std::span{&challenge, 1}};
+}
+
+// Wake a reader before its future is destroyed, including when a test throws.
+struct InterruptLogReader {
+    Logger& m_logger;
+    ~InterruptLogReader() { m_logger.Interrupt(); }
 };
 
 struct TestDirectory {
@@ -665,10 +681,166 @@ BOOST_AUTO_TEST_CASE(logging_tests)
     {
         logging_set_level_category(LogCategory::KERNEL, LogLevel::TRACE_LEVEL);
         logging_enable_category(LogCategory::KERNEL);
-        Logger logger{std::make_unique<TestLog>()};
-        Logger logger_2{std::make_unique<TestLog>()};
+        Logger logger;
+        {
+            Logger logger_2;
+            logger_2.Interrupt();
+            auto message{logger_2.Read()};
+            BOOST_REQUIRE(message);
+            BOOST_CHECK(message->GetText().ends_with("[kernel:debug] Logger connected.\n"));
+            BOOST_CHECK_EQUAL(message->GetDiscarded(), 0);
+            BOOST_CHECK(!logger_2.Read());
+        }
+        logger.Interrupt();
+        size_t count{0};
+        while (logger.Read()) ++count;
+        BOOST_CHECK_GE(count, 3);
     }
-    Logger logger{std::make_unique<TestLog>()};
+    Logger logger;
+    logger.Interrupt();
+    BOOST_CHECK(logger.Read());
+    BOOST_CHECK(!logger.Read());
+}
+
+BOOST_FIXTURE_TEST_CASE(logging_stream, LoggingSetup)
+{
+    Logger logger;
+    Logger other;
+    LogTestMessage(1);
+    btck_LoggingOptions options{};
+    options.always_print_category_levels = true;
+    logging_set_options(options);
+    LogTestMessage(2);
+    auto first{logger.Read()};
+    auto second{logger.Read()};
+    BOOST_REQUIRE(first);
+    BOOST_REQUIRE(second);
+    BOOST_CHECK_EQUAL(first->GetText(), "Signet with challenge 01\n");
+    BOOST_CHECK_EQUAL(second->GetText(), "[all:info] Signet with challenge 02\n");
+    BOOST_CHECK_EQUAL(first->GetDiscarded(), 0);
+    BOOST_CHECK_EQUAL(second->GetDiscarded(), 0);
+
+    // Application handling can call back into kernel APIs that log.
+    LogTestMessage(3);
+    auto reentrant{logger.Read()};
+    BOOST_REQUIRE(reentrant);
+    BOOST_CHECK_EQUAL(reentrant->GetText(), "[all:info] Signet with challenge 03\n");
+    BOOST_CHECK_EQUAL(first->GetText(), "Signet with challenge 01\n");
+    other.Interrupt();
+    auto independent{other.Read()};
+    BOOST_REQUIRE(independent);
+    BOOST_CHECK_EQUAL(independent->GetText(), first->GetText());
+}
+
+BOOST_FIXTURE_TEST_CASE(logging_stream_c_api_lifetime, LoggingSetup)
+{
+    std::unique_ptr<btck_LoggingConnection, decltype(&btck_logging_connection_destroy)> connection{
+        btck_logging_connection_create(100), btck_logging_connection_destroy};
+    BOOST_REQUIRE(connection);
+    LogTestMessage(1);
+    btck_LogReadStatus status;
+    std::unique_ptr<btck_LogMessage, decltype(&btck_log_message_destroy)> message{
+        btck_logging_connection_read(connection.get(), &status), btck_log_message_destroy};
+    BOOST_CHECK_EQUAL(status, btck_LogReadStatus_OK);
+    BOOST_REQUIRE(message);
+    size_t len;
+    const char* text{btck_log_message_get_text(message.get(), &len)};
+    const std::string_view saved{text, len};
+    btck_logging_connection_interrupt(connection.get());
+    BOOST_CHECK(btck_logging_connection_read(connection.get(), &status) == nullptr);
+    BOOST_CHECK_EQUAL(status, btck_LogReadStatus_INTERRUPTED);
+    connection.reset();
+    BOOST_CHECK_EQUAL(saved, "Signet with challenge 01\n");
+    BOOST_CHECK_EQUAL(btck_log_message_get_discarded(message.get()), 0);
+}
+
+BOOST_FIXTURE_TEST_CASE(logging_stream_capacity, LoggingSetup)
+{
+    Logger logger{std::string_view{"Signet with challenge 01\n"}.size()};
+    LogTestMessage(1);
+    LogTestMessage(2);
+    logger.Interrupt();
+    LogTestMessage(3); // An interrupted connection no longer captures messages.
+    auto message{logger.Read()};
+    BOOST_REQUIRE(message);
+    BOOST_CHECK_EQUAL(message->GetText(), "Signet with challenge 02\n");
+    BOOST_CHECK_EQUAL(message->GetDiscarded(), 1);
+    BOOST_CHECK(!logger.Read());
+}
+
+BOOST_FIXTURE_TEST_CASE(logging_stream_wait, LoggingSetup)
+{
+    for (size_t capacity : {0, 100}) {
+        Logger logger{capacity};
+        std::promise<void> started;
+        auto reader{std::async(std::launch::async, [&] {
+            started.set_value();
+            return logger.Read();
+        })};
+        InterruptLogReader interrupt{logger};
+        started.get_future().wait();
+        const auto before{reader.wait_for(0s)};
+        LogTestMessage(1);
+        const auto after{reader.wait_for(5s)};
+        logger.Interrupt();
+        auto message{reader.get()};
+        BOOST_CHECK(before == std::future_status::timeout);
+        BOOST_CHECK(after == std::future_status::ready);
+        BOOST_REQUIRE(message);
+        BOOST_CHECK_EQUAL(message->GetText(), capacity == 0 ? "" : "Signet with challenge 01\n");
+        BOOST_CHECK_EQUAL(message->GetDiscarded(), capacity == 0 ? 1 : 0);
+        BOOST_CHECK(!logger.Read());
+    }
+    Logger logger;
+    std::promise<void> started;
+    auto reader{std::async(std::launch::async, [&] {
+        started.set_value();
+        return logger.Read();
+    })};
+    InterruptLogReader interrupt{logger};
+    started.get_future().wait();
+    logger.Interrupt();
+    const auto status{reader.wait_for(5s)};
+    auto message{reader.get()};
+    BOOST_CHECK(status == std::future_status::ready);
+    BOOST_CHECK(!message);
+}
+
+BOOST_FIXTURE_TEST_CASE(logging_stream_concurrent, LoggingSetup)
+{
+    Logger logger;
+    Logger reference;
+    auto reader{std::async(std::launch::async, [&] {
+        std::vector<LogMessage> messages;
+        while (auto message = logger.Read()) messages.push_back(std::move(*message));
+        return messages;
+    })};
+    InterruptLogReader interrupt{logger};
+    std::vector<std::future<void>> producers;
+    for (uint8_t producer{0}; producer < 2; ++producer) {
+        producers.push_back(std::async(std::launch::async, [producer] {
+            for (uint8_t i{0}; i < 64; ++i) LogTestMessage(producer * 64 + i);
+        }));
+    }
+    auto connections{std::async(std::launch::async, [] {
+        for (int i{0}; i < 100; ++i) Logger transient{64};
+    })};
+    for (auto& producer : producers) producer.get();
+    connections.get();
+    logger.Interrupt();
+    reference.Interrupt();
+    auto received{reader.get()};
+    std::vector<std::string> expected;
+    while (auto message = reference.Read()) {
+        BOOST_CHECK_EQUAL(message->GetDiscarded(), 0);
+        expected.emplace_back(message->GetText());
+    }
+    BOOST_REQUIRE_EQUAL(expected.size(), 128);
+    BOOST_REQUIRE_EQUAL(received.size(), expected.size());
+    for (size_t i{0}; i < expected.size(); ++i) {
+        BOOST_CHECK_EQUAL(received[i].GetText(), expected[i]);
+        BOOST_CHECK_EQUAL(received[i].GetDiscarded(), 0);
+    }
 }
 
 BOOST_AUTO_TEST_CASE(btck_chainparams_tests)
@@ -774,7 +946,7 @@ Context create_context(std::shared_ptr<TestKernelNotifications> notifications, C
 
 BOOST_AUTO_TEST_CASE(btck_chainman_tests)
 {
-    Logger logger{std::make_unique<TestLog>()};
+    Logger logger;
     auto test_directory{TestDirectory{"chainman_test_bitcoin_kernel"}};
 
     { // test with default context

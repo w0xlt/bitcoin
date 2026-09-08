@@ -12,6 +12,7 @@ snapshot and extend the snapshot chain with new blocks.
 """
 
 import subprocess
+from pathlib import Path
 
 from test_framework.test_framework import BitcoinTestFramework
 from test_framework.util import assert_equal
@@ -80,6 +81,20 @@ class BitcoinChainstateTest(BitcoinTestFramework):
         self.add_block(datadir, "00", expected_stderr="Block decode failed")
         self.add_block(datadir, "", expected_stderr="Empty line found")
 
+    def startup_failure_test(self):
+        self.log.info("Test bitcoin-chainstate stops its log reader after startup failure")
+        datadir = Path(self.options.tmpdir) / "chainstate_startup_failure"
+        datadir.mkdir()
+        (datadir / "chainstate").touch()  # Prevent creation of the chainstate database.
+        proc = subprocess.run(
+            self.get_binaries().chainstate_argv() + ["-regtest", str(datadir)],
+            input="", capture_output=True, text=True,
+            timeout=5 * self.options.timeout_factor,
+        )
+        assert_equal(proc.returncode, 1)
+        assert "Failed to instantiate ChainMan, exiting" in proc.stderr
+        assert "Failed to load chainstate" in proc.stdout
+
     def assumeutxo_test(self, dump_output_path):
         n0 = self.nodes[0]
         n1 = self.nodes[1]
@@ -98,6 +113,7 @@ class BitcoinChainstateTest(BitcoinTestFramework):
         self.add_block(datadir, n0.getblock(new_tip_hash, 0), expected_stdout="Block tip changed")
 
     def run_test(self):
+        self.startup_failure_test()
         dump_output = self.generate_snapshot_chain()
         self.basic_test()
         self.assumeutxo_test(dump_output['path'])

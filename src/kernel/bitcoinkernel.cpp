@@ -45,7 +45,6 @@
 #include <exception>
 #include <functional>
 #include <limits>
-#include <list>
 #include <memory>
 #include <optional>
 #include <span>
@@ -236,50 +235,35 @@ btck_Warning cast_btck_warning(kernel::Warning warning)
 }
 
 struct LoggingConnection {
-    std::unique_ptr<std::list<std::function<void(const std::string&)>>::iterator> m_connection;
-    void* m_user_data;
-    std::function<void(void* user_data)> m_deleter;
+    std::unique_ptr<BCLog::LogBuffer> m_buffer;
 
-    LoggingConnection(btck_LogCallback callback, void* user_data, btck_DestroyCallback user_data_destroy_callback)
+    explicit LoggingConnection(size_t max_buffer_bytes)
     {
         LOCK(cs_main);
-
-        auto connection{LogInstance().PushBackCallback([callback, user_data](const std::string& str) { callback(user_data, str.c_str(), str.length()); })};
-
-        // Only start logging if we just added the connection.
-        if (LogInstance().NumConnections() == 1 && !LogInstance().StartLogging()) {
-            LogError("Logger start failed.");
-            LogInstance().DeleteCallback(connection);
-            if (user_data && user_data_destroy_callback) {
-                user_data_destroy_callback(user_data);
+        m_buffer = std::make_unique<BCLog::LogBuffer>(LogInstance(), max_buffer_bytes);
+        try {
+            // Only start logging for the first connection.
+            if (LogInstance().NumConnections() == 1 && !LogInstance().StartLogging()) {
+                throw std::runtime_error("Failed to start logging");
             }
-            throw std::runtime_error("Failed to start logging");
+            LogDebug(BCLog::KERNEL, "Logger connected.");
+        } catch (...) {
+            Disconnect();
+            throw;
         }
-
-        m_connection = std::make_unique<std::list<std::function<void(const std::string&)>>::iterator>(connection);
-        m_user_data = user_data;
-        m_deleter = user_data_destroy_callback;
-
-        LogDebug(BCLog::KERNEL, "Logger connected.");
     }
 
     ~LoggingConnection()
     {
         LOCK(cs_main);
         LogDebug(BCLog::KERNEL, "Logger disconnecting.");
+        Disconnect();
+    }
 
-        // Switch back to buffering by calling DisconnectTestLogger if the
-        // connection that we are about to remove is the last one.
-        if (LogInstance().NumConnections() == 1) {
-            LogInstance().DisconnectTestLogger();
-        } else {
-            LogInstance().DeleteCallback(*m_connection);
-        }
-
-        m_connection.reset();
-        if (m_user_data && m_deleter) {
-            m_deleter(m_user_data);
-        }
+    void Disconnect() EXCLUSIVE_LOCKS_REQUIRED(cs_main)
+    {
+        m_buffer.reset();
+        if (LogInstance().NumConnections() == 0) LogInstance().DisconnectTestLogger();
     }
 };
 
@@ -492,6 +476,7 @@ struct btck_Transaction : Handle<btck_Transaction, std::shared_ptr<const CTransa
 struct btck_TransactionOutput : Handle<btck_TransactionOutput, CTxOut> {};
 struct btck_ScriptPubkey : Handle<btck_ScriptPubkey, CScript> {};
 struct btck_LoggingConnection : Handle<btck_LoggingConnection, LoggingConnection> {};
+struct btck_LogMessage : Handle<btck_LogMessage, BCLog::LogMessage> {};
 struct btck_ContextOptions : Handle<btck_ContextOptions, ContextOptions> {};
 struct btck_Context : Handle<btck_Context, std::shared_ptr<const Context>> {};
 struct btck_ChainParameters : Handle<btck_ChainParameters, CChainParams> {};
@@ -824,18 +809,59 @@ void btck_logging_disable()
     LogInstance().DisableLogging();
 }
 
-btck_LoggingConnection* btck_logging_connection_create(btck_LogCallback callback, void* user_data, btck_DestroyCallback user_data_destroy_callback)
+btck_LoggingConnection* btck_logging_connection_create(size_t max_buffer_bytes)
 {
     try {
-        return btck_LoggingConnection::create(callback, user_data, user_data_destroy_callback);
+        return btck_LoggingConnection::create(max_buffer_bytes);
     } catch (const std::exception&) {
         return nullptr;
     }
 }
 
+btck_LogMessage* btck_logging_connection_read(btck_LoggingConnection* connection, btck_LogReadStatus* status)
+{
+    *status = btck_LogReadStatus_ERROR;
+    try {
+        // Allocate before consuming a message so allocation failure leaves the stream intact.
+        auto result{std::make_unique<BCLog::LogMessage>()};
+        auto message{btck_LoggingConnection::get(connection).m_buffer->Read()};
+        if (!message) {
+            *status = btck_LogReadStatus_INTERRUPTED;
+            return nullptr;
+        }
+        *result = std::move(*message);
+        *status = btck_LogReadStatus_OK;
+        return btck_LogMessage::ref(result.release());
+    } catch (const std::exception&) {
+        return nullptr;
+    }
+}
+
+void btck_logging_connection_interrupt(btck_LoggingConnection* connection)
+{
+    btck_LoggingConnection::get(connection).m_buffer->Interrupt();
+}
+
 void btck_logging_connection_destroy(btck_LoggingConnection* connection)
 {
     delete connection;
+}
+
+const char* btck_log_message_get_text(const btck_LogMessage* message, size_t* message_len)
+{
+    const auto& text{btck_LogMessage::get(message).message};
+    *message_len = text.size();
+    return text.data();
+}
+
+size_t btck_log_message_get_discarded(const btck_LogMessage* message)
+{
+    return btck_LogMessage::get(message).discarded;
+}
+
+void btck_log_message_destroy(btck_LogMessage* message)
+{
+    delete message;
 }
 
 btck_ChainParameters* btck_chain_parameters_create(const btck_ChainType chain_type)
