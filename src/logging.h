@@ -19,6 +19,7 @@
 #include <atomic>
 #include <cstdint>
 #include <cstring>
+#include <deque>
 #include <functional>
 #include <list>
 #include <memory>
@@ -66,6 +67,47 @@ namespace BCLog {
     constexpr uint64_t RATELIMIT_MAX_BYTES{1_MiB}; // maximum number of bytes per source location that can be logged within the RATELIMIT_WINDOW
     constexpr auto RATELIMIT_WINDOW{1h}; // time window after which log ratelimit stats are reset
     constexpr bool DEFAULT_LOGRATELIMIT{true};
+
+    class Logger;
+
+    /** An owned log message and the number of messages discarded since the previous read.
+     * An empty message reports discarded messages when no message is available.
+     */
+    struct LogMessage {
+        std::string message;
+        size_t discarded{0};
+    };
+
+    /** Capture formatted log messages without running consumer code in the logger.
+     * The capacity limits pending message bytes, excluding container overhead and messages
+     * already read. The oldest pending messages are discarded when the buffer fills.
+     * A message larger than the capacity is discarded without evicting pending messages.
+     * The logger must outlive this buffer, and readers must finish before its destruction.
+     */
+    class LogBuffer
+    {
+    private:
+        friend class Logger;
+        Logger& m_logger;
+        const size_t m_max_bytes;
+        StdMutex m_mutex;
+        std::deque<std::string> m_messages GUARDED_BY(m_mutex);
+        size_t m_bytes GUARDED_BY(m_mutex){0};
+        size_t m_discarded GUARDED_BY(m_mutex){0};
+
+        void Append(const std::string& message) EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
+
+    public:
+        LogBuffer(Logger& logger, size_t max_bytes);
+        ~LogBuffer();
+        LogBuffer(const LogBuffer&) = delete;
+        LogBuffer& operator=(const LogBuffer&) = delete;
+
+        /** Read one message without waiting, or report losses even if no message survived.
+         * Returns nullopt if neither a message nor discarded messages are available.
+         */
+        std::optional<LogMessage> TryRead() EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
+    };
 
     //! Fixed window rate limiter for logging.
     class LogRateLimiter
@@ -130,6 +172,7 @@ namespace BCLog {
     class Logger
     {
     private:
+        friend class LogBuffer;
         mutable StdMutex m_cs; // Can not use Mutex from sync.h because in debug mode it would cause a deadlock when a potential deadlock was detected
 
         FILE* m_fileout GUARDED_BY(m_cs) = nullptr;
@@ -158,6 +201,10 @@ namespace BCLog {
 
         /** Slots that connect to the print signal */
         std::list<std::function<void(const std::string&)>> m_print_callbacks GUARDED_BY(m_cs){};
+        std::list<LogBuffer*> m_log_buffers GUARDED_BY(m_cs);
+
+        void AddBuffer(LogBuffer& buffer) EXCLUSIVE_LOCKS_REQUIRED(!m_cs);
+        void RemoveBuffer(LogBuffer& buffer) EXCLUSIVE_LOCKS_REQUIRED(!m_cs);
 
         /** Send an entry to the log output (internal) */
         void LogPrint_(util::log::Entry log_entry) EXCLUSIVE_LOCKS_REQUIRED(m_cs);
@@ -184,7 +231,7 @@ namespace BCLog {
         bool Enabled() const EXCLUSIVE_LOCKS_REQUIRED(!m_cs)
         {
             STDLOCK(m_cs);
-            return m_buffering || m_print_to_console || m_print_to_file || !m_print_callbacks.empty();
+            return m_buffering || m_print_to_console || m_print_to_file || !m_print_callbacks.empty() || !m_log_buffers.empty();
         }
 
         /** Connect a slot to the print signal and return the connection */
@@ -205,7 +252,7 @@ namespace BCLog {
         size_t NumConnections() EXCLUSIVE_LOCKS_REQUIRED(!m_cs)
         {
             STDLOCK(m_cs);
-            return m_print_callbacks.size();
+            return m_print_callbacks.size() + m_log_buffers.size();
         }
 
         /** Start logging (and flush all buffered messages) */

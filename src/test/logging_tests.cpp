@@ -110,6 +110,127 @@ BOOST_AUTO_TEST_CASE(logging_timer)
     BOOST_CHECK_EQUAL(micro_timer.LogMsg("msg").substr(0, result_prefix.size()), result_prefix);
 }
 
+static void LogTo(BCLog::Logger& logger, std::string message)
+{
+    logger.LogPrint({.category = BCLog::ALL, .level = BCLog::Level::Info, .should_ratelimit = false,
+                     .source_loc = SourceLocation{__func__}, .message = std::move(message)});
+}
+
+BOOST_AUTO_TEST_CASE(logging_buffer_capture)
+{
+    BCLog::Logger logger;
+    logger.m_log_timestamps = false;
+    LogTo(logger, "before start");
+    std::optional<BCLog::LogMessage> owned;
+    {
+        BCLog::LogBuffer first{logger, 100};
+        BOOST_CHECK(!first.TryRead());
+        BOOST_REQUIRE(logger.StartLogging());
+        auto early{first.TryRead()};
+        BOOST_REQUIRE(early);
+        BOOST_CHECK_EQUAL(early->message, "before start\n");
+        BOOST_CHECK_EQUAL(early->discarded, 0);
+        BOOST_CHECK(logger.Enabled());
+        {
+            BCLog::LogBuffer second{logger, 100};
+            BOOST_CHECK_EQUAL(logger.NumConnections(), 2);
+            BOOST_CHECK(!second.TryRead());
+            LogTo(logger, "captured\x01");
+            // Pending messages keep their formatting even if options change before reading.
+            logger.m_always_print_category_level = true;
+            owned = first.TryRead();
+            auto other{second.TryRead()};
+            BOOST_REQUIRE(owned);
+            BOOST_REQUIRE(other);
+            BOOST_CHECK_EQUAL(owned->message, "captured\\x01\n");
+            BOOST_CHECK_EQUAL(other->message, owned->message);
+            BOOST_CHECK_EQUAL(other->discarded, 0);
+            BOOST_CHECK(!first.TryRead());
+            BOOST_CHECK(!second.TryRead());
+        }
+        BOOST_CHECK_EQUAL(logger.NumConnections(), 1);
+        logger.m_always_print_category_level = false;
+        LogTo(logger, "after disconnect");
+        auto remaining{first.TryRead()};
+        BOOST_REQUIRE(remaining);
+        BOOST_CHECK_EQUAL(remaining->message, "after disconnect\n");
+    }
+    BOOST_CHECK_EQUAL(logger.NumConnections(), 0);
+    BOOST_CHECK(!logger.Enabled());
+    // Reading transfers ownership; destroying the buffer does not invalidate the message.
+    BOOST_CHECK_EQUAL(owned->message, "captured\\x01\n");
+}
+
+BOOST_AUTO_TEST_CASE(logging_buffer_limits)
+{
+    BCLog::Logger logger;
+    logger.m_log_timestamps = false;
+    BCLog::LogBuffer buffer{logger, 6};
+    BOOST_REQUIRE(logger.StartLogging());
+    LogTo(logger, "aa");
+    LogTo(logger, "bb"); // The two formatted messages exactly fill the buffer.
+    LogTo(logger, "c"); // Drop the oldest message to make room.
+    auto message{buffer.TryRead()};
+    BOOST_REQUIRE(message);
+    BOOST_CHECK_EQUAL(message->message, "bb\n");
+    BOOST_CHECK_EQUAL(message->discarded, 1);
+
+    LogTo(logger, "ddd"); // A read made room for this message.
+    message = buffer.TryRead();
+    BOOST_REQUIRE(message);
+    BOOST_CHECK_EQUAL(message->message, "c\n");
+    BOOST_CHECK_EQUAL(message->discarded, 0);
+    message = buffer.TryRead();
+    BOOST_REQUIRE(message);
+    BOOST_CHECK_EQUAL(message->message, "ddd\n");
+    BOOST_CHECK_EQUAL(message->discarded, 0);
+    BOOST_CHECK(!buffer.TryRead());
+
+    LogTo(logger, "z");
+    LogTo(logger, "123456"); // Oversized messages do not evict the pending message.
+    message = buffer.TryRead();
+    BOOST_REQUIRE(message);
+    BOOST_CHECK_EQUAL(message->message, "z\n");
+    BOOST_CHECK_EQUAL(message->discarded, 1);
+    BOOST_CHECK(!buffer.TryRead());
+
+    LogTo(logger, "a");
+    LogTo(logger, "b");
+    LogTo(logger, "ccccc"); // Making room can discard more than one message.
+    message = buffer.TryRead();
+    BOOST_REQUIRE(message);
+    BOOST_CHECK_EQUAL(message->message, "ccccc\n");
+    BOOST_CHECK_EQUAL(message->discarded, 2);
+    BOOST_CHECK(!buffer.TryRead());
+}
+
+BOOST_AUTO_TEST_CASE(logging_buffer_loss_only)
+{
+    BCLog::Logger logger;
+    logger.m_log_timestamps = false;
+    BCLog::LogBuffer zero{logger, 0};
+    BCLog::LogBuffer small{logger, 1};
+    BOOST_REQUIRE(logger.StartLogging());
+    LogTo(logger, "oversized");
+    LogTo(logger, "also oversized");
+    for (auto* buffer : {&zero, &small}) {
+        auto message{buffer->TryRead()};
+        BOOST_REQUIRE(message);
+        BOOST_CHECK(message->message.empty());
+        BOOST_CHECK_EQUAL(message->discarded, 2);
+        BOOST_CHECK(!buffer->TryRead());
+    }
+    LogTo(logger, ""); // Even an empty log entry contains its terminating newline.
+    auto message{zero.TryRead()};
+    BOOST_REQUIRE(message);
+    BOOST_CHECK(message->message.empty());
+    BOOST_CHECK_EQUAL(message->discarded, 1);
+    message = small.TryRead();
+    BOOST_REQUIRE(message);
+    BOOST_CHECK_EQUAL(message->message, "\n");
+    BOOST_CHECK_EQUAL(message->discarded, 0);
+}
+
 BOOST_FIXTURE_TEST_CASE(logging_LogPrint, LogSetup)
 {
     LogInstance().m_log_sourcelocations = true;

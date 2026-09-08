@@ -14,6 +14,7 @@
 #include <array>
 #include <cstring>
 #include <map>
+#include <new>
 #include <optional>
 #include <utility>
 
@@ -49,6 +50,62 @@ bool fLogIPs = DEFAULT_LOGIPS;
 static int FileWriteStr(std::string_view str, FILE *fp)
 {
     return fwrite(str.data(), 1, str.size(), fp);
+}
+
+BCLog::LogBuffer::LogBuffer(Logger& logger, size_t max_bytes)
+    : m_logger{logger}, m_max_bytes{max_bytes}
+{
+    m_logger.AddBuffer(*this);
+}
+
+BCLog::LogBuffer::~LogBuffer()
+{
+    m_logger.RemoveBuffer(*this);
+}
+
+void BCLog::LogBuffer::Append(const std::string& message)
+{
+    STDLOCK(m_mutex);
+    if (message.size() > m_max_bytes) {
+        ++m_discarded;
+        return;
+    }
+    while (m_bytes > m_max_bytes - message.size()) {
+        m_bytes -= m_messages.front().size();
+        m_messages.pop_front();
+        ++m_discarded;
+    }
+    try {
+        m_messages.push_back(message);
+        m_bytes += message.size();
+    } catch (const std::bad_alloc&) {
+        ++m_discarded;
+    }
+}
+
+std::optional<BCLog::LogMessage> BCLog::LogBuffer::TryRead()
+{
+    STDLOCK(m_mutex);
+    if (m_messages.empty() && m_discarded == 0) return std::nullopt;
+    LogMessage result{.message = {}, .discarded = std::exchange(m_discarded, 0)};
+    if (!m_messages.empty()) {
+        m_bytes -= m_messages.front().size();
+        result.message = std::move(m_messages.front());
+        m_messages.pop_front();
+    }
+    return result;
+}
+
+void BCLog::Logger::AddBuffer(LogBuffer& buffer)
+{
+    STDLOCK(m_cs);
+    m_log_buffers.push_back(&buffer);
+}
+
+void BCLog::Logger::RemoveBuffer(LogBuffer& buffer)
+{
+    STDLOCK(m_cs);
+    m_log_buffers.remove(&buffer);
 }
 
 bool BCLog::Logger::StartLogging()
@@ -93,6 +150,7 @@ bool BCLog::Logger::StartLogging()
         for (const auto& cb : m_print_callbacks) {
             cb(s);
         }
+        for (auto* buffer : m_log_buffers) buffer->Append(s);
     }
     m_cur_buffer_memusage = 0;
     if (m_print_to_console) fflush(stdout);
@@ -103,6 +161,7 @@ bool BCLog::Logger::StartLogging()
 void BCLog::Logger::DisconnectTestLogger()
 {
     STDLOCK(m_cs);
+    assert(m_log_buffers.empty());
     m_buffering = true;
     if (m_fileout != nullptr) fclose(m_fileout);
     m_fileout = nullptr;
@@ -119,6 +178,7 @@ void BCLog::Logger::DisableLogging()
         STDLOCK(m_cs);
         assert(m_buffering);
         assert(m_print_callbacks.empty());
+        assert(m_log_buffers.empty());
     }
     m_print_to_file = false;
     m_print_to_console = false;
@@ -498,6 +558,7 @@ void BCLog::Logger::LogPrint_(util::log::Entry entry)
     for (const auto& cb : m_print_callbacks) {
         cb(str_prefixed);
     }
+    for (auto* buffer : m_log_buffers) buffer->Append(str_prefixed);
     if (m_print_to_file && !ratelimit) {
         assert(m_fileout != nullptr);
 
