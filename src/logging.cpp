@@ -66,8 +66,10 @@ BCLog::LogBuffer::~LogBuffer()
 void BCLog::LogBuffer::Append(const std::string& message)
 {
     STDLOCK(m_mutex);
+    if (m_interrupted) return;
     if (message.size() > m_max_bytes) {
         ++m_discarded;
+        m_ready.notify_one();
         return;
     }
     while (m_bytes > m_max_bytes - message.size()) {
@@ -81,11 +83,35 @@ void BCLog::LogBuffer::Append(const std::string& message)
     } catch (const std::bad_alloc&) {
         ++m_discarded;
     }
+    m_ready.notify_one();
 }
 
 std::optional<BCLog::LogMessage> BCLog::LogBuffer::TryRead()
 {
     STDLOCK(m_mutex);
+    return Pop();
+}
+
+std::optional<BCLog::LogMessage> BCLog::LogBuffer::Read()
+{
+    STDLOCK(m_mutex);
+    while (m_messages.empty() && m_discarded == 0 && !m_interrupted) {
+        m_ready.wait(m_mutex);
+    }
+    return Pop();
+}
+
+void BCLog::LogBuffer::Interrupt()
+{
+    {
+        STDLOCK(m_mutex);
+        m_interrupted = true;
+    }
+    m_ready.notify_all();
+}
+
+std::optional<BCLog::LogMessage> BCLog::LogBuffer::Pop()
+{
     if (m_messages.empty() && m_discarded == 0) return std::nullopt;
     LogMessage result{.message = {}, .discarded = std::exchange(m_discarded, 0)};
     if (!m_messages.empty()) {

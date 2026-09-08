@@ -17,6 +17,7 @@
 #include <util/time.h>
 
 #include <atomic>
+#include <condition_variable>
 #include <cstdint>
 #include <cstring>
 #include <deque>
@@ -91,11 +92,14 @@ namespace BCLog {
         Logger& m_logger;
         const size_t m_max_bytes;
         StdMutex m_mutex;
+        std::condition_variable_any m_ready;
         std::deque<std::string> m_messages GUARDED_BY(m_mutex);
         size_t m_bytes GUARDED_BY(m_mutex){0};
         size_t m_discarded GUARDED_BY(m_mutex){0};
+        bool m_interrupted GUARDED_BY(m_mutex){false};
 
         void Append(const std::string& message) EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
+        std::optional<LogMessage> Pop() EXCLUSIVE_LOCKS_REQUIRED(m_mutex);
 
     public:
         LogBuffer(Logger& logger, size_t max_bytes);
@@ -107,6 +111,16 @@ namespace BCLog {
          * Returns nullopt if neither a message nor discarded messages are available.
          */
         std::optional<LogMessage> TryRead() EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
+
+        /** Wait for a message or losses. Returns nullopt after interruption once both are empty.
+         * Multiple readers may share the buffer; each message is returned to only one reader.
+         */
+        std::optional<LogMessage> Read() EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
+
+        /** Permanently stop accepting messages and wake all readers. Pending messages and losses
+         * remain readable. Call this and wait for readers to finish before destroying the buffer.
+         */
+        void Interrupt() EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
     };
 
     //! Fixed window rate limiter for logging.

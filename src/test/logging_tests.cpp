@@ -14,6 +14,7 @@
 #include <util/fs_helpers.h>
 #include <util/string.h>
 
+#include <array>
 #include <chrono>
 #include <fstream>
 #include <future>
@@ -229,6 +230,128 @@ BOOST_AUTO_TEST_CASE(logging_buffer_loss_only)
     BOOST_REQUIRE(message);
     BOOST_CHECK_EQUAL(message->message, "\n");
     BOOST_CHECK_EQUAL(message->discarded, 0);
+}
+
+BOOST_AUTO_TEST_CASE(logging_buffer_wait)
+{
+    for (size_t capacity : {0, 100}) {
+        BCLog::Logger logger;
+        logger.m_log_timestamps = false;
+        BCLog::LogBuffer buffer{logger, capacity};
+        BOOST_REQUIRE(logger.StartLogging());
+        std::promise<void> started;
+        auto reader{std::async(std::launch::async, [&] {
+            started.set_value();
+            return buffer.Read();
+        })};
+        started.get_future().wait();
+        const auto before{reader.wait_for(0s)};
+        LogTo(logger, "wake");
+        const auto after{reader.wait_for(5s)};
+        buffer.Interrupt(); // Also release the reader if the wakeup failed.
+        auto message{reader.get()};
+        BOOST_CHECK(before == std::future_status::timeout);
+        BOOST_CHECK(after == std::future_status::ready);
+        BOOST_REQUIRE(message);
+        BOOST_CHECK_EQUAL(message->message, capacity == 0 ? "" : "wake\n");
+        BOOST_CHECK_EQUAL(message->discarded, capacity == 0 ? 1 : 0);
+        BOOST_CHECK(!buffer.Read());
+    }
+}
+
+BOOST_AUTO_TEST_CASE(logging_buffer_interrupt)
+{
+    BCLog::Logger logger;
+    logger.m_log_timestamps = false;
+    BCLog::LogBuffer empty{logger, 6};
+    BCLog::LogBuffer queued{logger, 6};
+    BCLog::LogBuffer losses{logger, 0};
+    BOOST_REQUIRE(logger.StartLogging());
+    empty.Interrupt(); // Interruption before reading must not be missed.
+    BOOST_CHECK(!empty.Read());
+    LogTo(logger, "a");
+    LogTo(logger, "b");
+    LogTo(logger, "ccccc");
+    queued.Interrupt();
+    losses.Interrupt();
+    LogTo(logger, "ignored");
+    auto message{queued.Read()};
+    BOOST_REQUIRE(message);
+    BOOST_CHECK_EQUAL(message->message, "ccccc\n");
+    BOOST_CHECK_EQUAL(message->discarded, 2);
+    message = losses.Read();
+    BOOST_REQUIRE(message);
+    BOOST_CHECK(message->message.empty());
+    BOOST_CHECK_EQUAL(message->discarded, 3);
+    for (auto* buffer : {&empty, &queued, &losses}) {
+        buffer->Interrupt(); // Repeated interruption is harmless.
+        BOOST_CHECK(!buffer->Read());
+        BOOST_CHECK(!buffer->TryRead());
+    }
+}
+
+BOOST_AUTO_TEST_CASE(logging_buffer_interrupt_readers)
+{
+    BCLog::Logger logger;
+    BCLog::LogBuffer buffer{logger, 100};
+    BOOST_REQUIRE(logger.StartLogging());
+    std::array<std::promise<void>, 2> started;
+    std::vector<std::future<std::optional<BCLog::LogMessage>>> readers;
+    for (auto& promise : started) {
+        readers.push_back(std::async(std::launch::async, [&buffer, &promise] {
+            promise.set_value();
+            return buffer.Read();
+        }));
+    }
+    for (auto& promise : started) promise.get_future().wait();
+    buffer.Interrupt();
+    const auto first_status{readers[0].wait_for(5s)};
+    const auto second_status{readers[1].wait_for(5s)};
+    // Repeat the notification to allow cleanup if only one waiter was woken.
+    buffer.Interrupt();
+    auto first{readers[0].get()};
+    auto second{readers[1].get()};
+    BOOST_CHECK(first_status == std::future_status::ready);
+    BOOST_CHECK(second_status == std::future_status::ready);
+    BOOST_CHECK(!first);
+    BOOST_CHECK(!second);
+}
+
+BOOST_AUTO_TEST_CASE(logging_buffer_slow_reader)
+{
+    BCLog::Logger logger;
+    logger.m_log_timestamps = false;
+    BCLog::LogBuffer buffer{logger, 100};
+    BOOST_REQUIRE(logger.StartLogging());
+    LogTo(logger, "first");
+    std::promise<void> received;
+    std::promise<void> resume;
+    auto resume_future{resume.get_future()};
+    auto reader{std::async(std::launch::async, [&] {
+        auto message{buffer.Read()};
+        received.set_value();
+        resume_future.wait(); // Simulate application code that takes time to handle the message.
+        return message;
+    })};
+    const auto read_status{received.get_future().wait_for(5s)};
+    auto producer{std::async(std::launch::async, [&] {
+        for (int i{0}; i < 1000; ++i) LogTo(logger, "next");
+    })};
+    const auto write_status{producer.wait_for(5s)};
+    resume.set_value();
+    buffer.Interrupt();
+    producer.get();
+    auto message{reader.get()};
+    BOOST_CHECK(read_status == std::future_status::ready);
+    BOOST_CHECK(write_status == std::future_status::ready);
+    BOOST_REQUIRE(message);
+    BOOST_CHECK_EQUAL(message->message, "first\n");
+    size_t accounted{0};
+    while ((message = buffer.Read())) {
+        BOOST_CHECK_EQUAL(message->message, "next\n");
+        accounted += 1 + message->discarded;
+    }
+    BOOST_CHECK_EQUAL(accounted, 1000);
 }
 
 BOOST_FIXTURE_TEST_CASE(logging_LogPrint, LogSetup)
