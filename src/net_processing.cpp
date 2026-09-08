@@ -4854,6 +4854,8 @@ void PeerManagerImpl::ProcessMessage(Peer& peer, CNode& pfrom, const std::string
         // below)
         std::shared_ptr<CBlock> pblock = std::make_shared<CBlock>();
         bool fBlockReconstructed = false;
+        bool attempt_optimistic_reconstruction{false};
+        bool segwit_active{false};
 
         {
         LOCK(cs_main);
@@ -4974,19 +4976,9 @@ void PeerManagerImpl::ProcessMessage(Peer& peer, CNode& pfrom, const std::string
                 // download from.
                 // Optimistically try to reconstruct anyway since we might be
                 // able to without any round trips.
-                PartiallyDownloadedBlock tempBlock(&m_mempool);
-                ReadStatus status = tempBlock.InitData(cmpctblock, vExtraTxnForCompact);
-                if (status != READ_STATUS_OK) {
-                    // TODO: don't ignore failures
-                    return;
-                }
-                std::vector<CTransactionRef> dummy;
+                attempt_optimistic_reconstruction = true;
                 const CBlockIndex* prev_block{Assume(m_chainman.m_blockman.LookupBlockIndex(cmpctblock.header.hashPrevBlock))};
-                status = tempBlock.FillBlock(*pblock, dummy,
-                                             /*segwit_active=*/DeploymentActiveAfter(prev_block, m_chainman, Consensus::DEPLOYMENT_SEGWIT));
-                if (status == READ_STATUS_OK) {
-                    fBlockReconstructed = true;
-                }
+                segwit_active = DeploymentActiveAfter(prev_block, m_chainman, Consensus::DEPLOYMENT_SEGWIT);
             }
         } else {
             if (requested_block_from_this_peer) {
@@ -5002,6 +4994,21 @@ void PeerManagerImpl::ProcessMessage(Peer& peer, CNode& pfrom, const std::string
             }
         }
         } // cs_main
+
+        if (attempt_optimistic_reconstruction) {
+            // The reconstruction object is local, and g_msgproc_mutex protects vExtraTxnForCompact.
+            PartiallyDownloadedBlock tempBlock(&m_mempool);
+            ReadStatus status = tempBlock.InitData(cmpctblock, vExtraTxnForCompact);
+            if (status != READ_STATUS_OK) {
+                // TODO: don't ignore failures
+                return;
+            }
+            std::vector<CTransactionRef> dummy;
+            status = tempBlock.FillBlock(*pblock, dummy, segwit_active);
+            if (status == READ_STATUS_OK) {
+                fBlockReconstructed = true;
+            }
+        }
 
         if (fProcessBLOCKTXN) {
             BlockTransactions txn;
