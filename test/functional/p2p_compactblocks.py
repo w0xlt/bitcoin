@@ -3,6 +3,7 @@
 # Distributed under the MIT software license, see the accompanying
 # file COPYING or http://www.opensource.org/licenses/mit-license.php.
 """Test compact blocks (BIP 152)."""
+from copy import deepcopy
 import random
 
 from test_framework.blocktools import (
@@ -190,12 +191,15 @@ class CompactBlocksTest(BitcoinTestFramework):
         assert_equal(self.nodes[0].getbestblockhash(), block2.hash_hex)
         self.utxos.extend([[tx.txid_int, i, out_value] for i in range(COUNT)])
 
-    def announce_cmpct_block(self, node, peer, txn_count=5, solicit=False):
+    def announce_cmpct_block(self, node, peer, txn_count=5, solicit=False, *, with_witness=False):
         utxo = self.utxos.pop(0)
         block = self.build_block_with_transactions(node, utxo, txn_count)
+        if with_witness:
+            add_witness_commitment(block)
+            block.solve()
 
         cmpct_block = HeaderAndShortIDs()
-        cmpct_block.initialize_from_block(block)
+        cmpct_block.initialize_from_block(block, use_witness=with_witness)
         msg = msg_cmpctblock(cmpct_block.to_p2p())
         if solicit:
             peer.send_without_ping(msg_headers([block]))
@@ -964,7 +968,7 @@ class CompactBlocksTest(BitcoinTestFramework):
             # Remaining low-bandwidth peer is stalling_peer, who announces first
             assert_equal([peer['bip152_hb_to'] for peer in node.getpeerinfo()], [False, True, True, True])
 
-            block, cmpct_block = self.announce_cmpct_block(node, stalling_peer, num_missing, solicit=True)
+            block, cmpct_block = self.announce_cmpct_block(node, stalling_peer, num_missing, solicit=True, with_witness=True)
 
             delivery_peer.send_and_ping(msg_cmpctblock(cmpct_block.to_p2p()))
             # The second peer to announce should still get a getblocktxn
@@ -980,12 +984,63 @@ class CompactBlocksTest(BitcoinTestFramework):
             # The third peer to announce should get a getblocktxn if outbound
             self.getblocktxn_expected(outbound_peer, block.hash_int)
 
-            # Second peer completes the compact block first
+            # Fill all three slots from MAX_CMPCTBLOCKS_INFLIGHT_PER_BLOCK in net_processing.h.
+            # The inbound attempt above gave up its slot to reserve it for an outbound peer.
+            height = node.getblockcount() + 1
+            expected_inflight = [[height], [height], [], [height]]
+            for peer in [stalling_peer, delivery_peer, outbound_peer]:
+                self.getblocktxn_expected(peer, block.hash_int, indices=list(range(1, len(block.vtx))))
+            peerinfo = node.getpeerinfo()
+            assert_equal([peer['inflight'] for peer in peerinfo], expected_inflight)
+            assert peerinfo[2]['bip152_hb_to']
+            with p2p_lock:
+                getdata_count = inbound_peer.message_count['getdata']
+
+            self.log.info("Test optimistic reconstruction preserves existing requests on incomplete or mutated blocks")
+            for expected_error in [None, "bad-witness-merkle-match", "bad-txnmrklroot"]:
+                attempt = cmpct_block
+                if expected_error is not None:
+                    # Prefill every transaction so mutation checks run even with an empty mempool.
+                    # Copy the block because compact-block prefilled transactions alias its transactions.
+                    mutated_block = deepcopy(block)
+                    if expected_error == "bad-witness-merkle-match":
+                        mutated_block.vtx[0].wit.vtxinwit[0].scriptWitness.stack = [ser_uint256(1)]
+                    else:
+                        mutated_block.vtx[0].vout[0].nValue -= 1
+                    assert_equal(mutated_block.hash_int, block.hash_int)
+                    attempt = HeaderAndShortIDs()
+                    attempt.initialize_from_block(mutated_block, prefill_list=list(range(len(block.vtx))), use_witness=True)
+
+                # This HB peer has no request and all slots remain occupied, so the retry is optimistic.
+                expected_logs = [f"Block mutated: {expected_error}"] if expected_error is not None else []
+                with node.assert_debug_log(expected_msgs=expected_logs):
+                    inbound_peer.send_and_ping(msg_cmpctblock(attempt.to_p2p()))
+                assert_equal(int(node.getbestblockhash(), 16), block.hashPrevBlock)
+                assert_equal([peer['inflight'] for peer in node.getpeerinfo()], expected_inflight)
+                with p2p_lock:
+                    assert "getblocktxn" not in inbound_peer.last_message
+                    assert_equal(inbound_peer.message_count['getdata'], getdata_count)
+
             msg = msg_blocktxn()
             msg.block_transactions.blockhash = block.hash_int
             msg.block_transactions.transactions = block.vtx[1:]
-            delivery_peer.send_and_ping(msg)
+            if num_missing == 1:
+                self.log.info("Test optimistic reconstruction from the mempool with a valid witness commitment")
+                for tx in block.vtx[1:]:
+                    inbound_peer.send_without_ping(msg_tx(tx))
+                inbound_peer.sync_with_ping()
+                mempool = node.getrawmempool()
+                for tx in block.vtx[1:]:
+                    assert tx.txid_hex in mempool
+                inbound_peer.send_and_ping(msg_cmpctblock(cmpct_block.to_p2p()))
+                with p2p_lock:
+                    assert "getblocktxn" not in inbound_peer.last_message
+                    assert_equal(inbound_peer.message_count['getdata'], getdata_count)
+            else:
+                # The original queued reconstruction remains usable after the optimistic failures.
+                delivery_peer.send_and_ping(msg)
             assert_equal(node.getbestblockhash(), block.hash_hex)
+            assert_equal([peer['inflight'] for peer in node.getpeerinfo()], [[], [], [], []])
 
             # Nothing bad should happen if we get a late fill from the first peer...
             stalling_peer.send_and_ping(msg)
