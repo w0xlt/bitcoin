@@ -451,17 +451,17 @@ BOOST_AUTO_TEST_CASE(logargs)
     SetupArgs(local_args, {okaylog_bool, okaylog_negbool, okaylog, dontlog});
     ResetArgs(local_args, "-okaylog-bool -nookaylog-negbool -okaylog=public -dontlog=private42");
 
-    // Everything logged to debug.log will also append to str
-    std::string str;
-    auto print_connection = LogInstance().PushBackCallback(
-        [&str](const std::string& s) {
-            str += s;
-        });
+    BCLog::LogBuffer capture{LogInstance(), BCLog::DEFAULT_MAX_LOG_BUFFER};
 
     // Log the arguments
     local_args.LogArgs();
 
-    LogInstance().DeleteCallback(print_connection);
+    capture.Interrupt();
+    std::string str;
+    while (auto message = capture.TryRead()) {
+        BOOST_REQUIRE_EQUAL(message->discarded, 0);
+        str += message->message;
+    }
     // Check that what should appear does, and what shouldn't doesn't.
     BOOST_CHECK(str.find("Command-line arg: okaylog-bool=\"\"") != std::string::npos);
     BOOST_CHECK(str.find("Command-line arg: okaylog-negbool=false") != std::string::npos);

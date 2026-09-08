@@ -5,38 +5,28 @@
 #ifndef BITCOIN_TEST_UTIL_LOGGING_H
 #define BITCOIN_TEST_UTIL_LOGGING_H
 
+#include <logging.h>
 #include <util/macros.h>
 
-#include <functional>
-#include <list>
 #include <string>
 
 class DebugLogHelper
 {
 public:
-    //! Custom match checking function.
-    //!
-    //! Invoked with pointers to lines containing matching strings, and with
-    //! null if check_found() is called without any successful match.
-    //!
-    //! Can return true to enable default DebugLogHelper behavior of:
-    //! (1) ending search after first successful match, and
-    //! (2) raising an error in check_found if no match was found
-    //! Can return false to do the opposite in either case.
-    using MatchFn = std::function<bool(const std::string* line)>;
-
-    explicit DebugLogHelper(std::string message, MatchFn match = [](const std::string*){ return true; });
+    explicit DebugLogHelper(std::string message);
 
     DebugLogHelper(const DebugLogHelper&) = delete;
     DebugLogHelper& operator=(const DebugLogHelper&) = delete;
 
     ~DebugLogHelper();
 
+    //! Count matching messages captured so far. Fails if the capture buffer overflowed.
+    size_t Count();
+
 private:
     const std::string m_message;
-    bool m_found{false};
-    std::list<std::function<void(const std::string&)>>::iterator m_print_connection;
-    MatchFn m_match;
+    BCLog::LogBuffer m_buffer;
+    size_t m_count{0};
 };
 
 #define ASSERT_DEBUG_LOG(message) DebugLogHelper BITCOIN_UNIQUE_NAME(debugloghelper)(message)

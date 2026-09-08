@@ -624,20 +624,12 @@ BOOST_FIXTURE_TEST_CASE(CreateWallet, TestChain100Setup)
     TestUnloadWallet(std::move(wallet));
 
 
-    // Add log hook to detect AddToWallet events from rescans, blockConnected,
+    // Capture AddToWallet events from rescans, blockConnected,
     // and transactionAddedToMempool notifications
-    int addtx_count = 0;
-    DebugLogHelper addtx_counter("[default wallet] AddToWallet", [&](const std::string* s) {
-        if (s) ++addtx_count;
-        return false;
-    });
+    DebugLogHelper addtx_counter{"[default wallet] AddToWallet"};
 
 
-    bool rescan_completed = false;
-    DebugLogHelper rescan_check("[default wallet] Rescan completed", [&](const std::string* s) {
-        if (s) rescan_completed = true;
-        return false;
-    });
+    DebugLogHelper rescan_check{"[default wallet] Rescan completed"};
 
 
     // Block the queue to prevent the wallet receiving blockConnected and
@@ -659,9 +651,9 @@ BOOST_FIXTURE_TEST_CASE(CreateWallet, TestChain100Setup)
     // being blocked
     // Loading will also ask for current mempool transactions
     wallet = TestLoadWallet(context);
-    BOOST_CHECK(rescan_completed);
+    BOOST_CHECK(rescan_check.Count() > 0);
     // AddToWallet events for block_tx and mempool_tx (x2)
-    BOOST_CHECK_EQUAL(addtx_count, 3);
+    BOOST_CHECK_EQUAL(addtx_counter.Count(), 3);
     {
         LOCK(wallet->cs_wallet);
         BOOST_CHECK(wallet->mapWallet.contains(block_tx.GetHash()));
@@ -675,7 +667,7 @@ BOOST_FIXTURE_TEST_CASE(CreateWallet, TestChain100Setup)
     m_node.validation_signals->SyncWithValidationInterfaceQueue();
     // AddToWallet events for block_tx and mempool_tx events are counted a
     // second time as the notification queue is processed
-    BOOST_CHECK_EQUAL(addtx_count, 5);
+    BOOST_CHECK_EQUAL(addtx_counter.Count(), 5);
 
 
     TestUnloadWallet(std::move(wallet));
@@ -687,9 +679,9 @@ BOOST_FIXTURE_TEST_CASE(CreateWallet, TestChain100Setup)
     // lock during the sync is a little artificial but is needed to avoid a
     // deadlock during the sync and simulates a new block notification happening
     // as soon as possible.
-    addtx_count = 0;
+    const auto addtx_count_before_load{addtx_counter.Count()};
     auto handler = HandleLoadWallet(context, [&](std::unique_ptr<interfaces::Wallet> wallet) {
-            BOOST_CHECK(rescan_completed);
+            BOOST_CHECK(rescan_check.Count() > 0);
             m_coinbase_txns.push_back(CreateAndProcessBlock({}, GetScriptForRawPubKey(coinbaseKey.GetPubKey())).vtx[0]);
             block_tx = TestSimpleSpend(*m_coinbase_txns[2], 0, coinbaseKey, GetScriptForRawPubKey(key.GetPubKey()));
             m_coinbase_txns.push_back(CreateAndProcessBlock({block_tx}, GetScriptForRawPubKey(coinbaseKey.GetPubKey())).vtx[0]);
@@ -700,7 +692,7 @@ BOOST_FIXTURE_TEST_CASE(CreateWallet, TestChain100Setup)
     wallet = TestLoadWallet(context);
     // Since mempool transactions are requested at the end of loading, there will
     // be 2 additional AddToWallet calls, one from the previous test, and a duplicate for mempool_tx
-    BOOST_CHECK_EQUAL(addtx_count, 2 + 2);
+    BOOST_CHECK_EQUAL(addtx_counter.Count() - addtx_count_before_load, 2 + 2);
     {
         LOCK(wallet->cs_wallet);
         BOOST_CHECK(wallet->mapWallet.contains(block_tx.GetHash()));

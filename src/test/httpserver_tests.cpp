@@ -985,16 +985,10 @@ BOOST_AUTO_TEST_CASE(http_socket_error_tests)
     // together. This indicates the non-optimistic send path was used
     // because a reply was already sitting in the send buffer when a second reply
     // was added.
-    DebugLogHelper find_two_replies{strprintf("Sent %d bytes to client", reply_length * 2),
-                                    [&](const std::string* s) {
-                                        return true;
-                                    }};
+    ASSERT_DEBUG_LOG(strprintf("Sent %d bytes to client", reply_length * 2));
     // Last reply should be sent on its own by optimistic send path, because
     // the send buffer was empty when the reply was written.
-    DebugLogHelper find_one_reply{strprintf("Sent %d bytes to client", reply_length),
-                                  [&](const std::string* s) {
-                                      return true;
-                                   }};
+    ASSERT_DEBUG_LOG(strprintf("Sent %d bytes to client", reply_length));
 
     // Connect the ErrorSock as mock client with the preloaded data and get a handle on the I/O pipes
     std::shared_ptr<ErrorSock::Pipes> mock_client_socket_pipes{

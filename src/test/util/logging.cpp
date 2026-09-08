@@ -11,23 +11,30 @@
 #include <cstdlib>
 #include <iostream>
 
-DebugLogHelper::DebugLogHelper(std::string message, MatchFn match)
-    : m_message{std::move(message)}, m_match(std::move(match))
+DebugLogHelper::DebugLogHelper(std::string message)
+    : m_message{std::move(message)}, m_buffer{LogInstance(), BCLog::DEFAULT_MAX_LOG_BUFFER}
 {
-    m_print_connection = LogInstance().PushBackCallback(
-        [this](const std::string& s) {
-            if (m_found) return;
-            m_found = s.find(m_message) != std::string::npos && m_match(&s);
-        });
     noui_test_redirect();
 }
 
 DebugLogHelper::~DebugLogHelper()
 {
     noui_reconnect();
-    LogInstance().DeleteCallback(m_print_connection);
-    if (!m_found && m_match(nullptr)) {
+    m_buffer.Interrupt();
+    if (Count() == 0) {
         tfm::format(std::cerr, "Fatal error: expected message not found in the debug log: '%s'\n", m_message);
         std::abort();
     }
+}
+
+size_t DebugLogHelper::Count()
+{
+    while (auto message = m_buffer.TryRead()) {
+        if (message->discarded > 0) {
+            tfm::format(std::cerr, "Fatal error: %d messages discarded while capturing the debug log for '%s'\n", message->discarded, m_message);
+            std::abort();
+        }
+        if (message->message.find(m_message) != std::string::npos) ++m_count;
+    }
+    return m_count;
 }
