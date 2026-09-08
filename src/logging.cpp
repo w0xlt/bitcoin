@@ -173,9 +173,6 @@ bool BCLog::Logger::StartLogging()
 
         if (m_print_to_file) FileWriteStr(s, m_fileout);
         if (m_print_to_console) fwrite(s.data(), 1, s.size(), stdout);
-        for (const auto& cb : m_print_callbacks) {
-            cb(s);
-        }
         for (auto* buffer : m_log_buffers) buffer->Append(s);
     }
     m_cur_buffer_memusage = 0;
@@ -191,7 +188,6 @@ void BCLog::Logger::DisconnectTestLogger()
     m_buffering = true;
     if (m_fileout != nullptr) fclose(m_fileout);
     m_fileout = nullptr;
-    m_print_callbacks.clear();
     m_max_buffer_memusage = DEFAULT_MAX_LOG_BUFFER;
     m_cur_buffer_memusage = 0;
     m_buffer_lines_discarded = 0;
@@ -203,7 +199,6 @@ void BCLog::Logger::DisableLogging()
     {
         STDLOCK(m_cs);
         assert(m_buffering);
-        assert(m_print_callbacks.empty());
         assert(m_log_buffers.empty());
     }
     m_print_to_file = false;
@@ -580,9 +575,6 @@ void BCLog::Logger::LogPrint_(util::log::Entry entry)
         // print to console
         fwrite(str_prefixed.data(), 1, str_prefixed.size(), stdout);
         fflush(stdout);
-    }
-    for (const auto& cb : m_print_callbacks) {
-        cb(str_prefixed);
     }
     for (auto* buffer : m_log_buffers) buffer->Append(str_prefixed);
     if (m_print_to_file && !ratelimit) {

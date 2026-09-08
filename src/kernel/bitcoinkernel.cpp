@@ -43,7 +43,6 @@
 #include <cstddef>
 #include <cstring>
 #include <exception>
-#include <functional>
 #include <limits>
 #include <memory>
 #include <optional>

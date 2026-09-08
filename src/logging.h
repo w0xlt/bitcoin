@@ -213,8 +213,6 @@ namespace BCLog {
 
         std::string LogTimestampStr(SystemClock::time_point now, std::chrono::seconds mocktime) const;
 
-        /** Slots that connect to the print signal */
-        std::list<std::function<void(const std::string&)>> m_print_callbacks GUARDED_BY(m_cs){};
         std::list<LogBuffer*> m_log_buffers GUARDED_BY(m_cs);
 
         void AddBuffer(LogBuffer& buffer) EXCLUSIVE_LOCKS_REQUIRED(!m_cs);
@@ -245,28 +243,13 @@ namespace BCLog {
         bool Enabled() const EXCLUSIVE_LOCKS_REQUIRED(!m_cs)
         {
             STDLOCK(m_cs);
-            return m_buffering || m_print_to_console || m_print_to_file || !m_print_callbacks.empty() || !m_log_buffers.empty();
-        }
-
-        /** Connect a slot to the print signal and return the connection */
-        std::list<std::function<void(const std::string&)>>::iterator PushBackCallback(std::function<void(const std::string&)> fun) EXCLUSIVE_LOCKS_REQUIRED(!m_cs)
-        {
-            STDLOCK(m_cs);
-            m_print_callbacks.push_back(std::move(fun));
-            return --m_print_callbacks.end();
-        }
-
-        /** Delete a connection */
-        void DeleteCallback(std::list<std::function<void(const std::string&)>>::iterator it) EXCLUSIVE_LOCKS_REQUIRED(!m_cs)
-        {
-            STDLOCK(m_cs);
-            m_print_callbacks.erase(it);
+            return m_buffering || m_print_to_console || m_print_to_file || !m_log_buffers.empty();
         }
 
         size_t NumConnections() EXCLUSIVE_LOCKS_REQUIRED(!m_cs)
         {
             STDLOCK(m_cs);
-            return m_print_callbacks.size() + m_log_buffers.size();
+            return m_log_buffers.size();
         }
 
         /** Start logging (and flush all buffered messages) */
