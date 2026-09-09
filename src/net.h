@@ -1283,7 +1283,9 @@ public:
     // alias for thread safety annotations only, not defined
     Mutex& GetNodesMutex() const LOCK_RETURNED(m_nodes_mutex);
 
-    bool ForNode(NodeId id, std::function<bool(CNode* pnode)> func) EXCLUSIVE_LOCKS_REQUIRED(!m_nodes_mutex);
+    /** Invoke func under the node-list lock. By default skip nodes that are not
+     * fully connected; callers opting out must also handle disconnecting nodes. */
+    bool ForNode(NodeId id, std::function<bool(CNode* pnode)> func, bool fully_connected_only = true) EXCLUSIVE_LOCKS_REQUIRED(!m_nodes_mutex);
 
     void PushMessage(CNode* pnode, CSerializedNetMsg&& msg) EXCLUSIVE_LOCKS_REQUIRED(!m_total_bytes_sent_mutex);
 

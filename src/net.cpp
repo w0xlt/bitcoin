@@ -4228,7 +4228,7 @@ void CConnman::PushMessage(CNode* pnode, CSerializedNetMsg&& msg)
     if (nBytesSent) RecordBytesSent(nBytesSent);
 }
 
-bool CConnman::ForNode(NodeId id, std::function<bool(CNode* pnode)> func)
+bool CConnman::ForNode(NodeId id, std::function<bool(CNode* pnode)> func, bool fully_connected_only)
 {
     AssertLockNotHeld(m_nodes_mutex);
 
@@ -4240,7 +4240,7 @@ bool CConnman::ForNode(NodeId id, std::function<bool(CNode* pnode)> func)
             break;
         }
     }
-    return found != nullptr && NodeFullyConnected(found) && func(found);
+    return found != nullptr && (!fully_connected_only || NodeFullyConnected(found)) && func(found);
 }
 
 CSipHasher CConnman::GetDeterministicRandomizer(uint64_t id) const
