@@ -4456,7 +4456,7 @@ bool ChainstateManager::StoreBlock(const std::shared_ptr<const CBlock>& pblock, 
     return true;
 }
 
-bool ChainstateManager::ProcessNewBlock(const std::shared_ptr<const CBlock>& block, bool force_processing, bool min_pow_checked, bool* new_block)
+bool ChainstateManager::ProcessNewBlock(const std::shared_ptr<const CBlock>& block, BlockValidationState& state, bool force_processing, bool min_pow_checked, bool* new_block)
 {
     AssertLockNotHeld(cs_main);
     AssertLockNotHeld(m_check_block_mutex);
@@ -4464,7 +4464,6 @@ bool ChainstateManager::ProcessNewBlock(const std::shared_ptr<const CBlock>& blo
     {
         CBlockIndex *pindex = nullptr;
         if (new_block) *new_block = false;
-        BlockValidationState state;
 
         // Skipping AcceptBlock() for CheckBlock() failures means that we will never mark a block as invalid if
         // CheckBlock() fails.  This is protective against consensus failure if there are any unknown forms of block
@@ -4494,9 +4493,9 @@ bool ChainstateManager::ProcessNewBlock(const std::shared_ptr<const CBlock>& blo
 
     NotifyHeaderTip();
 
-    BlockValidationState state; // Only used to report errors, not invalidity - ignore it
-    if (!ActiveChainstate().ActivateBestChain(state, block)) {
-        LogError("%s: ActivateBestChain failed (%s)\n", __func__, state.ToString());
+    BlockValidationState activation_state; // Only used to report errors, not invalidity - ignore it
+    if (!ActiveChainstate().ActivateBestChain(activation_state, block)) {
+        LogError("%s: ActivateBestChain failed (%s)\n", __func__, activation_state.ToString());
         return false;
     }
 
