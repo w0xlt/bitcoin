@@ -17,6 +17,8 @@
 #include <primitives/block.h>
 #include <primitives/transaction.h>
 #include <protocol.h>
+#include <rpc/server.h>
+#include <streams.h>
 #include <sync.h>
 #include <test/util/logging.h>
 #include <test/util/mining.h>
@@ -24,8 +26,10 @@
 #include <test/util/setup_common.h>
 #include <test/util/time.h>
 #include <test/util/validation.h>
+#include <univalue.h>
 #include <util/check.h>
 #include <util/fs.h>
+#include <util/strencodings.h>
 #include <util/string.h>
 #include <validation.h>
 #include <validationinterface.h>
@@ -1447,6 +1451,94 @@ BOOST_AUTO_TEST_CASE(block_worker_exception_delivery)
     BOOST_CHECK(admitted && ready);
     BOOST_CHECK(!worker.TakeResult());
     BOOST_CHECK_EQUAL(checked->m_threads.size(), 21);
+}
+
+BOOST_FIXTURE_TEST_CASE(async_block_synchronous_submitblock, BlockProcessingTestSetup)
+{
+    const auto blocks{CreateBlockChain(2, Params())};
+    CNode* source;
+    {
+        LOCK(NetEventsInterface::g_msgproc_mutex);
+        source = &AddPeer();
+        // Queue everything before the worker can write to the fixture transport.
+        for (const auto& block : {blocks[0], blocks[0], blocks[1]}) {
+            BOOST_REQUIRE(m_connman.ReceiveMsgFrom(*source, NetMsg::Make(NetMsgType::BLOCK, TX_WITH_WITNESS(*block))));
+        }
+        BOOST_REQUIRE(m_connman.ReceiveMsgFrom(*source, NetMsg::Make(NetMsgType::PING, uint64_t{1})));
+    }
+
+    JSONRPCRequest request;
+    request.context = &m_node;
+    request.strMethod = "submitblock";
+    request.params = UniValue::VARR;
+    DataStream encoded;
+    encoded << TX_WITH_WITNESS(*blocks[1]);
+    request.params.push_back(HexStr(encoded));
+    if (RPCIsInWarmup(nullptr)) SetRPCWarmupFinished();
+
+    UniValue result;
+    std::exception_ptr exception;
+    std::promise<void> returned;
+    auto rpc_returned{returned.get_future()};
+    std::latch started{1};
+    bool first_entered{false}, child_entered{false}, synchronous{false}, pending{false};
+    std::thread::id callback_thread, rpc_thread, worker_thread;
+    {
+        BlockProcessingPause first{m_node, *blocks[0], /*on_check=*/false};
+        BlockProcessingPause child{m_node, *blocks[1], /*on_check=*/true};
+        std::jthread rpc;
+        // Release BOTH pauses before the RPC owner joins or either raw
+        // subscriber drains, including if submission or thread creation throws.
+        ReleaseBlockPauses release_all{first, &child};
+        WITH_LOCK(NetEventsInterface::g_msgproc_mutex, m_connman.ProcessMessagesOnce(*source));
+        first_entered = first.WaitEntered();
+        if (first_entered) {
+            rpc = std::jthread{[&] {
+                started.count_down();
+                try {
+                    result = tableRPC.execute(request);
+                } catch (...) {
+                    exception = std::current_exception();
+                }
+                returned.set_value();
+            }};
+            rpc_thread = rpc.get_id();
+            started.wait(); // Arrival only; RPC validation still needs main.
+            first.Release();
+            child_entered = child.WaitEntered();
+            synchronous = rpc_returned.wait_for(0s) != std::future_status::ready;
+        }
+        release_all.Release();
+        if (rpc.joinable()) rpc.join();
+        // Readiness leaves the outstanding P2P controller reservation intact.
+        pending = m_node.peerman->WaitForBlockProcessing();
+        worker_thread = first.m_thread;
+        callback_thread = child.m_thread;
+    }
+    // End both one-shot pauses before replaying the queued duplicate and child.
+    if (exception) std::rethrow_exception(exception);
+    BOOST_REQUIRE(first_entered);
+    BOOST_REQUIRE(child_entered);
+    BOOST_CHECK(synchronous);
+    BOOST_CHECK(pending);
+    BOOST_CHECK(result.isNull());
+    // Either activation caller may connect the child. Its synchronous callback
+    // must not be dispatched onto the message controller.
+    BOOST_CHECK(callback_thread == rpc_thread || callback_thread == worker_thread);
+    BOOST_CHECK(callback_thread != std::this_thread::get_id());
+    BOOST_CHECK(WITH_LOCK(cs_main, return m_node.chainman->ActiveTip()->GetBlockHash()) == blocks[1]->GetHash());
+
+    {
+        WAIT_LOCK(NetEventsInterface::g_msgproc_mutex, lock);
+        for (int i{0}; i < 3; ++i)
+            FinishBlock(*source, lock);
+        BOOST_CHECK(!source->PeekMessageType());
+        const auto messages{SentMessages(*source)};
+        BOOST_CHECK_EQUAL(std::count(messages.begin(), messages.end(), NetMsgType::PONG), 1);
+        BOOST_CHECK(!source->fDisconnect);
+    }
+    BOOST_CHECK(!m_node.peerman->WaitForBlockProcessing());
+    BOOST_CHECK(WITH_LOCK(cs_main, return m_node.chainman->ActiveTip()->GetBlockHash()) == blocks[1]->GetHash());
 }
 
 BOOST_AUTO_TEST_SUITE_END()
