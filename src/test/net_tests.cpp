@@ -140,6 +140,58 @@ BOOST_AUTO_TEST_CASE(cnode_simple_test)
     BOOST_CHECK_EQUAL(pnode4->ConnectedThroughNetwork(), Network::NET_ONION);
 }
 
+BOOST_AUTO_TEST_CASE(cnode_peek_message_type)
+{
+    auto& connman{static_cast<ConnmanTestMsg&>(*m_node.connman)};
+    // Pause receiving whenever a message is queued, including after a peek.
+    CNode node{/*id=*/0, /*sock=*/nullptr, CAddress{}, /*nKeyedNetGroupIn=*/0,
+               /*nLocalHostNonceIn=*/0, CService{}, /*addrNameIn=*/"",
+               ConnectionType::INBOUND, /*inbound_onion=*/false, /*network_key=*/0,
+               CNodeOptions{.recv_flood_size = 0}};
+
+    BOOST_CHECK(!node.PeekMessageType());
+    BOOST_CHECK(!node.PollMessage());
+    BOOST_CHECK(!node.fPauseRecv);
+    BOOST_CHECK_EQUAL(WITH_LOCK(node.cs_vRecv, return node.nRecvBytes), 0);
+
+    BOOST_REQUIRE(connman.ReceiveMsgFrom(node, NetMsg::Make(NetMsgType::PING, uint64_t{1})));
+    auto first_type{node.PeekMessageType()};
+    BOOST_REQUIRE(first_type);
+    BOOST_CHECK_EQUAL(*first_type, NetMsgType::PING);
+    BOOST_CHECK(node.fPauseRecv);
+
+    // Appending after a peek does not change the front or consume its payload.
+    BOOST_REQUIRE(connman.ReceiveMsgFrom(node, NetMsg::Make(NetMsgType::PONG, uint64_t{2})));
+    const auto received_bytes{WITH_LOCK(node.cs_vRecv, return node.nRecvBytes)};
+    BOOST_CHECK_EQUAL(received_bytes, 2 * (CMessageHeader::HEADER_SIZE + sizeof(uint64_t)));
+    BOOST_CHECK(node.PeekMessageType() == NetMsgType::PING);
+    *first_type = "changed";
+    BOOST_CHECK(node.PeekMessageType() == NetMsgType::PING);
+    BOOST_CHECK(node.fPauseRecv);
+    BOOST_CHECK_EQUAL(WITH_LOCK(node.cs_vRecv, return node.nRecvBytes), received_bytes);
+
+    auto polled{node.PollMessage()};
+    BOOST_REQUIRE(polled);
+    BOOST_CHECK_EQUAL(polled->first.m_type, NetMsgType::PING);
+    BOOST_CHECK(polled->second);
+    uint64_t nonce{0};
+    polled->first.m_recv >> nonce;
+    BOOST_CHECK_EQUAL(nonce, 1);
+    BOOST_CHECK(node.PeekMessageType() == NetMsgType::PONG);
+    BOOST_CHECK(node.fPauseRecv);
+
+    polled = node.PollMessage();
+    BOOST_REQUIRE(polled);
+    BOOST_CHECK_EQUAL(polled->first.m_type, NetMsgType::PONG);
+    BOOST_CHECK(!polled->second);
+    polled->first.m_recv >> nonce;
+    BOOST_CHECK_EQUAL(nonce, 2);
+    BOOST_CHECK(!node.PeekMessageType());
+    BOOST_CHECK(!node.PollMessage());
+    BOOST_CHECK(!node.fPauseRecv);
+    BOOST_CHECK_EQUAL(WITH_LOCK(node.cs_vRecv, return node.nRecvBytes), received_bytes);
+}
+
 BOOST_AUTO_TEST_CASE(cnetaddr_basic)
 {
     CNetAddr addr;

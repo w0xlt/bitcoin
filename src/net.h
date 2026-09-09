@@ -760,6 +760,12 @@ public:
     void MarkReceivedMsgsForProcessing()
         EXCLUSIVE_LOCKS_REQUIRED(!m_msg_process_queue_mutex);
 
+    /** Copy the next queued message type without consuming it, or return std::nullopt.
+     * Callers relying on the same front message must serialize consumption
+     * across this query and PollMessage(). */
+    std::optional<std::string> PeekMessageType()
+        EXCLUSIVE_LOCKS_REQUIRED(!m_msg_process_queue_mutex);
+
     /** Poll the next message from the processing queue of this connection.
      *
      * Returns std::nullopt if the processing queue is empty, or a pair
