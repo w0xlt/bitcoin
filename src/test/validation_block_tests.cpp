@@ -14,6 +14,7 @@
 #include <primitives/transaction.h>
 #include <random.h>
 #include <script/script.h>
+#include <streams.h>
 #include <sync.h>
 #include <test/util/common.h>
 #include <test/util/script.h>
@@ -26,10 +27,16 @@
 
 #include <boost/test/unit_test.hpp>
 
+#include <array>
+#include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <exception>
+#include <latch>
 #include <memory>
 #include <span>
+#include <string_view>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -165,6 +172,472 @@ void MinerTestingSetup::BuildChain(const uint256& root, int height, const unsign
     if (gen_fork) {
         blocks.push_back(GoodBlock(root));
         BuildChain(blocks.back()->GetHash(), height - 1, invalid_rate, branch_rate, max_size, blocks);
+    }
+}
+
+// Mine a private block without checking it or publishing its header.
+static void MineUncheckedBlock(CBlock& block, const Consensus::Params& consensus)
+{
+    block.m_validation_cache.m_checked.store(false);
+    block.m_validation_cache.m_checked_merkle_root.store(false);
+    block.m_validation_cache.m_checked_witness_commitment.store(false);
+    block.hashMerkleRoot = BlockMerkleRoot(block);
+    while (!CheckProofOfWork(block.GetHash(), block.nBits, consensus)) {
+        ++block.nNonce;
+    }
+}
+
+static std::vector<std::byte> BlockBytes(const CBlock& block)
+{
+    DataStream stream;
+    stream << TX_WITH_WITNESS(block);
+    return {stream.begin(), stream.end()};
+}
+
+static void CheckStoredBlock(ChainstateManager& chainman, const CBlock& block)
+{
+    LOCK(cs_main);
+    const auto* index{chainman.m_blockman.LookupBlockIndex(block.GetHash())};
+    BOOST_REQUIRE(index);
+    BOOST_CHECK(index->nStatus & BLOCK_HAVE_DATA);
+    BOOST_CHECK(index->IsValid(BLOCK_VALID_TRANSACTIONS));
+    CBlock readback;
+    BOOST_REQUIRE(chainman.m_blockman.ReadBlock(readback, *index));
+    BOOST_CHECK(BlockBytes(readback) == BlockBytes(block));
+}
+
+struct BlockCheckedCatcher final : CValidationInterface {
+    const uint256 m_hash;
+    std::atomic<bool> m_returned{false};
+    size_t m_count GUARDED_BY(cs_main){0};
+    size_t m_pow_count GUARDED_BY(cs_main){0};
+    bool m_before_return GUARDED_BY(cs_main){true};
+    std::thread::id m_thread GUARDED_BY(cs_main);
+    BlockValidationState m_state GUARDED_BY(cs_main);
+
+    explicit BlockCheckedCatcher(const uint256& hash) : m_hash{hash} {}
+
+    void BlockChecked(const std::shared_ptr<const CBlock>& block, const BlockValidationState& state) override EXCLUSIVE_LOCKS_REQUIRED(cs_main)
+    {
+        AssertLockHeld(cs_main);
+        if (block->GetHash() != m_hash) return;
+        ++m_count;
+        m_before_return &= !m_returned.load();
+        m_thread = std::this_thread::get_id();
+        m_state = state;
+    }
+
+    void NewPoWValidBlock(const CBlockIndex*, const std::shared_ptr<const CBlock>& block) override EXCLUSIVE_LOCKS_REQUIRED(cs_main)
+    {
+        AssertLockHeld(cs_main);
+        if (block->GetHash() == m_hash) ++m_pow_count;
+    }
+};
+
+BOOST_AUTO_TEST_CASE(processnewblock_check_outside_main)
+{
+    auto& chainman{*Assert(m_node.chainman)};
+    for (bool valid : {true, false}) {
+        const auto prev{WITH_LOCK(cs_main, return chainman.ActiveTip()->GetBlockHash())};
+        auto block{Block(prev)};
+        if (!valid) {
+            CMutableTransaction coinbase{*block->vtx[0]};
+            coinbase.vin[0].scriptSig.clear();
+            block->vtx[0] = MakeTransactionRef(std::move(coinbase));
+        }
+        MineUncheckedBlock(*block, chainman.GetConsensus());
+        CBlock reference{*block};
+        BlockValidationState expected;
+        BOOST_REQUIRE_EQUAL(CheckBlock(reference, expected, chainman.GetConsensus()), valid);
+        BOOST_CHECK(!block->m_validation_cache.m_checked.load());
+        BOOST_CHECK(!block->m_validation_cache.m_checked_merkle_root.load());
+        BOOST_CHECK(!block->m_validation_cache.m_checked_witness_commitment.load());
+
+        auto catcher{std::make_shared<BlockCheckedCatcher>(block->GetHash())};
+        m_node.validation_signals->RegisterSharedValidationInterface(catcher);
+        bool processed{false}, new_block{true}, progressed{false}, unpublished{false};
+        size_t callbacks_while_locked{0};
+        std::exception_ptr exception;
+        // On every unwind, release main before this owner joins its worker.
+        std::jthread worker;
+        {
+            LOCK(cs_main);
+            BOOST_REQUIRE(!chainman.m_blockman.LookupBlockIndex(block->GetHash()));
+            worker = std::jthread{[&] {
+                try {
+                    processed = chainman.ProcessNewBlock(block, true, true, &new_block);
+                } catch (...) {
+                    exception = std::current_exception();
+                }
+                catcher->m_returned.store(true);
+            }};
+            const auto& progress{valid ? block->m_validation_cache.m_checked : block->m_validation_cache.m_checked_merkle_root};
+            const auto deadline{std::chrono::steady_clock::now() + std::chrono::seconds{10}};
+            while (!progress.load() && std::chrono::steady_clock::now() < deadline) {
+                std::this_thread::yield();
+            }
+            progressed = progress.load();
+            unpublished = !chainman.m_blockman.LookupBlockIndex(block->GetHash());
+            callbacks_while_locked = catcher->m_count + catcher->m_pow_count;
+        }
+        const auto caller{worker.get_id()};
+        // Release main and join before reporting a missed progress deadline.
+        worker.join();
+        m_node.validation_signals->SyncWithValidationInterfaceQueue();
+        m_node.validation_signals->UnregisterSharedValidationInterface(catcher);
+        BOOST_CHECK(!exception);
+        BOOST_CHECK(progressed);
+        BOOST_CHECK(unpublished);
+        BOOST_CHECK_EQUAL(callbacks_while_locked, 0);
+        BOOST_CHECK_EQUAL(processed, valid);
+        BOOST_CHECK_EQUAL(new_block, valid);
+        {
+            LOCK(cs_main);
+            BOOST_CHECK_EQUAL(catcher->m_count, 1);
+            BOOST_CHECK(catcher->m_before_return);
+            BOOST_CHECK(catcher->m_thread == caller);
+            BOOST_CHECK(catcher->m_state.GetResult() == expected.GetResult());
+            BOOST_CHECK_EQUAL(catcher->m_state.ToString(), expected.ToString());
+            if (!valid) {
+                BOOST_CHECK(!chainman.m_blockman.LookupBlockIndex(block->GetHash()));
+                BOOST_CHECK(!block->m_validation_cache.m_checked.load());
+            }
+        }
+        if (valid) CheckStoredBlock(chainman, *block);
+        BOOST_CHECK_EQUAL(chainman.ProcessNewBlock(block, true, true, nullptr), valid);
+    }
+}
+
+BOOST_AUTO_TEST_CASE(processnewblock_check_gate_released_before_main)
+{
+    auto& chainman{*Assert(m_node.chainman)};
+    const auto prev{WITH_LOCK(cs_main, return chainman.ActiveTip()->GetBlockHash())};
+    const std::array blocks{Block(prev), Block(prev)};
+    std::array<std::shared_ptr<BlockCheckedCatcher>, 2> catchers;
+    for (size_t i = 0; i < blocks.size(); ++i) {
+        MineUncheckedBlock(*blocks[i], chainman.GetConsensus());
+        BOOST_CHECK(!blocks[i]->m_validation_cache.m_checked.load());
+        BOOST_CHECK(!blocks[i]->m_validation_cache.m_checked_merkle_root.load());
+        BOOST_CHECK(!blocks[i]->m_validation_cache.m_checked_witness_commitment.load());
+        catchers[i] = std::make_shared<BlockCheckedCatcher>(blocks[i]->GetHash());
+        m_node.validation_signals->RegisterSharedValidationInterface(catchers[i]);
+    }
+    BOOST_REQUIRE(blocks[0]->GetHash() != blocks[1]->GetHash());
+    struct Result {
+        bool processed{false};
+        bool new_block{false};
+        std::exception_ptr exception;
+    };
+    std::array<Result, 2> results;
+    std::array<bool, 2> progressed{}, unpublished{};
+    std::array<size_t, 2> callbacks_while_locked{};
+    // In particular, failure to launch B releases main before joining A.
+    std::array<std::jthread, 2> workers;
+    {
+        LOCK(cs_main);
+        for (const auto& block : blocks) {
+            BOOST_REQUIRE(!chainman.m_blockman.LookupBlockIndex(block->GetHash()));
+        }
+        for (size_t i = 0; i < blocks.size(); ++i) {
+            workers[i] = std::jthread{[&, i] {
+                try {
+                    results[i].processed = chainman.ProcessNewBlock(blocks[i], true, true, &results[i].new_block);
+                } catch (...) {
+                    results[i].exception = std::current_exception();
+                }
+                catchers[i]->m_returned.store(true);
+            }};
+            const auto deadline{std::chrono::steady_clock::now() + std::chrono::seconds{10}};
+            while (!blocks[i]->m_validation_cache.m_checked.load() && std::chrono::steady_clock::now() < deadline) {
+                std::this_thread::yield();
+            }
+            progressed[i] = blocks[i]->m_validation_cache.m_checked.load();
+        }
+        for (size_t i = 0; i < blocks.size(); ++i) {
+            unpublished[i] = !chainman.m_blockman.LookupBlockIndex(blocks[i]->GetHash());
+            callbacks_while_locked[i] = catchers[i]->m_count + catchers[i]->m_pow_count;
+        }
+    }
+    for (auto& worker : workers) {
+        worker.join();
+    }
+    m_node.validation_signals->SyncWithValidationInterfaceQueue();
+    for (const auto& catcher : catchers) {
+        m_node.validation_signals->UnregisterSharedValidationInterface(catcher);
+    }
+    for (size_t i = 0; i < blocks.size(); ++i) {
+        BOOST_CHECK_MESSAGE(progressed[i], "caller " << i << " did not finish initial checking before main release");
+        BOOST_CHECK(unpublished[i]);
+        BOOST_CHECK_EQUAL(callbacks_while_locked[i], 0);
+        BOOST_CHECK(!results[i].exception);
+        BOOST_CHECK(results[i].processed);
+        BOOST_CHECK(results[i].new_block);
+        CheckStoredBlock(chainman, *blocks[i]);
+    }
+}
+
+BOOST_FIXTURE_TEST_CASE(processnewblock_invalid_and_mutated, TestChain100Setup)
+{
+    auto& chainman{*Assert(m_node.chainman)};
+    const auto check_failure = [&](const std::shared_ptr<const CBlock>& block, BlockValidationResult result, std::string_view reason, bool initial = true) {
+        CBlock reference{*block};
+        BlockValidationState expected;
+        BOOST_CHECK_EQUAL(CheckBlock(reference, expected, chainman.GetConsensus()), !initial);
+        const CBlockIndex* before;
+        uint32_t status{0};
+        {
+            LOCK(cs_main);
+            before = chainman.m_blockman.LookupBlockIndex(block->GetHash());
+            if (before) status = before->nStatus;
+        }
+        auto catcher{std::make_shared<BlockCheckedCatcher>(block->GetHash())};
+        m_node.validation_signals->RegisterSharedValidationInterface(catcher);
+        bool new_block{true};
+        const bool processed{chainman.ProcessNewBlock(block, true, true, &new_block)};
+        catcher->m_returned.store(true);
+        m_node.validation_signals->UnregisterSharedValidationInterface(catcher);
+        BOOST_CHECK(!processed);
+        BOOST_CHECK(!new_block);
+        LOCK(cs_main);
+        BOOST_CHECK_EQUAL(catcher->m_count, 1);
+        BOOST_CHECK_EQUAL(catcher->m_pow_count, 0);
+        BOOST_CHECK(catcher->m_before_return);
+        BOOST_CHECK(catcher->m_thread == std::this_thread::get_id());
+        BOOST_CHECK(catcher->m_state.GetResult() == result);
+        BOOST_CHECK_EQUAL(catcher->m_state.GetRejectReason(), reason);
+        const auto* after{chainman.m_blockman.LookupBlockIndex(block->GetHash())};
+        if (initial) {
+            BOOST_CHECK_EQUAL(catcher->m_state.ToString(), expected.ToString());
+            BOOST_CHECK(after == before);
+            if (after) BOOST_CHECK_EQUAL(after->nStatus, status);
+        } else {
+            BOOST_REQUIRE(after);
+            BOOST_CHECK(!(after->nStatus & (BLOCK_HAVE_DATA | BLOCK_FAILED_VALID)));
+        }
+    };
+    const auto make_block = [&] {
+        auto block{std::make_shared<CBlock>(CreateBlock({}, CScript{} << OP_TRUE))};
+        MineUncheckedBlock(*block, chainman.GetConsensus());
+        return block;
+    };
+
+    auto bad_pow{make_block()};
+    while (CheckProofOfWork(bad_pow->GetHash(), bad_pow->nBits, chainman.GetConsensus())) {
+        ++bad_pow->nNonce;
+    }
+    check_failure(bad_pow, BlockValidationResult::BLOCK_INVALID_HEADER, "high-hash");
+
+    auto negative_output{make_block()};
+    CMutableTransaction negative_coinbase{*negative_output->vtx[0]};
+    negative_coinbase.vout[0].nValue = -1;
+    negative_output->vtx[0] = MakeTransactionRef(std::move(negative_coinbase));
+    MineUncheckedBlock(*negative_output, chainman.GetConsensus());
+    check_failure(negative_output, BlockValidationResult::BLOCK_CONSENSUS, "bad-txns-vout-negative");
+
+    // Three valid transactions allow duplication of the last leaf without changing the header.
+    auto spend{CreateValidMempoolTransaction(m_coinbase_txns[0], 0, 1, coinbaseKey, CScript{} << OP_TRUE, 49 * COIN, /*submit=*/false)};
+    CMutableTransaction child;
+    child.vin.emplace_back(COutPoint{spend.GetHash(), 0});
+    child.vout.emplace_back(48 * COIN, CScript{} << OP_TRUE);
+    auto correct{std::make_shared<CBlock>(CreateBlock({spend, child}, CScript{} << OP_TRUE))};
+    MineUncheckedBlock(*correct, chainman.GetConsensus());
+    auto wrong_merkle{std::make_shared<CBlock>(*correct)};
+    wrong_merkle->vtx.pop_back();
+    check_failure(wrong_merkle, BlockValidationResult::BLOCK_MUTATED, "bad-txnmrklroot");
+    auto duplicate{std::make_shared<CBlock>(*correct)};
+    duplicate->vtx.push_back(duplicate->vtx.back());
+    BOOST_REQUIRE(duplicate->GetHash() == correct->GetHash());
+    BOOST_REQUIRE(BlockMerkleRoot(*duplicate) == correct->hashMerkleRoot);
+    check_failure(duplicate, BlockValidationResult::BLOCK_MUTATED, "bad-txns-duplicate");
+
+    // The same malformed body must also leave an already-known header unchanged.
+    BlockValidationState header_state;
+    BOOST_REQUIRE(chainman.ProcessNewBlockHeaders({{*correct}}, true, header_state));
+    check_failure(duplicate, BlockValidationResult::BLOCK_MUTATED, "bad-txns-duplicate");
+    bool new_block{false};
+    BOOST_REQUIRE(chainman.ProcessNewBlock(correct, true, true, &new_block));
+    BOOST_CHECK(new_block);
+    CheckStoredBlock(chainman, *correct);
+
+    // Witness data is checked contextually, not by the initial CheckBlock call.
+    auto witness{make_block()};
+    BOOST_REQUIRE(witness->vtx[0]->HasWitness());
+    auto bad_witness{std::make_shared<CBlock>(*witness)};
+    CMutableTransaction witness_coinbase{*bad_witness->vtx[0]};
+    witness_coinbase.vin[0].scriptWitness.stack[0][0] ^= 1;
+    bad_witness->vtx[0] = MakeTransactionRef(std::move(witness_coinbase));
+    BOOST_REQUIRE(bad_witness->GetHash() == witness->GetHash());
+    check_failure(bad_witness, BlockValidationResult::BLOCK_MUTATED, "bad-witness-merkle-match", /*initial=*/false);
+    BOOST_CHECK(bad_witness->m_validation_cache.m_checked.load());
+    BOOST_CHECK(!bad_witness->m_validation_cache.m_checked_witness_commitment.load());
+    BOOST_REQUIRE(chainman.ProcessNewBlock(witness, true, true, nullptr));
+    BOOST_CHECK(witness->m_validation_cache.m_checked_witness_commitment.load());
+    CheckStoredBlock(chainman, *witness);
+}
+
+BOOST_AUTO_TEST_CASE(processnewblock_concurrent)
+{
+    auto& chainman{*Assert(m_node.chainman)};
+    // Initial checks use their own gate; master cs_main still serializes admission.
+    for (size_t worker_count : {8U, 20U}) {
+        // Shared pointer, separately decoded copies, and independent sibling blocks.
+        for (int mode : {0, 1, 2}) {
+            for (int round = 0; round < 4; ++round) {
+                const auto prev{WITH_LOCK(cs_main, return chainman.ActiveTip()->GetBlockHash())};
+                auto original{Block(prev)};
+                MineUncheckedBlock(*original, chainman.GetConsensus());
+                std::vector<std::shared_ptr<const CBlock>> blocks;
+                blocks.reserve(worker_count);
+                for (size_t i = 0; i < worker_count; ++i) {
+                    if (mode == 0) {
+                        blocks.push_back(original);
+                    } else if (mode == 1) {
+                        DataStream stream{BlockBytes(*original)};
+                        auto decoded{std::make_shared<CBlock>()};
+                        stream >> TX_WITH_WITNESS(*decoded);
+                        blocks.push_back(std::move(decoded));
+                    } else {
+                        auto sibling{Block(prev)};
+                        MineUncheckedBlock(*sibling, chainman.GetConsensus());
+                        blocks.push_back(std::move(sibling));
+                    }
+                    BOOST_CHECK(!blocks.back()->m_validation_cache.m_checked.load());
+                }
+                struct Result {
+                    bool processed{false};
+                    bool new_block{false};
+                    bool duplicate{false};
+                    bool duplicate_new{true};
+                    bool null_output{false};
+                    std::exception_ptr exception;
+                };
+                std::vector<Result> results(worker_count);
+                std::latch start{1};
+                bool cancelled{false};
+                std::vector<std::thread> workers;
+                workers.reserve(worker_count);
+                try {
+                    for (size_t i = 0; i < worker_count; ++i) {
+                        workers.emplace_back([&, i] {
+                            start.wait();
+                            if (cancelled) return;
+                            try {
+                                auto& result{results[i]};
+                                result.processed = chainman.ProcessNewBlock(blocks[i], true, true, &result.new_block);
+                                result.duplicate = chainman.ProcessNewBlock(blocks[i], true, true, &result.duplicate_new);
+                                result.null_output = chainman.ProcessNewBlock(blocks[i], true, true, nullptr);
+                            } catch (...) {
+                                results[i].exception = std::current_exception();
+                            }
+                        });
+                    }
+                } catch (...) {
+                    // Cancel before releasing a partially launched group.
+                    cancelled = true;
+                    start.count_down();
+                    for (auto& worker : workers) {
+                        worker.join();
+                    }
+                    throw;
+                }
+                start.count_down();
+                for (auto& worker : workers) {
+                    worker.join();
+                }
+                size_t admissions{0};
+                for (size_t i = 0; i < worker_count; ++i) {
+                    const auto& result{results[i]};
+                    BOOST_CHECK(!result.exception);
+                    BOOST_CHECK(result.processed);
+                    BOOST_CHECK(result.duplicate);
+                    BOOST_CHECK(!result.duplicate_new);
+                    BOOST_CHECK(result.null_output);
+                    admissions += result.new_block;
+                    CheckStoredBlock(chainman, *blocks[i]);
+                }
+                BOOST_CHECK_EQUAL(admissions, mode == 2 ? worker_count : 1);
+            }
+        }
+    }
+}
+
+BOOST_AUTO_TEST_CASE(processnewblock_concurrent_invalidation)
+{
+    auto& chainman{*Assert(m_node.chainman)};
+    auto& chainstate{WITH_LOCK(cs_main, return chainman.ActiveChainstate())};
+    for (int round = 0; round < 4; ++round) {
+        const auto root{WITH_LOCK(cs_main, return chainman.ActiveTip()->GetBlockHash())};
+        const auto parent{GoodBlock(root)};
+        BOOST_REQUIRE(chainman.ProcessNewBlock(parent, true, true, nullptr));
+        auto child{Block(parent->GetHash())};
+        MineUncheckedBlock(*child, chainman.GetConsensus());
+
+        // InvalidateBlock snapshots known headers. Keep the sole racing child's
+        // index in that snapshot; concurrent creation of new headers is not covered.
+        BlockValidationState header_state;
+        BOOST_REQUIRE(chainman.ProcessNewBlockHeaders({{*child}}, true, header_state));
+        CBlockIndex* parent_index;
+        {
+            LOCK(cs_main);
+            parent_index = chainman.m_blockman.LookupBlockIndex(parent->GetHash());
+            BOOST_REQUIRE(parent_index);
+            const auto* child_index{chainman.m_blockman.LookupBlockIndex(child->GetHash())};
+            BOOST_REQUIRE(child_index);
+            BOOST_CHECK(child_index->IsValid(BLOCK_VALID_TREE));
+            BOOST_CHECK(!(child_index->nStatus & (BLOCK_HAVE_DATA | BLOCK_FAILED_VALID)));
+        }
+        BOOST_CHECK(!child->m_validation_cache.m_checked.load());
+        BOOST_CHECK(!child->m_validation_cache.m_checked_merkle_root.load());
+        BOOST_CHECK(!child->m_validation_cache.m_checked_witness_commitment.load());
+
+        std::array<std::exception_ptr, 2> exceptions;
+        BlockValidationState state;
+        bool invalidated{false};
+        std::latch start{1};
+        std::jthread worker{[&] {
+            start.wait();
+            try {
+                chainman.ProcessNewBlock(child, true, true, nullptr);
+            } catch (...) {
+                exceptions[0] = std::current_exception();
+            }
+        }};
+        start.count_down();
+        try {
+            // This API acquires its own locks; never invoke it while holding main.
+            invalidated = chainstate.InvalidateBlock(state, parent_index);
+        } catch (...) {
+            exceptions[1] = std::current_exception();
+        }
+        worker.join();
+        for (const auto& exception : exceptions) {
+            BOOST_CHECK(!exception);
+        }
+        BOOST_REQUIRE(invalidated);
+        BOOST_CHECK(state.IsValid());
+        BOOST_CHECK(child->m_validation_cache.m_checked.load());
+        {
+            LOCK(cs_main);
+            BOOST_CHECK(parent_index->nStatus & BLOCK_FAILED_VALID);
+            BOOST_CHECK(chainman.ActiveTip()->GetBlockHash() == root);
+        }
+        // Either concurrent ordering is allowed. Only after joining, construct
+        // a fresh child to check invalid-parent rejection and then reconsider.
+        auto later{Block(parent->GetHash())};
+        MineUncheckedBlock(*later, chainman.GetConsensus());
+        bool new_block{true};
+        BOOST_CHECK(!chainman.ProcessNewBlock(later, true, true, &new_block));
+        BOOST_CHECK(!new_block);
+        BOOST_CHECK(later->m_validation_cache.m_checked.load());
+        {
+            LOCK(cs_main);
+            BOOST_CHECK(!chainman.m_blockman.LookupBlockIndex(later->GetHash()));
+            chainstate.ResetBlockFailureFlags(parent_index);
+            chainman.RecalculateBestHeader();
+        }
+        BOOST_REQUIRE(chainman.ProcessNewBlock(child, true, true, nullptr));
+        BOOST_CHECK(WITH_LOCK(cs_main, return chainman.ActiveTip()->GetBlockHash()) == child->GetHash());
+        CheckStoredBlock(chainman, *child);
     }
 }
 
