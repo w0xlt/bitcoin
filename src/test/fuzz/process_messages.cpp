@@ -88,7 +88,7 @@ FUZZ_TARGET(process_messages, .init = initialize_process_messages)
 
     node.validation_signals->RegisterValidationInterface(node.peerman.get());
 
-    LOCK(NetEventsInterface::g_msgproc_mutex);
+    WAIT_LOCK(NetEventsInterface::g_msgproc_mutex, lock);
 
     std::vector<CNode*> peers;
     const auto num_peers_to_add = fuzzed_data_provider.ConsumeIntegralInRange(1, 3);
@@ -130,9 +130,17 @@ FUZZ_TARGET(process_messages, .init = initialize_process_messages)
             } catch (const std::ios_base::failure&) {
             }
             node.peerman->SendMessages(random_node);
+            {
+                REVERSE_LOCK(lock, NetEventsInterface::g_msgproc_mutex);
+                more_work |= node.peerman->WaitForBlockProcessing();
+            }
         }
     }
-    node.validation_signals->SyncWithValidationInterfaceQueue();
+    {
+        REVERSE_LOCK(lock, NetEventsInterface::g_msgproc_mutex);
+        node.peerman->StopBlockProcessing();
+        node.validation_signals->SyncWithValidationInterfaceQueue();
+    }
     node.validation_signals->UnregisterValidationInterface(node.peerman.get());
     node.connman->StopNodes();
     const auto end_sequence{WITH_LOCK(node.mempool->cs, return node.mempool->GetSequence())};

@@ -146,7 +146,7 @@ FUZZ_TARGET(cmpctblock, .init = initialize_cmpctblock)
     setup->m_node.validation_signals->RegisterValidationInterface(peerman.get());
     setup->m_node.validation_signals->SyncWithValidationInterfaceQueue();
 
-    LOCK(NetEventsInterface::g_msgproc_mutex);
+    WAIT_LOCK(NetEventsInterface::g_msgproc_mutex, lock);
 
     std::vector<CNode*> peers;
     for (int i = 0; i < 4; ++i) {
@@ -436,6 +436,10 @@ FUZZ_TARGET(cmpctblock, .init = initialize_cmpctblock)
 
             more_work = connman.ProcessMessagesOnce(random_node);
             peerman->SendMessages(random_node);
+            {
+                REVERSE_LOCK(lock, NetEventsInterface::g_msgproc_mutex);
+                more_work |= peerman->WaitForBlockProcessing();
+            }
         }
 
         std::vector<CNodeStats> stats;
@@ -460,7 +464,11 @@ FUZZ_TARGET(cmpctblock, .init = initialize_cmpctblock)
         }
     }
 
-    setup->m_node.validation_signals->SyncWithValidationInterfaceQueue();
+    {
+        REVERSE_LOCK(lock, NetEventsInterface::g_msgproc_mutex);
+        peerman->StopBlockProcessing();
+        setup->m_node.validation_signals->SyncWithValidationInterfaceQueue();
+    }
     setup->m_node.validation_signals->UnregisterAllValidationInterfaces();
     connman.StopNodes();
 

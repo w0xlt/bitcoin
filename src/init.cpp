@@ -339,15 +339,18 @@ void Shutdown(NodeContext& node)
 
     // Because these depend on each-other, we make sure that neither can be
     // using the other before destroying them.
+    if (node.connman) node.connman->StopThreads();
+    if (node.peerman) node.peerman->StopBlockProcessing();
+    if (node.background_init_thread.joinable()) node.background_init_thread.join();
+    if (node.validation_signals) node.validation_signals->SyncWithValidationInterfaceQueue();
     if (node.peerman && node.validation_signals) node.validation_signals->UnregisterValidationInterface(node.peerman.get());
-    if (node.connman) node.connman->Stop();
+    if (node.connman) node.connman->StopNodes();
 
     if (node.tor_controller) {
         node.tor_controller->Join();
         node.tor_controller.reset();
     }
 
-    if (node.background_init_thread.joinable()) node.background_init_thread.join();
     // After everything has been shut down, but before things get flushed, stop the
     // the scheduler. After this point, SyncWithValidationInterfaceQueue() should not be called anymore
     // as this would prevent the shutdown from completing.

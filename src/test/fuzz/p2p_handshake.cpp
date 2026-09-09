@@ -61,7 +61,7 @@ FUZZ_TARGET(p2p_handshake, .init = ::initialize)
     connman.SetMsgProc(node.peerman.get());
     connman.SetAddrman(*node.addrman);
 
-    LOCK(NetEventsInterface::g_msgproc_mutex);
+    WAIT_LOCK(NetEventsInterface::g_msgproc_mutex, lock);
 
     std::vector<CNode*> peers;
     const auto num_peers_to_add = fuzzed_data_provider.ConsumeIntegralInRange(1, 3);
@@ -113,5 +113,9 @@ FUZZ_TARGET(p2p_handshake, .init = ::initialize)
         }
     }
 
+    {
+        REVERSE_LOCK(lock, NetEventsInterface::g_msgproc_mutex);
+        node.peerman->StopBlockProcessing();
+    }
     node.connman->StopNodes();
 }

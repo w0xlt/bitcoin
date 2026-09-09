@@ -30,6 +30,7 @@
 #include <netaddress.h>
 #include <netbase.h>
 #include <netmessagemaker.h>
+#include <node/blockprocessing.h>
 #include <node/blockstorage.h>
 #include <node/connection_types.h>
 #include <node/protocol_version.h>
@@ -59,6 +60,7 @@
 #include <util/check.h>
 #include <util/hasher.h>
 #include <util/strencodings.h>
+#include <util/thread.h>
 #include <util/time.h>
 #include <util/tokenbucket.h>
 #include <util/trace.h>
@@ -570,6 +572,7 @@ public:
     PeerManagerImpl(CConnman& connman, AddrMan& addrman,
                     BanMan* banman, ChainstateManager& chainman,
                     CTxMemPool& pool, node::Warnings& warnings, Options opts);
+    ~PeerManagerImpl() override { m_block_worker.Stop(); }
 
     /** Overridden from CValidationInterface. */
     void ActiveTipChange(const CBlockIndex& new_tip, bool) override
@@ -596,6 +599,9 @@ public:
 
     /** Implement PeerManager */
     void StartScheduledTasks(CScheduler& scheduler) override;
+    void StartBlockProcessing() override EXCLUSIVE_LOCKS_REQUIRED(!g_msgproc_mutex) LOCKS_EXCLUDED(cs_main);
+    bool WaitForBlockProcessing() override EXCLUSIVE_LOCKS_REQUIRED(!g_msgproc_mutex) LOCKS_EXCLUDED(cs_main);
+    void StopBlockProcessing() override EXCLUSIVE_LOCKS_REQUIRED(!g_msgproc_mutex) LOCKS_EXCLUDED(cs_main);
     void CheckForStaleTipAndEvictPeers() override;
     util::Expected<void, std::string> FetchBlock(NodeId peer_id, const CBlockIndex& block_index) override
         EXCLUSIVE_LOCKS_REQUIRED(!m_peer_mutex);
@@ -855,6 +861,7 @@ private:
     BanMan* const m_banman;
     ChainstateManager& m_chainman;
     CTxMemPool& m_mempool;
+    node::BlockProcessingWorker m_block_worker;
 
     /** Synchronizes tx download including TxRequestTracker, rejection filters, and TxOrphanage.
      * Lock invariants:
@@ -1052,16 +1059,10 @@ private:
         EXCLUSIVE_LOCKS_REQUIRED(!m_most_recent_block_mutex, peer.m_getdata_requests_mutex, NetEventsInterface::g_msgproc_mutex)
         LOCKS_EXCLUDED(::cs_main);
 
-    /** ProcessNewBlock outcomes; neither implies full consensus validity. */
-    struct BlockProcessingResult {
-        bool processing_success{false};
-        bool new_block{false};
-    };
-
-    BlockProcessingResult ProcessBlock(const std::shared_ptr<const CBlock>& block, bool force_processing, bool min_pow_checked);
+    node::BlockProcessingResult ProcessBlock(node::BlockProcessingJob job) LOCKS_EXCLUDED(cs_main);
 
     /** Apply post-processing peer updates on the message-handler thread. */
-    void CompleteBlockProcessing(CNode& node, const uint256& hash, const BlockProcessingResult& result, bool optimistic_reconstruction)
+    void CompleteBlockProcessing(CNode& node, const node::BlockProcessingResult& result)
         EXCLUSIVE_LOCKS_REQUIRED(g_msgproc_mutex);
 
     /** Process compact block txns  */
@@ -2146,6 +2147,7 @@ PeerManagerImpl::PeerManagerImpl(CConnman& connman, AddrMan& addrman,
       m_banman(banman),
       m_chainman(chainman),
       m_mempool(pool),
+      m_block_worker{chainman, connman},
       m_txdownloadman{node::TxDownloadOptions{pool, opts.deterministic_rng}},
       m_warnings{warnings},
       m_opts{opts},
@@ -3682,14 +3684,148 @@ void PeerManagerImpl::ProcessGetCFCheckPt(CNode& node, Peer& peer, DataStream& v
               headers);
 }
 
-PeerManagerImpl::BlockProcessingResult PeerManagerImpl::ProcessBlock(const std::shared_ptr<const CBlock>& block, bool force_processing, bool min_pow_checked)
+node::BlockProcessingWorker::~BlockProcessingWorker()
 {
-    BlockProcessingResult result;
-    result.processing_success = m_chainman.ProcessNewBlock(block, force_processing, min_pow_checked, &result.new_block);
-    return result;
+    Stop();
 }
 
-void PeerManagerImpl::CompleteBlockProcessing(CNode& node, const uint256& hash, const BlockProcessingResult& result, bool optimistic_reconstruction)
+void node::BlockProcessingWorker::Start()
+{
+    LOCK(m_mutex);
+    assert(!m_thread.joinable() && !m_job && !m_running && !m_result);
+    m_open = true;
+}
+
+bool node::BlockProcessingWorker::Submit(BlockProcessingJob job)
+{
+    {
+        LOCK(m_mutex);
+        if (!m_open || m_job || m_running || m_result) return false;
+        // Start before admitting the job: a thread-creation exception leaves
+        // the empty slot intact. The worker cannot enter until this unlocks.
+        if (!m_thread.joinable()) {
+            m_thread = std::thread{[this] { util::TraceThread("blkproc", [this] { Run(); }); }};
+        }
+        m_job.emplace(std::move(job));
+    }
+    m_condition.notify_one();
+    return true;
+}
+
+bool node::BlockProcessingWorker::Wait()
+{
+    AssertLockNotHeld(cs_main);
+    WAIT_LOCK(m_mutex, lock);
+    m_condition.wait(lock, [this]() EXCLUSIVE_LOCKS_REQUIRED(m_mutex) { return !m_job && !m_running; });
+    return m_result.has_value();
+}
+
+std::optional<node::BlockProcessingResult> node::BlockProcessingWorker::TakeResult()
+{
+    LOCK(m_mutex);
+    return std::exchange(m_result, std::nullopt);
+}
+
+void node::BlockProcessingWorker::Run()
+{
+    while (true) {
+        BlockProcessingResult result;
+        {
+            std::optional<BlockProcessingJob> job;
+            {
+                WAIT_LOCK(m_mutex, lock);
+                m_condition.wait(lock, [this]() EXCLUSIVE_LOCKS_REQUIRED(m_mutex) { return !m_open || m_job.has_value(); });
+                if (!m_job) return;
+                job = std::exchange(m_job, std::nullopt);
+                m_running = true;
+            }
+            result.source = job->source;
+            result.hash = job->block->GetHash();
+            result.optimistic_reconstruction = job->optimistic_reconstruction;
+            try {
+                result.processing_success = m_chainman.ProcessNewBlock(job->block, job->force_processing, job->min_pow_checked, &result.new_block);
+            } catch (...) {
+                result.exception = std::current_exception();
+            }
+        } // Finish the catch scope and release the task's payload before publishing.
+        {
+            LOCK(m_mutex);
+            m_result.emplace(std::move(result));
+            result.exception = nullptr;
+            m_running = false;
+        }
+        m_condition.notify_all();
+        // Even duplicates, ignored blocks and exceptions need this wake. A
+        // consumer may reuse the slot now, but must still join before teardown.
+        m_connman.WakeMessageHandler();
+    }
+}
+
+void node::BlockProcessingWorker::Stop()
+{
+    {
+        LOCK(m_mutex);
+        m_open = false;
+    }
+    m_condition.notify_all();
+    if (m_thread.joinable()) {
+        AssertLockNotHeld(cs_main);
+        AssertLockNotHeld(NetEventsInterface::g_msgproc_mutex);
+        assert(m_thread.get_id() != std::this_thread::get_id());
+        m_thread.join();
+    }
+    if (auto result{TakeResult()}; result && result->exception) {
+        try {
+            std::rethrow_exception(result->exception);
+        } catch (const std::exception& e) {
+            LogError("Exception while stopping block processing: %s", e.what());
+        } catch (...) {
+            LogError("Unknown exception while stopping block processing");
+        }
+    }
+}
+
+void PeerManagerImpl::StartBlockProcessing()
+{
+    AssertLockNotHeld(g_msgproc_mutex);
+    m_block_worker.Start();
+}
+
+bool PeerManagerImpl::WaitForBlockProcessing()
+{
+    AssertLockNotHeld(g_msgproc_mutex);
+    return m_block_worker.Wait();
+}
+
+void PeerManagerImpl::StopBlockProcessing()
+{
+    AssertLockNotHeld(g_msgproc_mutex);
+    m_block_worker.Stop();
+}
+
+node::BlockProcessingResult PeerManagerImpl::ProcessBlock(node::BlockProcessingJob job)
+{
+    // Temporary synchronous bridge. The worker and its callbacks do not take
+    // g_msgproc_mutex; no validation or peer locks may be held while waiting.
+    const auto source{job.source};
+    const auto hash{job.block->GetHash()};
+    try {
+        Assert(m_block_worker.Submit(std::move(job)));
+    } catch (...) {
+        // No job was admitted if thread creation failed. Do not leave source
+        // attribution behind, or erase an entry belonging to another source.
+        LOCK(cs_main);
+        const auto it{mapBlockSource.find(hash)};
+        if (it != mapBlockSource.end() && it->second.first == source) mapBlockSource.erase(it);
+        throw;
+    }
+    Assert(m_block_worker.Wait());
+    auto result{Assert(m_block_worker.TakeResult())};
+    if (result->exception) std::rethrow_exception(result->exception);
+    return std::move(*result);
+}
+
+void PeerManagerImpl::CompleteBlockProcessing(CNode& node, const node::BlockProcessingResult& result)
 {
     // new_block can be true even if processing failed, for example on a write error.
     if (result.new_block) {
@@ -3697,20 +3833,20 @@ void PeerManagerImpl::CompleteBlockProcessing(CNode& node, const uint256& hash, 
         // In case this block came from a different peer than we requested
         // from, we can erase the block request now anyway.
         LOCK(cs_main);
-        RemoveBlockRequest(hash, std::nullopt);
+        RemoveBlockRequest(result.hash, std::nullopt);
     } else {
         LOCK(cs_main);
-        mapBlockSource.erase(hash);
+        mapBlockSource.erase(result.hash);
     }
 
-    if (optimistic_reconstruction) {
+    if (result.optimistic_reconstruction) {
         LOCK(cs_main);
-        const CBlockIndex* index{Assert(m_chainman.m_blockman.LookupBlockIndex(hash))};
+        const CBlockIndex* index{Assert(m_chainman.m_blockman.LookupBlockIndex(result.hash))};
         if (index->IsValid(BLOCK_VALID_TRANSACTIONS)) {
             // Clear download state for this block, which is in process from
             // some other peer. Do this after ProcessNewBlock so a malleated
             // compact block cannot interfere with block relay.
-            RemoveBlockRequest(hash, std::nullopt);
+            RemoveBlockRequest(result.hash, std::nullopt);
         }
     }
 }
@@ -3797,8 +3933,8 @@ void PeerManagerImpl::ProcessCompactBlockTxns(CNode& pfrom, Peer& peer, const Bl
         // disk-space attacks), but this should be safe due to the
         // protections in the compact block handler -- see related comment
         // in compact block optimistic reconstruction handling.
-        const auto result{ProcessBlock(pblock, /*force_processing=*/true, /*min_pow_checked=*/true)};
-        CompleteBlockProcessing(pfrom, pblock->GetHash(), result, /*optimistic_reconstruction=*/false);
+        const auto result{ProcessBlock({pblock, pfrom.GetId(), /*force_processing=*/true, /*min_pow_checked=*/true})};
+        CompleteBlockProcessing(pfrom, result);
     }
     return;
 }
@@ -5060,8 +5196,8 @@ void PeerManagerImpl::ProcessMessage(Peer& peer, CNode& pfrom, const std::string
             // we have a chain with at least the minimum chain work), and we ignore
             // compact blocks with less work than our tip, it is safe to treat
             // reconstructed compact blocks as having been requested.
-            const auto result{ProcessBlock(pblock, /*force_processing=*/true, /*min_pow_checked=*/true)};
-            CompleteBlockProcessing(pfrom, pblock->GetHash(), result, /*optimistic_reconstruction=*/true);
+            const auto result{ProcessBlock({pblock, pfrom.GetId(), /*force_processing=*/true, /*min_pow_checked=*/true, /*optimistic_reconstruction=*/true})};
+            CompleteBlockProcessing(pfrom, result);
         }
         return;
     }
@@ -5164,8 +5300,8 @@ void PeerManagerImpl::ProcessMessage(Peer& peer, CNode& pfrom, const std::string
                 min_pow_checked = true;
             }
         }
-        const auto result{ProcessBlock(pblock, forceProcessing, min_pow_checked)};
-        CompleteBlockProcessing(pfrom, hash, result, /*optimistic_reconstruction=*/false);
+        const auto result{ProcessBlock({pblock, pfrom.GetId(), forceProcessing, min_pow_checked})};
+        CompleteBlockProcessing(pfrom, result);
         return;
     }
 

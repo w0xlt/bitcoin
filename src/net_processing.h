@@ -127,6 +127,13 @@ public:
     /** Begin running background tasks, should only be called once */
     virtual void StartScheduledTasks(CScheduler& scheduler) = 0;
 
+    /** Reopen block processing after a stop; starts no thread until needed. */
+    virtual void StartBlockProcessing() EXCLUSIVE_LOCKS_REQUIRED(!g_msgproc_mutex) LOCKS_EXCLUDED(cs_main) = 0;
+    /** Wait for outstanding work; true means a result still needs consumption. */
+    virtual bool WaitForBlockProcessing() EXCLUSIVE_LOCKS_REQUIRED(!g_msgproc_mutex) LOCKS_EXCLUDED(cs_main) = 0;
+    /** Stop admissions and join before unregistering callbacks or dependencies. */
+    virtual void StopBlockProcessing() EXCLUSIVE_LOCKS_REQUIRED(!g_msgproc_mutex) LOCKS_EXCLUDED(cs_main) = 0;
+
     /** Get statistics from node state */
     virtual bool GetNodeStateStats(NodeId nodeid, CNodeStateStats& stats) const = 0;
 

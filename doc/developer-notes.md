@@ -750,8 +750,12 @@ and its `cs_KeyStore` lock for example).
 - Net threads:
 
   - [ThreadMessageHandler (`b-msghand`)](https://doxygen.bitcoincore.org/class_c_connman.html#msghand)
-    : Application level message handling (sending and receiving). Almost
-    all net_processing and validation logic runs on this thread.
+    : Application level message handling (sending and receiving).
+
+  - Block processing (`b-blkproc`)
+    : Processes received blocks on behalf of the message handler, with one
+    outstanding job. Starts lazily and is joined before network dependencies
+    and validation subscribers are destroyed.
 
   - [ThreadDNSAddressSeed (`b-dnsseed`)](https://doxygen.bitcoincore.org/class_c_connman.html#dnsseed)
     : Loads addresses of peers from the DNS.

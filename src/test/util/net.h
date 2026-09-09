@@ -7,11 +7,11 @@
 
 #include <attributes.h>
 #include <compat/compat.h>
-#include <netmessagemaker.h>
 #include <net.h>
 #include <net_permissions.h>
 #include <net_processing.h>
 #include <netaddress.h>
+#include <netmessagemaker.h>
 #include <node/connection_types.h>
 #include <node/eviction.h>
 #include <span.h>
@@ -29,6 +29,7 @@
 #include <optional>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 class FastRandomContext;
@@ -52,6 +53,14 @@ struct ConnmanTestMsg : public CConnman {
     void ResetMaxOutboundCycle();
     /// Reset the internal state.
     void Reset();
+
+    /** Test access to the existing wake gate, without changing production wakeups. */
+    Mutex& MessageWakeMutex() LOCK_RETURNED(mutexMsgProc) { return mutexMsgProc; }
+    bool TakeMessageWake() EXCLUSIVE_LOCKS_REQUIRED(!mutexMsgProc)
+    {
+        LOCK(mutexMsgProc);
+        return std::exchange(fMsgProcWake, false);
+    }
 
     std::vector<CNode*> TestNodes()
     {

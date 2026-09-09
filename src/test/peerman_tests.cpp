@@ -9,12 +9,14 @@
 #include <interfaces/mining.h>
 #include <net_processing.h>
 #include <netbase.h>
+#include <node/blockprocessing.h>
 #include <node/kernel_notifications.h>
 #include <pow.h>
 #include <primitives/block.h>
 #include <primitives/transaction.h>
 #include <protocol.h>
 #include <sync.h>
+#include <test/util/logging.h>
 #include <test/util/mining.h>
 #include <test/util/net.h>
 #include <test/util/setup_common.h>
@@ -28,11 +30,17 @@
 #include <boost/test/unit_test.hpp>
 
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
+#include <exception>
 #include <initializer_list>
+#include <latch>
 #include <memory>
+#include <optional>
+#include <stdexcept>
 #include <string>
 #include <system_error>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -122,6 +130,7 @@ struct BlockProcessingTestSetup : RegTestingSetup {
     {
         AssertLockNotHeld(cs_main);
         AssertLockNotHeld(NetEventsInterface::g_msgproc_mutex);
+        m_node.peerman->StopBlockProcessing();
         // Test-body locks have unwound. Keep subscribers, peers and the clock
         // alive until all queued validation callbacks have finished.
         m_node.validation_signals->SyncWithValidationInterfaceQueue();
@@ -361,6 +370,409 @@ BOOST_FIXTURE_TEST_CASE(block_processing_completion_disconnected_source, BlockPr
     BOOST_CHECK(BlocksInFlight(requested).empty());
     BOOST_CHECK(!requested.fDisconnect);
     BOOST_CHECK(WITH_LOCK(cs_main, return m_node.chainman->ActiveTip()->GetBlockHash()) == block->GetHash());
+}
+
+namespace {
+/** No peer subscriber is registered by RegTestingSetup: only this job can wake. */
+node::BlockProcessingResult RunWorkerJob(node::BlockProcessingWorker& worker, ConnmanTestMsg& connman, node::BlockProcessingJob job)
+    LOCKS_EXCLUDED(cs_main)
+{
+    worker.Start();
+    // Outlive the inner wake lock, but settle before the caller restores any
+    // fixture state, including if submission or result inspection throws.
+    struct StopOnExit {
+        node::BlockProcessingWorker& worker;
+        ~StopOnExit() { worker.Stop(); }
+    } stop_on_exit{worker};
+    connman.TakeMessageWake();
+    bool admitted, ready, rejected;
+    std::optional<node::BlockProcessingResult> result;
+    {
+        LOCK(connman.MessageWakeMutex());
+        admitted = worker.Submit(job);
+        ready = worker.Wait();
+        rejected = !worker.Submit(job);
+        result = worker.TakeResult();
+    }
+    worker.Stop();
+    // Obtaining a result while the real wake mutex was held proves publication
+    // came first. Assertions run only after releasing that mutex and joining.
+    BOOST_CHECK(admitted);
+    BOOST_CHECK(ready);
+    BOOST_CHECK(rejected);
+    BOOST_CHECK(connman.TakeMessageWake());
+    BOOST_REQUIRE(result);
+    BOOST_CHECK_EQUAL(result->source, job.source);
+    BOOST_CHECK(result->hash == job.block->GetHash());
+    BOOST_CHECK_EQUAL(result->optimistic_reconstruction, job.optimistic_reconstruction);
+    return std::move(*result);
+}
+
+/** Declare before the worker so every producer is joined before unregistering. */
+struct WorkerObserver {
+    ValidationSignals& m_signals;
+    const std::shared_ptr<CValidationInterface> m_observer;
+    bool m_registered{true};
+
+    WorkerObserver(ValidationSignals& signals, std::shared_ptr<CValidationInterface> observer)
+        : m_signals{signals}, m_observer{std::move(observer)}
+    {
+        m_signals.RegisterSharedValidationInterface(m_observer);
+    }
+    void Finish()
+    {
+        if (!m_registered) return;
+        AssertLockNotHeld(cs_main);
+        AssertLockNotHeld(NetEventsInterface::g_msgproc_mutex);
+        m_signals.SyncWithValidationInterfaceQueue();
+        m_signals.UnregisterSharedValidationInterface(m_observer);
+        m_registered = false;
+    }
+    ~WorkerObserver() { Finish(); }
+};
+
+struct WorkerChecked final : CValidationInterface {
+    std::vector<std::thread::id> m_threads; // Read only after worker joins.
+    bool m_throw{false};
+    void BlockChecked(const std::shared_ptr<const CBlock>&, const BlockValidationState&) override
+        EXCLUSIVE_LOCKS_REQUIRED(cs_main)
+    {
+        AssertLockHeld(cs_main);
+        AssertLockNotHeld(NetEventsInterface::g_msgproc_mutex);
+        m_threads.push_back(std::this_thread::get_id());
+        if (m_throw) throw std::runtime_error{"block worker test exception"};
+    }
+};
+
+/** The master-compatible running pause holds main; never take main to release it. */
+struct WorkerPoWPause final : CValidationInterface {
+    const uint256 m_hash;
+    Mutex m_mutex;
+    std::condition_variable m_condition;
+    bool m_entered GUARDED_BY(m_mutex){false};
+    bool m_released GUARDED_BY(m_mutex){false};
+    std::thread::id m_thread; // Read only after worker joins.
+
+    explicit WorkerPoWPause(const uint256& hash) : m_hash{hash} {}
+    void NewPoWValidBlock(const CBlockIndex*, const std::shared_ptr<const CBlock>& block) override
+        EXCLUSIVE_LOCKS_REQUIRED(cs_main, !m_mutex)
+    {
+        AssertLockHeld(cs_main);
+        AssertLockNotHeld(NetEventsInterface::g_msgproc_mutex);
+        if (block->GetHash() != m_hash) return;
+        WAIT_LOCK(m_mutex, lock);
+        m_thread = std::this_thread::get_id();
+        m_entered = true;
+        m_condition.notify_all();
+        m_condition.wait(lock, [this]() EXCLUSIVE_LOCKS_REQUIRED(m_mutex) { return m_released; });
+    }
+    bool WaitEntered() EXCLUSIVE_LOCKS_REQUIRED(!m_mutex)
+    {
+        WAIT_LOCK(m_mutex, lock);
+        return m_condition.wait_until(lock, std::chrono::steady_clock::now() + 5s,
+                                      [this]() EXCLUSIVE_LOCKS_REQUIRED(m_mutex) { return m_entered; });
+    }
+    void Release() EXCLUSIVE_LOCKS_REQUIRED(!m_mutex)
+    {
+        LOCK(m_mutex);
+        m_released = true;
+        m_condition.notify_all();
+    }
+};
+} // namespace
+
+BOOST_AUTO_TEST_CASE(block_worker_idle_and_ready)
+{
+    auto& connman{static_cast<ConnmanTestMsg&>(*m_node.connman)};
+    node::BlockProcessingWorker worker{*m_node.chainman, connman};
+    BOOST_CHECK(!worker.Wait());
+    BOOST_CHECK(!worker.TakeResult());
+    worker.Stop();
+    worker.Stop();
+    BOOST_CHECK(!worker.Submit({std::make_shared<const CBlock>(Params().GenesisBlock()), 3, true, true}));
+
+    worker.Start();
+    auto payload{std::make_shared<const CBlock>(Params().GenesisBlock())};
+    std::weak_ptr<const CBlock> weak_payload{payload};
+    connman.TakeMessageWake();
+    bool admitted, ready, released, rejected;
+    std::optional<node::BlockProcessingResult> result;
+    {
+        LOCK(connman.MessageWakeMutex());
+        admitted = worker.Submit({std::move(payload), 3, true, true});
+        ready = worker.Wait();
+        released = weak_payload.expired();
+        rejected = !worker.Submit({std::make_shared<const CBlock>(Params().GenesisBlock()), 4, true, true});
+        result = worker.TakeResult();
+    }
+    worker.Stop();
+    BOOST_CHECK(admitted);
+    BOOST_CHECK(ready);
+    BOOST_CHECK(released);
+    BOOST_CHECK(rejected);
+    BOOST_CHECK(connman.TakeMessageWake());
+    BOOST_REQUIRE(result);
+    BOOST_CHECK(result->processing_success);
+    BOOST_CHECK(!result->new_block);
+    BOOST_CHECK(!result->exception);
+    BOOST_CHECK_EQUAL(result->source, 3);
+    BOOST_CHECK(result->hash == Params().GenesisBlock().GetHash());
+    BOOST_CHECK(!worker.Wait());
+    BOOST_CHECK(!worker.TakeResult());
+}
+
+BOOST_AUTO_TEST_CASE(block_worker_terminal_wakeups)
+{
+    auto& chainman{*m_node.chainman};
+    auto& connman{static_cast<ConnmanTestMsg&>(*m_node.connman)};
+    const auto blocks{CreateBlockChain(3, Params())};
+    auto side{std::make_shared<CBlock>(*blocks[0])};
+    do {
+        ++side->nNonce;
+    } while (!CheckProofOfWork(side->GetHash(), side->nBits, Params().GetConsensus()));
+    auto invalid{std::make_shared<CBlock>(*blocks[1])};
+    invalid->vtx.clear();
+    invalid->m_validation_cache = {};
+    node::BlockProcessingWorker worker{chainman, connman};
+
+    const auto valid{RunWorkerJob(worker, connman, {blocks[0], 7, true, true})};
+    BOOST_CHECK(valid.processing_success && valid.new_block && !valid.exception);
+    const auto duplicate{RunWorkerJob(worker, connman, {blocks[0], 7, true, true})};
+    BOOST_CHECK(duplicate.processing_success && !duplicate.new_block && !duplicate.exception);
+    const auto next{RunWorkerJob(worker, connman, {blocks[1], 7, true, true})};
+    BOOST_CHECK(next.processing_success && next.new_block && !next.exception);
+
+    // Lower-work, unrequested data is ignored; requesting it then stores a
+    // side-chain block without changing the active tip. Both still need a wake.
+    const auto ignored{RunWorkerJob(worker, connman, {side, 8, false, true})};
+    BOOST_CHECK(ignored.processing_success && !ignored.new_block && !ignored.exception);
+    BOOST_CHECK(!(WITH_LOCK(cs_main, return chainman.m_blockman.LookupBlockIndex(side->GetHash())->nStatus) & BLOCK_HAVE_DATA));
+    const auto no_tip{RunWorkerJob(worker, connman, {side, 8, true, true, true})};
+    BOOST_CHECK(no_tip.processing_success && no_tip.new_block && !no_tip.exception);
+    BOOST_CHECK(WITH_LOCK(cs_main, return chainman.ActiveTip()->GetBlockHash()) == blocks[1]->GetHash());
+    const auto failed{RunWorkerJob(worker, connman, {invalid, 9, true, true})};
+    BOOST_CHECK(!failed.processing_success && !failed.new_block && !failed.exception);
+
+    const auto path{chainman.m_blockman.GetBlockPosFilename(FlatFilePos{0, 0})};
+    const auto saved_path{path.parent_path() / "blk00000.saved"};
+    BOOST_REQUIRE(fs::is_regular_file(path));
+    BOOST_REQUIRE(!fs::exists(saved_path));
+    std::optional<node::BlockProcessingResult> write_failed;
+    {
+        struct RestoreBlockFile {
+            node::KernelNotifications& notifications;
+            const bool shutdown_on_fatal_error;
+            const fs::path path;
+            const fs::path saved_path;
+            bool renamed{false};
+            bool created_directory{false};
+
+            ~RestoreBlockFile()
+            {
+                notifications.m_shutdown_on_fatal_error = shutdown_on_fatal_error;
+                std::error_code error;
+                if (created_directory) {
+                    Assert(fs::remove(path, error));
+                    Assert(!error);
+                }
+                if (renamed) {
+                    fs::rename(saved_path, path, error);
+                    Assert(!error);
+                }
+            }
+        } restore{*m_node.notifications, m_node.notifications->m_shutdown_on_fatal_error, path, saved_path};
+        fs::rename(path, saved_path);
+        restore.renamed = true;
+        restore.created_directory = fs::create_directory(path);
+        BOOST_REQUIRE(restore.created_directory);
+        m_node.notifications->m_shutdown_on_fatal_error = false;
+        write_failed = RunWorkerJob(worker, connman, {blocks[2], 9, true, true});
+    }
+    BOOST_CHECK(fs::is_regular_file(path));
+    BOOST_CHECK(!fs::exists(saved_path));
+    BOOST_REQUIRE(write_failed);
+    // The new_block output is assigned before the failed write.
+    BOOST_CHECK(!write_failed->processing_success && write_failed->new_block && !write_failed->exception);
+}
+
+BOOST_AUTO_TEST_CASE(block_worker_queued_shutdown)
+{
+    auto& connman{static_cast<ConnmanTestMsg&>(*m_node.connman)};
+    auto invalid{std::make_shared<CBlock>(Params().GenesisBlock())};
+    invalid->vtx.clear();
+    invalid->m_validation_cache = {};
+    auto checked{std::make_shared<WorkerChecked>()};
+    WorkerObserver observer{*m_node.validation_signals, checked};
+    node::BlockProcessingWorker worker{*m_node.chainman, connman};
+    std::latch stopping{1};
+    std::thread::id stop_thread;
+    std::jthread stopper;
+    bool admitted, ready, queued;
+    std::optional<node::BlockProcessingResult> first;
+    connman.TakeMessageWake();
+    {
+        LOCK(connman.MessageWakeMutex());
+        admitted = worker.Submit({invalid, 11, true, true});
+        ready = worker.Wait();
+        first = worker.TakeResult();
+        // The worker cannot finish its first wake yet, so this second job is
+        // queued, not already running. Stop must never process it on its caller.
+        queued = worker.Submit({invalid, 12, true, true});
+        stopper = std::jthread{[&] {
+            stop_thread = std::this_thread::get_id();
+            // Acknowledge arrival at Stop, not that admission is already closed.
+            stopping.count_down();
+            worker.Stop();
+        }};
+        stopping.wait();
+    }
+    stopper.join();
+    observer.Finish();
+    BOOST_CHECK(admitted && ready && queued);
+    BOOST_REQUIRE(first);
+    BOOST_CHECK(!first->processing_success && !first->exception);
+    BOOST_CHECK(connman.TakeMessageWake());
+    BOOST_REQUIRE_EQUAL(checked->m_threads.size(), 2);
+    BOOST_CHECK(checked->m_threads[0] == checked->m_threads[1]);
+    BOOST_CHECK(checked->m_threads[0] != std::this_thread::get_id());
+    BOOST_CHECK(checked->m_threads[1] != stop_thread);
+    BOOST_CHECK(!worker.Wait());
+    BOOST_CHECK(!worker.TakeResult());
+    BOOST_CHECK(!worker.Submit({invalid, 13, true, true}));
+}
+
+BOOST_AUTO_TEST_CASE(block_worker_running_shutdown)
+{
+    auto& connman{static_cast<ConnmanTestMsg&>(*m_node.connman)};
+    const auto block{CreateBlockChain(1, Params()).front()};
+    static_cast<TestChainstateManager&>(*m_node.chainman).JumpOutOfIbd();
+    auto paused{std::make_shared<WorkerPoWPause>(block->GetHash())};
+    WorkerObserver observer{*m_node.validation_signals, paused};
+    node::BlockProcessingWorker worker{*m_node.chainman, connman};
+    std::latch stopping{1};
+    std::thread::id stop_thread;
+    std::jthread stopper;
+    // Younger than both join owners: even failed stopper construction releases
+    // the main-held notification before a worker destructor can wait for it.
+    struct ReleaseOnExit {
+        WorkerPoWPause& paused;
+        ~ReleaseOnExit() { paused.Release(); }
+    } release_on_exit{*paused};
+    const bool admitted{worker.Submit({block, 14, true, true})};
+    const bool entered{admitted && paused->WaitEntered()};
+    const bool early_result{worker.TakeResult().has_value()};
+    const bool rejected{!worker.Submit({block, 14, true, true})};
+    stopper = std::jthread{[&] {
+        stop_thread = std::this_thread::get_id();
+        // Arrival only; the test does not infer that admission is closed yet.
+        stopping.count_down();
+        worker.Stop();
+    }};
+    stopping.wait();
+    // Do not query chainstate or remove nodes while the notification holds main.
+    paused->Release();
+    stopper.join();
+    observer.Finish();
+    BOOST_CHECK(admitted);
+    BOOST_CHECK(entered);
+    BOOST_CHECK(!early_result);
+    BOOST_CHECK(rejected);
+    BOOST_CHECK(paused->m_thread != std::this_thread::get_id());
+    BOOST_CHECK(paused->m_thread != stop_thread);
+    BOOST_CHECK(WITH_LOCK(cs_main, return m_node.chainman->ActiveTip()->GetBlockHash()) == block->GetHash());
+    BOOST_CHECK(!worker.Wait());
+    BOOST_CHECK(!worker.TakeResult());
+    BOOST_CHECK(!worker.Submit({block, 14, true, true}));
+}
+
+BOOST_FIXTURE_TEST_CASE(block_worker_ready_source_gone, BlockProcessingTestSetup)
+{
+    const auto block{CreateBlockChain(1, Params()).front()};
+    NodeId source_id;
+    {
+        LOCK(NetEventsInterface::g_msgproc_mutex);
+        source_id = AddPeer(CAddress{LookupNumeric("1.2.3.4", Params().GetDefaultPort()), NODE_NONE}).GetId();
+    }
+    node::BlockProcessingWorker worker{*m_node.chainman, m_connman};
+    const bool admitted{worker.Submit({block, source_id, true, true})};
+    const bool ready{worker.Wait()};
+    const bool rejected{!worker.Submit({block, source_id, true, true})};
+    // PNB has returned, but the ready result still owns the slot. Readiness is
+    // not a queue drain; keep connman and all subscribers alive until Stop/drain.
+    m_connman.StopNodes();
+    const bool rejected_after_removal{!worker.Submit({block, source_id, true, true})};
+    auto result{worker.TakeResult()};
+    worker.Stop();
+    m_node.validation_signals->SyncWithValidationInterfaceQueue();
+    BOOST_CHECK(admitted);
+    BOOST_CHECK(ready);
+    BOOST_CHECK(rejected);
+    BOOST_CHECK(m_connman.TestNodes().empty());
+    BOOST_CHECK(rejected_after_removal);
+    BOOST_CHECK(!m_connman.ForNode(source_id, [](CNode*) { return true; }));
+    BOOST_REQUIRE(result);
+    BOOST_CHECK_EQUAL(result->source, source_id);
+    BOOST_CHECK(result->hash == block->GetHash());
+    BOOST_CHECK(result->processing_success && result->new_block && !result->exception);
+    BOOST_CHECK(WITH_LOCK(cs_main, return m_node.chainman->ActiveTip()->GetBlockHash()) == block->GetHash());
+    BOOST_CHECK(!worker.Wait());
+    BOOST_CHECK(!worker.TakeResult());
+}
+
+BOOST_AUTO_TEST_CASE(block_worker_exception_delivery)
+{
+    auto& connman{static_cast<ConnmanTestMsg&>(*m_node.connman)};
+    auto invalid{std::make_shared<CBlock>(Params().GenesisBlock())};
+    invalid->vtx.clear();
+    invalid->m_validation_cache = {};
+    auto checked{std::make_shared<WorkerChecked>()};
+    checked->m_throw = true;
+    WorkerObserver observer{*m_node.validation_signals, checked};
+    node::BlockProcessingWorker worker{*m_node.chainman, connman};
+    for (int i{0}; i < 20; ++i) {
+        worker.Start();
+        connman.TakeMessageWake();
+        bool admitted, ready, rejected;
+        std::optional<node::BlockProcessingResult> result;
+        std::string message;
+        {
+            LOCK(connman.MessageWakeMutex());
+            admitted = worker.Submit({invalid, 15, true, true});
+            ready = worker.Wait();
+            rejected = !worker.Submit({invalid, 16, true, true});
+            result = worker.TakeResult();
+            // Inspect before the worker can wake or be joined, matching the
+            // synchronous bridge's terminal-result ownership boundary.
+            if (result && result->exception) {
+                try {
+                    std::rethrow_exception(result->exception);
+                } catch (const std::runtime_error& e) {
+                    message = e.what();
+                }
+            }
+        }
+        worker.Stop();
+        BOOST_CHECK(admitted && ready && rejected);
+        BOOST_CHECK(connman.TakeMessageWake());
+        BOOST_REQUIRE(result);
+        BOOST_CHECK(!result->processing_success && !result->new_block);
+        BOOST_CHECK(result->exception);
+        BOOST_CHECK_EQUAL(message, "block worker test exception");
+    }
+    // Shutdown must also observe an exceptional outcome nobody has consumed.
+    worker.Start();
+    const bool admitted{worker.Submit({invalid, 16, true, true})};
+    const bool ready{worker.Wait()};
+    {
+        ASSERT_DEBUG_LOG("Exception while stopping block processing: block worker test exception");
+        worker.Stop();
+    }
+    // Iterate retains its entry count if a subscriber throws. Keep this shared
+    // subscriber owned through every join, with no later PNB call in the fixture.
+    observer.Finish();
+    BOOST_CHECK(admitted && ready);
+    BOOST_CHECK(!worker.TakeResult());
+    BOOST_CHECK_EQUAL(checked->m_threads.size(), 21);
 }
 
 BOOST_AUTO_TEST_SUITE_END()

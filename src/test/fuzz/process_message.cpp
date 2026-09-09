@@ -94,7 +94,7 @@ FUZZ_TARGET(process_message, .init = initialize_process_message)
 
     connman.SetMsgProc(node.peerman.get());
     connman.SetAddrman(*node.addrman);
-    LOCK(NetEventsInterface::g_msgproc_mutex);
+    WAIT_LOCK(NetEventsInterface::g_msgproc_mutex, lock);
 
     const std::string random_message_type{fuzzed_data_provider.ConsumeBytesAsString(CMessageHeader::MESSAGE_TYPE_SIZE).c_str()};
     if (!LIMIT_TO_MESSAGE_TYPE.empty() && random_message_type != LIMIT_TO_MESSAGE_TYPE) {
@@ -129,8 +129,16 @@ FUZZ_TARGET(process_message, .init = initialize_process_message)
         } catch (const std::ios_base::failure&) {
         }
         node.peerman->SendMessages(p2p_node);
+        {
+            REVERSE_LOCK(lock, NetEventsInterface::g_msgproc_mutex);
+            more_work |= node.peerman->WaitForBlockProcessing();
+        }
     }
-    node.validation_signals->SyncWithValidationInterfaceQueue();
+    {
+        REVERSE_LOCK(lock, NetEventsInterface::g_msgproc_mutex);
+        node.peerman->StopBlockProcessing();
+        node.validation_signals->SyncWithValidationInterfaceQueue();
+    }
     node.validation_signals->UnregisterValidationInterface(node.peerman.get());
     node.connman->StopNodes();
     const auto end_sequence{WITH_LOCK(node.mempool->cs, return node.mempool->GetSequence())};

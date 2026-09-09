@@ -86,7 +86,7 @@ FUZZ_TARGET(p2p_private_broadcast, .init = ::initialize)
         seeded_txs.push_back(tx);
     }
 
-    LOCK(NetEventsInterface::g_msgproc_mutex);
+    WAIT_LOCK(NetEventsInterface::g_msgproc_mutex, lock);
 
     static NodeId node_id{0};
     // Create at least one PRIVATE_BROADCAST peer, optionally add others of random types.
@@ -247,10 +247,18 @@ FUZZ_TARGET(p2p_private_broadcast, .init = ::initialize)
                 } catch (const std::ios_base::failure&) {
                 }
                 node.peerman->SendMessages(p2p_node);
+                {
+                    REVERSE_LOCK(lock, NetEventsInterface::g_msgproc_mutex);
+                    more_work |= node.peerman->WaitForBlockProcessing();
+                }
             }
         }
     }
 
+    {
+        REVERSE_LOCK(lock, NetEventsInterface::g_msgproc_mutex);
+        node.peerman->StopBlockProcessing();
+    }
     CaptureMessage = CaptureMessageOrig;
     connman.SetCaptureMessages(false);
 
