@@ -177,10 +177,9 @@ BOOST_AUTO_TEST_CASE(processnewblock_signals_ordering)
         BuildChain(Params().GenesisBlock().GetHash(), 100, 15, 10, 500, blocks);
     }
 
-    bool ignored;
     // Connect the genesis block and drain any outstanding events
     BlockValidationState state;
-    BOOST_CHECK(Assert(m_node.chainman)->ProcessNewBlock(std::make_shared<CBlock>(Params().GenesisBlock()), state, true, true, &ignored));
+    BOOST_CHECK(Assert(m_node.chainman)->ProcessNewBlock(std::make_shared<CBlock>(Params().GenesisBlock()), state, true, true).processing_success);
     m_node.validation_signals->SyncWithValidationInterfaceQueue();
 
     // subscribe to events (this subscriber will validate event ordering)
@@ -199,19 +198,18 @@ BOOST_AUTO_TEST_CASE(processnewblock_signals_ordering)
     threads.reserve(10);
     for (int i = 0; i < 10; i++) {
         threads.emplace_back([&]() {
-            bool ignored;
             FastRandomContext insecure;
             for (int i = 0; i < 1000; i++) {
                 const auto& block = blocks[insecure.randrange(blocks.size() - 1)];
                 BlockValidationState state;
-                Assert(m_node.chainman)->ProcessNewBlock(block, state, true, true, &ignored);
+                Assert(m_node.chainman)->ProcessNewBlock(block, state, true, true);
             }
 
             // to make sure that eventually we process the full chain - do it here
             for (const auto& block : blocks) {
                 if (block->vtx.size() == 1) {
                     BlockValidationState state;
-                    bool processed = Assert(m_node.chainman)->ProcessNewBlock(block, state, true, true, &ignored);
+                    bool processed = Assert(m_node.chainman)->ProcessNewBlock(block, state, true, true).processing_success;
                     assert(processed);
                 }
             }
@@ -248,10 +246,9 @@ BOOST_AUTO_TEST_CASE(processnewblock_signals_ordering)
  */
 BOOST_AUTO_TEST_CASE(mempool_locks_reorg)
 {
-    bool ignored;
     auto ProcessBlock = [&](std::shared_ptr<const CBlock> block) -> bool {
         BlockValidationState state;
-        return Assert(m_node.chainman)->ProcessNewBlock(block, state, /*force_processing=*/true, /*min_pow_checked=*/true, /*new_block=*/&ignored);
+        return Assert(m_node.chainman)->ProcessNewBlock(block, state, /*force_processing=*/true, /*min_pow_checked=*/true).processing_success;
     };
 
     // Process all mined blocks
