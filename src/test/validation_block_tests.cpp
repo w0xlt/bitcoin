@@ -179,7 +179,7 @@ BOOST_AUTO_TEST_CASE(processnewblock_signals_ordering)
 
     // Connect the genesis block and drain any outstanding events
     BlockValidationState state;
-    BOOST_CHECK(Assert(m_node.chainman)->ProcessNewBlock(std::make_shared<CBlock>(Params().GenesisBlock()), state, true, true).processing_success);
+    BOOST_CHECK(Assert(m_node.chainman)->ProcessNewBlock(std::make_shared<CBlock>(Params().GenesisBlock()), state, true, true).get().processing_success);
     m_node.validation_signals->SyncWithValidationInterfaceQueue();
 
     // subscribe to events (this subscriber will validate event ordering)
@@ -202,14 +202,14 @@ BOOST_AUTO_TEST_CASE(processnewblock_signals_ordering)
             for (int i = 0; i < 1000; i++) {
                 const auto& block = blocks[insecure.randrange(blocks.size() - 1)];
                 BlockValidationState state;
-                Assert(m_node.chainman)->ProcessNewBlock(block, state, true, true);
+                (void)Assert(m_node.chainman)->ProcessNewBlock(block, state, true, true).get();
             }
 
             // to make sure that eventually we process the full chain - do it here
             for (const auto& block : blocks) {
                 if (block->vtx.size() == 1) {
                     BlockValidationState state;
-                    bool processed = Assert(m_node.chainman)->ProcessNewBlock(block, state, true, true).processing_success;
+                    bool processed = Assert(m_node.chainman)->ProcessNewBlock(block, state, true, true).get().processing_success;
                     assert(processed);
                 }
             }
@@ -248,7 +248,7 @@ BOOST_AUTO_TEST_CASE(mempool_locks_reorg)
 {
     auto ProcessBlock = [&](std::shared_ptr<const CBlock> block) -> bool {
         BlockValidationState state;
-        return Assert(m_node.chainman)->ProcessNewBlock(block, state, /*force_processing=*/true, /*min_pow_checked=*/true).processing_success;
+        return Assert(m_node.chainman)->ProcessNewBlock(block, state, /*force_processing=*/true, /*min_pow_checked=*/true).get().processing_success;
     };
 
     // Process all mined blocks
