@@ -19,9 +19,24 @@
 namespace node {
 class BlockManager;
 }
+class BaseIndex;
 class CValidationInterface;
 class FakeNodeClock;
+class ValidationSignals;
 struct TestingSetup;
+
+/** Unregister and drain callbacks before a test-owned index is destroyed, also on assertion failure. */
+class IndexTestGuard
+{
+    BaseIndex& m_index;
+    ValidationSignals& m_signals;
+
+public:
+    IndexTestGuard(BaseIndex& index, ValidationSignals& signals) : m_index{index}, m_signals{signals} {}
+    ~IndexTestGuard();
+    IndexTestGuard(const IndexTestGuard&) = delete;
+    IndexTestGuard& operator=(const IndexTestGuard&) = delete;
+};
 
 /// Runs callbacks synchronously and deterministically, while avoiding DEBUG_LOCKORDER false positives.
 class ImmediateBackgroundTaskRunner : public util::TaskRunnerInterface

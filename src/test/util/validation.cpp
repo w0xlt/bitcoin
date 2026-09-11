@@ -6,6 +6,7 @@
 
 #include <coins.h>
 #include <consensus/consensus.h>
+#include <index/base.h>
 #include <node/blockstorage.h>
 #include <node/mining_types.h>
 #include <test/util/mining.h>
@@ -24,6 +25,13 @@
 #include <vector>
 
 using kernel::ChainstateRole;
+
+IndexTestGuard::~IndexTestGuard()
+{
+    m_index.Interrupt();
+    m_index.Stop();
+    m_signals.SyncWithValidationInterfaceQueue();
+}
 
 void TestBlockManager::CleanupForFuzzing()
 {

@@ -75,6 +75,17 @@ BOOST_AUTO_TEST_CASE(connections_desirable_service_flags)
     // By now, we tested that the connections desirable services flags change based on the node's time proximity to the tip.
     // Now, perform the same tests for when the node receives a block.
     m_node.validation_signals->RegisterValidationInterface(peerman.get());
+    struct PeerManagerGuard {
+        ValidationSignals& signals;
+        PeerManager& peerman;
+
+        ~PeerManagerGuard()
+        {
+            // Block futures are consumed; finish queued callbacks before destroying peerman.
+            signals.UnregisterValidationInterface(&peerman);
+            signals.SyncWithValidationInterfaceQueue();
+        }
+    } guard{*m_node.validation_signals, *peerman};
 
     // First, verify a block in the past doesn't enable limited peers connections
     // At this point, our time is (NODE_NETWORK_LIMITED_ALLOW_CONN_BLOCKS + 1) * 10 minutes ahead the tip's time.
