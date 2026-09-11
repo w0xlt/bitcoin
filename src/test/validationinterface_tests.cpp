@@ -28,6 +28,7 @@ BOOST_AUTO_TEST_CASE(unregister_validation_interface_race)
         BlockValidationState state_dummy;
         while (generate) {
             m_node.validation_signals->BlockChecked(std::make_shared<const CBlock>(), state_dummy);
+            m_node.validation_signals->BlockProcessed();
         }
     }};
 
