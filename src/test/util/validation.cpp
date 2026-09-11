@@ -21,6 +21,7 @@
 #include <validationinterface.h>
 
 #include <memory>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -31,6 +32,34 @@ IndexTestGuard::~IndexTestGuard()
     m_index.Interrupt();
     m_index.Stop();
     m_signals.SyncWithValidationInterfaceQueue();
+}
+
+FuzzTaskRunner::Scope::Scope(FuzzTaskRunner& owner) : m_owner{owner}
+{
+    Assert(!m_owner.m_runner);
+    m_owner.m_runner = &m_runner;
+    m_scheduler.m_service_thread = std::thread([this] { m_scheduler.serviceQueue(); });
+}
+
+FuzzTaskRunner::Scope::~Scope()
+{
+    m_scheduler.StopWhenDrained();
+    m_owner.m_runner = nullptr;
+}
+
+void FuzzTaskRunner::insert(std::function<void()> func)
+{
+    Assert(m_runner)->insert(std::move(func));
+}
+
+void FuzzTaskRunner::flush()
+{
+    if (m_runner) m_runner->flush();
+}
+
+size_t FuzzTaskRunner::size()
+{
+    return m_runner ? m_runner->size() : 0;
 }
 
 void TestBlockManager::CleanupForFuzzing()

@@ -60,14 +60,13 @@ public:
     {
         if (m_on_destroy) m_on_destroy();
     }
-    void BlockChecked(const std::shared_ptr<const CBlock>& block, const BlockValidationState& state) override
+    void NewPoWValidBlock(const CBlockIndex*, const std::shared_ptr<const CBlock>&) override
     {
         if (m_on_call) m_on_call();
     }
     void Call()
     {
-        BlockValidationState state;
-        m_signals.BlockChecked(std::make_shared<const CBlock>(), state);
+        m_signals.NewPoWValidBlock(nullptr, std::make_shared<const CBlock>());
     }
     std::function<void()> m_on_call;
     std::function<void()> m_on_destroy;

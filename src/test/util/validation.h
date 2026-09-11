@@ -7,12 +7,12 @@
 
 #include <consensus/amount.h>
 #include <primitives/transaction.h>
+#include <scheduler.h>
 #include <util/task_runner.h>
 #include <validation.h>
 
 #include <cstddef>
 #include <functional>
-#include <thread>
 #include <utility>
 #include <vector>
 
@@ -38,13 +38,27 @@ public:
     IndexTestGuard& operator=(const IndexTestGuard&) = delete;
 };
 
-/// Runs callbacks synchronously and deterministically, while avoiding DEBUG_LOCKORDER false positives.
-class ImmediateBackgroundTaskRunner : public util::TaskRunnerInterface
+/** Queue callbacks on a separate thread, with no worker left running between fuzz inputs. */
+class FuzzTaskRunner : public util::TaskRunnerInterface
 {
+    SerialTaskRunner* m_runner{nullptr};
+
 public:
-    void insert(std::function<void()> func) override { std::thread(std::move(func)).join(); }
-    void flush() override {}
-    size_t size() override { return 0; }
+    /** Keep active during initialization and each input; drain before leaving either scope. */
+    class Scope
+    {
+        CScheduler m_scheduler;
+        SerialTaskRunner m_runner{m_scheduler};
+        FuzzTaskRunner& m_owner;
+
+    public:
+        explicit Scope(FuzzTaskRunner& owner);
+        ~Scope();
+    };
+
+    void insert(std::function<void()> func) override;
+    void flush() override;
+    size_t size() override;
 };
 
 struct TestBlockManager : public node::BlockManager {
