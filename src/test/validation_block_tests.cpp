@@ -19,6 +19,7 @@
 #include <test/util/logging.h>
 #include <test/util/script.h>
 #include <test/util/setup_common.h>
+#include <test/util/validation.h>
 #include <txmempool.h>
 #include <uint256.h>
 #include <util/check.h>
@@ -191,14 +192,18 @@ BOOST_AUTO_TEST_CASE(processnewblock_initial_state)
     auto sub{std::make_shared<StateCatcher>()};
     m_node.validation_signals->RegisterSharedValidationInterface(sub);
 
-    // Every synchronous processing outcome must be available before consuming the future.
+    // Initial rejection and admission no-ops return ready futures.
     const auto GetReadyResult = [](std::future<BlockProcessingResult> future) {
         BOOST_REQUIRE(future.valid());
         BOOST_REQUIRE(future.wait_for(std::chrono::seconds{0}) == std::future_status::ready);
         return future.get();
     };
+    const auto GetResult = [](std::future<BlockProcessingResult> future) {
+        BOOST_REQUIRE(future.wait_for(std::chrono::seconds{30}) == std::future_status::ready);
+        return future.get();
+    };
 
-    // CheckBlock failures are returned directly and still notified synchronously.
+    // CheckBlock failures are returned directly without a validation callback.
     {
         auto mutated{std::make_shared<CBlock>(*block)};
         mutated->m_validation_cache = {};
@@ -211,19 +216,17 @@ BOOST_AUTO_TEST_CASE(processnewblock_initial_state)
         BOOST_CHECK(!result.new_block);
         BOOST_CHECK(state.GetResult() == BlockValidationResult::BLOCK_MUTATED);
         BOOST_CHECK_EQUAL(state.GetRejectReason(), "bad-txnmrklroot");
-        BOOST_CHECK_EQUAL(sub->m_calls, 1);
-        BOOST_CHECK(sub->m_state.GetResult() == state.GetResult());
-        BOOST_CHECK_EQUAL(sub->m_state.ToString(), state.ToString());
+        BOOST_CHECK_EQUAL(sub->m_calls, 0);
     }
 
     // The valid version remains acceptable; its duplicate needs no storage or notification.
     {
         BlockValidationState state;
-        const auto result{GetReadyResult(chainman.ProcessNewBlock(block, state, true, true))};
+        const auto result{GetResult(chainman.ProcessNewBlock(block, state, true, true))};
         BOOST_CHECK(result.processing_success);
         BOOST_CHECK(result.new_block);
         BOOST_CHECK(state.IsValid());
-        BOOST_CHECK_EQUAL(sub->m_calls, 2);
+        BOOST_CHECK_EQUAL(sub->m_calls, 1);
         BOOST_CHECK(sub->m_state.IsValid());
     }
     {
@@ -232,10 +235,10 @@ BOOST_AUTO_TEST_CASE(processnewblock_initial_state)
         BOOST_CHECK(result.processing_success);
         BOOST_CHECK(!result.new_block);
         BOOST_CHECK(state.IsValid());
-        BOOST_CHECK_EQUAL(sub->m_calls, 2);
+        BOOST_CHECK_EQUAL(sub->m_calls, 1);
     }
 
-    // Contextual failures from AcceptBlock are exposed through the same state.
+    // Contextual admission failures are exposed through the initial state too.
     {
         auto bad_height{Block(block->GetHash())};
         bad_height->m_validation_cache = {};
@@ -249,20 +252,19 @@ BOOST_AUTO_TEST_CASE(processnewblock_initial_state)
         BOOST_CHECK(!result.new_block);
         BOOST_CHECK(state.GetResult() == BlockValidationResult::BLOCK_CONSENSUS);
         BOOST_CHECK_EQUAL(state.GetRejectReason(), "bad-cb-height");
-        BOOST_CHECK_EQUAL(sub->m_calls, 3);
-        BOOST_CHECK(sub->m_state.GetResult() == state.GetResult());
-        BOOST_CHECK_EQUAL(sub->m_state.ToString(), state.ToString());
+        BOOST_CHECK_EQUAL(sub->m_calls, 1);
     }
 
     // A block can pass admission and be stored, but fail validation when connected.
     {
         const auto invalid{BadBlock(block->GetHash())};
         BlockValidationState state;
-        const auto result{GetReadyResult(chainman.ProcessNewBlock(invalid, state, true, true))};
+        const auto result{GetResult(chainman.ProcessNewBlock(invalid, state, true, true))};
         BOOST_CHECK(result.processing_success);
         BOOST_CHECK(result.new_block);
         BOOST_CHECK(state.IsValid());
-        BOOST_CHECK_EQUAL(sub->m_calls, 4);
+        BOOST_CHECK_EQUAL(sub->m_calls, 2);
+        BOOST_CHECK(!result.cached_invalid);
         BOOST_CHECK(sub->m_state.IsInvalid());
         BOOST_CHECK(sub->m_state.GetResult() == BlockValidationResult::BLOCK_CONSENSUS);
         BOOST_CHECK_EQUAL(WITH_LOCK(cs_main, return chainman.ActiveChain().Tip()->GetBlockHash()), block->GetHash());
@@ -278,21 +280,119 @@ BOOST_AUTO_TEST_CASE(processnewblock_initial_state)
         fs::create_directory(block_file);
         BlockValidationState state;
         ASSERT_DEBUG_LOG("Failed to write block.");
-        auto future{chainman.ProcessNewBlock(unwritten, state, true, true)};
+        const auto result{GetResult(chainman.ProcessNewBlock(unwritten, state, true, true))};
         fs::remove(block_file);
         fs::rename(backup_file, block_file);
 
-        const auto result{GetReadyResult(std::move(future))};
         BOOST_CHECK(!result.processing_success);
         BOOST_CHECK(result.new_block);
-        BOOST_CHECK(state.IsError());
-        BOOST_CHECK_EQUAL(sub->m_calls, 5);
+        BOOST_CHECK(state.IsValid());
+        BOOST_CHECK_EQUAL(sub->m_calls, 3);
         BOOST_CHECK(sub->m_state.IsError());
-        BOOST_CHECK_EQUAL(sub->m_state.ToString(), state.ToString());
+        BOOST_CHECK(!sub->m_state.ToString().empty());
         BOOST_CHECK_EQUAL(WITH_LOCK(cs_main, return chainman.ActiveChain().Tip()->GetBlockHash()), block->GetHash());
     }
 
     m_node.validation_signals->UnregisterSharedValidationInterface(sub);
+}
+
+BOOST_AUTO_TEST_CASE(processnewblock_after_worker_gate)
+{
+    auto& chainman{*Assert(m_node.chainman)};
+    {
+        BlockWorkerGate gate{chainman};
+        gate.Wait();
+    }
+
+    // Releasing a temporary gate must leave the worker available for new blocks.
+    BlockValidationState state;
+    const auto block{GoodBlock(Params().GenesisBlock().GetHash())};
+    auto completion{chainman.ProcessNewBlock(block, state, true, true)};
+    BOOST_REQUIRE(completion.wait_for(std::chrono::seconds{30}) == std::future_status::ready);
+    const auto result{completion.get()};
+    BOOST_CHECK(state.IsValid());
+    BOOST_CHECK(result.processing_success && result.new_block);
+}
+
+BOOST_AUTO_TEST_CASE(processnewblock_queued_child_invalidated)
+{
+    struct Subscriber final : CValidationInterface {
+        const uint256 m_child_hash;
+        int m_child_checked{0};
+        BlockValidationState m_child_state;
+
+        explicit Subscriber(const uint256& child_hash) : m_child_hash{child_hash} {}
+
+        void BlockChecked(const std::shared_ptr<const CBlock>& block, const BlockValidationState& state) override
+        {
+            if (block->GetHash() != m_child_hash) return;
+            ++m_child_checked;
+            m_child_state = state;
+        }
+    };
+
+    auto& chainman{*Assert(m_node.chainman)};
+    auto& signals{*Assert(m_node.validation_signals)};
+    const auto primer{GoodBlock(Params().GenesisBlock().GetHash())};
+    const auto parent{BadBlock(primer->GetHash())};
+    const auto child{GoodBlock(parent->GetHash())};
+    auto sub{std::make_shared<Subscriber>(child->GetHash())};
+    BlockValidationState parent_state, child_state;
+    std::future<BlockProcessingResult> parent_future, child_future;
+    signals.RegisterSharedValidationInterface(sub);
+    BlockValidationState primer_state;
+    BOOST_REQUIRE(chainman.ProcessNewBlock(primer, primer_state, true, true).get().processing_success);
+    {
+        // Block an otherwise idle worker so both jobs can be admitted before either runs.
+        BlockWorkerGate gate{chainman};
+        gate.Wait();
+
+        parent_future = chainman.ProcessNewBlock(parent, parent_state, true, true);
+        child_future = chainman.ProcessNewBlock(child, child_state, true, true);
+        BOOST_REQUIRE(parent_state.IsValid());
+        BOOST_REQUIRE(child_state.IsValid());
+        BOOST_REQUIRE(parent_future.wait_for(std::chrono::seconds{0}) == std::future_status::timeout);
+        BOOST_REQUIRE(child_future.wait_for(std::chrono::seconds{0}) == std::future_status::timeout);
+        {
+            LOCK(cs_main);
+            const CBlockIndex* index{Assert(chainman.m_blockman.LookupBlockIndex(child->GetHash()))};
+            BOOST_CHECK(!(index->nStatus & BLOCK_FAILED_VALID));
+            BOOST_CHECK(!(index->nStatus & BLOCK_HAVE_DATA));
+            BOOST_CHECK_EQUAL(index->nTx, 0U);
+            BOOST_CHECK_EQUAL(index->nStatus & BLOCK_VALID_MASK, BLOCK_VALID_TREE);
+        }
+    }
+
+    // The parent fails during connection, invalidating the child before its job runs.
+    BOOST_REQUIRE(parent_future.wait_for(std::chrono::seconds{30}) == std::future_status::ready);
+    const auto parent_result{parent_future.get()};
+    BOOST_CHECK(parent_result.processing_success);
+    BOOST_CHECK(parent_result.new_block);
+    BOOST_REQUIRE(child_future.wait_for(std::chrono::seconds{30}) == std::future_status::ready);
+    const auto child_result{child_future.get()};
+    signals.UnregisterSharedValidationInterface(sub);
+    signals.SyncWithValidationInterfaceQueue();
+
+    BOOST_CHECK(!child_result.processing_success);
+    BOOST_CHECK(!child_result.new_block);
+    BOOST_CHECK(child_result.cached_invalid);
+    BOOST_CHECK(child_state.IsValid());
+    BOOST_CHECK_EQUAL(sub->m_child_checked, 1);
+    BOOST_CHECK(sub->m_child_state.GetResult() == BlockValidationResult::BLOCK_CACHED_INVALID);
+    BOOST_CHECK_EQUAL(sub->m_child_state.GetRejectReason(), "duplicate-invalid");
+
+    // Reject the cached-invalid child without storing it or advancing its transaction validity.
+    {
+        LOCK(cs_main);
+        const CBlockIndex* index{Assert(chainman.m_blockman.LookupBlockIndex(child->GetHash()))};
+        BOOST_CHECK(index->pprev->nStatus & BLOCK_FAILED_VALID);
+        BOOST_CHECK(index->nStatus & BLOCK_FAILED_VALID);
+        BOOST_CHECK(!(index->nStatus & BLOCK_HAVE_DATA));
+        BOOST_CHECK_EQUAL(index->nTx, 0U);
+        BOOST_CHECK_EQUAL(index->nStatus & BLOCK_VALID_MASK, BLOCK_VALID_TREE);
+        BOOST_CHECK_EQUAL(chainman.ActiveChain().Tip()->GetBlockHash(), primer->GetHash());
+    }
+    chainman.CheckBlockIndex();
 }
 
 BOOST_AUTO_TEST_CASE(processnewblock_signals_ordering)

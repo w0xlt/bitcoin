@@ -269,6 +269,36 @@ BOOST_AUTO_TEST_CASE(processor_can_submit_without_holding_queue_mutex)
     BOOST_CHECK(Get(**nested).processing_success);
 }
 
+BOOST_AUTO_TEST_CASE(completion_notification_follows_future_and_releases_mutex)
+{
+    const auto block{Block()};
+    std::future<BlockProcessingResult> first;
+    std::optional<BlockProcessingQueue::Submission> nested;
+    std::promise<bool> notified;
+    auto notification{notified.get_future()};
+    bool first_notification{true};
+    BlockProcessingQueue queue;
+    JobGate gate;
+    queue.Start([&] {
+        if (!first_notification) return;
+        first_notification = false;
+        const bool ready{first.wait_for(0s) == std::future_status::ready};
+        nested = queue.Submit(block, Process);
+        notified.set_value(ready);
+    });
+    first = Submit(queue, block, [wait = gate.Waiter()](const auto& value) {
+        wait();
+        return Process(value);
+    });
+    gate.WaitUntilEntered();
+    gate.Open();
+    BOOST_REQUIRE(notification.wait_for(30s) == std::future_status::ready);
+    BOOST_CHECK(notification.get());
+    BOOST_REQUIRE(nested && nested->has_value());
+    BOOST_CHECK(Get(first).processing_success);
+    BOOST_CHECK(Get(**nested).processing_success);
+}
+
 BOOST_AUTO_TEST_CASE(destructor_finishes_accepted_jobs)
 {
     std::vector<std::future<BlockProcessingResult>> futures;
@@ -280,10 +310,10 @@ BOOST_AUTO_TEST_CASE(destructor_finishes_accepted_jobs)
     for (auto& future : futures) BOOST_CHECK(Get(future).processing_success);
 }
 
-BOOST_FIXTURE_TEST_CASE(manager_worker_stopped_by_fixture, TestingSetup)
+BOOST_FIXTURE_TEST_CASE(manager_worker_started_and_stopped_by_fixture, TestingSetup)
 {
     // Exercise the fixture's early stop while its mempool and callbacks are alive.
-    m_node.chainman->StartBlockProcessing();
+    BOOST_CHECK_THROW(m_node.chainman->StartBlockProcessing(), std::logic_error);
 }
 
 BOOST_AUTO_TEST_SUITE_END()
