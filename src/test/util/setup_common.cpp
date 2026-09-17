@@ -310,6 +310,7 @@ ChainTestingSetup::ChainTestingSetup(const ChainType chainType, TestOpts opts)
             // Use no worker threads while fuzzing to avoid racy non-determinism
             // and dangling thread handles if AFL forks after initialization.
             .worker_threads_num = EnableFuzzDeterminism() ? 0 : 2,
+            .blockfetch_threads_num = EnableFuzzDeterminism() ? 0 : DEFAULT_BLOCKFETCH_THREADS,
             .prevoutfetch_threads_num = EnableFuzzDeterminism() ? 0 : 2,
         };
         if (opts.min_validation_cache) {
