@@ -318,6 +318,76 @@ BOOST_AUTO_TEST_CASE(processnewblock_after_worker_gate)
     BOOST_CHECK(result.processing_success && result.new_block);
 }
 
+BOOST_AUTO_TEST_CASE(tryprocessnewblock_retries_before_admission)
+{
+    auto& chainman{*m_node.chainman};
+    // Give a valid block a new header which has not already been admitted by GoodBlock().
+    auto block{std::make_shared<CBlock>(*GoodBlock(Params().GenesisBlock().GetHash()))};
+    do {
+        ++block->nNonce;
+    } while (!CheckProofOfWork(block->GetHash(), block->nBits, chainman.GetConsensus()));
+    block->m_validation_cache = {};
+    BlockValidationState busy_state;
+    std::future<std::optional<std::future<BlockProcessingResult>>> attempt;
+    {
+        LOCK(cs_main);
+        BOOST_CHECK(!chainman.m_blockman.LookupBlockIndex(block->GetHash()));
+        attempt = std::async(std::launch::async, [&] {
+            return chainman.TryProcessNewBlock(block, busy_state, true, true);
+        });
+        BOOST_CHECK(attempt.wait_for(std::chrono::seconds{10}) == std::future_status::ready);
+    } // Release the lock before joining even if a regression blocks admission.
+    BOOST_CHECK(!attempt.get());
+    BOOST_CHECK(busy_state.IsValid());
+    BOOST_CHECK(block->m_validation_cache.m_checked.load()); // CheckBlock ran outside cs_main.
+    BOOST_CHECK(WITH_LOCK(cs_main, return !chainman.m_blockman.LookupBlockIndex(block->GetHash())));
+
+    // An initial mutation failure is definitive even while the chain lock is busy.
+    auto mutated{std::make_shared<CBlock>(*block)};
+    CMutableTransaction coinbase{*mutated->vtx[0]};
+    ++coinbase.vout[0].nValue;
+    mutated->vtx[0] = MakeTransactionRef(std::move(coinbase));
+    mutated->m_validation_cache = {};
+    BlockValidationState invalid_state;
+    {
+        LOCK(cs_main);
+        attempt = std::async(std::launch::async, [&] {
+            return chainman.TryProcessNewBlock(mutated, invalid_state, true, true);
+        });
+        BOOST_CHECK(attempt.wait_for(std::chrono::seconds{10}) == std::future_status::ready);
+    }
+    auto rejected{attempt.get()};
+    BOOST_REQUIRE(rejected);
+    BOOST_CHECK(!rejected->get().processing_success);
+    BOOST_CHECK(invalid_state.GetResult() == BlockValidationResult::BLOCK_MUTATED);
+    BOOST_CHECK(WITH_LOCK(cs_main, return !chainman.m_blockman.LookupBlockIndex(block->GetHash())));
+
+    BlockValidationState state;
+    auto accepted{chainman.TryProcessNewBlock(block, state, true, true)};
+    BOOST_REQUIRE(accepted);
+    BOOST_CHECK(state.IsValid());
+    BOOST_CHECK(accepted->get().new_block);
+    m_node.validation_signals->SyncWithValidationInterfaceQueue();
+    BlockValidationState duplicate_state;
+    auto duplicate{chainman.TryProcessNewBlock(block, duplicate_state, true, true)};
+    BOOST_REQUIRE(duplicate);
+    const auto result{duplicate->get()};
+    BOOST_CHECK(result.processing_success);
+    BOOST_CHECK(!result.new_block);
+}
+
+BOOST_AUTO_TEST_CASE(tryprocessnewblock_stopped_worker)
+{
+    auto& chainman{*m_node.chainman};
+    const auto block{GoodBlock(Params().GenesisBlock().GetHash())};
+    chainman.StopBlockProcessing();
+    BlockValidationState state;
+    auto result{chainman.TryProcessNewBlock(block, state, true, true)};
+    BOOST_REQUIRE(result);
+    BOOST_CHECK(state.IsError());
+    BOOST_CHECK(!result->get().new_block);
+}
+
 BOOST_AUTO_TEST_CASE(processnewblock_completes_before_callbacks)
 {
     struct Subscriber final : CValidationInterface {

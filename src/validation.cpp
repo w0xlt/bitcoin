@@ -4515,6 +4515,17 @@ BlockProcessingResult ChainstateManager::FinishBlockProcessing(const std::shared
 
 std::future<BlockProcessingResult> ChainstateManager::ProcessNewBlock(const std::shared_ptr<const CBlock>& block, BlockValidationState& state, bool force_processing, bool min_pow_checked)
 {
+    auto result{ProcessNewBlockImpl(block, state, force_processing, min_pow_checked, /*try_lock=*/false)};
+    return std::move(result.value());
+}
+
+std::optional<std::future<BlockProcessingResult>> ChainstateManager::TryProcessNewBlock(const std::shared_ptr<const CBlock>& block, BlockValidationState& state, bool force_processing, bool min_pow_checked)
+{
+    return ProcessNewBlockImpl(block, state, force_processing, min_pow_checked, /*try_lock=*/true);
+}
+
+std::optional<std::future<BlockProcessingResult>> ChainstateManager::ProcessNewBlockImpl(const std::shared_ptr<const CBlock>& block, BlockValidationState& state, bool force_processing, bool min_pow_checked, bool try_lock)
+{
     AssertLockNotHeld(cs_main);
     AssertLockNotHeld(m_check_block_mutex);
 
@@ -4532,12 +4543,14 @@ std::future<BlockProcessingResult> ChainstateManager::ProcessNewBlock(const std:
     // not very expensive, the anti-DoS benefits of caching failure (of a definitely-invalid block) are not substantial.
     bool accepted;
     {
-        LOCK(m_check_block_mutex);
+        UniqueLock lock{LOCK_ARGS(m_check_block_mutex), try_lock};
+        if (!lock) return std::nullopt;
         accepted = CheckBlock(*block, state, GetConsensus());
     }
     bool should_write{false};
     if (accepted) {
-        LOCK(cs_main);
+        UniqueLock lock{LOCK_ARGS(cs_main), try_lock};
+        if (!lock) return std::nullopt;
         CBlockIndex* index{nullptr};
         accepted = PreWriteCheckBlock(*block, state, index, force_processing, should_write, min_pow_checked);
     }

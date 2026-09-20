@@ -978,6 +978,9 @@ private:
 
     BlockProcessingResult FinishBlockProcessing(const std::shared_ptr<const CBlock>& block, bool force_processing) LOCKS_EXCLUDED(cs_main);
 
+    std::optional<std::future<BlockProcessingResult>> ProcessNewBlockImpl(const std::shared_ptr<const CBlock>& block, BlockValidationState& state, bool force_processing, bool min_pow_checked, bool try_lock)
+        EXCLUSIVE_LOCKS_REQUIRED(!m_check_block_mutex) LOCKS_EXCLUDED(cs_main);
+
     /** The last header for which a headerTip notification was issued. */
     CBlockIndex* m_last_notified_header GUARDED_BY(GetMutex()){nullptr};
 
@@ -1352,6 +1355,13 @@ public:
      *              indicates rejection by the worker's pre-storage invalidity recheck.
      */
     std::future<BlockProcessingResult> ProcessNewBlock(const std::shared_ptr<const CBlock>& block, BlockValidationState& state, bool force_processing, bool min_pow_checked)
+        EXCLUSIVE_LOCKS_REQUIRED(!m_check_block_mutex) LOCKS_EXCLUDED(cs_main);
+
+    /** Like ProcessNewBlock, but return nullopt if an initial lock is busy, before changing the block index or submitting work.
+     * The caller must retain the block and retry with a fresh state. A returned future has the ordinary ProcessNewBlock semantics.
+     * An inactive worker still processes admitted blocks inline, for kernel callers and deterministic fuzzing.
+     */
+    std::optional<std::future<BlockProcessingResult>> TryProcessNewBlock(const std::shared_ptr<const CBlock>& block, BlockValidationState& state, bool force_processing, bool min_pow_checked)
         EXCLUSIVE_LOCKS_REQUIRED(!m_check_block_mutex) LOCKS_EXCLUDED(cs_main);
 
     /**
