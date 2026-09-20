@@ -74,6 +74,7 @@
 #include <functional>
 #include <future>
 #include <initializer_list>
+#include <ios>
 #include <iterator>
 #include <limits>
 #include <list>
@@ -1086,13 +1087,37 @@ private:
     /** One completion per source peer, retained here even after the peer disconnects. */
     std::map<NodeId, PendingBlockProcessing> m_pending_block_processing GUARDED_BY(g_msgproc_mutex);
 
+    struct PendingBlockAdmission {
+        CBlockHeader header;
+        // Keep wire-sized storage, not unchecked decoded transactions or witness stacks.
+        DataStream serialized;
+        CBlock::ValidationCache validation_cache;
+        bool force_processing;
+        bool min_pow_checked;
+        bool via_compact_block;
+        bool optimistic_reconstruction;
+        bool requested_from_peer{false};
+        bool source_recorded{false};
+    };
+
+    /** One unadmitted block per peer; discarded on disconnection, never a download-suppression marker. */
+    std::map<NodeId, PendingBlockAdmission> m_pending_block_admission GUARDED_BY(g_msgproc_mutex);
+
     /** Whether a received block is still awaiting processing completion. */
     bool IsBlockBeingProcessed(const uint256& hash) const EXCLUSIVE_LOCKS_REQUIRED(g_msgproc_mutex);
 
     void TrackBlockProcessing(NodeId peer_id, const uint256& hash, std::future<BlockProcessingResult> future, bool via_compact_block)
         EXCLUSIVE_LOCKS_REQUIRED(g_msgproc_mutex);
 
-    void ProcessBlock(NodeId peer_id, const std::shared_ptr<const CBlock>& block, bool force_processing, bool min_pow_checked, bool via_compact_block, bool optimistic_reconstruction)
+    void ProcessBlock(CNode& node, Peer& peer, const std::shared_ptr<const CBlock>& block, bool force_processing, bool min_pow_checked, bool via_compact_block, bool optimistic_reconstruction)
+        EXCLUSIVE_LOCKS_REQUIRED(g_msgproc_mutex, !m_peer_mutex, !m_block_mutex);
+
+    void ProcessBlock(CNode& node, Peer& peer, PendingBlockAdmission pending, std::shared_ptr<const CBlock> block = {})
+        EXCLUSIVE_LOCKS_REQUIRED(g_msgproc_mutex, !m_peer_mutex, !m_block_mutex);
+
+    void RetryBlockAdmission(CNode& node, Peer& peer, std::shared_ptr<const CBlock> block = {})
+        EXCLUSIVE_LOCKS_REQUIRED(g_msgproc_mutex, !m_peer_mutex, !m_block_mutex);
+    void CancelBlockAdmission(NodeId peer_id)
         EXCLUSIVE_LOCKS_REQUIRED(g_msgproc_mutex, !m_peer_mutex, !m_block_mutex);
 
     /** Consume a completion after its callbacks. Return true while either is pending. */
@@ -3766,26 +3791,143 @@ void PeerManagerImpl::UnitTestBlockProcessing(NodeId peer_id, const uint256& has
     TrackBlockProcessing(peer_id, hash, std::move(future), via_compact_block);
 }
 
-void PeerManagerImpl::ProcessBlock(NodeId peer_id, const std::shared_ptr<const CBlock>& block, bool force_processing, bool min_pow_checked, bool via_compact_block, bool optimistic_reconstruction)
+void PeerManagerImpl::ProcessBlock(CNode& node, Peer& peer, const std::shared_ptr<const CBlock>& block, bool force_processing, bool min_pow_checked, bool via_compact_block, bool optimistic_reconstruction)
+{
+    // Reconstructed compact blocks have no full-block message to retain. FillBlock
+    // bounds their serialized size before reaching here. Do not repeat reconstruction.
+    PendingBlockAdmission pending{
+        .header = *block,
+        .serialized = DataStream{},
+        .validation_cache = block->m_validation_cache,
+        .force_processing = force_processing,
+        .min_pow_checked = min_pow_checked,
+        .via_compact_block = via_compact_block,
+        .optimistic_reconstruction = optimistic_reconstruction,
+    };
+    ProcessBlock(node, peer, std::move(pending), block);
+}
+
+void PeerManagerImpl::ProcessBlock(CNode& node, Peer& peer, PendingBlockAdmission pending, std::shared_ptr<const CBlock> block)
 {
     AssertLockHeld(g_msgproc_mutex);
-    assert(!m_pending_block_processing.contains(peer_id));
-    BlockValidationState state;
-    auto future{m_chainman.ProcessNewBlock(block, state, force_processing, min_pow_checked)};
-    if (!state.IsValid()) {
-        // Attribute initial failures to this sender, even if another peer has
-        // an admitted block with the same header hash awaiting validation.
-        MaybePunishNodeForBlock(peer_id, state, via_compact_block);
-        CompleteBlockProcessing(peer_id, block->GetHash(), future.get());
+    assert(!m_pending_block_processing.contains(peer.m_id));
+    const auto [it, inserted]{m_pending_block_admission.emplace(peer.m_id, std::move(pending))};
+    assert(inserted);
+    node.SetPendingReceiveMemory(it->second.serialized.GetMemoryUsage());
+    RetryBlockAdmission(node, peer, block);
+    const auto deferred{m_pending_block_admission.find(peer.m_id)};
+    if (deferred != m_pending_block_admission.end() && deferred->second.serialized.empty()) {
+        // Serialize a reconstructed block only if it actually has to wait.
+        auto& serialized{deferred->second.serialized};
+        serialized.reserve(GetSerializeSize(TX_WITH_WITNESS(*Assert(block))));
+        serialized << TX_WITH_WITNESS(*block);
+        node.SetPendingReceiveMemory(serialized.GetMemoryUsage());
+    }
+}
+
+void PeerManagerImpl::CancelBlockAdmission(NodeId peer_id)
+{
+    const auto it{m_pending_block_admission.find(peer_id)};
+    if (it == m_pending_block_admission.end()) return;
+    if (it->second.source_recorded) {
+        LOCK(m_block_mutex);
+        const auto source{mapBlockSource.find(it->second.header.GetHash())};
+        if (source != mapBlockSource.end() && source->second.first == peer_id) mapBlockSource.erase(source);
+    }
+    m_pending_block_admission.erase(it);
+}
+
+void PeerManagerImpl::RetryBlockAdmission(CNode& node, Peer& peer, std::shared_ptr<const CBlock> block)
+{
+    const auto it{m_pending_block_admission.find(peer.m_id)};
+    if (it == m_pending_block_admission.end()) return;
+    try {
+        auto& pending{it->second};
+        const CBlockIndex* prev_block{nullptr};
+        bool min_pow_checked{pending.min_pow_checked};
+        {
+            // Check availability before decoding. Gather the parent and work threshold
+            // together; neither decoding nor expensive validation belongs under this lock.
+            TRY_LOCK(cs_main, lock_main);
+            if (!lock_main) return;
+            if (!pending.via_compact_block) {
+                prev_block = m_chainman.m_blockman.LookupBlockIndex(pending.header.hashPrevBlock);
+                min_pow_checked = prev_block &&
+                                  prev_block->nChainWork + GetBlockProof(pending.header) >= GetAntiDoSWorkThreshold();
+            }
+        }
+        if (!block) {
+            auto decoded{std::make_shared<CBlock>()};
+            SpanReader reader{pending.serialized};
+            try {
+                reader >> TX_WITH_WITNESS(*decoded);
+            } catch (const std::ios_base::failure&) {
+                // The request was removed on receipt. A malformed reply must not
+                // let its sender reset download timers by being requested again.
+                if (pending.requested_from_peer) {
+                    LogDebug(BCLog::NET, "Malformed requested block from peer=%d\n", peer.m_id);
+                    node.fDisconnect = true;
+                }
+                throw;
+            }
+            // The bytes are unchanged, so completed context-free checks remain reusable.
+            decoded->m_validation_cache = pending.validation_cache;
+            block = std::move(decoded);
+        }
+        // Block-index entries live until chainman teardown. Deployment state uses immutable parent facts.
+        if (prev_block && IsBlockMutated(*block, DeploymentActiveAfter(prev_block, m_chainman, Consensus::DEPLOYMENT_SEGWIT))) {
+            LogDebug(BCLog::NET, "Received mutated block from peer=%d\n", peer.m_id);
+            Misbehaving(peer, "mutated block");
+            CancelBlockAdmission(peer.m_id);
+            node.SetPendingReceiveMemory(0);
+            return;
+        }
+        if (!pending.source_recorded) {
+            LOCK(m_block_mutex);
+            pending.source_recorded = mapBlockSource.emplace(block->GetHash(), std::make_pair(peer.m_id, !pending.via_compact_block)).second;
+        }
+
+        BlockValidationState state;
+        auto future{m_chainman.TryProcessNewBlock(block, state, pending.force_processing, min_pow_checked)};
+        if (!future) {
+            // An unadmitted block must not own another peer's validation result.
+            // Reacquire source ownership on retry, preserving any existing owner.
+            if (pending.source_recorded) {
+                LOCK(m_block_mutex);
+                const auto source{mapBlockSource.find(block->GetHash())};
+                if (source != mapBlockSource.end() && source->second.first == peer.m_id) mapBlockSource.erase(source);
+                pending.source_recorded = false;
+            }
+            pending.validation_cache = block->m_validation_cache;
+            // A later admission lock can also be busy. Only serialized bytes survive this attempt.
+            return;
+        }
+
+        const auto hash{block->GetHash()};
+        const bool via_compact_block{pending.via_compact_block};
+        const bool optimistic_reconstruction{pending.optimistic_reconstruction};
+        m_pending_block_admission.erase(it);
+        node.SetPendingReceiveMemory(0);
+        if (!state.IsValid()) {
+            // Attribute initial failures to this sender, even if another peer has
+            // an admitted block with the same header hash awaiting validation.
+            MaybePunishNodeForBlock(peer.m_id, state, via_compact_block);
+            CompleteBlockProcessing(peer.m_id, hash, future->get());
+            return;
+        }
+        TrackBlockProcessing(peer.m_id, hash, std::move(*future), via_compact_block);
+        if (optimistic_reconstruction) {
+            // Unchecked deferred blocks must not cancel another peer's requests.
+            WITH_LOCK(m_block_mutex, RemoveBlockRequest(hash, std::nullopt));
+        }
         return;
+    } catch (const std::exception& e) {
+        LogDebug(BCLog::NET, "Block admission for peer=%d: %s\n", peer.m_id, e.what());
+    } catch (...) {
+        LogDebug(BCLog::NET, "Block admission for peer=%d: unknown exception\n", peer.m_id);
     }
-    TrackBlockProcessing(peer_id, block->GetHash(), std::move(future), via_compact_block);
-    if (optimistic_reconstruction) {
-        // Clear other peers' requests only after initial admission succeeds, so a
-        // malleated compact block cannot interfere with block relay. The pending
-        // entry prevents downloading this block again while processing completes.
-        WITH_LOCK(m_block_mutex, RemoveBlockRequest(block->GetHash(), std::nullopt));
-    }
+    CancelBlockAdmission(peer.m_id);
+    node.SetPendingReceiveMemory(0);
 }
 
 bool PeerManagerImpl::IsBlockProcessingPending(NodeId peer_id)
@@ -3838,6 +3980,12 @@ bool PeerManagerImpl::IsBlockProcessingPending(NodeId peer_id)
 void PeerManagerImpl::ProcessPendingEvents()
 {
     AssertLockHeld(g_msgproc_mutex);
+    // Unadmitted input belongs to a live peer. Do not retain it like accepted worker jobs.
+    for (auto it{m_pending_block_admission.begin()}; it != m_pending_block_admission.end();) {
+        const NodeId peer_id{it->first};
+        ++it;
+        if (!m_connman.ForNode(peer_id, [](CNode*) { return true; })) CancelBlockAdmission(peer_id);
+    }
     // Poll even disconnected peers: completion can clear another peer's block request.
     for (auto it{m_pending_block_processing.begin()}; it != m_pending_block_processing.end();) {
         const NodeId peer_id{it->first};
@@ -3936,14 +4084,13 @@ void PeerManagerImpl::ProcessCompactBlockTxns(CNode& pfrom, Peer& peer, const Bl
     if (fBlockRead) {
         // BIP 152 permits peers to relay compact blocks after validating only
         // the header, so an invalid reconstructed block must not punish them.
-        WITH_LOCK(m_block_mutex, mapBlockSource.emplace(block_transactions.blockhash, std::make_pair(pfrom.GetId(), false)));
         // Since we requested this block (it was in mapBlocksInFlight), force it to be processed,
         // even if it would not be a candidate for new tip (missing previous block, chain not long enough, etc)
         // This bypasses some anti-DoS logic in AcceptBlock (eg to prevent
         // disk-space attacks), but this should be safe due to the
         // protections in the compact block handler -- see related comment
         // in compact block optimistic reconstruction handling.
-        ProcessBlock(peer.m_id, pblock, /*force_processing=*/true, /*min_pow_checked=*/true, /*via_compact_block=*/true, /*optimistic_reconstruction=*/false);
+        ProcessBlock(pfrom, peer, pblock, /*force_processing=*/true, /*min_pow_checked=*/true, /*via_compact_block=*/true, /*optimistic_reconstruction=*/false);
     }
     return;
 }
@@ -5194,10 +5341,6 @@ void PeerManagerImpl::ProcessMessage(Peer& peer, CNode& pfrom, const std::string
         if (fBlockReconstructed) {
             // If we got here, we were able to optimistically reconstruct a
             // block that is in flight from some other peer.
-            {
-                LOCK(m_block_mutex);
-                mapBlockSource.emplace(pblock->GetHash(), std::make_pair(pfrom.GetId(), false));
-            }
             // Setting force_processing to true means that we bypass some of
             // our anti-DoS protections in AcceptBlock, which filters
             // unrequested blocks that might be trying to waste our resources
@@ -5207,7 +5350,7 @@ void PeerManagerImpl::ProcessMessage(Peer& peer, CNode& pfrom, const std::string
             // we have a chain with at least the minimum chain work), and we ignore
             // compact blocks with less work than our tip, it is safe to treat
             // reconstructed compact blocks as having been requested.
-            ProcessBlock(peer.m_id, pblock, /*force_processing=*/true, /*min_pow_checked=*/true, /*via_compact_block=*/true, /*optimistic_reconstruction=*/true);
+            ProcessBlock(pfrom, peer, pblock, /*force_processing=*/true, /*min_pow_checked=*/true, /*via_compact_block=*/true, /*optimistic_reconstruction=*/true);
         }
         return;
     }
@@ -5275,41 +5418,35 @@ void PeerManagerImpl::ProcessMessage(Peer& peer, CNode& pfrom, const std::string
             return;
         }
 
-        std::shared_ptr<CBlock> pblock = std::make_shared<CBlock>();
-        vRecv >> TX_WITH_WITNESS(*pblock);
+        CBlockHeader header;
+        SpanReader reader{vRecv};
+        reader >> header;
 
-        LogDebug(BCLog::NET, "received block %s peer=%d\n", pblock->GetHash().ToString(), pfrom.GetId());
-
-        const CBlockIndex* prev_block{WITH_LOCK(m_chainman.GetMutex(), return m_chainman.m_blockman.LookupBlockIndex(pblock->hashPrevBlock))};
-
-        // Check for possible mutation if it connects to something we know so we can check for DEPLOYMENT_SEGWIT being active
-        if (prev_block && IsBlockMutated(/*block=*/*pblock,
-                           /*check_witness_root=*/DeploymentActiveAfter(prev_block, m_chainman, Consensus::DEPLOYMENT_SEGWIT))) {
-            LogDebug(BCLog::NET, "Received mutated block from peer=%d\n", peer.m_id);
-            Misbehaving(peer, "mutated block");
-            WITH_LOCK(m_block_mutex, RemoveBlockRequest(pblock->GetHash(), peer.m_id));
-            return;
-        }
+        LogDebug(BCLog::NET, "received block %s peer=%d\n", header.GetHash().ToString(), pfrom.GetId());
 
         bool forceProcessing = false;
-        const uint256 hash(pblock->GetHash());
-        bool min_pow_checked = false;
-        {
-            LOCK(cs_main);
-            // Check claimed work on this block against our anti-dos thresholds.
-            if (prev_block && prev_block->nChainWork + GetBlockProof(*pblock) >= GetAntiDoSWorkThreshold()) {
-                min_pow_checked = true;
-            }
-        }
+        bool requested_from_peer{false};
+        const uint256 hash{header.GetHash()};
         {
             LOCK(m_block_mutex);
             // Always process the block if we requested it, since we may
             // need it even when it's not a candidate for a new best tip.
             forceProcessing = IsBlockRequested(hash);
+            const auto [first, last]{mapBlocksInFlight.equal_range(hash)};
+            requested_from_peer = std::any_of(first, last, [&](const auto& request) { return request.second.first == peer.m_id; });
+            // Delivery is complete even if local admission must wait. Do not time out this request.
             RemoveBlockRequest(hash, pfrom.GetId());
-            mapBlockSource.emplace(hash, std::make_pair(pfrom.GetId(), true));
         }
-        ProcessBlock(peer.m_id, pblock, forceProcessing, min_pow_checked, /*via_compact_block=*/false, /*optimistic_reconstruction=*/false);
+        ProcessBlock(pfrom, peer, PendingBlockAdmission{
+                                      .header = header,
+                                      .serialized = std::move(vRecv),
+                                      .validation_cache = {},
+                                      .force_processing = forceProcessing,
+                                      .min_pow_checked = false,
+                                      .via_compact_block = false,
+                                      .optimistic_reconstruction = false,
+                                      .requested_from_peer = requested_from_peer,
+                                  });
         return;
     }
 
@@ -5602,6 +5739,14 @@ bool PeerManagerImpl::ProcessMessages(CNode& node, std::atomic<bool>& interruptM
     if (MaybeDiscourageAndDisconnect(node, peer) || node.fDisconnect) return false;
     if (pending_block) return false;
 
+    if (m_pending_block_admission.contains(peer.m_id)) {
+        RetryBlockAdmission(node, peer);
+        // A busy lock is not immediately runnable work, even with later messages buffered.
+        // Successful submission wakes us on completion; a rejection may unblock buffered messages.
+        if (!m_pending_block_admission.contains(peer.m_id)) m_connman.WakeMessageHandler();
+        return false;
+    }
+
     if (processed_orphan) return true;
 
     // this maintains the order of responses
@@ -5639,6 +5784,7 @@ bool PeerManagerImpl::ProcessMessages(CNode& node, std::atomic<bool>& interruptM
     try {
         ProcessMessage(peer, node, msg.m_type, msg.m_recv, msg.m_time, interruptMsgProc);
         if (interruptMsgProc) return false;
+        if (m_pending_block_admission.contains(peer.m_id)) return false;
         {
             LOCK(peer.m_getdata_requests_mutex);
             if (!peer.m_getdata_requests.empty()) fMoreWork = true;
@@ -6233,7 +6379,7 @@ bool PeerManagerImpl::SendMessages(CNode& node)
 
     // Apply punishment even while validation is pending or the handshake is incomplete.
     if (MaybeDiscourageAndDisconnect(node, peer)) return true;
-    if (pending_block) return true;
+    if (pending_block || m_pending_block_admission.contains(peer.m_id)) return true;
 
     // Initiate version handshake for outbound connections
     if (!node.IsInboundConn() && !peer.m_outbound_version_message_sent) {

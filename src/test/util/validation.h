@@ -55,6 +55,8 @@ public:
     ~BlockWorkerGate();
     void Wait();
     void Open();
+    /** Allow peer tests to hold initial checking while exercising admission retries. */
+    static Mutex& CheckBlockMutex(ChainstateManager& chainman) { return chainman.m_check_block_mutex; }
 };
 
 /** Hold queued validation callbacks without taking validation locks. */

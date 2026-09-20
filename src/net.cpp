@@ -4132,7 +4132,7 @@ void CNode::MarkReceivedMsgsForProcessing()
     LOCK(m_msg_process_queue_mutex);
     m_msg_process_queue.splice(m_msg_process_queue.end(), vRecvMsg);
     m_msg_process_queue_size += nSizeAdded;
-    fPauseRecv = m_msg_process_queue_size > m_recv_flood_size;
+    fPauseRecv = m_msg_process_queue_size + m_pending_receive_memory > m_recv_flood_size;
 }
 
 std::optional<std::pair<CNetMessage, bool>> CNode::PollMessage()
@@ -4144,9 +4144,16 @@ std::optional<std::pair<CNetMessage, bool>> CNode::PollMessage()
     // Just take one message
     msgs.splice(msgs.begin(), m_msg_process_queue, m_msg_process_queue.begin());
     m_msg_process_queue_size -= msgs.front().GetMemoryUsage();
-    fPauseRecv = m_msg_process_queue_size > m_recv_flood_size;
+    fPauseRecv = m_msg_process_queue_size + m_pending_receive_memory > m_recv_flood_size;
 
     return std::make_pair(std::move(msgs.front()), !m_msg_process_queue.empty());
+}
+
+void CNode::SetPendingReceiveMemory(size_t usage)
+{
+    LOCK(m_msg_process_queue_mutex);
+    m_pending_receive_memory = usage;
+    fPauseRecv = m_msg_process_queue_size + m_pending_receive_memory > m_recv_flood_size;
 }
 
 bool CConnman::NodeFullyConnected(const CNode* pnode)

@@ -768,6 +768,9 @@ public:
     std::optional<std::pair<CNetMessage, bool>> PollMessage()
         EXCLUSIVE_LOCKS_REQUIRED(!m_msg_process_queue_mutex);
 
+    /** Include a message retained by the message handler in receive backpressure. */
+    void SetPendingReceiveMemory(size_t usage) EXCLUSIVE_LOCKS_REQUIRED(!m_msg_process_queue_mutex);
+
     /** Account for the total size of a sent message in the per msg type connection stats. */
     void AccountForSentBytes(const std::string& msg_type, size_t sent_bytes)
         EXCLUSIVE_LOCKS_REQUIRED(cs_vSend)
@@ -1013,6 +1016,7 @@ private:
     Mutex m_msg_process_queue_mutex;
     std::list<CNetMessage> m_msg_process_queue GUARDED_BY(m_msg_process_queue_mutex);
     size_t m_msg_process_queue_size GUARDED_BY(m_msg_process_queue_mutex){0};
+    size_t m_pending_receive_memory GUARDED_BY(m_msg_process_queue_mutex){0};
 
     // Our address, as reported by the peer
     CService m_addr_local GUARDED_BY(m_addr_local_mutex);
