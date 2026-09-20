@@ -4,6 +4,7 @@
 
 #include <blockencodings.h>
 #include <chainparams.h>
+#include <consensus/consensus.h>
 #include <consensus/merkle.h>
 #include <pow.h>
 #include <streams.h>
@@ -54,6 +55,24 @@ static CBlock BuildBlockTestCase(FastRandomContext& ctx) {
     assert(!mutated);
     while (!CheckProofOfWork(block.GetHash(), block.nBits, Params().GetConsensus())) ++block.nNonce;
     return block;
+}
+
+BOOST_AUTO_TEST_CASE(reconstructed_block_serialized_size_bound)
+{
+    auto block{BuildBlockTestCase(m_rng)};
+    // Each component can fit in a message, while their reconstruction is too large.
+    for (size_t i{1}; i < block.vtx.size(); ++i) {
+        CMutableTransaction tx{*block.vtx[i]};
+        tx.vout[0].scriptPubKey.resize(MAX_BLOCK_WEIGHT / 2);
+        block.vtx[i] = MakeTransactionRef(std::move(tx));
+    }
+    block.hashMerkleRoot = BlockMerkleRoot(block);
+    block.m_validation_cache = {};
+    BOOST_REQUIRE_GT(GetSerializeSize(TX_WITH_WITNESS(block)), MAX_BLOCK_WEIGHT);
+    PartiallyDownloadedBlock partial{m_node.mempool.get()};
+    BOOST_REQUIRE(partial.InitData(CBlockHeaderAndShortTxIDs{block, 0}, empty_extra_txn) == READ_STATUS_OK);
+    CBlock reconstructed;
+    BOOST_CHECK(partial.FillBlock(reconstructed, {block.vtx[1], block.vtx[2]}, /*segwit_active=*/true) == READ_STATUS_FAILED);
 }
 
 // Number of shared use_counts we expect for a tx we haven't touched

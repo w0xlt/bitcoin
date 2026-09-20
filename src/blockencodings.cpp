@@ -212,6 +212,13 @@ ReadStatus PartiallyDownloadedBlock::FillBlock(CBlock& block, const std::vector<
         return READ_STATUS_INVALID;
     }
 
+    // A valid block cannot serialize to more bytes than its maximum weight. In
+    // particular, do not retain an oversized reconstruction for deferred admission.
+    // Treat it like a reconstruction failure, preserving the full-block fallback.
+    if (GetSerializeSize(TX_WITH_WITNESS(block)) > MAX_BLOCK_WEIGHT) {
+        return READ_STATUS_FAILED;
+    }
+
     // Check for possible mutations early now that we have a seemingly good block
     IsBlockMutatedFn check_mutated{m_check_block_mutated_mock ? m_check_block_mutated_mock : IsBlockMutated};
     if (check_mutated(/*block=*/block, /*check_witness_root=*/segwit_active)) {

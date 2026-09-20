@@ -3,6 +3,7 @@
 // file COPYING or https://opensource.org/license/mit.
 
 #include <blockencodings.h>
+#include <consensus/consensus.h>
 #include <consensus/merkle.h>
 #include <consensus/validation.h>
 #include <primitives/block.h>
@@ -124,10 +125,11 @@ FUZZ_TARGET(partially_downloaded_block, .init = initialize_pdb)
     case READ_STATUS_OK:
         assert(!skipped_missing);
         assert(!fail_block_mutated);
+        assert(GetSerializeSize(TX_WITH_WITNESS(reconstructed_block)) <= MAX_BLOCK_WEIGHT);
         assert(block->GetHash() == reconstructed_block.GetHash());
         break;
     case READ_STATUS_FAILED:
-        assert(fail_block_mutated);
+        assert(fail_block_mutated || GetSerializeSize(TX_WITH_WITNESS(reconstructed_block)) > MAX_BLOCK_WEIGHT);
         break;
     case READ_STATUS_INVALID:
         break;
