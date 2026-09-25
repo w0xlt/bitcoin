@@ -2048,6 +2048,7 @@ ValidationCache::ValidationCache(const size_t script_execution_cache_bytes, cons
  * script checks which are not necessary (eg due to script execution cache hits) are, obviously,
  * not pushed onto pvChecks/run.
  *
+ * ScriptCacheMode::Bypass skips all full-script cache access, including key computation.
  * ScriptCacheMode::Consume marks matching full-script-cache entries eligible for eviction
  * and does not insert results. Store does not mark hits for eviction and inserts successful
  * synchronous checks. Deferred checks never insert full-script-cache entries.
@@ -2077,11 +2078,13 @@ bool CheckInputScripts(const CTransaction& tx, TxValidationState& state,
     // properly commits to the scriptPubKey in the inputs view of that
     // transaction).
     uint256 hashCacheEntry;
-    CSHA256 hasher = validation_cache.ScriptExecutionCacheHasher();
-    hasher.Write(UCharCast(tx.GetWitnessHash().begin()), 32).Write((unsigned char*)&flags, sizeof(flags)).Finalize(hashCacheEntry.begin());
     AssertLockHeld(cs_main); //TODO: Remove this requirement by making CuckooCache not require external locks
-    if (validation_cache.m_script_execution_cache.contains(hashCacheEntry, script_cache_mode == ScriptCacheMode::Consume)) {
-        return true;
+    if (script_cache_mode != ScriptCacheMode::Bypass) {
+        CSHA256 hasher = validation_cache.ScriptExecutionCacheHasher();
+        hasher.Write(UCharCast(tx.GetWitnessHash().begin()), 32).Write((unsigned char*)&flags, sizeof(flags)).Finalize(hashCacheEntry.begin());
+        if (validation_cache.m_script_execution_cache.contains(hashCacheEntry, script_cache_mode == ScriptCacheMode::Consume)) {
+            return true;
+        }
     }
 
     if (!txdata.m_spent_outputs_ready) {

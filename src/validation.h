@@ -362,8 +362,13 @@ static_assert(std::is_nothrow_move_assignable_v<CScriptCheck>);
 static_assert(std::is_nothrow_move_constructible_v<CScriptCheck>);
 static_assert(std::is_nothrow_destructible_v<CScriptCheck>);
 
-/** Full-script cache behavior. Signature caching is controlled independently. */
+/**
+ * Full-script cache behavior. Reading or storing results requires that the spent
+ * outputs match the transaction's prevouts. Signature caching is controlled independently.
+ */
 enum class ScriptCacheMode {
+    /** Do not read or modify the full-script cache. */
+    Bypass,
     /** Consult cached results, mark hits eligible for eviction, and do not insert. */
     Consume,
     /** Consult cached results without marking hits for eviction; cache successful synchronous checks. */

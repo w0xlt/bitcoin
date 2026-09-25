@@ -2,18 +2,32 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
+#include <chain.h>
+#include <checkqueue.h>
+#include <coins.h>
+#include <consensus/amount.h>
 #include <consensus/validation.h>
 #include <key.h>
+#include <primitives/block.h>
+#include <primitives/transaction.h>
+#include <pubkey.h>
 #include <random.h>
+#include <script/interpreter.h>
+#include <script/script.h>
 #include <script/sigcache.h>
 #include <script/sign.h>
 #include <script/signingprovider.h>
+#include <sync.h>
 #include <test/util/setup_common.h>
 #include <txmempool.h>
+#include <uint256.h>
 #include <util/chaintype.h>
 #include <validation.h>
 
 #include <boost/test/unit_test.hpp>
+
+#include <utility>
+#include <vector>
 
 struct Dersig100Setup : public TestChain100Setup {
     Dersig100Setup()
@@ -27,6 +41,163 @@ bool CheckInputScripts(const CTransaction& tx, TxValidationState& state,
                        std::vector<CScriptCheck>* pvChecks) EXCLUSIVE_LOCKS_REQUIRED(cs_main);
 
 BOOST_AUTO_TEST_SUITE(txvalidationcache_tests)
+
+BOOST_FIXTURE_TEST_CASE(script_cache_bypass, BasicTestingSetup)
+{
+    LOCK(cs_main);
+    CMutableTransaction mutable_tx;
+    mutable_tx.vin.emplace_back(Txid{}, 0);
+    mutable_tx.vout.emplace_back(1, CScript{} << OP_TRUE);
+    const CTransaction tx{mutable_tx};
+
+    // The same prevout resolves to different scripts in these views. Cache reuse
+    // is only safe if the spent output actually matches the prevout.
+    CCoinsViewCache valid_inputs{&CoinsViewEmpty::Get()};
+    CCoinsViewCache invalid_inputs{&CoinsViewEmpty::Get()};
+    valid_inputs.AddCoin(tx.vin[0].prevout, Coin{CTxOut{2, CScript{} << OP_TRUE}, 1, false}, false);
+    invalid_inputs.AddCoin(tx.vin[0].prevout, Coin{CTxOut{2, CScript{} << OP_FALSE}, 1, false}, false);
+
+    CCheckQueue<CScriptCheck> queue{/*batch_size=*/128, /*worker_threads_num=*/2};
+    for (const bool deferred : {false, true}) {
+        BOOST_TEST_CONTEXT("deferred=" << deferred)
+        {
+            ValidationCache cache{/*script_execution_cache_bytes=*/1024, /*signature_cache_bytes=*/1024};
+            const auto check = [&](const CCoinsViewCache& inputs, ScriptCacheMode mode, bool expect_cached = false) EXCLUSIVE_LOCKS_REQUIRED(cs_main) {
+                TxValidationState state;
+                PrecomputedTransactionData txdata;
+                std::vector<CScriptCheck> checks;
+                const bool valid{CheckInputScripts(tx, state, inputs, SCRIPT_VERIFY_NONE, /*cacheSigStore=*/true, mode, txdata, cache, deferred ? &checks : nullptr)};
+                if (!deferred) return valid;
+                BOOST_REQUIRE(valid);
+                BOOST_CHECK_EQUAL(checks.size(), expect_cached ? 0 : tx.vin.size());
+                // Complete the checks before txdata goes out of scope.
+                CCheckQueueControl<CScriptCheck> control{queue};
+                control.Add(std::move(checks));
+                return !control.Complete().has_value();
+            };
+
+            // Bypass neither caches failures nor inserts successful checks.
+            BOOST_CHECK(!check(invalid_inputs, ScriptCacheMode::Bypass));
+            BOOST_CHECK(check(valid_inputs, ScriptCacheMode::Bypass));
+            BOOST_CHECK(!check(invalid_inputs, ScriptCacheMode::Consume));
+
+            // Consume still runs uncached scripts without inserting results.
+            BOOST_CHECK(check(valid_inputs, ScriptCacheMode::Consume));
+            BOOST_CHECK(!check(invalid_inputs, ScriptCacheMode::Consume));
+            if (deferred) {
+                // Successful deferred checks do not populate the full-script cache, even in Store mode.
+                BOOST_CHECK(check(valid_inputs, ScriptCacheMode::Store));
+                BOOST_CHECK(!check(invalid_inputs, ScriptCacheMode::Consume));
+            }
+
+            // Populate the cache with synchronous checks against the OP_TRUE output.
+            TxValidationState state;
+            PrecomputedTransactionData txdata;
+            BOOST_REQUIRE(CheckInputScripts(tx, state, valid_inputs, SCRIPT_VERIFY_NONE, /*cacheSigStore=*/true, ScriptCacheMode::Store, txdata, cache, nullptr));
+
+            // Bypass must check the supplied scripts despite the existing entry.
+            BOOST_CHECK(!check(invalid_inputs, ScriptCacheMode::Bypass));
+            BOOST_CHECK(check(valid_inputs, ScriptCacheMode::Bypass));
+
+            // Both ordinary modes still hit the entry after bypassing it.
+            BOOST_CHECK(check(invalid_inputs, ScriptCacheMode::Store, /*expect_cached=*/true));
+            BOOST_CHECK(check(invalid_inputs, ScriptCacheMode::Consume, /*expect_cached=*/true));
+        }
+    }
+}
+
+BOOST_FIXTURE_TEST_CASE(script_cache_bypass_signature_cache, BasicTestingSetup)
+{
+    LOCK(cs_main);
+    const CKey key{GenerateRandomKey()};
+    const CPubKey pubkey{key.GetPubKey()};
+    const CScript script_pub_key{CScript{} << ToByteVector(pubkey) << OP_CHECKSIG};
+    CMutableTransaction mutable_tx;
+    mutable_tx.vin.emplace_back(Txid{}, 0);
+    mutable_tx.vout.emplace_back(1, CScript{} << OP_TRUE);
+    const uint256 sighash{SignatureHash(script_pub_key, mutable_tx, 0, SIGHASH_ALL, 2, SigVersion::BASE)};
+    std::vector<unsigned char> signature;
+    BOOST_REQUIRE(key.Sign(sighash, signature));
+    auto signature_with_hashtype{signature};
+    signature_with_hashtype.push_back(SIGHASH_ALL);
+    mutable_tx.vin[0].scriptSig << signature_with_hashtype;
+    const CTransaction tx{mutable_tx};
+    CCoinsViewCache inputs{&CoinsViewEmpty::Get()};
+    inputs.AddCoin(tx.vin[0].prevout, Coin{CTxOut{2, script_pub_key}, 1, false}, false);
+
+    CCheckQueue<CScriptCheck> queue{/*batch_size=*/128, /*worker_threads_num=*/2};
+    for (const bool deferred : {false, true}) {
+        for (const bool cache_sig_store : {false, true}) {
+            BOOST_TEST_CONTEXT("deferred=" << deferred << ", cache_sig_store=" << cache_sig_store)
+            {
+                ValidationCache cache{/*script_execution_cache_bytes=*/1024, /*signature_cache_bytes=*/1024};
+                uint256 entry;
+                cache.m_signature_cache.ComputeEntryECDSA(entry, sighash, signature, pubkey);
+                BOOST_CHECK(!cache.m_signature_cache.Get(entry, /*erase=*/false));
+
+                TxValidationState state;
+                PrecomputedTransactionData txdata;
+                std::vector<CScriptCheck> checks;
+                BOOST_REQUIRE(CheckInputScripts(tx, state, inputs, SCRIPT_VERIFY_NONE, cache_sig_store, ScriptCacheMode::Bypass, txdata, cache, deferred ? &checks : nullptr));
+                if (deferred) {
+                    BOOST_REQUIRE_EQUAL(checks.size(), 1U);
+                    CCheckQueueControl<CScriptCheck> control{queue};
+                    control.Add(std::move(checks));
+                    BOOST_CHECK(!control.Complete().has_value());
+                }
+                // Full-script bypass leaves signature-cache storage under its own control.
+                BOOST_CHECK_EQUAL(cache.m_signature_cache.Get(entry, /*erase=*/false), cache_sig_store);
+            }
+        }
+    }
+}
+
+BOOST_FIXTURE_TEST_CASE(connectblock_script_cache_bypass, TestChain100Setup)
+{
+    // Spend a mature coinbase without the required signature.
+    CMutableTransaction spend;
+    spend.vin.emplace_back(m_coinbase_txns[0]->GetHash(), 0);
+    spend.vout.emplace_back(49 * COIN, CScript{} << OP_TRUE);
+    const CBlock block{CreateBlock({spend}, CScript{} << OP_TRUE)};
+
+    LOCK(cs_main);
+    auto& chainman{*m_node.chainman};
+    auto& chainstate{chainman.ActiveChainstate()};
+    BOOST_REQUIRE(chainman.GetCheckQueue().HasThreads());
+    CBlockIndex index{block};
+    index.pprev = chainstate.m_chain.Tip();
+    index.nHeight = index.pprev->nHeight + 1;
+    const uint256 block_hash{block.GetHash()};
+    index.phashBlock = &block_hash;
+
+    const auto connect = [&](ScriptCacheMode mode) EXCLUSIVE_LOCKS_REQUIRED(cs_main) {
+        CCoinsViewCache view{&chainstate.CoinsTip()};
+        BlockValidationState state;
+        const bool valid{chainstate.ConnectBlock(block, state, &index, view, mode, /*fJustCheck=*/true)};
+        BOOST_CHECK_EQUAL(valid, state.IsValid());
+        if (!valid) {
+            BOOST_CHECK(state.GetResult() == BlockValidationResult::BLOCK_CONSENSUS);
+            BOOST_CHECK(state.GetRejectReason().starts_with("block-script-verify-flag-failed"));
+        }
+        return valid;
+    };
+    BOOST_CHECK(!connect(ScriptCacheMode::Consume));
+
+    // Cache a successful script check using a different output for the same prevout.
+    CCoinsViewCache inputs{&chainstate.CoinsTip()};
+    Coin coin{inputs.AccessCoin(spend.vin[0].prevout)};
+    coin.out.scriptPubKey = CScript{} << OP_TRUE;
+    inputs.AddCoin(spend.vin[0].prevout, std::move(coin), /*possible_overwrite=*/true);
+    TxValidationState state;
+    PrecomputedTransactionData txdata;
+    BOOST_REQUIRE(CheckInputScripts(*block.vtx[1], state, inputs, GetBlockScriptFlags(index, chainman), /*cacheSigStore=*/true, ScriptCacheMode::Store, txdata, chainman.m_validation_cache, nullptr));
+
+    // ConnectBlock must pass Bypass to the deferred script checks. Ordinary
+    // cache use still trusts the entry, which remains available after bypassing.
+    BOOST_CHECK(connect(ScriptCacheMode::Consume));
+    BOOST_CHECK(!connect(ScriptCacheMode::Bypass));
+    BOOST_CHECK(connect(ScriptCacheMode::Store));
+}
 
 BOOST_FIXTURE_TEST_CASE(tx_mempool_block_doublespend, Dersig100Setup)
 {
