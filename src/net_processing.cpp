@@ -583,7 +583,7 @@ public:
     void UpdatedBlockTip(const CBlockIndex *pindexNew, const CBlockIndex *pindexFork, bool fInitialDownload) override
         EXCLUSIVE_LOCKS_REQUIRED(!m_peer_mutex);
     void BlockChecked(const std::shared_ptr<const CBlock>& block, const BlockValidationState& state) override
-        EXCLUSIVE_LOCKS_REQUIRED(!m_peer_mutex);
+        EXCLUSIVE_LOCKS_REQUIRED(!m_peer_mutex, !m_block_mutex);
     void NewPoWValidBlock(const CBlockIndex *pindex, const std::shared_ptr<const CBlock>& pblock) override
         EXCLUSIVE_LOCKS_REQUIRED(!m_most_recent_block_mutex);
 
@@ -592,9 +592,9 @@ public:
     void FinalizeNode(const CNode& node) override EXCLUSIVE_LOCKS_REQUIRED(!m_peer_mutex, !m_headers_presync_mutex, !m_tx_download_mutex);
     bool HasAllDesirableServiceFlags(ServiceFlags services) const override;
     bool ProcessMessages(CNode& node, std::atomic<bool>& interrupt) override
-        EXCLUSIVE_LOCKS_REQUIRED(!m_peer_mutex, !m_most_recent_block_mutex, !m_headers_presync_mutex, g_msgproc_mutex, !m_tx_download_mutex, !m_inv_to_send_mutex);
+        EXCLUSIVE_LOCKS_REQUIRED(!m_peer_mutex, !m_most_recent_block_mutex, !m_headers_presync_mutex, g_msgproc_mutex, !m_tx_download_mutex, !m_inv_to_send_mutex, !m_block_mutex);
     bool SendMessages(CNode& node) override
-        EXCLUSIVE_LOCKS_REQUIRED(!m_peer_mutex, !m_most_recent_block_mutex, g_msgproc_mutex, !m_tx_download_mutex, !m_inv_to_send_mutex);
+        EXCLUSIVE_LOCKS_REQUIRED(!m_peer_mutex, !m_most_recent_block_mutex, g_msgproc_mutex, !m_tx_download_mutex, !m_inv_to_send_mutex, !m_block_mutex);
 
     /** Implement PeerManager */
     void StartScheduledTasks(CScheduler& scheduler) override;
@@ -621,7 +621,7 @@ public:
 private:
     void ProcessMessage(Peer& peer, CNode& pfrom, const std::string& msg_type, DataStream& vRecv, NodeClock::time_point time_received,
                         const std::atomic<bool>& interruptMsgProc)
-        EXCLUSIVE_LOCKS_REQUIRED(!m_peer_mutex, !m_most_recent_block_mutex, !m_headers_presync_mutex, g_msgproc_mutex, !m_tx_download_mutex, !m_inv_to_send_mutex);
+        EXCLUSIVE_LOCKS_REQUIRED(!m_peer_mutex, !m_most_recent_block_mutex, !m_headers_presync_mutex, g_msgproc_mutex, !m_tx_download_mutex, !m_inv_to_send_mutex, !m_block_mutex);
 
     /** Consider evicting an outbound peer based on the amount of time they've been behind our tip */
     void ConsiderEviction(CNode& pto, Peer& peer, std::chrono::seconds time_in_seconds) EXCLUSIVE_LOCKS_REQUIRED(cs_main, g_msgproc_mutex);
@@ -890,6 +890,10 @@ private:
       * on extra block-relay-only peers. */
     bool m_initial_sync_finished GUARDED_BY(cs_main){false};
 
+    /** Protects block-source bookkeeping.
+     *  Acquire cs_main and the mempool lock first when they are also needed. */
+    mutable Mutex m_block_mutex ACQUIRED_AFTER(cs_main, m_mempool.cs) ACQUIRED_BEFORE(m_peer_mutex);
+
     /** Protects m_peer_map. This mutex must not be locked while holding a lock
      *  on any of the mutexes inside a Peer object. */
     mutable Mutex m_peer_mutex;
@@ -925,7 +929,7 @@ private:
      * Set mapBlockSource[hash].second to false if the node should not be
      * punished if the block is invalid.
      */
-    std::map<uint256, std::pair<NodeId, bool>> mapBlockSource GUARDED_BY(cs_main);
+    std::map<uint256, std::pair<NodeId, bool>> mapBlockSource GUARDED_BY(m_block_mutex);
 
     /** Number of peers with wtxid relay. */
     std::atomic<int> m_wtxid_relay_peers{0};
@@ -1055,11 +1059,12 @@ private:
         LOCKS_EXCLUDED(::cs_main);
 
     /** Process a new block. Perform any post-processing housekeeping */
-    void ProcessBlock(CNode& node, const std::shared_ptr<const CBlock>& block, bool force_processing, bool min_pow_checked);
+    void ProcessBlock(CNode& node, const std::shared_ptr<const CBlock>& block, bool force_processing, bool min_pow_checked)
+        EXCLUSIVE_LOCKS_REQUIRED(!m_block_mutex);
 
     /** Process compact block txns  */
     void ProcessCompactBlockTxns(CNode& pfrom, Peer& peer, const BlockTransactions& block_transactions)
-        EXCLUSIVE_LOCKS_REQUIRED(g_msgproc_mutex, !m_most_recent_block_mutex);
+        EXCLUSIVE_LOCKS_REQUIRED(g_msgproc_mutex, !m_most_recent_block_mutex, !m_peer_mutex, !m_block_mutex);
 
     /**
      * Schedule an INV for a transaction to be sent to the given peer (via `PushMessage()`).
@@ -2326,7 +2331,7 @@ void PeerManagerImpl::UpdatedBlockTip(const CBlockIndex *pindexNew, const CBlock
  */
 void PeerManagerImpl::BlockChecked(const std::shared_ptr<const CBlock>& block, const BlockValidationState& state)
 {
-    LOCK(cs_main);
+    LOCK2(cs_main, m_block_mutex);
 
     const uint256 hash(block->GetHash());
     std::map<uint256, std::pair<NodeId, bool>>::iterator it = mapBlockSource.find(hash);
@@ -3688,7 +3693,7 @@ void PeerManagerImpl::ProcessBlock(CNode& node, const std::shared_ptr<const CBlo
         LOCK(cs_main);
         RemoveBlockRequest(block->GetHash(), std::nullopt);
     } else {
-        LOCK(cs_main);
+        LOCK(m_block_mutex);
         mapBlockSource.erase(block->GetHash());
     }
 }
@@ -3759,16 +3764,12 @@ void PeerManagerImpl::ProcessCompactBlockTxns(CNode& pfrom, Peer& peer, const Bl
             // Block is okay for further processing
             RemoveBlockRequest(block_transactions.blockhash, pfrom.GetId()); // it is now an empty pointer
             fBlockRead = true;
-            // mapBlockSource is used for potentially punishing peers and
-            // updating which peers send us compact blocks, so the race
-            // between here and cs_main in ProcessNewBlock is fine.
-            // BIP 152 permits peers to relay compact blocks after validating
-            // the header only; we should not punish peers if the block turns
-            // out to be invalid.
-            mapBlockSource.emplace(block_transactions.blockhash, std::make_pair(pfrom.GetId(), false));
         }
     } // Don't hold cs_main when we call into ProcessNewBlock
     if (fBlockRead) {
+        // BIP 152 permits peers to relay compact blocks after validating only
+        // the header, so an invalid reconstructed block must not punish them.
+        WITH_LOCK(m_block_mutex, mapBlockSource.emplace(block_transactions.blockhash, std::make_pair(pfrom.GetId(), false)));
         // Since we requested this block (it was in mapBlocksInFlight), force it to be processed,
         // even if it would not be a candidate for new tip (missing previous block, chain not long enough, etc)
         // This bypasses some anti-DoS logic in AcceptBlock (eg to prevent
@@ -5024,7 +5025,7 @@ void PeerManagerImpl::ProcessMessage(Peer& peer, CNode& pfrom, const std::string
             // If we got here, we were able to optimistically reconstruct a
             // block that is in flight from some other peer.
             {
-                LOCK(cs_main);
+                LOCK(m_block_mutex);
                 mapBlockSource.emplace(pblock->GetHash(), std::make_pair(pfrom.GetId(), false));
             }
             // Setting force_processing to true means that we bypass some of
@@ -5137,16 +5138,12 @@ void PeerManagerImpl::ProcessMessage(Peer& peer, CNode& pfrom, const std::string
             // need it even when it's not a candidate for a new best tip.
             forceProcessing = IsBlockRequested(hash);
             RemoveBlockRequest(hash, pfrom.GetId());
-            // mapBlockSource is only used for punishing peers and setting
-            // which peers send us compact blocks, so the race between here and
-            // cs_main in ProcessNewBlock is fine.
-            mapBlockSource.emplace(hash, std::make_pair(pfrom.GetId(), true));
-
             // Check claimed work on this block against our anti-dos thresholds.
             if (prev_block && prev_block->nChainWork + GetBlockProof(*pblock) >= GetAntiDoSWorkThreshold()) {
                 min_pow_checked = true;
             }
         }
+        WITH_LOCK(m_block_mutex, mapBlockSource.emplace(hash, std::make_pair(pfrom.GetId(), true)));
         ProcessBlock(pfrom, pblock, forceProcessing, min_pow_checked);
         return;
     }
