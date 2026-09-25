@@ -10,11 +10,14 @@
 #include <consensus/validation.h>
 #include <interfaces/types.h>
 #include <kernel/chainparams.h>
+#include <node/blockstorage.h>
 #include <node/kernel_notifications.h>
 #include <node/miner.h>
 #include <node/mining_args.h>
+#include <node/mining_types.h>
 #include <primitives/block.h>
 #include <sync.h>
+#include <txmempool.h>
 #include <uint256.h>
 #include <util/check.h>
 #include <util/signalinterrupt.h>
@@ -46,6 +49,40 @@ std::unique_ptr<CBlockTemplate> BlockTemplateManager::CreateNewTemplate(const Bl
         &m_mempool,
         MergeMiningOptions(options, m_block_create_args),
     }.CreateNewBlock();
+}
+
+CachedBlockTemplate BlockTemplateManager::GetCachedTemplate() const
+{
+    AssertLockHeld(::cs_main);
+    return m_cached_template;
+}
+
+CachedBlockTemplate BlockTemplateManager::RefreshCachedTemplate(const uint256& tip)
+{
+    AssertLockHeld(::cs_main);
+    CachedBlockTemplate& cache{m_cached_template};
+    if (!cache.prev || cache.prev->GetBlockHash() != tip ||
+        (m_mempool.GetTransactionsUpdated() != cache.transactions_updated && Now<NodeSeconds>() - cache.time_start > 5s)) {
+        // Clear prev so future calls make a new block, despite any failures from here on
+        cache.prev = nullptr;
+
+        // Store the pindexBest used before CreateNewTemplate, to avoid races
+        cache.transactions_updated = m_mempool.GetTransactionsUpdated();
+        const CBlockIndex* prev_new{m_chainman.m_blockman.LookupBlockIndex(tip)};
+        cache.time_start = Now<NodeSeconds>();
+
+        // Create new block. Opt-out of cooldown mechanism, because it would add
+        // a delay to each getblocktemplate call. This differs from typical
+        // long-lived IPC usage, where the overhead is paid only when creating
+        // the initial template.
+        std::unique_ptr<CBlockTemplate> block_template{CreateNewTemplate({})};
+        CHECK_NONFATAL(block_template);
+        cache.block_template = std::move(block_template);
+
+        // Need to update only after we know CreateNewTemplate succeeded
+        cache.prev = prev_new;
+    }
+    return cache;
 }
 
 namespace {

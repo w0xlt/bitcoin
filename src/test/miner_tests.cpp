@@ -26,6 +26,7 @@
 #include <serialize.h>
 #include <sync.h>
 #include <test/util/common.h>
+#include <test/util/mining.h>
 #include <test/util/setup_common.h>
 #include <test/util/transaction_utils.h>
 #include <test/util/time.h>
@@ -980,6 +981,70 @@ BOOST_AUTO_TEST_CASE(block_template_manager)
     BOOST_CHECK(block.vtx[0]->IsCoinBase());
     BOOST_CHECK(block_template->vTxFees.empty());
     BOOST_CHECK(block_template->vTxSigOpsCost.empty());
+}
+
+// Uses regtest so that MineBlock() can solve a block.
+BOOST_FIXTURE_TEST_CASE(block_template_manager_cached_template, RegTestingSetup)
+{
+    auto& block_template_manager{*Assert(m_node.block_template_manager)};
+    auto& mempool{*Assert(m_node.mempool)};
+    FakeNodeClock clock{};
+    const auto active_tip{[&] { return WITH_LOCK(::cs_main, return m_node.chainman->ActiveChain().Tip()->GetBlockHash()); }};
+    const auto refresh{[&](const uint256& tip) { return WITH_LOCK(::cs_main, return block_template_manager.RefreshCachedTemplate(tip)); }};
+
+    // Nothing is cached before the first refresh.
+    const auto empty{WITH_LOCK(::cs_main, return block_template_manager.GetCachedTemplate())};
+    BOOST_CHECK(!empty.prev);
+    BOOST_CHECK(!empty.block_template);
+
+    // The first refresh builds a template on the tip.
+    const uint256 tip{active_tip()};
+    const auto first{refresh(tip)};
+    BOOST_REQUIRE(first.prev);
+    BOOST_REQUIRE(first.block_template);
+    BOOST_CHECK_EQUAL(first.prev->GetBlockHash(), tip);
+    BOOST_CHECK_EQUAL(first.block_template->block.hashPrevBlock, tip);
+    BOOST_CHECK_EQUAL(first.transactions_updated, mempool.GetTransactionsUpdated());
+    BOOST_CHECK_EQUAL(first.time_start, Now<NodeSeconds>());
+    BOOST_CHECK(WITH_LOCK(::cs_main, return block_template_manager.GetCachedTemplate()).block_template == first.block_template);
+
+    // Without a mempool change, the template is reused however old it is.
+    clock += 1h;
+    BOOST_CHECK(refresh(tip).block_template == first.block_template);
+
+    // A mempool change rebuilds a template that is more than 5 seconds old.
+    mempool.AddTransactionsUpdated(1);
+    const auto second{refresh(tip)};
+    BOOST_CHECK(second.block_template != first.block_template);
+    BOOST_CHECK_EQUAL(second.transactions_updated, mempool.GetTransactionsUpdated());
+    BOOST_CHECK_EQUAL(second.time_start, Now<NodeSeconds>());
+
+    // A mempool change does not rebuild a template that is up to 5 seconds old.
+    mempool.AddTransactionsUpdated(1);
+    clock += 5s;
+    BOOST_CHECK(refresh(tip).block_template == second.block_template);
+    clock += 1s;
+    const auto third{refresh(tip)};
+    BOOST_CHECK(third.block_template != second.block_template);
+
+    // A new tip rebuilds the template.
+    MineBlock(m_node, {});
+    const uint256 new_tip{active_tip()};
+    BOOST_REQUIRE(new_tip != tip);
+    const auto fourth{refresh(new_tip)};
+    BOOST_CHECK(fourth.block_template != third.block_template);
+    BOOST_REQUIRE(fourth.prev);
+    BOOST_CHECK_EQUAL(fourth.prev->GetBlockHash(), new_tip);
+    BOOST_CHECK_EQUAL(fourth.block_template->block.hashPrevBlock, new_tip);
+
+    // An unknown tip leaves prev unset, so the next refresh rebuilds.
+    const auto unknown{refresh(uint256::ONE)};
+    BOOST_CHECK(!unknown.prev);
+    BOOST_CHECK(unknown.block_template != fourth.block_template);
+    const auto fifth{refresh(new_tip)};
+    BOOST_CHECK(fifth.block_template != unknown.block_template);
+    BOOST_REQUIRE(fifth.prev);
+    BOOST_CHECK_EQUAL(fifth.prev->GetBlockHash(), new_tip);
 }
 
 BOOST_AUTO_TEST_SUITE_END()
