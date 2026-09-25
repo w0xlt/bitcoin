@@ -1801,6 +1801,7 @@ void PeerManagerImpl::FinalizeNode(const CNode& node)
     NodeId nodeid = node.GetId();
     {
     LOCK(cs_main);
+    {
     PeerRef peer;
     {
         // We remove the PeerRef from g_peer_map here, but we don't always
@@ -1831,10 +1832,6 @@ void PeerManagerImpl::FinalizeNode(const CNode& node)
             }
         }
     }
-    {
-        LOCK(m_tx_download_mutex);
-        m_txdownloadman.DisconnectedPeer(nodeid);
-    }
     if (m_txreconciliation) m_txreconciliation->ForgetPeer(nodeid);
     m_num_preferred_download_peers -= state->fPreferredDownload;
     m_peers_downloading_from -= (!download.vBlocksInFlight.empty());
@@ -1852,7 +1849,12 @@ void PeerManagerImpl::FinalizeNode(const CNode& node)
         assert(m_peers_downloading_from == 0);
         assert(m_outbound_peers_with_protect_from_disconnect == 0);
         assert(m_wtxid_relay_peers == 0);
-        WITH_LOCK(m_tx_download_mutex, m_txdownloadman.CheckIsEmpty());
+    }
+    }
+    {
+        LOCK(m_tx_download_mutex);
+        m_txdownloadman.DisconnectedPeer(nodeid);
+        if (m_node_states.empty()) m_txdownloadman.CheckIsEmpty();
     }
     } // cs_main
     if (node.fSuccessfullyConnected &&
@@ -6453,121 +6455,123 @@ bool PeerManagerImpl::SendMessages(CNode& node)
         if (!vInv.empty())
             MakeAndPushMessage(node, NetMsgType::INV, vInv);
 
-        auto& download{BlockDownload(peer)};
-        // Detect whether we're stalling
-        auto stalling_timeout = m_block_stalling_timeout.load();
-        if (download.m_stalling_since.count() && download.m_stalling_since < current_time - stalling_timeout) {
-            // Stalling only triggers when the block download window cannot move. During normal steady state,
-            // the download window should be much larger than the to-be-downloaded set of blocks, so disconnection
-            // should only happen during initial block download.
-            if (node.IsManualConn()) {
-                LogInfo("Pausing block downloads from stalling manual peer=%d for %d seconds\n", node.GetId(), count_seconds(MANUAL_PEER_BLOCK_DOWNLOAD_COOLDOWN));
-                download.m_block_download_paused_until = current_time + MANUAL_PEER_BLOCK_DOWNLOAD_COOLDOWN;
-                while (!download.vBlocksInFlight.empty()) {
-                    RemoveBlockRequest(download.vBlocksInFlight.front().pindex->GetBlockHash(), node.GetId());
+        std::vector<CInv> vGetData;
+        {
+            auto& download{BlockDownload(peer)};
+            // Detect whether we're stalling
+            auto stalling_timeout = m_block_stalling_timeout.load();
+            if (download.m_stalling_since.count() && download.m_stalling_since < current_time - stalling_timeout) {
+                // Stalling only triggers when the block download window cannot move. During normal steady state,
+                // the download window should be much larger than the to-be-downloaded set of blocks, so disconnection
+                // should only happen during initial block download.
+                if (node.IsManualConn()) {
+                    LogInfo("Pausing block downloads from stalling manual peer=%d for %d seconds\n", node.GetId(), count_seconds(MANUAL_PEER_BLOCK_DOWNLOAD_COOLDOWN));
+                    download.m_block_download_paused_until = current_time + MANUAL_PEER_BLOCK_DOWNLOAD_COOLDOWN;
+                    while (!download.vBlocksInFlight.empty()) {
+                        RemoveBlockRequest(download.vBlocksInFlight.front().pindex->GetBlockHash(), node.GetId());
+                    }
+                } else {
+                    LogInfo("Peer is stalling block download, %s", node.DisconnectMsg());
+                    node.fDisconnect = true;
                 }
-            } else {
-                LogInfo("Peer is stalling block download, %s", node.DisconnectMsg());
-                node.fDisconnect = true;
-            }
-            // Increase the timeout for the next peer so that we don't repeatedly react to apparent
-            // stalls caused by insufficient local bandwidth.
-            const auto new_timeout = std::min(2 * stalling_timeout, BLOCK_STALLING_TIMEOUT_MAX);
-            if (stalling_timeout != new_timeout && m_block_stalling_timeout.compare_exchange_strong(stalling_timeout, new_timeout)) {
-                LogDebug(BCLog::NET, "Increased stalling timeout temporarily to %d seconds\n", count_seconds(new_timeout));
-            }
-            return true;
-        }
-        // In case there is a block that has been in flight from this peer for block_interval * (1 + 0.5 * N)
-        // (with N the number of peers from which we're downloading validated blocks), disconnect due to timeout.
-        // We compensate for other peers to prevent killing off peers due to our own downstream link
-        // being saturated. We only count validated in-flight blocks so peers can't advertise non-existing block hashes
-        // to unreasonably increase our timeout.
-        if (download.vBlocksInFlight.size() > 0) {
-            QueuedBlock &queuedBlock = download.vBlocksInFlight.front();
-            int nOtherPeersWithValidatedDownloads = m_peers_downloading_from - 1;
-            if (current_time > download.m_downloading_since + std::chrono::seconds{consensusParams.nPowTargetSpacing} * (BLOCK_DOWNLOAD_TIMEOUT_BASE + BLOCK_DOWNLOAD_TIMEOUT_PER_PEER * nOtherPeersWithValidatedDownloads)) {
-                LogInfo("Timeout downloading block %s, %s", queuedBlock.pindex->GetBlockHash().ToString(), node.DisconnectMsg());
-                node.fDisconnect = true;
+                // Increase the timeout for the next peer so that we don't repeatedly react to apparent
+                // stalls caused by insufficient local bandwidth.
+                const auto new_timeout = std::min(2 * stalling_timeout, BLOCK_STALLING_TIMEOUT_MAX);
+                if (stalling_timeout != new_timeout && m_block_stalling_timeout.compare_exchange_strong(stalling_timeout, new_timeout)) {
+                    LogDebug(BCLog::NET, "Increased stalling timeout temporarily to %d seconds\n", count_seconds(new_timeout));
+                }
                 return true;
             }
-        }
-        // Check for headers sync timeouts
-        if (state.fSyncStarted && peer.m_headers_sync_timeout < std::chrono::microseconds::max()) {
-            // Detect whether this is a stalling initial-headers-sync peer
-            if (m_chainman.m_best_header->Time() <= NodeClock::now() - 24h) {
-                if (current_time > peer.m_headers_sync_timeout && nSyncStarted == 1 && (m_num_preferred_download_peers - state.fPreferredDownload >= 1)) {
-                    // Disconnect a peer (without NetPermissionFlags::NoBan permission) if it is our only sync peer,
-                    // and we have others we could be using instead.
-                    // Note: If all our peers are inbound, then we won't
-                    // disconnect our sync peer for stalling; we have bigger
-                    // problems if we can't get any outbound peers.
-                    if (!node.HasPermission(NetPermissionFlags::NoBan)) {
-                        LogInfo("Timeout downloading headers, %s", node.DisconnectMsg());
-                        node.fDisconnect = true;
-                        return true;
-                    } else {
-                        LogInfo("Timeout downloading headers from noban peer, not %s", node.DisconnectMsg());
-                        // Reset the headers sync state so that we have a
-                        // chance to try downloading from a different peer.
-                        // Note: this will also result in at least one more
-                        // getheaders message to be sent to
-                        // this peer (eventually).
-                        state.fSyncStarted = false;
-                        nSyncStarted--;
-                        peer.m_headers_sync_timeout = 0us;
-                    }
+            // In case there is a block that has been in flight from this peer for block_interval * (1 + 0.5 * N)
+            // (with N the number of peers from which we're downloading validated blocks), disconnect due to timeout.
+            // We compensate for other peers to prevent killing off peers due to our own downstream link
+            // being saturated. We only count validated in-flight blocks so peers can't advertise non-existing block hashes
+            // to unreasonably increase our timeout.
+            if (download.vBlocksInFlight.size() > 0) {
+                QueuedBlock &queuedBlock = download.vBlocksInFlight.front();
+                int nOtherPeersWithValidatedDownloads = m_peers_downloading_from - 1;
+                if (current_time > download.m_downloading_since + std::chrono::seconds{consensusParams.nPowTargetSpacing} * (BLOCK_DOWNLOAD_TIMEOUT_BASE + BLOCK_DOWNLOAD_TIMEOUT_PER_PEER * nOtherPeersWithValidatedDownloads)) {
+                    LogInfo("Timeout downloading block %s, %s", queuedBlock.pindex->GetBlockHash().ToString(), node.DisconnectMsg());
+                    node.fDisconnect = true;
+                    return true;
                 }
-            } else {
-                // After we've caught up once, reset the timeout so we can't trigger
-                // disconnect later.
-                peer.m_headers_sync_timeout = std::chrono::microseconds::max();
             }
-        }
-
-        // Check that outbound peers have reasonable chains
-        // GetTime() is used by this anti-DoS logic so we can test this using mocktime
-        ConsiderEviction(node, peer, GetTime<std::chrono::seconds>());
-
-        //
-        // Message: getdata (blocks)
-        //
-        std::vector<CInv> vGetData;
-        const bool can_request_blocks_from_peer{current_time >= download.m_block_download_paused_until};
-        if (CanServeBlocks(peer) && can_request_blocks_from_peer && ((sync_blocks_and_headers_from_peer && !IsLimitedPeer(peer)) || !m_chainman.IsInitialBlockDownload()) && download.vBlocksInFlight.size() < MAX_BLOCKS_IN_TRANSIT_PER_PEER) {
-            std::vector<const CBlockIndex*> vToDownload;
-            NodeId staller = -1;
-            auto get_inflight_budget = [&download]() {
-                return std::max(0, MAX_BLOCKS_IN_TRANSIT_PER_PEER - static_cast<int>(download.vBlocksInFlight.size()));
-            };
-
-            // If there are multiple chainstates, download blocks for the
-            // current chainstate first, to prioritize getting to network tip
-            // before downloading historical blocks.
-            FindNextBlocksToDownload(peer, get_inflight_budget(), vToDownload, staller);
-            auto historical_blocks{m_chainman.GetHistoricalBlockRange()};
-            if (historical_blocks && !IsLimitedPeer(peer)) {
-                // If the first needed historical block is not an ancestor of the last,
-                // we need to start requesting blocks from their last common ancestor.
-                const CBlockIndex* from_tip = LastCommonAncestor(historical_blocks->first, historical_blocks->second);
-                TryDownloadingHistoricalBlocks(
-                    peer,
-                    get_inflight_budget(),
-                    vToDownload, from_tip, historical_blocks->second);
+            // Check for headers sync timeouts
+            if (state.fSyncStarted && peer.m_headers_sync_timeout < std::chrono::microseconds::max()) {
+                // Detect whether this is a stalling initial-headers-sync peer
+                if (m_chainman.m_best_header->Time() <= NodeClock::now() - 24h) {
+                    if (current_time > peer.m_headers_sync_timeout && nSyncStarted == 1 && (m_num_preferred_download_peers - state.fPreferredDownload >= 1)) {
+                        // Disconnect a peer (without NetPermissionFlags::NoBan permission) if it is our only sync peer,
+                        // and we have others we could be using instead.
+                        // Note: If all our peers are inbound, then we won't
+                        // disconnect our sync peer for stalling; we have bigger
+                        // problems if we can't get any outbound peers.
+                        if (!node.HasPermission(NetPermissionFlags::NoBan)) {
+                            LogInfo("Timeout downloading headers, %s", node.DisconnectMsg());
+                            node.fDisconnect = true;
+                            return true;
+                        } else {
+                            LogInfo("Timeout downloading headers from noban peer, not %s", node.DisconnectMsg());
+                            // Reset the headers sync state so that we have a
+                            // chance to try downloading from a different peer.
+                            // Note: this will also result in at least one more
+                            // getheaders message to be sent to
+                            // this peer (eventually).
+                            state.fSyncStarted = false;
+                            nSyncStarted--;
+                            peer.m_headers_sync_timeout = 0us;
+                        }
+                    }
+                } else {
+                    // After we've caught up once, reset the timeout so we can't trigger
+                    // disconnect later.
+                    peer.m_headers_sync_timeout = std::chrono::microseconds::max();
+                }
             }
-            for (const CBlockIndex *pindex : vToDownload) {
-                uint32_t nFetchFlags = GetFetchFlags(peer);
-                vGetData.emplace_back(MSG_BLOCK | nFetchFlags, pindex->GetBlockHash());
-                BlockRequested(node.GetId(), *pindex);
-                LogDebug(BCLog::NET, "Requesting block %s (%d) peer=%d\n", pindex->GetBlockHash().ToString(),
-                    pindex->nHeight, node.GetId());
-            }
-            if (download.vBlocksInFlight.empty() && staller != -1) {
-                const PeerRef stalling_peer{Assert(GetPeerRef(staller))};
-                auto& stalling{BlockDownload(*stalling_peer)};
-                if (stalling.m_stalling_since == 0us) {
-                    stalling.m_stalling_since = current_time;
-                    LogDebug(BCLog::NET, "Stall started peer=%d\n", staller);
+
+            // Check that outbound peers have reasonable chains
+            // GetTime() is used by this anti-DoS logic so we can test this using mocktime
+            ConsiderEviction(node, peer, GetTime<std::chrono::seconds>());
+
+            //
+            // Message: getdata (blocks)
+            //
+            const bool can_request_blocks_from_peer{current_time >= download.m_block_download_paused_until};
+            if (CanServeBlocks(peer) && can_request_blocks_from_peer && ((sync_blocks_and_headers_from_peer && !IsLimitedPeer(peer)) || !m_chainman.IsInitialBlockDownload()) && download.vBlocksInFlight.size() < MAX_BLOCKS_IN_TRANSIT_PER_PEER) {
+                std::vector<const CBlockIndex*> vToDownload;
+                NodeId staller = -1;
+                auto get_inflight_budget = [&download]() {
+                    return std::max(0, MAX_BLOCKS_IN_TRANSIT_PER_PEER - static_cast<int>(download.vBlocksInFlight.size()));
+                };
+
+                // If there are multiple chainstates, download blocks for the
+                // current chainstate first, to prioritize getting to network tip
+                // before downloading historical blocks.
+                FindNextBlocksToDownload(peer, get_inflight_budget(), vToDownload, staller);
+                auto historical_blocks{m_chainman.GetHistoricalBlockRange()};
+                if (historical_blocks && !IsLimitedPeer(peer)) {
+                    // If the first needed historical block is not an ancestor of the last,
+                    // we need to start requesting blocks from their last common ancestor.
+                    const CBlockIndex* from_tip = LastCommonAncestor(historical_blocks->first, historical_blocks->second);
+                    TryDownloadingHistoricalBlocks(
+                        peer,
+                        get_inflight_budget(),
+                        vToDownload, from_tip, historical_blocks->second);
+                }
+                for (const CBlockIndex *pindex : vToDownload) {
+                    uint32_t nFetchFlags = GetFetchFlags(peer);
+                    vGetData.emplace_back(MSG_BLOCK | nFetchFlags, pindex->GetBlockHash());
+                    BlockRequested(node.GetId(), *pindex);
+                    LogDebug(BCLog::NET, "Requesting block %s (%d) peer=%d\n", pindex->GetBlockHash().ToString(),
+                        pindex->nHeight, node.GetId());
+                }
+                if (download.vBlocksInFlight.empty() && staller != -1) {
+                    const PeerRef stalling_peer{Assert(GetPeerRef(staller))};
+                    auto& stalling{BlockDownload(*stalling_peer)};
+                    if (stalling.m_stalling_since == 0us) {
+                        stalling.m_stalling_since = current_time;
+                        LogDebug(BCLog::NET, "Stall started peer=%d\n", staller);
+                    }
                 }
             }
         }
