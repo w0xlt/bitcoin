@@ -5,13 +5,19 @@
 #include <chain.h>
 #include <chainparams.h>
 #include <consensus/params.h>
+#include <consensus/validation.h>
+#include <net.h>
 #include <net_processing.h>
+#include <netbase.h>
 #include <node/block_template_manager.h>
+#include <node/connection_types.h>
 #include <node/miner.h>
 #include <pow.h>
 #include <primitives/block.h>
 #include <protocol.h>
 #include <sync.h>
+#include <test/util/mining.h>
+#include <test/util/net.h>
 #include <test/util/setup_common.h>
 #include <test/util/time.h>
 #include <util/check.h>
@@ -20,8 +26,74 @@
 
 #include <boost/test/unit_test.hpp>
 
+#include <chrono>
 #include <cstdint>
+#include <future>
 #include <memory>
+#include <utility>
+#include <vector>
+
+namespace {
+struct NetLockTestingSetup : RegTestingSetup {
+    ConnmanTestMsg& Connman() { return static_cast<ConnmanTestMsg&>(*m_node.connman); }
+    PeerManager& Peerman() { return *m_node.peerman; }
+
+    NetLockTestingSetup()
+    {
+        m_node.validation_signals->SyncWithValidationInterfaceQueue();
+        m_node.validation_signals->RegisterValidationInterface(m_node.peerman.get());
+    }
+
+    ~NetLockTestingSetup()
+    {
+        m_node.validation_signals->SyncWithValidationInterfaceQueue();
+        m_node.validation_signals->UnregisterValidationInterface(m_node.peerman.get());
+        for (const auto node : Connman().TestNodes())
+            Peerman().FinalizeNode(*node);
+        Connman().ClearTestNodes();
+    }
+
+    CNode& AddPeer(NodeId id) EXCLUSIVE_LOCKS_REQUIRED(NetEventsInterface::g_msgproc_mutex)
+    {
+        // Connman owns these nodes until ClearTestNodes().
+        auto node{std::make_unique<CNode>(id, /*sock=*/nullptr,
+                                          CAddress{LookupNumeric("127.0.0.1", 18444), NODE_NONE}, /*nKeyedNetGroupIn=*/0,
+                                          /*nLocalHostNonceIn=*/0, CAddress{}, /*addrNameIn=*/"", ConnectionType::INBOUND,
+                                          /*inbound_onion=*/false, /*network_key=*/0)};
+        auto& result{*node};
+        Connman().AddTestNode(*node.release());
+        Connman().Handshake(result, /*successfully_connected=*/true,
+                            /*remote_services=*/ServiceFlags(NODE_NETWORK | NODE_WITNESS),
+                            /*local_services=*/ServiceFlags(NODE_NETWORK | NODE_WITNESS),
+                            PROTOCOL_VERSION, /*relay_txs=*/true);
+        Connman().FlushSendBuffer(result);
+        result.fPauseSend = false;
+        return result;
+    }
+
+    CNodeStateStats Stats(NodeId id)
+    {
+        CNodeStateStats stats;
+        BOOST_REQUIRE(Peerman().GetNodeStateStats(id, stats));
+        return stats;
+    }
+};
+
+// Release cs_main before joining, even if the check fails or an exception is thrown.
+// A regression that takes cs_main should fail the test instead of hanging it.
+bool RunsWithoutChainLock(auto&& action)
+{
+    std::future<void> done;
+    bool ready;
+    {
+        LOCK(cs_main);
+        done = std::async(std::launch::async, std::forward<decltype(action)>(action));
+        ready = done.wait_for(std::chrono::seconds{10}) == std::future_status::ready;
+    }
+    done.get();
+    return ready;
+}
+} // namespace
 
 BOOST_FIXTURE_TEST_SUITE(peerman_tests, RegTestingSetup)
 
@@ -87,6 +159,40 @@ BOOST_AUTO_TEST_CASE(connections_desirable_service_flags)
     // Lastly, verify the stale tip checks can disallow limited peers connections after not receiving blocks for a prolonged period.
     clock += std::chrono::seconds{consensus.nPowTargetSpacing * NODE_NETWORK_LIMITED_ALLOW_CONN_BLOCKS + 1};
     BOOST_CHECK(peerman->GetDesirableServiceFlags(peer_flags) == ServiceFlags(NODE_NETWORK | NODE_WITNESS));
+}
+
+BOOST_FIXTURE_TEST_CASE(block_requests_do_not_wait_for_cs_main, NetLockTestingSetup)
+{
+    auto& chainman{*m_node.chainman};
+    auto block{PrepareBlock(m_node, {})};
+    while (!CheckProofOfWork(block->GetHash(), block->nBits, chainman.GetConsensus()))
+        ++block->nNonce;
+    BlockValidationState state;
+    const CBlockIndex* index{nullptr};
+    BOOST_REQUIRE(chainman.ProcessNewBlockHeaders({{*block}}, /*min_pow_checked=*/true, state, &index));
+    BOOST_REQUIRE(index);
+    {
+        LOCK(NetEventsInterface::g_msgproc_mutex);
+        AddPeer(0);
+        AddPeer(1);
+    }
+
+    bool requested{false};
+    BOOST_CHECK(RunsWithoutChainLock([&] {
+        requested = bool{Peerman().FetchBlock(0, *index)};
+    }));
+    BOOST_REQUIRE(requested);
+    BOOST_CHECK(Stats(0).vHeightInFlight == std::vector<int>{index->nHeight});
+    BOOST_CHECK(Stats(1).vHeightInFlight.empty());
+
+    // Reassigning the request also clears the first peer's bookkeeping without cs_main.
+    BOOST_CHECK(RunsWithoutChainLock([&] {
+        requested = bool{Peerman().FetchBlock(1, *index)};
+    }));
+    BOOST_REQUIRE(requested);
+    BOOST_CHECK(Stats(0).vHeightInFlight.empty());
+    BOOST_CHECK(Stats(1).vHeightInFlight == std::vector<int>{index->nHeight});
+    // Fixture teardown finalizes a peer with an outstanding request and checks the global counters.
 }
 
 BOOST_AUTO_TEST_SUITE_END()
