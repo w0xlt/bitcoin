@@ -5,6 +5,7 @@
 #include <blockencodings.h>
 #include <chain.h>
 #include <chainparams.h>
+#include <consensus/consensus.h>
 #include <consensus/params.h>
 #include <consensus/validation.h>
 #include <net.h>
@@ -18,9 +19,11 @@
 #include <primitives/block.h>
 #include <primitives/transaction.h>
 #include <protocol.h>
+#include <script/script.h>
 #include <sync.h>
 #include <test/util/mining.h>
 #include <test/util/net.h>
+#include <test/util/script.h>
 #include <test/util/setup_common.h>
 #include <test/util/time.h>
 #include <util/check.h>
@@ -184,6 +187,21 @@ struct NetLockTestingSetup : RegTestingSetup {
                std::ranges::any_of(node.vSendMsg, [&](const auto& msg) { return msg.m_type == msg_type; });
     }
 };
+
+// Release cs_main before joining, even if the check fails or an exception is thrown.
+// A regression that takes cs_main should fail the test instead of hanging it.
+bool RunsWithoutChainLock(auto&& action)
+{
+    std::future<void> done;
+    bool ready;
+    {
+        LOCK(cs_main);
+        done = std::async(std::launch::async, std::forward<decltype(action)>(action));
+        ready = done.wait_for(std::chrono::seconds{10}) == std::future_status::ready;
+    }
+    done.get();
+    return ready;
+}
 } // namespace
 
 BOOST_FIXTURE_TEST_SUITE(peerman_tests, RegTestingSetup)
@@ -356,6 +374,64 @@ BOOST_FIXTURE_TEST_CASE(block_request_moves_between_peers, NetLockTestingSetup)
     BOOST_CHECK(Stats(0).vHeightInFlight.empty());
     BOOST_CHECK(Stats(1).vHeightInFlight == std::vector<int>{index->nHeight});
     // Fixture teardown finalizes a peer with an outstanding request and checks the global counters.
+}
+
+BOOST_FIXTURE_TEST_CASE(compact_blocktxn_does_not_wait_for_cs_main, NetLockTestingSetup)
+{
+    auto& chainman{*m_node.chainman};
+    FakeNodeClock clock{chainman.GetParams().GenesisBlock().Time() + 1h};
+    const auto funding_blocks{CreateBlockChain(COINBASE_MATURITY, chainman.GetParams())};
+    for (const auto& block : funding_blocks) {
+        BOOST_REQUIRE(chainman.ProcessNewBlock(block, /*force_processing=*/true, /*min_pow_checked=*/true, nullptr));
+    }
+    m_node.validation_signals->SyncWithValidationInterfaceQueue();
+
+    // Leave one transaction missing so the compact block requests a BLOCKTXN response.
+    CMutableTransaction spend;
+    spend.vin.emplace_back(COutPoint{funding_blocks.front()->vtx[0]->GetHash(), 0});
+    spend.vin[0].scriptWitness.stack.push_back(WITNESS_STACK_ELEM_OP_TRUE);
+    spend.vout.push_back(funding_blocks.front()->vtx[0]->vout[0]);
+    --spend.vout[0].nValue;
+    auto block{PrepareBlock(m_node, {})};
+    block->vtx.push_back(MakeTransactionRef(spend));
+    node::RegenerateCommitments(*block, chainman);
+    SolvePow(*block, chainman.GetConsensus());
+
+    CNode* source{&AddCompactBlockPeer(0)};
+    {
+        LOCK(NetEventsInterface::g_msgproc_mutex);
+        const CBlockHeaderAndShortTxIDs compact{*block, /*nonce=*/0};
+        BOOST_REQUIRE(Connman().ReceiveMsgFrom(*source, NetMsg::Make(NetMsgType::CMPCTBLOCK, compact)));
+        Connman().ProcessMessagesOnce(*source);
+    }
+    BOOST_REQUIRE(HasMessage(*source, NetMsgType::GETBLOCKTXN));
+    BOOST_REQUIRE_EQUAL(Stats(source->GetId()).vHeightInFlight.size(), 1);
+    FlushSends(*source);
+
+    auto process_without_chain_lock = [&] {
+        BOOST_CHECK(RunsWithoutChainLock([&] {
+            LOCK(NetEventsInterface::g_msgproc_mutex);
+            Connman().ProcessMessagesOnce(*source);
+        }));
+    };
+
+    // An unexpected response must be discarded without waiting for block validation.
+    BlockTransactions response;
+    BOOST_REQUIRE(Connman().ReceiveMsgFrom(*source, NetMsg::Make(NetMsgType::BLOCKTXN, response)));
+    process_without_chain_lock();
+    BOOST_CHECK(!source->fDisconnect);
+    BOOST_CHECK(!HasMessage(*source, NetMsgType::GETDATA));
+    BOOST_CHECK_EQUAL(Stats(source->GetId()).vHeightInFlight.size(), 1);
+
+    // A reconstruction failure must also reach the full-block fallback without cs_main.
+    response.blockhash = block->GetHash();
+    --spend.vout[0].nValue;
+    response.txn.push_back(MakeTransactionRef(spend));
+    BOOST_REQUIRE(Connman().ReceiveMsgFrom(*source, NetMsg::Make(NetMsgType::BLOCKTXN, response)));
+    process_without_chain_lock();
+    BOOST_CHECK(!source->fDisconnect);
+    BOOST_CHECK(HasMessage(*source, NetMsgType::GETDATA));
+    BOOST_CHECK_EQUAL(Stats(source->GetId()).vHeightInFlight.size(), 1);
 }
 
 BOOST_AUTO_TEST_SUITE_END()

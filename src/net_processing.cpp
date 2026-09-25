@@ -3767,7 +3767,7 @@ void PeerManagerImpl::ProcessCompactBlockTxns(CNode& pfrom, Peer& peer, const Bl
     std::shared_ptr<CBlock> pblock = std::make_shared<CBlock>();
     bool fBlockRead{false};
     {
-        LOCK2(cs_main, m_block_mutex);
+        LOCK(m_block_mutex);
 
         auto range_flight = mapBlocksInFlight.equal_range(block_transactions.blockhash);
         size_t already_in_flight = std::distance(range_flight.first, range_flight.second);
@@ -3785,16 +3785,15 @@ void PeerManagerImpl::ProcessCompactBlockTxns(CNode& pfrom, Peer& peer, const Bl
 
         if (partialBlock.header.IsNull()) {
             // It is possible for the header to be empty if a previous call to FillBlock wiped the header, but left
-            // the PartiallyDownloadedBlock pointer around (i.e. did not call RemoveBlockRequest). In this case, we
-            // should not call LookupBlockIndex below.
+            // the PartiallyDownloadedBlock pointer around (i.e. did not call RemoveBlockRequest).
             RemoveBlockRequest(block_transactions.blockhash, &peer);
             Misbehaving(peer, "previous compact block reconstruction attempt failed");
             LogDebug(BCLog::NET, "Peer %d sent compact block transactions multiple times", pfrom.GetId());
             return;
         }
 
-        // We should not have gotten this far in compact block processing unless it's attached to a known header
-        const CBlockIndex* prev_block{Assume(m_chainman.m_blockman.LookupBlockIndex(partialBlock.header.hashPrevBlock))};
+        // The request's validated header has an immutable predecessor and height, so no block-index lookup is needed.
+        const CBlockIndex* prev_block{Assume(requested->second.second->pindex->pprev)};
         ReadStatus status = partialBlock.FillBlock(*pblock, block_transactions.txn,
                                                    /*segwit_active=*/DeploymentActiveAfter(prev_block, m_chainman, Consensus::DEPLOYMENT_SEGWIT));
         if (status == READ_STATUS_INVALID) {
@@ -3827,7 +3826,7 @@ void PeerManagerImpl::ProcessCompactBlockTxns(CNode& pfrom, Peer& peer, const Bl
             // out to be invalid.
             mapBlockSource.emplace(block_transactions.blockhash, std::make_pair(pfrom.GetId(), false));
         }
-    } // Don't hold cs_main or m_block_mutex when we call into ProcessNewBlock
+    } // Don't hold m_block_mutex when we call into ProcessNewBlock
     if (fBlockRead) {
         // Since we requested this block (it was in mapBlocksInFlight), force it to be processed,
         // even if it would not be a candidate for new tip (missing previous block, chain not long enough, etc)
