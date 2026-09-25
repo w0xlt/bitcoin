@@ -67,6 +67,14 @@ struct ConnmanTestMsg : public CConnman {
         if (node.IsManualOrFullOutboundConn()) ++m_network_conn_counts[node.addr.GetNetwork()];
     }
 
+    // Stop listing the node, as a disconnection does. The caller then owns it.
+    void RemoveTestNode(CNode& node)
+    {
+        LOCK(m_nodes_mutex);
+        m_nodes.erase(std::remove(m_nodes.begin(), m_nodes.end(), &node), m_nodes.end());
+        if (node.IsManualOrFullOutboundConn()) --m_network_conn_counts[node.addr.GetNetwork()];
+    }
+
     void ClearTestNodes()
     {
         LOCK(m_nodes_mutex);
