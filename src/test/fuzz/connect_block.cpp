@@ -472,6 +472,7 @@ FUZZ_TARGET(connect_block, .init = initialize_connect_block)
                                                     state,
                                                     &new_index,
                                                     active_coins,
+                                                    ScriptCacheMode::Store,
                                                     /*fJustCheck=*/true);
     Assert(connected == state.IsValid());
 }

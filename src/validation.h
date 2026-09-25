@@ -362,6 +362,14 @@ static_assert(std::is_nothrow_move_assignable_v<CScriptCheck>);
 static_assert(std::is_nothrow_move_constructible_v<CScriptCheck>);
 static_assert(std::is_nothrow_destructible_v<CScriptCheck>);
 
+/** Full-script cache behavior. Signature caching is controlled independently. */
+enum class ScriptCacheMode {
+    /** Consult cached results, mark hits eligible for eviction, and do not insert. */
+    Consume,
+    /** Consult cached results without marking hits for eviction; cache successful synchronous checks. */
+    Store,
+};
+
 /**
  * Convenience class for initializing and passing the script execution cache
  * and signature cache.
@@ -787,7 +795,7 @@ public:
     DisconnectResult DisconnectBlock(const CBlock& block, const CBlockIndex* pindex, CCoinsViewCache& view)
         EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
     bool ConnectBlock(const CBlock& block, BlockValidationState& state, CBlockIndex* pindex,
-                      CCoinsViewCache& view, bool fJustCheck = false) EXCLUSIVE_LOCKS_REQUIRED(cs_main);
+                      CCoinsViewCache& view, ScriptCacheMode script_cache_mode, bool fJustCheck = false) EXCLUSIVE_LOCKS_REQUIRED(cs_main);
 
     // Apply the effects of a block disconnection on the UTXO set.
     bool DisconnectTip(BlockValidationState& state, DisconnectedBlockTransactions* disconnectpool) EXCLUSIVE_LOCKS_REQUIRED(cs_main, m_mempool->cs);

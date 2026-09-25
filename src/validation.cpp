@@ -148,10 +148,10 @@ const CBlockIndex* Chainstate::FindForkInGlobalIndex(const CBlockLocator& locato
 
 bool CheckInputScripts(const CTransaction& tx, TxValidationState& state,
                        const CCoinsViewCache& inputs, script_verify_flags flags, bool cacheSigStore,
-                       bool cacheFullScriptStore, PrecomputedTransactionData& txdata,
+                       ScriptCacheMode script_cache_mode, PrecomputedTransactionData& txdata,
                        ValidationCache& validation_cache,
                        std::vector<CScriptCheck>* pvChecks = nullptr)
-                       EXCLUSIVE_LOCKS_REQUIRED(cs_main);
+    EXCLUSIVE_LOCKS_REQUIRED(cs_main);
 
 bool CheckFinalTxAtTip(const CBlockIndex& active_chain_tip, const CTransaction& tx)
 {
@@ -436,7 +436,7 @@ static bool CheckInputsFromMempoolAndCache(const CTransaction& tx, TxValidationS
     }
 
     // Call CheckInputScripts() to cache signature and script validity against current tip consensus rules.
-    return CheckInputScripts(tx, state, view, flags, /* cacheSigStore= */ true, /* cacheFullScriptStore= */ true, txdata, validation_cache);
+    return CheckInputScripts(tx, state, view, flags, /* cacheSigStore= */ true, ScriptCacheMode::Store, txdata, validation_cache);
 }
 
 namespace {
@@ -1137,7 +1137,7 @@ bool MemPoolAccept::PolicyScriptChecks(Workspace& ws)
 
     // Check input scripts and signatures.
     // This is done last to help prevent CPU exhaustion denial-of-service attacks.
-    if (!CheckInputScripts(tx, state, m_view, scriptVerifyFlags, true, false, ws.m_precomputed_txdata, GetValidationCache())) {
+    if (!CheckInputScripts(tx, state, m_view, scriptVerifyFlags, true, ScriptCacheMode::Consume, ws.m_precomputed_txdata, GetValidationCache())) {
         // Detect a failure due to a missing witness so that p2p code can handle rejection caching appropriately.
         if (!tx.HasWitness() && SpendsNonAnchorWitnessProg(tx, m_view)) {
             state.Invalid(TxValidationResult::TX_WITNESS_STRIPPED,
@@ -2048,9 +2048,11 @@ ValidationCache::ValidationCache(const size_t script_execution_cache_bytes, cons
  * script checks which are not necessary (eg due to script execution cache hits) are, obviously,
  * not pushed onto pvChecks/run.
  *
- * Setting cacheSigStore/cacheFullScriptStore to false will remove elements from the corresponding cache
- * which are matched. This is useful for checking blocks where we will likely never need the cache
- * entry again.
+ * ScriptCacheMode::Consume marks matching full-script-cache entries eligible for eviction
+ * and does not insert results. Store does not mark hits for eviction and inserts successful
+ * synchronous checks. Deferred checks never insert full-script-cache entries.
+ * Setting cacheSigStore to false similarly marks matching signature-cache entries
+ * eligible for eviction and does not insert new signature-cache entries.
  *
  * Note that we may set state.reason to NOT_STANDARD for extra soft-fork flags in flags, block-checking
  * callers should probably reset it to CONSENSUS in such cases.
@@ -2059,7 +2061,7 @@ ValidationCache::ValidationCache(const size_t script_execution_cache_bytes, cons
  */
 bool CheckInputScripts(const CTransaction& tx, TxValidationState& state,
                        const CCoinsViewCache& inputs, script_verify_flags flags, bool cacheSigStore,
-                       bool cacheFullScriptStore, PrecomputedTransactionData& txdata,
+                       ScriptCacheMode script_cache_mode, PrecomputedTransactionData& txdata,
                        ValidationCache& validation_cache,
                        std::vector<CScriptCheck>* pvChecks)
 {
@@ -2078,7 +2080,7 @@ bool CheckInputScripts(const CTransaction& tx, TxValidationState& state,
     CSHA256 hasher = validation_cache.ScriptExecutionCacheHasher();
     hasher.Write(UCharCast(tx.GetWitnessHash().begin()), 32).Write((unsigned char*)&flags, sizeof(flags)).Finalize(hashCacheEntry.begin());
     AssertLockHeld(cs_main); //TODO: Remove this requirement by making CuckooCache not require external locks
-    if (validation_cache.m_script_execution_cache.contains(hashCacheEntry, !cacheFullScriptStore)) {
+    if (validation_cache.m_script_execution_cache.contains(hashCacheEntry, script_cache_mode == ScriptCacheMode::Consume)) {
         return true;
     }
 
@@ -2123,7 +2125,7 @@ bool CheckInputScripts(const CTransaction& tx, TxValidationState& state,
         }
     }
 
-    if (cacheFullScriptStore && !pvChecks) {
+    if (script_cache_mode == ScriptCacheMode::Store && !pvChecks) {
         // We executed all of the provided scripts, and were told to
         // cache the result. Do so now.
         validation_cache.m_script_execution_cache.insert(hashCacheEntry);
@@ -2292,7 +2294,7 @@ script_verify_flags GetBlockScriptFlags(const CBlockIndex& block_index, const Ch
  *  Validity checks that depend on the UTXO set are also done; ConnectBlock()
  *  can fail if those validity checks fail (among other reasons). */
 bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, CBlockIndex* pindex,
-                               CCoinsViewCache& view, bool fJustCheck)
+                              CCoinsViewCache& view, ScriptCacheMode script_cache_mode, bool fJustCheck)
 {
     AssertLockHeld(cs_main);
     assert(pindex);
@@ -2571,17 +2573,17 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
 
         if (!tx.IsCoinBase() && fScriptChecks)
         {
-            bool fCacheResults = fJustCheck; /* Don't cache results if we're actually connecting blocks (still consult the cache, though) */
+            const bool cache_sig_store{fJustCheck}; // Normal block connection consults, but does not populate, the signature cache.
             bool tx_ok;
             TxValidationState tx_state;
             // If CheckInputScripts is called with a pointer to a checks vector, the resulting checks are appended to it. In that case
             // they need to be added to control which runs them asynchronously. Otherwise, CheckInputScripts runs the checks before returning.
             if (control) {
                 std::vector<CScriptCheck> vChecks;
-                tx_ok = CheckInputScripts(tx, tx_state, view, flags, fCacheResults, fCacheResults, txsdata[i], m_chainman.m_validation_cache, &vChecks);
+                tx_ok = CheckInputScripts(tx, tx_state, view, flags, cache_sig_store, script_cache_mode, txsdata[i], m_chainman.m_validation_cache, &vChecks);
                 if (tx_ok) control->Add(std::move(vChecks));
             } else {
-                tx_ok = CheckInputScripts(tx, tx_state, view, flags, fCacheResults, fCacheResults, txsdata[i], m_chainman.m_validation_cache);
+                tx_ok = CheckInputScripts(tx, tx_state, view, flags, cache_sig_store, script_cache_mode, txsdata[i], m_chainman.m_validation_cache);
             }
             if (!tx_ok) {
                 // Any transaction validation failure in ConnectBlock is a block consensus failure
@@ -3041,7 +3043,7 @@ bool Chainstate::ConnectTip(
     {
         CoinsViewOverlay& view{*m_coins_views->m_connect_block_view};
         const auto reset_guard{view.StartFetching(*block_to_connect)};
-        bool rv = ConnectBlock(*block_to_connect, state, pindexNew, view);
+        bool rv = ConnectBlock(*block_to_connect, state, pindexNew, view, ScriptCacheMode::Consume);
         if (m_chainman.m_options.signals) {
             m_chainman.m_options.signals->BlockChecked(block_to_connect, state);
         }
@@ -4536,8 +4538,8 @@ BlockValidationState TestBlockValidity(
     index_dummy.phashBlock = &block_hash;
     CCoinsViewCache view_dummy(&chainstate.CoinsTip());
 
-    // Set fJustCheck to true in order to update, and not clear, validation caches.
-    if(!chainstate.ConnectBlock(block, state, &index_dummy, view_dummy, /*fJustCheck=*/true)) {
+    // Cache successful checks while avoiding chainstate updates.
+    if (!chainstate.ConnectBlock(block, state, &index_dummy, view_dummy, ScriptCacheMode::Store, /*fJustCheck=*/true)) {
         if (state.IsValid()) NONFATAL_UNREACHABLE();
         return state;
     }
@@ -4744,7 +4746,7 @@ VerifyDBResult CVerifyDB::VerifyDB(
                 LogError("Verification error: ReadBlock failed at %d, hash=%s", pindex->nHeight, pindex->GetBlockHash().ToString());
                 return VerifyDBResult::CORRUPTED_BLOCK_DB;
             }
-            if (!chainstate.ConnectBlock(block, state, pindex, coins)) {
+            if (!chainstate.ConnectBlock(block, state, pindex, coins, ScriptCacheMode::Consume)) {
                 LogError("Verification error: found unconnectable block at %d, hash=%s (%s)", pindex->nHeight, pindex->GetBlockHash().ToString(), state.ToString());
                 return VerifyDBResult::CORRUPTED_BLOCK_DB;
             }
