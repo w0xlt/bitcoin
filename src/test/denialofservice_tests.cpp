@@ -23,6 +23,7 @@
 
 #include <array>
 #include <cstdint>
+#include <utility>
 
 #include <boost/test/unit_test.hpp>
 
@@ -109,7 +110,8 @@ BOOST_AUTO_TEST_CASE(outbound_slow_chain_eviction)
 }
 
 struct OutboundTest : TestingSetup {
-void AddRandomOutboundPeer(NodeId& id, std::vector<CNode*>& vNodes, PeerManager& peerLogic, ConnmanTestMsg& connman, ConnectionType connType, bool onion_peer = false)
+// Create an outbound node with a random routable address, kept in vNodes.
+CNode& NewRandomOutboundNode(NodeId& id, std::vector<CNode*>& vNodes, ConnectionType connType, bool onion_peer = false)
 {
     CAddress addr;
 
@@ -132,13 +134,34 @@ void AddRandomOutboundPeer(NodeId& id, std::vector<CNode*>& vNodes, PeerManager&
                                   connType,
                                   /*inbound_onion=*/false,
                                   /*network_key=*/0});
-    CNode &node = *vNodes.back();
+    return *vNodes.back();
+}
+
+void AddRandomOutboundPeer(NodeId& id, std::vector<CNode*>& vNodes, PeerManager& peerLogic, ConnmanTestMsg& connman, ConnectionType connType, bool onion_peer = false)
+{
+    CNode &node = NewRandomOutboundNode(id, vNodes, connType, onion_peer);
     node.SetCommonVersion(PROTOCOL_VERSION);
 
     peerLogic.InitializeNode(node, ServiceFlags(NODE_NETWORK | NODE_WITNESS));
     node.fSuccessfullyConnected = true;
 
     connman.AddTestNode(node);
+}
+
+// Like AddRandomOutboundPeer, but complete the version handshake, so that blocks
+// can be requested from the peer.
+CNode& AddHandshakedOutboundPeer(NodeId& id, std::vector<CNode*>& vNodes, ConnmanTestMsg& connman, ConnectionType connType)
+    EXCLUSIVE_LOCKS_REQUIRED(NetEventsInterface::g_msgproc_mutex)
+{
+    CNode& node = NewRandomOutboundNode(id, vNodes, connType);
+    connman.AddTestNode(node);
+    connman.Handshake(node,
+                      /*successfully_connected=*/true,
+                      /*remote_services=*/ServiceFlags(NODE_NETWORK | NODE_WITNESS),
+                      /*local_services=*/ServiceFlags(NODE_NETWORK | NODE_WITNESS),
+                      /*version=*/PROTOCOL_VERSION,
+                      /*relay_txs=*/connType != ConnectionType::BLOCK_RELAY);
+    return node;
 }
 }; // struct OutboundTest
 
@@ -298,6 +321,49 @@ BOOST_FIXTURE_TEST_CASE(block_relay_only_eviction, OutboundTest)
         peerLogic->FinalizeNode(*node);
     }
     connman->ClearTestNodes();
+}
+
+// An extra outbound peer, block-relay-only or full-relay, is not evicted while
+// we are downloading a block from it.
+BOOST_FIXTURE_TEST_CASE(extra_peer_eviction_waits_for_blocks_in_flight, OutboundTest)
+{
+    LOCK(NetEventsInterface::g_msgproc_mutex);
+    const CBlockIndex& tip{*Assert(WITH_LOCK(cs_main, return m_node.chainman->ActiveChain().Tip()))};
+
+    for (const auto& [conn_type, max_peers] : {std::pair{ConnectionType::BLOCK_RELAY, MAX_BLOCK_RELAY_ONLY_CONNECTIONS},
+                                               std::pair{ConnectionType::OUTBOUND_FULL_RELAY, MAX_OUTBOUND_FULL_RELAY_CONNECTIONS}}) {
+        NodeId id{0};
+        FakeNodeClock clock{};
+        auto connman = std::make_unique<ConnmanTestMsg>(0x1337, 0x1337, *m_node.addrman, *m_node.netgroupman, Params());
+        auto peerLogic = PeerManager::make(*connman, *m_node.addrman, nullptr, *m_node.chainman, *m_node.mempool, *m_node.warnings, {});
+        CConnman::Options options;
+        options.m_max_automatic_connections = DEFAULT_MAX_PEER_CONNECTIONS;
+        options.m_msgproc = peerLogic.get();
+        connman->Init(options);
+        std::vector<CNode*> vNodes;
+
+        // One peer over the limit, so that the youngest is chosen for eviction
+        // once it has been connected long enough.
+        for (int i = 0; i <= max_peers; ++i) {
+            AddHandshakedOutboundPeer(id, vNodes, *connman, conn_type);
+        }
+        CNode& youngest{*vNodes.back()};
+        clock += 1min;
+
+        BOOST_CHECK(peerLogic->FetchBlock(youngest.GetId(), tip).has_value());
+        peerLogic->CheckForStaleTipAndEvictPeers();
+        BOOST_CHECK(!youngest.fDisconnect);
+
+        // Once the block is requested from another peer instead, the youngest is evicted.
+        BOOST_CHECK(peerLogic->FetchBlock(vNodes.front()->GetId(), tip).has_value());
+        peerLogic->CheckForStaleTipAndEvictPeers();
+        BOOST_CHECK(youngest.fDisconnect);
+
+        for (const CNode* node : vNodes) {
+            peerLogic->FinalizeNode(*node);
+        }
+        connman->ClearTestNodes();
+    }
 }
 
 BOOST_AUTO_TEST_CASE(peer_discouragement)
