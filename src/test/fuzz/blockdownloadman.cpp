@@ -19,7 +19,6 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
-#include <list>
 #include <map>
 #include <optional>
 #include <utility>
@@ -28,7 +27,7 @@
 using node::BlockDownloadCounter;
 using node::BlockDownloadManager;
 using node::BlockDownloadPeer;
-using node::QueuedBlock;
+using CompactRequest = node::BlockDownloadManager::CompactRequest;
 
 namespace {
 const TestingSetup* g_setup;
@@ -143,25 +142,20 @@ FUZZ_TARGET(blockdownloadman, .init = initialize_blockdownloadman)
                 const bool already{model.HasRequest(block, slot)};
                 if (!already && model.requesters[block].size() >= MAX_CMPCTBLOCKS_INFLIGHT_PER_BLOCK) return;
                 const bool compact{fuzzed_data_provider.ConsumeBool()};
-                std::list<QueuedBlock>::iterator* pit{nullptr};
-                bool added;
-                {
-                    LOCK(cs_main);
-                    added = compact ? bdm.BlockRequested(*peers[slot], g_blocks[block], &pit, mempool) : bdm.BlockRequested(*peers[slot], g_blocks[block]);
+                if (compact) {
+                    const bool was_compact{std::ranges::find(mpeer->requests, std::pair{block, true}) != mpeer->requests.end()};
+                    const auto result{WITH_LOCK(cs_main, return bdm.RequestCompactBlock(*peers[slot], g_blocks[block], *mempool))};
+                    Assert(result == (!already ? CompactRequest::ADDED : was_compact ? CompactRequest::ALREADY_COMPACT : CompactRequest::MADE_COMPACT));
+                } else {
+                    Assert(WITH_LOCK(cs_main, return bdm.BlockRequested(*peers[slot], g_blocks[block])) == !already);
                 }
-                Assert(added == !already);
-                if (added) {
+                if (!already) {
                     if (mpeer->requests.empty()) mpeer->downloading_since = now();
                     mpeer->requests.emplace_back(block, compact);
                     model.requesters[block].push_back(slot);
-                }
-                if (compact) {
-                    Assert(pit && (*pit)->pindex == &g_blocks[block]);
-                    auto& request{*std::ranges::find_if(mpeer->requests, [&](const auto& r) { return r.first == block; })};
-                    Assert(bool{(*pit)->partialBlock} == (added || request.second));
-                    // Like the compact block handler, give an existing request a partial block.
-                    if (!(*pit)->partialBlock) (*pit)->partialBlock = std::make_unique<PartiallyDownloadedBlock>(mempool);
-                    request.second = true;
+                } else if (compact) {
+                    // An existing request gets a partial block.
+                    std::ranges::find_if(mpeer->requests, [&](const auto& r) { return r.first == block; })->second = true;
                 }
             },
             [&] {
@@ -178,7 +172,7 @@ FUZZ_TARGET(blockdownloadman, .init = initialize_blockdownloadman)
                 Assert(info.requested_from_peer == model.HasRequest(block, slot));
                 const bool compact{std::ranges::find(mpeer->requests, std::pair{block, true}) != mpeer->requests.end()};
                 Assert((info.compact_request != nullptr) == compact);
-                if (info.compact_request) Assert(info.compact_request->pindex == &g_blocks[block] && info.compact_request->partialBlock);
+                if (info.compact_request) Assert(&bdm.RequestedBlock(*info.compact_request) == &g_blocks[block] && bdm.PartialBlockHeaderIsNull(*info.compact_request));
             },
             [&] {
                 if (!connected) return;

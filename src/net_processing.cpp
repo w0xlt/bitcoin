@@ -3591,9 +3591,7 @@ void PeerManagerImpl::ProcessCompactBlockTxns(CNode& pfrom, Peer& peer, const Bl
             return;
         }
 
-        PartiallyDownloadedBlock& partialBlock = *requested->partialBlock;
-
-        if (partialBlock.header.IsNull()) {
+        if (m_blockdownloadman.PartialBlockHeaderIsNull(*requested)) {
             // It is possible for the header to be empty if a previous call to FillBlock wiped the header, but left
             // the PartiallyDownloadedBlock pointer around (i.e. did not call RemoveBlockRequest).
             m_blockdownloadman.RemoveBlockRequest(block_transactions.blockhash, &download);
@@ -3603,9 +3601,9 @@ void PeerManagerImpl::ProcessCompactBlockTxns(CNode& pfrom, Peer& peer, const Bl
         }
 
         // The request's validated header has an immutable predecessor and height, so no block-index lookup is needed.
-        const CBlockIndex* prev_block{Assume(requested->pindex->pprev)};
-        ReadStatus status = partialBlock.FillBlock(*pblock, block_transactions.txn,
-                                                   /*segwit_active=*/DeploymentActiveAfter(prev_block, m_chainman, Consensus::DEPLOYMENT_SEGWIT));
+        const CBlockIndex* prev_block{Assume(m_blockdownloadman.RequestedBlock(*requested).pprev)};
+        ReadStatus status = m_blockdownloadman.FillBlock(*requested, *pblock, block_transactions.txn,
+                                                         /*segwit_active=*/DeploymentActiveAfter(prev_block, m_chainman, Consensus::DEPLOYMENT_SEGWIT));
         if (status == READ_STATUS_INVALID) {
             m_blockdownloadman.RemoveBlockRequest(block_transactions.blockhash, &download); // Reset in-flight state in case Misbehaving does not result in a disconnect
             Misbehaving(peer, "invalid compact block/non-matching block transactions");
@@ -4784,15 +4782,10 @@ void PeerManagerImpl::ProcessMessage(Peer& peer, CNode& pfrom, const std::string
         if (pindex->nHeight <= m_chainman.ActiveChain().Height() + 2) {
             if ((already_in_flight < MAX_CMPCTBLOCKS_INFLIGHT_PER_BLOCK && m_blockdownloadman.NumBlocksInFlight(download) < MAX_BLOCKS_IN_TRANSIT_PER_PEER) ||
                  requested_block_from_this_peer) {
-                std::list<QueuedBlock>::iterator* queuedBlockIt = nullptr;
-                if (!m_blockdownloadman.BlockRequested(download, *pindex, &queuedBlockIt, &m_mempool)) {
-                    if (!(*queuedBlockIt)->partialBlock)
-                        (*queuedBlockIt)->partialBlock.reset(new PartiallyDownloadedBlock(&m_mempool));
-                    else {
-                        // The block was already in flight using compact blocks from the same peer
-                        LogDebug(BCLog::NET, "Peer sent us compact block we were already syncing!\n");
-                        return;
-                    }
+                if (m_blockdownloadman.RequestCompactBlock(download, *pindex, m_mempool) == node::BlockDownloadManager::CompactRequest::ALREADY_COMPACT) {
+                    // The block was already in flight using compact blocks from the same peer
+                    LogDebug(BCLog::NET, "Peer sent us compact block we were already syncing!\n");
+                    return;
                 }
                 // The request's partial block is filled once both locks are released. Only
                 // compact block requests have one, so it also identifies the request then.
@@ -4840,8 +4833,7 @@ void PeerManagerImpl::ProcessMessage(Peer& peer, CNode& pfrom, const std::string
             const bool first_in_flight{flight.first_in_flight};
             // Count the requests as before this one was registered.
             const size_t already_in_flight{flight.already_in_flight - 1 + requested_block_from_this_peer};
-            PartiallyDownloadedBlock& partialBlock = *requested->partialBlock;
-            partialBlock = std::move(partial_block);
+            m_blockdownloadman.SetPartialBlock(*requested, std::move(partial_block));
             if (status == READ_STATUS_FAILED) {
                 if (first_in_flight)  {
                     // Duplicate txindexes, the block is now in-flight, so just request it
@@ -4856,10 +4848,7 @@ void PeerManagerImpl::ProcessMessage(Peer& peer, CNode& pfrom, const std::string
             }
 
             BlockTransactionsRequest req;
-            for (size_t i = 0; i < cmpctblock.BlockTxCount(); i++) {
-                if (!partialBlock.IsTxAvailable(i))
-                    req.indexes.push_back(i);
-            }
+            m_blockdownloadman.GetMissingTransactions(*requested, cmpctblock.BlockTxCount(), req.indexes);
             if (req.indexes.empty()) {
                 fProcessBLOCKTXN = true;
             } else if (first_in_flight) {

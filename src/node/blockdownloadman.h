@@ -5,13 +5,16 @@
 #ifndef BITCOIN_NODE_BLOCKDOWNLOADMAN_H
 #define BITCOIN_NODE_BLOCKDOWNLOADMAN_H
 
+#include <blockencodings.h>
 #include <kernel/cs_main.h>
 #include <net.h>
+#include <primitives/transaction.h>
 #include <uint256.h>
 
 #include <atomic>
 #include <chrono>
 #include <cstddef>
+#include <cstdint>
 #include <list>
 #include <map>
 #include <memory>
@@ -21,15 +24,26 @@
 
 class CBlockIndex;
 class CTxMemPool;
-class PartiallyDownloadedBlock;
 
 /** Maximum number of outstanding CMPCTBLOCK requests for the same block. */
 inline constexpr unsigned int MAX_CMPCTBLOCKS_INFLIGHT_PER_BLOCK = 3;
 
 namespace node {
 
-/** Blocks that are in flight, and that are in the queue to be downloaded. */
-struct QueuedBlock {
+/**
+ * A block that is in flight, and in the queue to be downloaded. It has no
+ * interface of its own: only BlockDownloadManager can use it, and only while the
+ * request exists and access is synchronized like access to the manager.
+ */
+class QueuedBlock
+{
+public:
+    QueuedBlock(const CBlockIndex* pindex_in, std::unique_ptr<PartiallyDownloadedBlock> partial_block)
+        : pindex{pindex_in}, partialBlock{std::move(partial_block)} {}
+
+private:
+    friend class BlockDownloadManager;
+
     /** BlockIndex. We must have this since we only request blocks when we've already validated the header. */
     const CBlockIndex* pindex;
     /** Optional, used for CMPCTBLOCK downloads */
@@ -91,7 +105,7 @@ struct BlockInFlightInfo {
     /** Whether the block is in flight from this peer. */
     bool requested_from_peer{false};
     /** This peer's request for the block, if it has a partial block. Only compact
-     *  block requests have one. */
+     *  block requests have one, and only the manager can use the request. */
     QueuedBlock* compact_request{nullptr};
 };
 
@@ -133,13 +147,40 @@ public:
     void RemoveBlockRequest(const uint256& hash, const BlockDownloadPeer* from_peer);
 
     /** Mark a block as in flight from a peer that is not disconnected.
-     *  Returns false, still setting pit, if the block was already in flight from the same peer.
-     *  Setting pit creates a partial block, which needs the mempool.
+     *  Returns false if the block was already in flight from the same peer.
      *  Requires cs_main, so that a cs_main holder sees no new requests, although
      *  existing ones may complete. */
-    bool BlockRequested(BlockDownloadPeer& peer, const CBlockIndex& block,
-                        std::list<QueuedBlock>::iterator** pit = nullptr,
-                        CTxMemPool* mempool = nullptr) EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
+    bool BlockRequested(BlockDownloadPeer& peer, const CBlockIndex& block) EXCLUSIVE_LOCKS_REQUIRED(::cs_main)
+    {
+        return AddRequest(peer, block, /*compact=*/nullptr, /*mempool=*/nullptr);
+    }
+
+    /** How RequestCompactBlock registered a request. */
+    enum class CompactRequest {
+        ADDED,           //!< A new request, with a partial block.
+        MADE_COMPACT,    //!< The peer's existing request, which now has a partial block.
+        ALREADY_COMPACT, //!< The peer's existing request, which already had a partial block.
+    };
+    /** Mark a block as in flight from a peer as a compact block, whose partial
+     *  block uses the mempool. Requires cs_main, like BlockRequested. */
+    CompactRequest RequestCompactBlock(BlockDownloadPeer& peer, const CBlockIndex& block, CTxMemPool& mempool) EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
+
+    /** The block a request is for. */
+    const CBlockIndex& RequestedBlock(const QueuedBlock& request) const { return *request.pindex; }
+    /** Replace a compact block request's partial block. */
+    void SetPartialBlock(QueuedBlock& request, PartiallyDownloadedBlock&& partial_block) { *request.partialBlock = std::move(partial_block); }
+    /** Whether a compact block request's partial block has no header, which is the
+     *  case until it is set, and again once FillBlock has used it. */
+    bool PartialBlockHeaderIsNull(const QueuedBlock& request) const { return request.partialBlock->header.IsNull(); }
+    /** Append the indexes of the transactions a compact block request's partial
+     *  block lacks, among the block's tx_count transactions. */
+    void GetMissingTransactions(const QueuedBlock& request, size_t tx_count, std::vector<uint16_t>& indexes) const;
+    /** Fill a compact block request's partial block with the missing
+     *  transactions, see PartiallyDownloadedBlock::FillBlock. */
+    ReadStatus FillBlock(QueuedBlock& request, CBlock& block, const std::vector<CTransactionRef>& vtx_missing, bool segwit_active)
+    {
+        return request.partialBlock->FillBlock(block, vtx_missing, segwit_active);
+    }
 
     /** Look up the requests for a block, as seen from one peer. */
     BlockInFlightInfo FindBlockInFlight(const uint256& hash, const BlockDownloadPeer& peer);
@@ -180,6 +221,11 @@ public:
     void EraseBlockSource(const uint256& hash) { mapBlockSource.erase(hash); }
 
 private:
+    /** Mark a block as in flight from a peer. Returns false, still setting compact,
+     *  if the block was already in flight from the same peer. Setting compact
+     *  creates a partial block for a new request, which needs the mempool. */
+    bool AddRequest(BlockDownloadPeer& peer, const CBlockIndex& block, QueuedBlock** compact, CTxMemPool* mempool) EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
+
     /* Multimap used to preserve insertion order */
     using BlockDownloadMap = std::multimap<uint256, std::pair<BlockDownloadPeer*, std::list<QueuedBlock>::iterator>>;
     /** Every block in flight has a block index entry, since BlockRequested()

@@ -94,23 +94,23 @@ void BlockDownloadManager::RemoveBlockRequest(const uint256& hash, const BlockDo
     }
 }
 
-bool BlockDownloadManager::BlockRequested(BlockDownloadPeer& peer, const CBlockIndex& block, std::list<QueuedBlock>::iterator** pit, CTxMemPool* mempool)
+bool BlockDownloadManager::AddRequest(BlockDownloadPeer& peer, const CBlockIndex& block, QueuedBlock** compact, CTxMemPool* mempool)
 {
     const uint256& hash{block.GetBlockHash()};
 
     auto& state{peer};
     assert(!state.m_disconnected);
 
-    // A request with pit creates a partial block, which needs the mempool.
-    Assume(!pit || mempool);
+    // A compact block request creates a partial block, which needs the mempool.
+    Assume(!compact || mempool);
 
     Assume(mapBlocksInFlight.count(hash) <= MAX_CMPCTBLOCKS_INFLIGHT_PER_BLOCK);
 
     // Short-circuit most stuff in case it is from the same node
     for (auto range = mapBlocksInFlight.equal_range(hash); range.first != range.second; range.first++) {
         if (range.first->second.first == &peer) {
-            if (pit) {
-                *pit = &range.first->second.second;
+            if (compact) {
+                *compact = &*range.first->second.second;
             }
             return false;
         }
@@ -120,17 +120,34 @@ bool BlockDownloadManager::BlockRequested(BlockDownloadPeer& peer, const CBlockI
     RemoveBlockRequest(hash, &peer);
 
     std::list<QueuedBlock>::iterator it = state.m_blocks_in_flight.insert(state.m_blocks_in_flight.end(),
-            {&block, std::unique_ptr<PartiallyDownloadedBlock>(pit ? new PartiallyDownloadedBlock(mempool) : nullptr)});
+            {&block, std::unique_ptr<PartiallyDownloadedBlock>(compact ? new PartiallyDownloadedBlock(mempool) : nullptr)});
     if (state.m_blocks_in_flight.size() == 1) {
         // We're starting a block download (batch) from this peer.
         state.m_downloading_since = GetTime<std::chrono::microseconds>();
         m_peers_downloading_from.m_value++;
     }
-    auto itInFlight = mapBlocksInFlight.insert(std::make_pair(hash, std::make_pair(&peer, it)));
-    if (pit) {
-        *pit = &itInFlight->second.second;
+    mapBlocksInFlight.insert(std::make_pair(hash, std::make_pair(&peer, it)));
+    if (compact) {
+        *compact = &*it;
     }
     return true;
+}
+
+BlockDownloadManager::CompactRequest BlockDownloadManager::RequestCompactBlock(BlockDownloadPeer& peer, const CBlockIndex& block, CTxMemPool& mempool)
+{
+    QueuedBlock* request{nullptr};
+    if (AddRequest(peer, block, &request, &mempool)) return CompactRequest::ADDED;
+    if (request->partialBlock) return CompactRequest::ALREADY_COMPACT;
+    request->partialBlock.reset(new PartiallyDownloadedBlock(&mempool));
+    return CompactRequest::MADE_COMPACT;
+}
+
+void BlockDownloadManager::GetMissingTransactions(const QueuedBlock& request, size_t tx_count, std::vector<uint16_t>& indexes) const
+{
+    for (size_t i = 0; i < tx_count; i++) {
+        if (!request.partialBlock->IsTxAvailable(i))
+            indexes.push_back(i);
+    }
 }
 
 BlockInFlightInfo BlockDownloadManager::FindBlockInFlight(const uint256& hash, const BlockDownloadPeer& peer)

@@ -5,7 +5,10 @@
 #include <arith_uint256.h>
 #include <blockencodings.h>
 #include <chain.h>
+#include <consensus/merkle.h>
 #include <node/blockdownloadman.h>
+#include <primitives/block.h>
+#include <primitives/transaction.h>
 #include <test/util/setup_common.h>
 #include <test/util/time.h>
 #include <uint256.h>
@@ -15,13 +18,12 @@
 
 #include <array>
 #include <chrono>
-#include <list>
 #include <vector>
 
 using node::BlockDownloadCounter;
 using node::BlockDownloadManager;
 using node::BlockDownloadPeer;
-using node::QueuedBlock;
+using CompactRequest = node::BlockDownloadManager::CompactRequest;
 
 namespace {
 /** Block index entries for requests. The manager only reads their hash and height. */
@@ -163,10 +165,7 @@ BOOST_AUTO_TEST_CASE(find_block_in_flight)
     BOOST_CHECK(info.compact_request == nullptr);
 
     bdm.BlockRequested(peer1, blocks.index[0]);
-    std::list<QueuedBlock>::iterator* pit{nullptr};
-    BOOST_CHECK(bdm.BlockRequested(peer2, blocks.index[0], &pit, m_node.mempool.get()));
-    BOOST_REQUIRE(pit != nullptr);
-    BOOST_CHECK((*pit)->partialBlock);
+    BOOST_CHECK(bdm.RequestCompactBlock(peer2, blocks.index[0], *m_node.mempool) == CompactRequest::ADDED);
 
     info = bdm.FindBlockInFlight(hash, peer1);
     BOOST_CHECK_EQUAL(info.already_in_flight, 2U);
@@ -178,7 +177,11 @@ BOOST_AUTO_TEST_CASE(find_block_in_flight)
     BOOST_CHECK_EQUAL(info.already_in_flight, 2U);
     BOOST_CHECK(!info.first_in_flight);
     BOOST_CHECK(info.requested_from_peer);
-    BOOST_CHECK(info.compact_request == &**pit);
+    auto* const compact_request{info.compact_request};
+    BOOST_REQUIRE(compact_request != nullptr);
+    BOOST_CHECK_EQUAL(&bdm.RequestedBlock(*compact_request), &blocks.index[0]);
+    // The partial block has no header until the reconstructed one is set.
+    BOOST_CHECK(bdm.PartialBlockHeaderIsNull(*compact_request));
 
     info = bdm.FindBlockInFlight(hash, peer3);
     BOOST_CHECK_EQUAL(info.already_in_flight, 2U);
@@ -186,14 +189,68 @@ BOOST_AUTO_TEST_CASE(find_block_in_flight)
     BOOST_CHECK(!info.requested_from_peer);
     BOOST_CHECK(info.compact_request == nullptr);
 
-    // A repeated compact request from the same peer returns its existing request.
-    std::list<QueuedBlock>::iterator* pit_again{nullptr};
-    BOOST_CHECK(!bdm.BlockRequested(peer2, blocks.index[0], &pit_again, m_node.mempool.get()));
-    BOOST_CHECK(pit_again != nullptr && &**pit_again == &**pit);
+    // A repeated compact request keeps the existing one, and an existing
+    // request for the full block gets a partial block.
+    BOOST_CHECK(bdm.RequestCompactBlock(peer2, blocks.index[0], *m_node.mempool) == CompactRequest::ALREADY_COMPACT);
+    BOOST_CHECK(bdm.FindBlockInFlight(hash, peer2).compact_request == compact_request);
+    BOOST_CHECK(bdm.RequestCompactBlock(peer1, blocks.index[0], *m_node.mempool) == CompactRequest::MADE_COMPACT);
+    BOOST_CHECK(bdm.FindBlockInFlight(hash, peer1).compact_request != nullptr);
+    BOOST_CHECK_EQUAL(bdm.CountBlocksInFlight(hash), 2U);
 
     bdm.DisconnectedPeer(peer1);
     bdm.DisconnectedPeer(peer2);
     bdm.DisconnectedPeer(peer3);
+    bdm.CheckIsEmpty();
+}
+
+// A compact block request's partial block is set after reconstruction, reports
+// the transactions it lacks, and is then filled with them.
+BOOST_AUTO_TEST_CASE(compact_block_request)
+{
+    LOCK(cs_main);
+    BlockDownloadCounter downloading_from;
+    BlockDownloadManager bdm{downloading_from};
+    BlockDownloadPeer peer{/*id=*/0, /*is_inbound=*/false};
+
+    // A block with a coinbase and two transactions, none of them in the mempool.
+    CBlock block;
+    block.nVersion = 42;
+    block.nBits = 0x207fffff;
+    CMutableTransaction tx;
+    tx.vin.resize(1);
+    tx.vout.resize(1);
+    tx.vout[0].nValue = 42;
+    for (int i{0}; i < 3; ++i) {
+        tx.vin[0].prevout.n = i;
+        block.vtx.push_back(MakeTransactionRef(tx));
+    }
+    bool mutated;
+    block.hashMerkleRoot = BlockMerkleRoot(block, &mutated);
+    BOOST_REQUIRE(!mutated);
+    const uint256 hash{block.GetHash()};
+    CBlockIndex index;
+    index.phashBlock = &hash;
+
+    BOOST_CHECK(bdm.RequestCompactBlock(peer, index, *m_node.mempool) == CompactRequest::ADDED);
+    const CBlockHeaderAndShortTxIDs cmpctblock{block, /*nonce=*/0};
+    PartiallyDownloadedBlock partial_block{m_node.mempool.get()};
+    BOOST_REQUIRE_EQUAL(partial_block.InitData(cmpctblock, /*extra_txn=*/{}), READ_STATUS_OK);
+
+    auto* request{bdm.FindBlockInFlight(hash, peer).compact_request};
+    BOOST_REQUIRE(request != nullptr);
+    bdm.SetPartialBlock(*request, std::move(partial_block));
+    BOOST_CHECK(!bdm.PartialBlockHeaderIsNull(*request));
+    std::vector<uint16_t> missing;
+    bdm.GetMissingTransactions(*request, cmpctblock.BlockTxCount(), missing);
+    BOOST_CHECK(missing == (std::vector<uint16_t>{1, 2}));
+
+    CBlock filled;
+    BOOST_CHECK_EQUAL(bdm.FillBlock(*request, filled, {block.vtx[1], block.vtx[2]}, /*segwit_active=*/false), READ_STATUS_OK);
+    BOOST_CHECK(filled.GetHash() == hash);
+    // Filling uses the partial block up.
+    BOOST_CHECK(bdm.PartialBlockHeaderIsNull(*request));
+
+    bdm.DisconnectedPeer(peer);
     bdm.CheckIsEmpty();
 }
 
