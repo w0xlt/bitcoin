@@ -21,6 +21,7 @@ add_executable(test_bitcoin
   bip324_tests.cpp
   bip352_tests.cpp
   blockchain_tests.cpp
+  blockdownload_tests.cpp
   blockencodings_tests.cpp
   blockfilter_index_tests.cpp
   blockfilter_tests.cpp
