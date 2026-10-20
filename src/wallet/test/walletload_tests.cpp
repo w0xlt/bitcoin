@@ -4,11 +4,12 @@
 
 #include <key.h>
 #include <script/descriptor.h>
-#include <wallet/test/util.h>
-#include <wallet/wallet.h>
 #include <test/util/common.h>
 #include <test/util/logging.h>
 #include <test/util/setup_common.h>
+#include <util/check.h>
+#include <wallet/test/util.h>
+#include <wallet/wallet.h>
 
 #include <boost/test/unit_test.hpp>
 
@@ -40,6 +41,7 @@ public:
     std::optional<int64_t> MaxSatisfactionWeight(bool) const override { return {}; }
     std::optional<int64_t> MaxSatisfactionElems() const override { return {}; }
     void GetPubKeys(std::set<CPubKey>& pubkeys, std::set<CExtPubKey>& ext_pubs) const override {}
+    DescriptorKeyInventory GetKeyInventory() const override { NONFATAL_UNREACHABLE(); }
     bool HasScripts() const override { return true; }
     std::vector<std::string> Warnings() const override { return {}; }
     uint32_t GetMaxKeyExpr() const override { return 0; }
