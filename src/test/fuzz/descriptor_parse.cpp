@@ -14,6 +14,42 @@
 //! The converter of mocked descriptors, needs to be initialized when the target is.
 MockedDescriptorConverter MOCKED_DESC_CONVERTER;
 
+/** Check the public policy projection, including inferred key indices. */
+static void TestPolicy(const Descriptor& desc)
+{
+    const auto policy{desc.GetPolicy()};
+    assert(!policy.nodes.empty());
+    assert(policy.keys.occurrences.size() == desc.GetKeyCount());
+    std::vector<size_t> parents(policy.nodes.size(), 0), key_uses(policy.keys.occurrences.size(), 0);
+    for (size_t i = 0; i < policy.nodes.size(); ++i) {
+        const auto& node{policy.nodes[i]};
+        for (const auto& child : node.children) {
+            assert(child.node > i && child.node < parents.size());
+            ++parents[child.node];
+        }
+        assert(parents[i] == (i == 0 ? 0U : 1U));
+        for (const auto key : node.keys) {
+            assert(key < key_uses.size());
+            ++key_uses[key];
+        }
+    }
+    const auto& occurrences{policy.keys.occurrences};
+    std::vector<size_t> key_parents(occurrences.size(), 0);
+    for (size_t i = 0; i < occurrences.size(); ++i) {
+        if (const auto* musig = std::get_if<DescriptorKeyInfo::MuSigKey>(&occurrences[i].expression.key)) {
+            for (const auto participant : musig->participants) {
+                assert(participant > i && participant < occurrences.size());
+                ++key_parents[participant];
+            }
+        }
+    }
+    for (size_t i = 0; i < occurrences.size(); ++i) {
+        const bool participant{occurrences[i].role == DescriptorKeyInventory::Role::MUSIG_PARTICIPANT};
+        assert(key_parents[i] == (participant ? 1U : 0U));
+        assert(key_uses[i] == (participant ? 0U : 1U));
+    }
+}
+
 /** Test a successfully parsed descriptor. */
 static void TestDescriptor(const Descriptor& desc, FlatSigningProvider& sig_provider, std::string& dummy, std::optional<bool>& is_ranged, std::optional<bool>& is_solvable)
 {
@@ -21,6 +57,7 @@ static void TestDescriptor(const Descriptor& desc, FlatSigningProvider& sig_prov
     (void)desc.IsRange();
     (void)desc.IsSingleType();
     (void)desc.GetOutputType();
+    TestPolicy(desc);
 
     if (is_ranged.has_value()) {
         assert(desc.IsRange() == *is_ranged);
@@ -47,7 +84,9 @@ static void TestDescriptor(const Descriptor& desc, FlatSigningProvider& sig_prov
 
     // If we could serialize to script we must be able to infer using the same provider.
     if (!out_scripts.empty()) {
-        assert(InferDescriptor(out_scripts.back(), sig_provider));
+        const auto inferred{InferDescriptor(out_scripts.back(), sig_provider)};
+        assert(inferred);
+        TestPolicy(*inferred);
 
         // The ScriptSize() must match the size of the serialized Script. (ScriptSize() is set for all descs but 'combo()'.)
         const bool is_combo{!desc.IsSingleType()};

@@ -42,6 +42,7 @@ public:
     std::optional<int64_t> MaxSatisfactionElems() const override { return {}; }
     void GetPubKeys(std::set<CPubKey>& pubkeys, std::set<CExtPubKey>& ext_pubs) const override {}
     DescriptorKeyInventory GetKeyInventory() const override { NONFATAL_UNREACHABLE(); }
+    DescriptorPolicy GetPolicy() const override { NONFATAL_UNREACHABLE(); }
     bool HasScripts() const override { return true; }
     std::vector<std::string> Warnings() const override { return {}; }
     uint32_t GetMaxKeyExpr() const override { return 0; }
