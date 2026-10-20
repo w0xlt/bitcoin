@@ -7,6 +7,7 @@
 
 #include <outputtype.h>
 #include <pubkey.h>
+#include <script/descriptor_analysis.h>
 #include <script/keyorigin.h>
 #include <uint256.h>
 #include <util/expected.h>
@@ -24,6 +25,7 @@
 class CScript;
 class SigningProvider;
 struct FlatSigningProvider;
+class DescriptorKeyInfoBuilder;
 
 using ExtPubKeyMap = std::unordered_map<uint32_t, CExtPubKey>;
 
@@ -150,6 +152,11 @@ public:
     /** Return explicitly provided key origin information, if any. */
     virtual std::optional<KeyOriginInfo> GetOriginInfo() const { return std::nullopt; }
 
+    /** Inspect the public key program without derivation, key access, or cache mutation.
+     * Returns an owned result whose size is linear in this key expression.
+     */
+    DescriptorKeyInfo GetKeyInfo() const;
+
     /** Make a deep copy of this PubkeyProvider */
     virtual std::unique_ptr<PubkeyProvider> Clone() const = 0;
 
@@ -161,6 +168,10 @@ public:
 
     /** Whether this PubkeyProvider can always provide a public key without cache or private key arguments */
     virtual bool CanSelfExpand() const = 0;
+
+private:
+    friend class DescriptorKeyInfoBuilder;
+    virtual size_t AppendKeyInfo(DescriptorKeyInfoBuilder& builder) const = 0;
 
 protected:
     static bool DetermineApostropheUse(StringType type, bool normalized, bool public_apostrophe);
