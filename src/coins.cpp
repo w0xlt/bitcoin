@@ -336,9 +336,22 @@ void CCoinsViewCache::ReallocateCache()
     // Cache should be empty when we're calling this.
     assert(cacheCoins.size() == 0);
     cacheCoins.~CCoinsMap();
-    m_cache_coins_memory_resource.~CCoinsMapMemoryResource();
-    ::new (&m_cache_coins_memory_resource) CCoinsMapMemoryResource{};
+    if (m_huge_pages && !m_memory_resource_options_changed) {
+        m_cache_coins_memory_resource.Reset();
+    } else {
+        m_cache_coins_memory_resource.~CCoinsMapMemoryResource();
+        ::new (&m_cache_coins_memory_resource) CCoinsMapMemoryResource{m_chunk_size_bytes, m_huge_pages};
+        m_memory_resource_options_changed = false;
+    }
     ::new (&cacheCoins) CCoinsMap{0, SaltedCoinsCacheHasher{/*deterministic=*/m_deterministic}, CCoinsMap::key_equal{}, &m_cache_coins_memory_resource};
+}
+
+void CCoinsViewCache::SetMemoryResourceOptions(size_t chunk_size_bytes, bool huge_pages)
+{
+    m_memory_resource_options_changed |= chunk_size_bytes != m_chunk_size_bytes || huge_pages != m_huge_pages;
+    m_chunk_size_bytes = chunk_size_bytes;
+    m_huge_pages = huge_pages;
+    if (cacheCoins.empty()) ReallocateCache();
 }
 
 void CCoinsViewCache::SanityCheck() const

@@ -13,6 +13,7 @@
 #include <primitives/transaction.h>
 #include <random.h>
 #include <script/script.h>
+#include <support/hugepages.h>
 #include <sync.h>
 #include <test/util/chainstate.h>
 #include <test/util/coins.h>
@@ -72,6 +73,52 @@ BOOST_AUTO_TEST_CASE(validation_chainstate_resize_caches)
         // The view cache should be empty since we had to destruct to downsize.
         BOOST_CHECK(!c1.CoinsTip().HaveCoinInCache(outpoint));
     }
+}
+
+//! Test that the coins cache's memory follows the cache size. Caches of at least 64 MiB are
+//! backed by huge pages, in chunks of 1/256 of the cache size rounded up to whole huge pages.
+BOOST_AUTO_TEST_CASE(validation_chainstate_coins_cache_memory)
+{
+    ChainstateManager& manager = *Assert(m_node.chainman);
+    CTxMemPool& mempool = *Assert(m_node.mempool);
+    Chainstate& c1 = WITH_LOCK(cs_main, return manager.InitializeChainstate(&mempool));
+    c1.InitCoinsDB(
+        /*cache_size_bytes=*/8_MiB, /*in_memory=*/true, /*should_wipe=*/false);
+    WITH_LOCK(::cs_main, c1.InitCoinsCache(1_GiB));
+    BOOST_REQUIRE(manager.LoadGenesisBlock()); // Need at least one block loaded to be able to flush caches
+
+    const auto chunks{[&] { return WITH_LOCK(::cs_main, return c1.CoinsTip().DynamicMemoryUsage()) / double(HUGE_PAGE_BYTES); }};
+    // Where huge pages are not available, the cache allocates as for a small cache.
+    const auto check_huge_page_chunks{[&](double huge_pages) {
+        if (HugePagesAvailable()) {
+            BOOST_CHECK(chunks() >= huge_pages && chunks() < huge_pages + 1);
+        } else {
+            BOOST_CHECK_LT(chunks(), 1);
+        }
+    }};
+    check_huge_page_chunks(2);
+
+    {
+        LOCK(::cs_main);
+        // Set a meaningless bestblock value in the coinsview cache - otherwise we won't
+        // flush during ResizeCoinsCaches() and will subsequently hit an assertion.
+        c1.CoinsTip().SetBestBlock(m_rng.rand256());
+
+        // Downsizing flushes the cache, which reallocates it for the new size.
+        const auto outpoint{AddTestCoin(m_rng, c1.CoinsTip())};
+        c1.ResizeCoinsCaches(64_MiB, 8_MiB);
+        BOOST_CHECK(!c1.CoinsTip().HaveCoinInCache(outpoint));
+        check_huge_page_chunks(1);
+        c1.ResizeCoinsCaches(8_MiB, 8_MiB);
+        BOOST_CHECK_LT(chunks(), 1);
+
+        // Upsizing keeps the cached coins and their memory until the next flush.
+        AddTestCoin(m_rng, c1.CoinsTip());
+        c1.ResizeCoinsCaches(1_GiB, 8_MiB);
+        BOOST_CHECK_LT(chunks(), 1);
+    }
+    c1.ForceFlushStateToDisk();
+    check_huge_page_chunks(2);
 }
 
 BOOST_FIXTURE_TEST_CASE(connect_tip_does_not_cache_inputs_on_failed_connect, TestChain100Setup)

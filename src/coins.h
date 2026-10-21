@@ -437,10 +437,20 @@ class CCoinsViewCache : public CCoinsViewBacked
 {
 private:
     const bool m_deterministic;
+    //! Options of m_cache_coins_memory_resource, applied whenever it is reallocated.
+    size_t m_chunk_size_bytes{CCoinsMapMemoryResource::DEFAULT_CHUNK_SIZE_BYTES};
+    bool m_huge_pages{false};
+    //! Whether the options changed since m_cache_coins_memory_resource was last reallocated.
+    bool m_memory_resource_options_changed{false};
 
     //! Force a reallocation of the cache map. This is required when downsizing
     //! the cache because the map's allocator may be hanging onto a lot of
     //! memory despite having called .clear().
+    //!
+    //! A cache backed by huge pages keeps its chunks for reuse instead, unless
+    //! its options changed: mapping them again would fault in their huge pages
+    //! again, which may stall on memory compaction. The system may reclaim the
+    //! kept chunks until they are reused.
     //!
     //! See: https://stackoverflow.com/questions/42114044/how-to-release-unordered-map-memory
     void ReallocateCache();
@@ -564,6 +574,13 @@ public:
 
     //! Calculate the size of the cache (in bytes)
     size_t DynamicMemoryUsage() const;
+
+    /**
+     * Set the chunk size of the cache map's memory resource, and whether it is backed by huge
+     * pages, see PoolResource. Huge pages suit large, long-lived caches like the chainstate's.
+     * Takes effect now if the cache is empty, otherwise when Flush() reallocates the cache.
+     */
+    void SetMemoryResourceOptions(size_t chunk_size_bytes, bool huge_pages);
 
     //! Check whether all prevouts of the transaction are present in the UTXO set represented by this view
     bool HaveInputs(const CTransaction& tx) const;

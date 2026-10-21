@@ -6,6 +6,7 @@
 #include <clientversion.h>
 #include <coins.h>
 #include <streams.h>
+#include <support/hugepages.h>
 #include <test/util/coins.h>
 #include <test/util/common.h>
 #include <test/util/poolresourcetester.h>
@@ -89,6 +90,7 @@ public:
     }
 
     CCoinsMap& map() const { return cacheCoins; }
+    CCoinsMapMemoryResource& resource() const { return m_cache_coins_memory_resource; }
     CoinsCachePair& sentinel() const { return m_sentinel; }
     size_t& usage() const { return cachedCoinsUsage; }
     size_t& dirty() const { return m_dirty_count; }
@@ -1091,6 +1093,80 @@ BOOST_AUTO_TEST_CASE(coins_resource_is_used)
     }
 
     PoolResourceTester::CheckAllDataAccountedFor(resource);
+}
+
+BOOST_AUTO_TEST_CASE(coins_memory_resource_options)
+{
+    CCoinsViewTest base{m_rng};
+    CCoinsViewCache cache{&base};
+    const auto add_coins{[&] {
+        COutPoint outpoint;
+        for (uint32_t i{0}; i < 1000; ++i) {
+            outpoint = COutPoint{Txid::FromUint256(m_rng.rand256()), i};
+            cache.AddCoin(outpoint, Coin{CTxOut{1, CScript{} << OP_TRUE}, 1, false}, /*possible_overwrite=*/false);
+        }
+        return outpoint;
+    }};
+    BOOST_TEST(cache.DynamicMemoryUsage() < HUGE_PAGE_BYTES);
+
+    // An empty cache is reallocated right away, with chunks rounded up to whole huge pages.
+    cache.SetMemoryResourceOptions(HUGE_PAGE_BYTES + 1, /*huge_pages=*/true);
+    BOOST_TEST(cache.DynamicMemoryUsage() >= 2 * HUGE_PAGE_BYTES);
+    for (int round{0}; round < 2; ++round) {
+        const COutPoint outpoint{add_coins()};
+        cache.Flush();
+        BOOST_CHECK_EQUAL(cache.GetCacheSize(), 0U);
+        BOOST_TEST(base.GetCoin(outpoint).has_value());
+        // Flush() keeps the options when it reallocates the cache.
+        BOOST_TEST(cache.DynamicMemoryUsage() >= 2 * HUGE_PAGE_BYTES);
+    }
+
+    // A non-empty cache keeps its memory until Flush() reallocates it.
+    add_coins();
+    cache.SetMemoryResourceOptions(CCoinsMapMemoryResource::DEFAULT_CHUNK_SIZE_BYTES, /*huge_pages=*/false);
+    BOOST_TEST(cache.DynamicMemoryUsage() >= 2 * HUGE_PAGE_BYTES);
+    cache.Flush();
+    BOOST_TEST(cache.DynamicMemoryUsage() < HUGE_PAGE_BYTES);
+}
+
+BOOST_AUTO_TEST_CASE(coins_memory_resource_reuse)
+{
+    CCoinsViewTest base{m_rng};
+    CCoinsViewCacheTest cache{&base};
+    const auto fill{[&] {
+        for (uint32_t i{0}; i < 50'000; ++i) {
+            cache.AddCoin(COutPoint{Txid::FromUint256(m_rng.rand256()), i}, Coin{CTxOut{1, CScript{} << OP_TRUE}, 1, false}, /*possible_overwrite=*/false);
+        }
+    }};
+
+    // A cache backed by huge pages keeps its chunks when Flush() reallocates it, and reuses them
+    // before it allocates new ones. They are not counted as memory usage.
+    cache.SetMemoryResourceOptions(HUGE_PAGE_BYTES, /*huge_pages=*/true);
+    fill();
+    const size_t num_chunks{cache.resource().NumAllocatedChunks()};
+    BOOST_REQUIRE_GT(num_chunks, 1U);
+    cache.Flush();
+    BOOST_CHECK_EQUAL(cache.resource().NumAllocatedChunks(), 1U);
+    BOOST_CHECK_EQUAL(PoolResourceTester::NumSpareChunks(cache.resource()), num_chunks - 1);
+    BOOST_TEST(cache.DynamicMemoryUsage() < 2 * HUGE_PAGE_BYTES);
+    fill();
+    BOOST_CHECK_EQUAL(cache.resource().NumAllocatedChunks(), num_chunks);
+    BOOST_CHECK_EQUAL(PoolResourceTester::NumSpareChunks(cache.resource()), 0U);
+    cache.SelfTest();
+
+    // Other options reallocate the chunks.
+    cache.Flush();
+    cache.SetMemoryResourceOptions(2 * HUGE_PAGE_BYTES, /*huge_pages=*/true);
+    BOOST_CHECK_EQUAL(cache.resource().ChunkSizeBytes(), 2 * HUGE_PAGE_BYTES);
+    BOOST_CHECK_EQUAL(PoolResourceTester::NumSpareChunks(cache.resource()), 0U);
+
+    // Without huge pages, Flush() frees the chunks as before.
+    cache.SetMemoryResourceOptions(CCoinsMapMemoryResource::DEFAULT_CHUNK_SIZE_BYTES, /*huge_pages=*/false);
+    fill();
+    BOOST_REQUIRE_GT(cache.resource().NumAllocatedChunks(), 1U);
+    cache.Flush();
+    BOOST_CHECK_EQUAL(cache.resource().NumAllocatedChunks(), 1U);
+    BOOST_CHECK_EQUAL(PoolResourceTester::NumSpareChunks(cache.resource()), 0U);
 }
 
 BOOST_AUTO_TEST_CASE(ccoins_addcoin_exception_keeps_usage_balanced)
