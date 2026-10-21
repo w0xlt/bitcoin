@@ -35,6 +35,15 @@ constexpr bool ShouldWarnOversizedDbCache(uint64_t dbcache, uint64_t total_ram) 
     const uint64_t cap{std::max(DEFAULT_KERNEL_CACHE, (available_ram / 4) * 3)};
     return dbcache > cap;
 }
+//! Whether the in-memory UTXO set, which may grow to coins_cache_bytes, may be backed by huge
+//! pages. Assembling a huge page may make the kernel reclaim and compact memory first, stalling
+//! block validation when memory is short. So they are only used when the UTXO set takes at most
+//! half of the memory beyond DBCACHE_WARNING_RESERVED_RAM.
+constexpr bool ShouldUseHugePagesForCoinsCache(uint64_t coins_cache_bytes, uint64_t total_ram) noexcept
+{
+    const uint64_t available_ram{total_ram > DBCACHE_WARNING_RESERVED_RAM ? total_ram - DBCACHE_WARNING_RESERVED_RAM : 0};
+    return coins_cache_bytes <= available_ram / 2;
+}
 
 void LogOversizedDbCache(const ArgsManager& args) noexcept;
 } // namespace node

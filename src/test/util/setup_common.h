@@ -50,6 +50,7 @@ struct TestOpts {
     bool setup_net{true};
     bool setup_validation_interface{true};
     bool min_validation_cache{false}; // Equivalent of -maxsigcachebytes=0
+    bool coins_cache_huge_pages{false};
 };
 
 /** Basic testing setup.

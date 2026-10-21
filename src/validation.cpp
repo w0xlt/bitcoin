@@ -124,9 +124,9 @@ static constexpr size_t HUGE_PAGES_COINS_CACHE_CHUNKS{256};
 
 //! Set how a coins cache of cache_size_bytes allocates memory, see CCoinsViewCache::SetMemoryResourceOptions().
 //! Without huge pages, it allocates as before.
-static void SetCoinsCacheMemoryResourceOptions(CCoinsViewCache& coins_cache, size_t cache_size_bytes)
+static void SetCoinsCacheMemoryResourceOptions(CCoinsViewCache& coins_cache, size_t cache_size_bytes, bool allow_huge_pages)
 {
-    if (cache_size_bytes >= MIN_HUGE_PAGES_COINS_CACHE_BYTES && HugePagesAvailable()) {
+    if (allow_huge_pages && cache_size_bytes >= MIN_HUGE_PAGES_COINS_CACHE_BYTES && HugePagesAvailable()) {
         coins_cache.SetMemoryResourceOptions(cache_size_bytes / HUGE_PAGES_COINS_CACHE_CHUNKS, /*huge_pages=*/true);
         LogInfo("Using transparent huge pages for a coins cache of %.1f MiB (%s)",
                 cache_size_bytes / double(1_MiB), TransparentHugePagesSettings());
@@ -1954,7 +1954,7 @@ void Chainstate::InitCoinsCache(size_t cache_size_bytes)
     assert(m_coins_views != nullptr);
     m_coinstip_cache_size_bytes = cache_size_bytes;
     m_coins_views->InitCache(m_chainman.m_options.prevoutfetch_threads_num);
-    SetCoinsCacheMemoryResourceOptions(CoinsTip(), cache_size_bytes);
+    SetCoinsCacheMemoryResourceOptions(CoinsTip(), cache_size_bytes, m_chainman.m_options.coins_cache_huge_pages);
 }
 
 // Lock-free: depends on `m_cached_is_ibd`, which is latched by `UpdateIBDStatus()`.
@@ -5508,7 +5508,7 @@ bool Chainstate::ResizeCoinsCaches(size_t coinstip_size, size_t coinsdb_size)
     m_coinstip_cache_size_bytes = coinstip_size;
     m_coinsdb_cache_size_bytes = coinsdb_size;
     CoinsDB().ResizeCache(coinsdb_size);
-    SetCoinsCacheMemoryResourceOptions(CoinsTip(), coinstip_size);
+    SetCoinsCacheMemoryResourceOptions(CoinsTip(), coinstip_size, m_chainman.m_options.coins_cache_huge_pages);
 
     LogInfo("[%s] resized coinsdb cache to %.1f MiB",
         this->ToString(), coinsdb_size / double(1_MiB));

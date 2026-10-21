@@ -78,6 +78,7 @@
 #include <rpc/util.h>
 #include <scheduler.h>
 #include <script/sigcache.h>
+#include <support/hugepages.h>
 #include <sync.h>
 #include <tinyformat.h>
 #include <torcontrol.h>
@@ -524,6 +525,7 @@ void SetupServerArgs(ArgsManager& argsman, bool can_listen_ipc)
     argsman.AddArg("-datadir=<dir>", "Specify data directory", ArgsManager::ALLOW_ANY | ArgsManager::DISALLOW_NEGATION, OptionsCategory::OPTIONS);
     argsman.AddArg("-dbbatchsize", strprintf("Maximum database write batch size in bytes (default: %u)", DEFAULT_DB_CACHE_BATCH), ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::OPTIONS);
     argsman.AddArg("-dbcache=<n>", strprintf("Maximum database cache size <n> MiB (minimum %d, default: %d). Make sure you have enough RAM. In addition, unused memory allocated to the mempool is shared with this cache (see -maxmempool).", MIN_DBCACHE_BYTES / 1_MiB, node::GetDefaultDBCache() / 1_MiB), ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
+    argsman.AddArg("-hugepages", strprintf("Use transparent huge pages for the in-memory UTXO set where the system supports them, on Linux (default: 1 if the in-memory UTXO set and -maxmempool take at most half of the memory beyond %d MiB, otherwise 0)", DBCACHE_WARNING_RESERVED_RAM / 1_MiB), ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
     argsman.AddArg("-includeconf=<file>", "Specify additional configuration file, relative to the -datadir path (only useable from configuration file, not command line)", ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
     argsman.AddArg("-allowignoredconf", strprintf("For backwards compatibility, treat an unused %s file in the datadir as a warning, not an error.", BITCOIN_CONF_FILENAME), ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
     argsman.AddArg("-loadblock=<file>", "Imports blocks from an external file on startup. Obfuscated blocks are not supported.", ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
@@ -1431,6 +1433,23 @@ static ChainstateLoadResult InitAndLoadChainstate(
         .signals = node.validation_signals.get(),
     };
     Assert(ApplyArgsManOptions(args, chainman_opts)); // no error can happen, already checked in AppInitParameterInteraction
+    if (const auto huge_pages{args.GetBoolArg("-hugepages")}) {
+        chainman_opts.coins_cache_huge_pages = *huge_pages;
+        if (*huge_pages && !HugePagesAvailable()) {
+            LogInfo("Not using huge pages for the in-memory UTXO set, as transparent huge pages are not available to this process (%s)",
+                    TransparentHugePagesSettings());
+        }
+    } else {
+        // The memory may be limited further for a container. The UTXO set may also use the unused
+        // mempool space.
+        std::optional<uint64_t> memory{TryGetTotalRam()};
+        if (const auto limit{TryGetCgroupMemoryLimit()}) memory = std::min(memory.value_or(*limit), *limit);
+        chainman_opts.coins_cache_huge_pages = memory && node::ShouldUseHugePagesForCoinsCache(cache_sizes.coins + uint64_t(mempool_opts.max_size_bytes), *memory);
+        if (memory && !chainman_opts.coins_cache_huge_pages) {
+            LogInfo("Not using huge pages for the in-memory UTXO set, as it is large for the memory of %.1f MiB",
+                    *memory / double(1_MiB));
+        }
+    }
 
     BlockManager::Options blockman_opts{
         .chainparams = chainman_opts.chainparams,

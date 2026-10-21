@@ -75,9 +75,25 @@ BOOST_AUTO_TEST_CASE(validation_chainstate_resize_caches)
     }
 }
 
+//! Test that ChainstateManager does not use huge pages unless asked to.
+BOOST_AUTO_TEST_CASE(validation_chainstate_coins_cache_default_memory)
+{
+    ChainstateManager& manager = *Assert(m_node.chainman);
+    CTxMemPool& mempool = *Assert(m_node.mempool);
+    Chainstate& c1 = WITH_LOCK(cs_main, return manager.InitializeChainstate(&mempool));
+    c1.InitCoinsDB(
+        /*cache_size_bytes=*/8_MiB, /*in_memory=*/true, /*should_wipe=*/false);
+    WITH_LOCK(::cs_main, c1.InitCoinsCache(1_GiB));
+    BOOST_CHECK_LT(WITH_LOCK(::cs_main, return c1.CoinsTip().DynamicMemoryUsage()), HUGE_PAGE_BYTES);
+}
+
+struct HugePagesChainTestingSetup : ChainTestingSetup {
+    HugePagesChainTestingSetup() : ChainTestingSetup{ChainType::MAIN, {.coins_cache_huge_pages = true}} {}
+};
+
 //! Test that the coins cache's memory follows the cache size. Caches of at least 64 MiB are
 //! backed by huge pages, in chunks of 1/256 of the cache size rounded up to whole huge pages.
-BOOST_AUTO_TEST_CASE(validation_chainstate_coins_cache_memory)
+BOOST_FIXTURE_TEST_CASE(validation_chainstate_coins_cache_memory, HugePagesChainTestingSetup)
 {
     ChainstateManager& manager = *Assert(m_node.chainman);
     CTxMemPool& mempool = *Assert(m_node.mempool);

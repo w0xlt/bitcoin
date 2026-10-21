@@ -38,4 +38,21 @@ BOOST_AUTO_TEST_CASE(oversized_dbcache_warning)
     }
 }
 
+BOOST_AUTO_TEST_CASE(coins_cache_huge_pages)
+{
+    // Without memory beyond DBCACHE_WARNING_RESERVED_RAM, huge pages are never used.
+    BOOST_CHECK(!ShouldUseHugePagesForCoinsCache(MIN_DBCACHE_BYTES, DBCACHE_WARNING_RESERVED_RAM));
+
+    // The default 1 GiB dbcache and 300 MB mempool get huge pages with 8 GiB of memory, but not with 4 GiB.
+    BOOST_CHECK(!ShouldUseHugePagesForCoinsCache(1_GiB + 300'000'000, 4_GiB));
+    BOOST_CHECK(ShouldUseHugePagesForCoinsCache(1_GiB + 300'000'000, 8_GiB));
+
+    // Otherwise, the UTXO set may take up to half of the memory beyond DBCACHE_WARNING_RESERVED_RAM.
+    for (const auto total_ram : {8_GiB, 16_GiB, 32_GiB}) {
+        const uint64_t threshold{(total_ram - DBCACHE_WARNING_RESERVED_RAM) / 2};
+        BOOST_CHECK(ShouldUseHugePagesForCoinsCache(threshold, total_ram));
+        BOOST_CHECK(!ShouldUseHugePagesForCoinsCache(threshold + 1, total_ram));
+    }
+}
+
 BOOST_AUTO_TEST_SUITE_END()

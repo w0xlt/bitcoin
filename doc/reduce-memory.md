@@ -19,6 +19,19 @@ The size of some in-memory caches can be reduced. As caches trade off memory usa
   - The minimum value for `-dbcache` is 4.
   - A lower `-dbcache` makes initial sync time much longer. After the initial sync, the effect is less pronounced for most use-cases, unless fast validation of blocks is important, such as for mining.
 
+## Huge pages
+
+On Linux with transparent huge pages of 2 MiB enabled, a UTXO cache of 64 MiB or more is backed by huge pages, to reduce TLB misses during block validation. By default, they are not used when the UTXO cache plus `-maxmempool` would take more than half of the memory beyond 2 GiB. The memory is the system memory, or the memory limit of the container or service if it is lower. The debug log shows whether huge pages are used, with the system's settings for them.
+
+The memory of the UTXO cache stays allocated when the cache is flushed, so that it can be reused without assembling huge pages again. Until it is reused, the kernel may reclaim it when memory is short.
+
+Assembling a huge page may make the kernel reclaim and compact memory first. If block validation stalls on a system with little free memory, any setting below helps.
+
+- Do not use huge pages for the UTXO cache: `-hugepages=0`
+- Let the kernel assemble huge pages in the background instead: `echo defer | sudo tee /sys/kernel/mm/transparent_hugepage/defrag`. This applies to all programs until the next reboot.
+
+Use `-hugepages=1` to use huge pages regardless of the size of the memory.
+
 ## Memory pool
 
 - In Bitcoin Core there is a memory pool limiter which can be configured with `-maxmempool=<n>`, where `<n>` is the size in MB (1000). The default value is `300`.
