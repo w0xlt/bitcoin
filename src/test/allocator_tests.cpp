@@ -17,6 +17,7 @@
 #include <memory>
 #include <new>
 #include <stdexcept>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -259,6 +260,25 @@ BOOST_AUTO_TEST_CASE(hugepages_tests)
     std::fill_n(p, 3 * HUGE_PAGE_BYTES, std::byte{0xa5});
     BOOST_CHECK(std::all_of(p, p + 3 * HUGE_PAGE_BYTES, [](std::byte b) { return b == std::byte{0xa5}; }));
     FreeHugePages(p, 3 * HUGE_PAGE_BYTES, alignment);
+}
+
+BOOST_AUTO_TEST_CASE(hugepages_mode_tests)
+{
+    // The active mode is the one in brackets.
+    BOOST_CHECK(ParseTransparentHugePages("[always] madvise never\n") == TransparentHugePages::ALWAYS);
+    BOOST_CHECK(ParseTransparentHugePages("always [madvise] never\n") == TransparentHugePages::MADVISE);
+    BOOST_CHECK(ParseTransparentHugePages("always madvise [never]\n") == TransparentHugePages::NEVER);
+    BOOST_CHECK(!ParseTransparentHugePages("always madvise never\n"));
+    BOOST_CHECK(!ParseTransparentHugePages("always madvise [never\n"));
+    BOOST_CHECK(!ParseTransparentHugePages(""));
+#ifndef __linux__
+    BOOST_CHECK(!HugePagesAvailable());
+#endif
+    // Huge pages are only used where their mode can be read, and is not "never".
+    if (HugePagesAvailable()) {
+        const std::string settings{TransparentHugePagesSettings()};
+        BOOST_CHECK(settings.starts_with("enabled=always,") || settings.starts_with("enabled=madvise,"));
+    }
 }
 
 BOOST_AUTO_TEST_SUITE_END()

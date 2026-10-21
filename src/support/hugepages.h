@@ -8,6 +8,9 @@
 #include <util/byte_units.h>
 
 #include <cstddef>
+#include <optional>
+#include <string>
+#include <string_view>
 
 /** Size of a transparent huge page on x86-64, and on arm64 with 4 KiB base pages. */
 inline constexpr std::size_t HUGE_PAGE_BYTES{2_MiB};
@@ -16,9 +19,9 @@ inline constexpr std::size_t HUGE_PAGE_BYTES{2_MiB};
  * Allocate memory that the operating system may back with transparent huge pages.
  *
  * Huge pages reduce TLB misses in large data structures that are accessed at random, like the
- * UTXO cache. On Linux the memory is mapped directly, aligned to HUGE_PAGE_BYTES and advised with
- * MADV_HUGEPAGE, which takes effect when transparent huge pages are in "always" or "madvise" mode.
- * Elsewhere this is equivalent to operator new.
+ * UTXO cache. On Linux the memory is mapped directly and aligned to HUGE_PAGE_BYTES, which is
+ * enough when transparent huge pages are in "always" mode. Otherwise it is also advised with
+ * MADV_HUGEPAGE, which "madvise" mode needs. Elsewhere this is equivalent to operator new.
  *
  * @param[in] bytes      Number of bytes to allocate.
  * @param[in] alignment  Required alignment, a power of two of at most HUGE_PAGE_BYTES.
@@ -36,5 +39,28 @@ void FreeHugePages(void* p, std::size_t bytes, std::size_t alignment) noexcept;
  * again. Reading the memory before writing it gives its old contents or zeros.
  */
 void DiscardHugePages(void* p, std::size_t bytes) noexcept;
+
+/** Modes of transparent huge pages, see /sys/kernel/mm/transparent_hugepage/enabled. */
+enum class TransparentHugePages {
+    ALWAYS,  //!< Used for all suitable memory
+    MADVISE, //!< Used for memory advised with MADV_HUGEPAGE
+    NEVER,   //!< Not used
+};
+
+/** Parse the contents of /sys/kernel/mm/transparent_hugepage/enabled, like "always [madvise] never". */
+std::optional<TransparentHugePages> ParseTransparentHugePages(std::string_view enabled);
+
+/**
+ * Whether memory from AllocateHugePages() may be backed by huge pages. It may not be on systems
+ * other than Linux, when transparent huge pages are disabled for the system ("never" mode) or
+ * for this process (PR_SET_THP_DISABLE), when their mode can not be read, or when they are not
+ * of HUGE_PAGE_BYTES. Regular allocations are better then: memory mapped by AllocateHugePages()
+ * is returned to the system when freed, so it has to be faulted in again, page by page, when it
+ * is allocated again.
+ */
+bool HugePagesAvailable();
+
+/** The system's transparent huge pages settings, like "enabled=madvise, defrag=madvise", for logging. */
+std::string TransparentHugePagesSettings();
 
 #endif // BITCOIN_SUPPORT_HUGEPAGES_H
