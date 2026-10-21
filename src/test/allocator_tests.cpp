@@ -3,14 +3,19 @@
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
 #include <common/system.h>
+#include <support/hugepages.h>
 #include <support/lockedpool.h>
 #include <test/util/common.h>
 #include <util/byte_units.h>
 
 #include <boost/test/unit_test.hpp>
 
+#include <algorithm>
+#include <cstddef>
+#include <cstdint>
 #include <limits>
 #include <memory>
+#include <new>
 #include <stdexcept>
 #include <utility>
 #include <vector>
@@ -226,6 +231,34 @@ BOOST_AUTO_TEST_CASE(lockedpool_tests_live)
     BOOST_CHECK(pool.stats().total <= (initial.total + LockedPool::ARENA_SIZE));
     // Usage must be back to where it started
     BOOST_CHECK(pool.stats().used == initial.used);
+}
+
+BOOST_AUTO_TEST_CASE(hugepages_tests)
+{
+    constexpr size_t alignment{alignof(std::max_align_t)};
+    for (const size_t bytes : {size_t{1}, HUGE_PAGE_BYTES, HUGE_PAGE_BYTES + 1, 3 * HUGE_PAGE_BYTES}) {
+        auto* p{static_cast<std::byte*>(AllocateHugePages(bytes, alignment))};
+        BOOST_CHECK(reinterpret_cast<uintptr_t>(p) % alignment == 0);
+#ifdef __linux__
+        // On Linux, the memory starts at a huge page boundary.
+        BOOST_CHECK(reinterpret_cast<uintptr_t>(p) % HUGE_PAGE_BYTES == 0);
+#endif
+        // The memory is usable from its first to its last byte.
+        std::fill_n(p, bytes, std::byte{0x5a});
+        BOOST_CHECK(p[0] == std::byte{0x5a} && p[bytes - 1] == std::byte{0x5a});
+        FreeHugePages(p, bytes, alignment);
+    }
+#ifdef __linux__
+    BOOST_CHECK_THROW(AllocateHugePages(std::numeric_limits<size_t>::max(), alignment), std::bad_alloc);
+#endif
+
+    // Discarded memory stays usable.
+    auto* p{static_cast<std::byte*>(AllocateHugePages(3 * HUGE_PAGE_BYTES, alignment))};
+    std::fill_n(p, 3 * HUGE_PAGE_BYTES, std::byte{0x5a});
+    DiscardHugePages(p, 3 * HUGE_PAGE_BYTES);
+    std::fill_n(p, 3 * HUGE_PAGE_BYTES, std::byte{0xa5});
+    BOOST_CHECK(std::all_of(p, p + 3 * HUGE_PAGE_BYTES, [](std::byte b) { return b == std::byte{0xa5}; }));
+    FreeHugePages(p, 3 * HUGE_PAGE_BYTES, alignment);
 }
 
 BOOST_AUTO_TEST_SUITE_END()

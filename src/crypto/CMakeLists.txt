@@ -20,6 +20,7 @@ add_library(bitcoin_crypto STATIC EXCLUDE_FROM_ALL
   sha512.cpp
   siphash.cpp
   ../support/cleanse.cpp
+  ../support/hugepages.cpp
   $<$<NOT:$<STREQUAL:${CMAKE_SYSTEM_NAME},Generic>>:../support/lockedpool.cpp>
 )
 
