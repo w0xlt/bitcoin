@@ -14,6 +14,7 @@
 #include <type_traits>
 #include <utility>
 
+#include <support/hugepages.h>
 #include <util/check.h>
 #include <util/overflow.h>
 
@@ -32,6 +33,11 @@
  *
  * * Block sizes or alignments that can not be served by the pools are allocated
  *   and deallocated by operator new().
+ *
+ * * Optionally, the chunks and allocations of at least HUGE_PAGE_BYTES are backed by
+ *   huge pages, see AllocateHugePages(). This suits large, long-lived resources.
+ *
+ * * Reset() makes all memory available again, keeping the chunks for reuse.
  *
  * PoolResource is not thread-safe. It is intended to be used by PoolAllocator.
  *
@@ -92,6 +98,7 @@ class PoolResource final
     static_assert((ELEM_ALIGN_BYTES & (ELEM_ALIGN_BYTES - 1)) == 0, "ELEM_ALIGN_BYTES must be a power of two");
     static_assert(sizeof(ListNode) <= ELEM_ALIGN_BYTES, "Units of size ELEM_SIZE_ALIGN need to be able to store a ListNode");
     static_assert((MAX_BLOCK_SIZE_BYTES & (ELEM_ALIGN_BYTES - 1)) == 0, "MAX_BLOCK_SIZE_BYTES needs to be a multiple of the alignment.");
+    static_assert(ELEM_ALIGN_BYTES <= HUGE_PAGE_BYTES, "Chunks backed by huge pages need to satisfy the alignment.");
 
     /**
      * Size in bytes to allocate per chunk
@@ -99,9 +106,19 @@ class PoolResource final
     const size_t m_chunk_size_bytes;
 
     /**
+     * Whether chunks and allocations of at least HUGE_PAGE_BYTES are backed by huge pages
+     */
+    const bool m_huge_pages;
+
+    /**
      * Contains all allocated pools of memory, used to free the data in the destructor.
      */
     std::list<std::byte*> m_allocated_chunks{};
+
+    /**
+     * Chunks kept by Reset(), which are reused before new chunks are allocated.
+     */
+    std::list<std::byte*> m_spare_chunks{};
 
     /**
      * Single linked lists of all data that came from deallocating.
@@ -140,6 +157,14 @@ class PoolResource final
     }
 
     /**
+     * True when an allocation that can not use the freelist is backed by huge pages
+     */
+    [[nodiscard]] bool UseHugePages(std::size_t bytes, std::size_t alignment) const
+    {
+        return m_huge_pages && bytes >= HUGE_PAGE_BYTES && alignment <= HUGE_PAGE_BYTES;
+    }
+
+    /**
      * Replaces node with placement constructed ListNode that points to the previous node
      */
     void PlacementAddToList(void* p, ListNode*& node)
@@ -163,7 +188,16 @@ class PoolResource final
             ASAN_POISON_MEMORY_REGION(m_available_memory_it, sizeof(ListNode));
         }
 
-        void* storage = ::operator new (m_chunk_size_bytes, std::align_val_t{ELEM_ALIGN_BYTES});
+        if (!m_spare_chunks.empty()) {
+            // Reuse a chunk kept by Reset(), which is still poisoned.
+            m_allocated_chunks.splice(m_allocated_chunks.end(), m_spare_chunks, m_spare_chunks.begin());
+            m_available_memory_it = m_allocated_chunks.back();
+            m_available_memory_end = m_available_memory_it + m_chunk_size_bytes;
+            return;
+        }
+
+        void* storage = m_huge_pages ? AllocateHugePages(m_chunk_size_bytes, ELEM_ALIGN_BYTES)
+                                     : ::operator new (m_chunk_size_bytes, std::align_val_t{ELEM_ALIGN_BYTES});
         m_available_memory_it = new (storage) std::byte[m_chunk_size_bytes];
         m_available_memory_end = m_available_memory_it + m_chunk_size_bytes;
         ASAN_POISON_MEMORY_REGION(m_available_memory_it, m_chunk_size_bytes);
@@ -177,20 +211,28 @@ class PoolResource final
 
 public:
     /**
-     * Construct a new PoolResource object which allocates the first chunk.
-     * chunk_size_bytes will be rounded up to next multiple of ELEM_ALIGN_BYTES.
+     * Default size in bytes to allocate per chunk, 2^18=262144.
      */
-    explicit PoolResource(std::size_t chunk_size_bytes)
-        : m_chunk_size_bytes(NumElemAlignBytes(chunk_size_bytes) * ELEM_ALIGN_BYTES)
+    static constexpr std::size_t DEFAULT_CHUNK_SIZE_BYTES{262144};
+
+    /**
+     * Construct a new PoolResource object which allocates the first chunk.
+     * chunk_size_bytes will be rounded up to next multiple of ELEM_ALIGN_BYTES, or of
+     * HUGE_PAGE_BYTES when huge_pages is set.
+     */
+    explicit PoolResource(std::size_t chunk_size_bytes, bool huge_pages = false)
+        : m_chunk_size_bytes(huge_pages ? CeilDiv(chunk_size_bytes, HUGE_PAGE_BYTES) * HUGE_PAGE_BYTES
+                                        : NumElemAlignBytes(chunk_size_bytes) * ELEM_ALIGN_BYTES),
+          m_huge_pages(huge_pages)
     {
         assert(m_chunk_size_bytes >= MAX_BLOCK_SIZE_BYTES);
         AllocateChunk();
     }
 
     /**
-     * Construct a new Pool Resource object, defaults to 2^18=262144 chunk size.
+     * Construct a new Pool Resource object with DEFAULT_CHUNK_SIZE_BYTES chunk size.
      */
-    PoolResource() : PoolResource(262144) {}
+    PoolResource() : PoolResource(DEFAULT_CHUNK_SIZE_BYTES) {}
 
     /**
      * Disable copy & move semantics, these are not supported for the resource.
@@ -205,9 +247,14 @@ public:
      */
     ~PoolResource()
     {
+        m_allocated_chunks.splice(m_allocated_chunks.end(), m_spare_chunks);
         for (std::byte* chunk : m_allocated_chunks) {
             std::destroy(chunk, chunk + m_chunk_size_bytes);
-            ::operator delete ((void*)chunk, std::align_val_t{ELEM_ALIGN_BYTES});
+            if (m_huge_pages) {
+                FreeHugePages(chunk, m_chunk_size_bytes, ELEM_ALIGN_BYTES);
+            } else {
+                ::operator delete ((void*)chunk, std::align_val_t{ELEM_ALIGN_BYTES});
+            }
             ASAN_UNPOISON_MEMORY_REGION(chunk, m_chunk_size_bytes);
         }
     }
@@ -243,7 +290,8 @@ public:
             return std::exchange(m_available_memory_it, m_available_memory_it + round_bytes);
         }
 
-        // Can't use the pool => use operator new()
+        // Can't use the pool => use huge pages or operator new()
+        if (UseHugePages(bytes, alignment)) return AllocateHugePages(bytes, alignment);
         return ::operator new (bytes, std::align_val_t{alignment});
     }
 
@@ -259,10 +307,33 @@ public:
             ASAN_UNPOISON_MEMORY_REGION(p, sizeof(ListNode));
             PlacementAddToList(p, m_free_lists[num_alignments]);
             ASAN_POISON_MEMORY_REGION(p, std::max(bytes, sizeof(ListNode)));
+        } else if (UseHugePages(bytes, alignment)) {
+            FreeHugePages(p, bytes, alignment);
         } else {
             // Can't use the pool => forward deallocation to ::operator delete().
             ::operator delete (p, std::align_val_t{alignment});
         }
+    }
+
+    /**
+     * Makes all memory available again, as in a new resource, but keeps the chunks to reuse them
+     * instead of freeing them. Spare chunks are not counted by NumAllocatedChunks(). Chunks backed
+     * by huge pages stay mapped, so that their huge pages need not be faulted in again, but the
+     * system may reclaim them until they are reused, see DiscardHugePages().
+     *
+     * Precondition: none of the allocated blocks is used anymore.
+     */
+    void Reset()
+    {
+        m_free_lists.fill(nullptr);
+        for (std::byte* chunk : m_allocated_chunks) {
+            ASAN_POISON_MEMORY_REGION(chunk, m_chunk_size_bytes);
+            if (m_huge_pages) DiscardHugePages(chunk, m_chunk_size_bytes);
+        }
+        m_spare_chunks.splice(m_spare_chunks.end(), m_allocated_chunks);
+        m_available_memory_it = nullptr;
+        m_available_memory_end = nullptr;
+        AllocateChunk();
     }
 
     /**

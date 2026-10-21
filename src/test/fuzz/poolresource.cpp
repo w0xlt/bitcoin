@@ -11,6 +11,7 @@
 #include <test/util/poolresourcetester.h>
 #include <util/byte_units.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <tuple>
 #include <vector>
@@ -38,7 +39,7 @@ class PoolResourceFuzzer
 public:
     PoolResourceFuzzer(FuzzedDataProvider& provider)
         : m_provider{provider},
-          m_test_resource{provider.ConsumeIntegralInRange<size_t>(MAX_BLOCK_SIZE_BYTES, 262144)}
+          m_test_resource{provider.ConsumeIntegralInRange<size_t>(MAX_BLOCK_SIZE_BYTES, 262144), /*huge_pages=*/provider.ConsumeBool()}
     {
     }
 
@@ -67,6 +68,15 @@ public:
         size_t alignment = size_t{1} << alignment_bits;
         size_t size_bits = m_provider.ConsumeIntegralInRange<size_t>(0, 16 - alignment_bits);
         size_t size = m_provider.ConsumeIntegralInRange<size_t>(size_t{1} << size_bits, (size_t{1} << (size_bits + 1)) - 1U) << alignment_bits;
+        Allocate(size, alignment);
+    }
+
+    void AllocateLarge()
+    {
+        // Large enough to be backed by huge pages, if the resource is.
+        if (m_total_allocated > 16_MiB) return;
+        size_t alignment = size_t{1} << m_provider.ConsumeIntegralInRange<size_t>(0, 7);
+        size_t size = m_provider.ConsumeIntegralInRange<size_t>(2_MiB / alignment, 4_MiB / alignment) * alignment;
         Allocate(size, alignment);
     }
 
@@ -114,13 +124,34 @@ public:
         PoolResourceTester::CheckAllDataAccountedFor(m_test_resource);
     }
 
+    void Reset()
+    {
+        // Blocks from the pool need not be deallocated before the resource is reset, but others
+        // must be. The pool serves the alignment of its freelist nodes too.
+        constexpr size_t pool_alignment{std::max(alignof(void*), ALIGN_BYTES)};
+        for (const auto& entry : m_entries) {
+            if (entry.span.size() <= MAX_BLOCK_SIZE_BYTES && entry.alignment <= pool_alignment) {
+                RandomContentCheck(entry);
+                m_total_allocated -= entry.span.size();
+            } else {
+                Deallocate(entry);
+            }
+        }
+        m_entries.clear();
+        m_test_resource.Reset();
+        assert(m_test_resource.NumAllocatedChunks() == 1);
+        PoolResourceTester::CheckAllDataAccountedFor(m_test_resource);
+    }
+
     void Fuzz()
     {
         LIMITED_WHILE (m_provider.ConsumeBool(), 10000) {
             CallOneOf(
                 m_provider,
                 [&] { Allocate(); },
-                [&] { Deallocate(); });
+                [&] { AllocateLarge(); },
+                [&] { Deallocate(); },
+                [&] { Reset(); });
         }
         Clear();
     }

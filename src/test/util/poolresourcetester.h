@@ -69,6 +69,15 @@ public:
     }
 
     /**
+     * Number of chunks kept by Reset() for reuse
+     */
+    template <std::size_t MAX_BLOCK_SIZE_BYTES, std::size_t ALIGN_BYTES>
+    static std::size_t NumSpareChunks(const PoolResource<MAX_BLOCK_SIZE_BYTES, ALIGN_BYTES>& resource)
+    {
+        return resource.m_spare_chunks.size();
+    }
+
+    /**
      * Once all blocks are given back to the resource, tests that the freelists are consistent:
      *
      * * All data in the freelists must come from the chunks

@@ -4,14 +4,17 @@
 
 #include <memusage.h>
 #include <support/allocators/pool.h>
+#include <support/hugepages.h>
 #include <test/util/poolresourcetester.h>
 #include <test/util/random.h>
 #include <test/util/setup_common.h>
 
 #include <boost/test/unit_test.hpp>
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <span>
 #include <unordered_map>
 #include <vector>
 
@@ -152,6 +155,86 @@ BOOST_AUTO_TEST_CASE(random_allocations)
     }
 
     PoolResourceTester::CheckAllDataAccountedFor(resource);
+}
+
+BOOST_AUTO_TEST_CASE(huge_pages)
+{
+    auto resource = PoolResource<128, 8>(1024, /*huge_pages=*/true);
+    BOOST_TEST(resource.ChunkSizeBytes() == HUGE_PAGE_BYTES);
+
+    // The first block is carved from the start of the first chunk.
+    void* first = resource.Allocate(8, 8);
+#ifdef __linux__
+    // On Linux, memory backed by huge pages starts at a huge page boundary.
+    BOOST_TEST(reinterpret_cast<uintptr_t>(first) % HUGE_PAGE_BYTES == 0);
+#endif
+    resource.Deallocate(first, 8, 8);
+
+    // makes a bunch of allocations, some of them too large for the pool, fills them, and gives
+    // all of them back in random order after checking that their contents are intact.
+    struct Entry {
+        std::span<std::byte> memory;
+        std::byte value;
+    };
+    std::vector<Entry> entries{};
+    for (size_t i = 0; i < 200; ++i) {
+        const size_t bytes = m_rng.randrange(10) == 0 ? HUGE_PAGE_BYTES + m_rng.randrange(HUGE_PAGE_BYTES / 8) * 8
+                                                      : (m_rng.randrange(128) / 8 + 1) * 8;
+        auto* ptr = static_cast<std::byte*>(resource.Allocate(bytes, 8));
+        BOOST_TEST((reinterpret_cast<uintptr_t>(ptr) & 7) == 0);
+#ifdef __linux__
+        if (bytes >= HUGE_PAGE_BYTES) BOOST_TEST(reinterpret_cast<uintptr_t>(ptr) % HUGE_PAGE_BYTES == 0);
+#endif
+        const auto value = static_cast<std::byte>(i);
+        std::fill_n(ptr, bytes, value);
+        entries.push_back({{ptr, bytes}, value});
+    }
+
+    std::shuffle(entries.begin(), entries.end(), m_rng);
+    for (const auto& [memory, value] : entries) {
+        BOOST_TEST(std::ranges::all_of(memory, [&](std::byte b) { return b == value; }));
+        resource.Deallocate(memory.data(), memory.size(), 8);
+    }
+
+    PoolResourceTester::CheckAllDataAccountedFor(resource);
+}
+
+BOOST_AUTO_TEST_CASE(reset)
+{
+    for (const bool huge_pages : {false, true}) {
+        auto resource = PoolResource<128, 8>(1024, huge_pages);
+        const size_t blocks_per_chunk{resource.ChunkSizeBytes() / 128};
+        const auto allocate{[&](size_t num_blocks) {
+            std::vector<void*> blocks;
+            for (size_t i = 0; i < num_blocks; ++i) {
+                blocks.push_back(resource.Allocate(128, 8));
+                std::fill_n(static_cast<std::byte*>(blocks.back()), 128, std::byte{0x5a});
+            }
+            return blocks;
+        }};
+
+        // Some blocks are deallocated, some are still allocated when the resource is reset.
+        const auto blocks{allocate(3 * blocks_per_chunk)};
+        BOOST_TEST(resource.NumAllocatedChunks() == 3);
+        for (size_t i = 0; i < blocks.size(); i += 2) resource.Deallocate(blocks[i], 128, 8);
+
+        // Spare chunks are not counted, and are reused in the same order, before new chunks.
+        resource.Reset();
+        BOOST_TEST(resource.NumAllocatedChunks() == 1);
+        BOOST_TEST(PoolResourceTester::NumSpareChunks(resource) == 2);
+        PoolResourceTester::CheckAllDataAccountedFor(resource);
+        BOOST_TEST(allocate(3 * blocks_per_chunk) == blocks);
+        BOOST_TEST(resource.NumAllocatedChunks() == 3);
+        BOOST_TEST(PoolResourceTester::NumSpareChunks(resource) == 0);
+        allocate(1);
+        BOOST_TEST(resource.NumAllocatedChunks() == 4);
+
+        // Spare chunks that are not reused are freed with the resource.
+        resource.Reset();
+        allocate(1);
+        BOOST_TEST(resource.NumAllocatedChunks() == 1);
+        BOOST_TEST(PoolResourceTester::NumSpareChunks(resource) == 3);
+    }
 }
 
 BOOST_AUTO_TEST_CASE(memusage_test)
