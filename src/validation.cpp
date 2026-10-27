@@ -4414,6 +4414,14 @@ bool ChainstateManager::ProcessNewBlock(const std::shared_ptr<const CBlock>& blo
 {
     AssertLockNotHeld(cs_main);
 
+    if (!AcceptNewBlock(block, force_processing, min_pow_checked, new_block)) return false;
+    return ActivateBestChains(block);
+}
+
+bool ChainstateManager::AcceptNewBlock(const std::shared_ptr<const CBlock>& block, bool force_processing, bool min_pow_checked, bool* new_block)
+{
+    AssertLockNotHeld(cs_main);
+
     {
         CBlockIndex *pindex = nullptr;
         if (new_block) *new_block = false;
@@ -4443,6 +4451,12 @@ bool ChainstateManager::ProcessNewBlock(const std::shared_ptr<const CBlock>& blo
     }
 
     NotifyHeaderTip();
+    return true;
+}
+
+bool ChainstateManager::ActivateBestChains(const std::shared_ptr<const CBlock>& block)
+{
+    AssertLockNotHeld(cs_main);
 
     BlockValidationState state; // Only used to report errors, not invalidity - ignore it
     if (!ActiveChainstate().ActivateBestChain(state, block)) {

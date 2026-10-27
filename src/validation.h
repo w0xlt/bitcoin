@@ -1274,6 +1274,30 @@ public:
     bool ProcessNewBlock(const std::shared_ptr<const CBlock>& block, bool force_processing, bool min_pow_checked, bool* new_block) LOCKS_EXCLUDED(cs_main);
 
     /**
+     * First half of ProcessNewBlock(): check the block and store it to disk,
+     * without making it active. Parameters are the same as ProcessNewBlock().
+     *
+     * Callers must follow a successful call with ActivateBestChains(), possibly
+     * from a different thread.
+     *
+     * @returns     False if the block failed CheckBlock() or AcceptBlock(), in which case
+     *              BlockChecked has been called
+     */
+    bool AcceptNewBlock(const std::shared_ptr<const CBlock>& block, bool force_processing, bool min_pow_checked, bool* new_block) LOCKS_EXCLUDED(cs_main);
+
+    /**
+     * Second half of ProcessNewBlock(): make the best known valid chain active
+     * on all chainstates.
+     *
+     * May not be called in a validationinterface callback.
+     *
+     * @param[in]   block The block most recently passed to AcceptNewBlock(), if any. Used to
+     *                    avoid reading it back from disk.
+     * @returns     False if a chainstate failed to activate its best chain because of a system error
+     */
+    bool ActivateBestChains(const std::shared_ptr<const CBlock>& block) LOCKS_EXCLUDED(cs_main);
+
+    /**
      * Process incoming block headers.
      *
      * May not be called in a
