@@ -128,6 +128,20 @@ public:
     /** Begin running background tasks, should only be called once */
     virtual void StartScheduledTasks(CScheduler& scheduler) = 0;
 
+    /**
+     * Start a thread that connects blocks received from peers, so that the
+     * message handler thread does not run ActivateBestChain(). Until this is
+     * called, blocks are connected on the message handler thread.
+     */
+    virtual void StartBlockActivation() = 0;
+
+    /**
+     * Stop the thread started by StartBlockActivation(). Must be called before
+     * the scheduler is stopped, because ActivateBestChain() may wait for the
+     * validation interface queue to drain.
+     */
+    virtual void StopBlockActivation() = 0;
+
     /** Get statistics from node state */
     virtual bool GetNodeStateStats(NodeId nodeid, CNodeStateStats& stats) const = 0;
 

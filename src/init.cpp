@@ -340,6 +340,7 @@ void Shutdown(NodeContext& node)
     // using the other before destroying them.
     if (node.peerman && node.validation_signals) node.validation_signals->UnregisterValidationInterface(node.peerman.get());
     if (node.connman) node.connman->Stop();
+    if (node.peerman) node.peerman->StopBlockActivation();
 
     if (node.tor_controller) {
         node.tor_controller->Join();
@@ -2426,6 +2427,7 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
         }
     }
 
+    node.peerman->StartBlockActivation();
     if (!node.connman->Start(scheduler, connOptions)) {
         return false;
     }

@@ -59,6 +59,7 @@
 #include <util/check.h>
 #include <util/hasher.h>
 #include <util/strencodings.h>
+#include <util/thread.h>
 #include <util/time.h>
 #include <util/tokenbucket.h>
 #include <util/trace.h>
@@ -68,6 +69,7 @@
 #include <array>
 #include <atomic>
 #include <compare>
+#include <condition_variable>
 #include <cstddef>
 #include <deque>
 #include <exception>
@@ -85,6 +87,7 @@
 #include <ratio>
 #include <set>
 #include <span>
+#include <thread>
 #include <typeinfo>
 #include <unordered_set>
 #include <utility>
@@ -572,6 +575,7 @@ public:
     PeerManagerImpl(CConnman& connman, AddrMan& addrman,
                     BanMan* banman, ChainstateManager& chainman,
                     CTxMemPool& pool, node::Warnings& warnings, Options opts);
+    ~PeerManagerImpl() override EXCLUSIVE_LOCKS_REQUIRED(!m_activation_mutex) { StopBlockActivation(); }
 
     /** Overridden from CValidationInterface. */
     void ActiveTipChange(const CBlockIndex& new_tip, bool) override
@@ -592,12 +596,14 @@ public:
     void FinalizeNode(const CNode& node) override EXCLUSIVE_LOCKS_REQUIRED(!m_peer_mutex, !m_headers_presync_mutex, !m_tx_download_mutex);
     bool HasAllDesirableServiceFlags(ServiceFlags services) const override;
     bool ProcessMessages(CNode& node, std::atomic<bool>& interrupt) override
-        EXCLUSIVE_LOCKS_REQUIRED(!m_peer_mutex, !m_most_recent_block_mutex, !m_headers_presync_mutex, g_msgproc_mutex, !m_tx_download_mutex, !m_inv_to_send_mutex);
+        EXCLUSIVE_LOCKS_REQUIRED(!m_peer_mutex, !m_most_recent_block_mutex, !m_headers_presync_mutex, g_msgproc_mutex, !m_tx_download_mutex, !m_inv_to_send_mutex, !m_activation_mutex);
     bool SendMessages(CNode& node) override
         EXCLUSIVE_LOCKS_REQUIRED(!m_peer_mutex, !m_most_recent_block_mutex, g_msgproc_mutex, !m_tx_download_mutex, !m_inv_to_send_mutex);
 
     /** Implement PeerManager */
     void StartScheduledTasks(CScheduler& scheduler) override;
+    void StartBlockActivation() override EXCLUSIVE_LOCKS_REQUIRED(!m_activation_mutex);
+    void StopBlockActivation() override EXCLUSIVE_LOCKS_REQUIRED(!m_activation_mutex);
     void CheckForStaleTipAndEvictPeers() override;
     util::Expected<void, std::string> FetchBlock(NodeId peer_id, const CBlockIndex& block_index) override
         EXCLUSIVE_LOCKS_REQUIRED(!m_peer_mutex);
@@ -1051,8 +1057,54 @@ private:
         EXCLUSIVE_LOCKS_REQUIRED(!m_most_recent_block_mutex, peer.m_getdata_requests_mutex, NetEventsInterface::g_msgproc_mutex)
         LOCKS_EXCLUDED(::cs_main);
 
-    /** Process a new block. Perform any post-processing housekeeping */
-    void ProcessBlock(CNode& node, const std::shared_ptr<const CBlock>& block, bool force_processing, bool min_pow_checked);
+    /**
+     * Store a new block and perform any post-processing housekeeping. The
+     * block is connected once the current message has been processed, see
+     * MaybeStartBlockActivation().
+     */
+    void ProcessBlock(CNode& node, const std::shared_ptr<const CBlock>& block, bool force_processing, bool min_pow_checked)
+        EXCLUSIVE_LOCKS_REQUIRED(NetEventsInterface::g_msgproc_mutex);
+
+    /** A block stored by the message handler that remains to be connected. */
+    struct BlockActivation {
+        /** The peer whose message provided the block. */
+        NodeId peer;
+        std::shared_ptr<const CBlock> block;
+        /** Whether the block was stored for the first time, see ProcessNewBlock(). */
+        bool new_block;
+    };
+
+    /** Block stored while processing the current message. */
+    std::optional<BlockActivation> m_block_to_activate GUARDED_BY(NetEventsInterface::g_msgproc_mutex);
+
+    /**
+     * Block being connected by the activation thread. While it is set, the
+     * message handler does not take cs_main or the mempool lock, which
+     * ActivateBestChain() holds while connecting blocks.
+     */
+    std::optional<BlockActivation> m_block_activating GUARDED_BY(NetEventsInterface::g_msgproc_mutex);
+
+    /** Hand the block stored by the current message to the activation thread, or connect it inline if that thread is not running. */
+    void MaybeStartBlockActivation() EXCLUSIVE_LOCKS_REQUIRED(NetEventsInterface::g_msgproc_mutex, !m_activation_mutex);
+
+    /** Whether the activation thread is connecting a block. Completes an activation it has finished first. */
+    bool IsActivatingBlock() EXCLUSIVE_LOCKS_REQUIRED(NetEventsInterface::g_msgproc_mutex);
+
+    /** Housekeeping once m_block_activating has been connected. */
+    void FinishBlockActivation() EXCLUSIVE_LOCKS_REQUIRED(NetEventsInterface::g_msgproc_mutex);
+
+    void ThreadBlockActivation() EXCLUSIVE_LOCKS_REQUIRED(!m_activation_mutex);
+
+    Mutex m_activation_mutex;
+    std::condition_variable m_activation_cv;
+    /** Whether blocks are connected by m_activation_thread rather than inline. */
+    bool m_activation_enabled GUARDED_BY(m_activation_mutex){false};
+    /** Block waiting to be picked up by the activation thread. */
+    std::shared_ptr<const CBlock> m_activation_request GUARDED_BY(m_activation_mutex);
+    /** Set by the message handler when it hands over a block, cleared by the activation thread once that block is connected. */
+    std::atomic_bool m_activation_in_flight{false};
+    /** Only accessed by StartBlockActivation() and StopBlockActivation(). */
+    std::thread m_activation_thread;
 
     /** Process compact block txns  */
     void ProcessCompactBlockTxns(CNode& pfrom, Peer& peer, const BlockTransactions& block_transactions)
@@ -2154,6 +2206,21 @@ PeerManagerImpl::PeerManagerImpl(CConnman& connman, AddrMan& addrman,
     if (opts.reconcile_txs) {
         m_txreconciliation = std::make_unique<TxReconciliationTracker>(TXRECONCILIATION_VERSION);
     }
+}
+
+void PeerManagerImpl::StartBlockActivation()
+{
+    LOCK(m_activation_mutex);
+    if (!Assume(!m_activation_enabled)) return;
+    m_activation_enabled = true;
+    m_activation_thread = std::thread(&util::TraceThread, "blkactivate", [this] { ThreadBlockActivation(); });
+}
+
+void PeerManagerImpl::StopBlockActivation()
+{
+    WITH_LOCK(m_activation_mutex, m_activation_enabled = false);
+    m_activation_cv.notify_all();
+    if (m_activation_thread.joinable()) m_activation_thread.join();
 }
 
 void PeerManagerImpl::StartScheduledTasks(CScheduler& scheduler)
@@ -3686,7 +3753,7 @@ void PeerManagerImpl::ProcessGetCFCheckPt(CNode& node, Peer& peer, DataStream& v
 void PeerManagerImpl::ProcessBlock(CNode& node, const std::shared_ptr<const CBlock>& block, bool force_processing, bool min_pow_checked)
 {
     bool new_block{false};
-    m_chainman.ProcessNewBlock(block, force_processing, min_pow_checked, &new_block);
+    const bool accepted{m_chainman.AcceptNewBlock(block, force_processing, min_pow_checked, &new_block)};
     if (new_block) {
         node.m_last_block_time = GetTime<std::chrono::seconds>();
         // In case this block came from a different peer than we requested
@@ -3694,9 +3761,73 @@ void PeerManagerImpl::ProcessBlock(CNode& node, const std::shared_ptr<const CBlo
         // this block to disk).
         LOCK(cs_main);
         RemoveBlockRequest(block->GetHash(), std::nullopt);
-    } else {
+    } else if (!accepted) {
         LOCK(cs_main);
         mapBlockSource.erase(block->GetHash());
+    }
+    if (accepted) {
+        Assume(!m_block_to_activate);
+        m_block_to_activate = BlockActivation{.peer = node.GetId(), .block = block, .new_block = new_block};
+    }
+}
+
+void PeerManagerImpl::MaybeStartBlockActivation()
+{
+    if (!m_block_to_activate) return;
+    Assume(!m_block_activating);
+    m_block_activating = std::exchange(m_block_to_activate, std::nullopt);
+
+    bool handed_over{false};
+    {
+        LOCK(m_activation_mutex);
+        if (m_activation_enabled) {
+            m_activation_in_flight = true;
+            m_activation_request = m_block_activating->block;
+            handed_over = true;
+        }
+    }
+    if (handed_over) {
+        m_activation_cv.notify_one();
+        return;
+    }
+
+    // There is no activation thread: connect the block inline, like ProcessNewBlock().
+    m_chainman.ActivateBestChains(m_block_activating->block);
+    FinishBlockActivation();
+}
+
+bool PeerManagerImpl::IsActivatingBlock()
+{
+    if (m_block_activating && !m_activation_in_flight) FinishBlockActivation();
+    return m_block_activating.has_value();
+}
+
+void PeerManagerImpl::FinishBlockActivation()
+{
+    if (!m_block_activating->new_block) {
+        // Like after ProcessNewBlock(), forget the source of a block we
+        // already had once it has been through activation.
+        LOCK(cs_main);
+        mapBlockSource.erase(m_block_activating->block->GetHash());
+    }
+    m_block_activating.reset();
+}
+
+void PeerManagerImpl::ThreadBlockActivation()
+{
+    WAIT_LOCK(m_activation_mutex, lock);
+    while (true) {
+        m_activation_cv.wait(lock, [this]() EXCLUSIVE_LOCKS_REQUIRED(m_activation_mutex) {
+            return !m_activation_enabled || m_activation_request;
+        });
+        if (!m_activation_enabled) return;
+        const auto block{std::exchange(m_activation_request, nullptr)};
+        {
+            REVERSE_LOCK(lock, m_activation_mutex);
+            m_chainman.ActivateBestChains(block);
+            m_activation_in_flight = false;
+            m_connman.WakeMessageHandler();
+        }
     }
 }
 
@@ -5427,6 +5558,10 @@ bool PeerManagerImpl::ProcessMessages(CNode& node, std::atomic<bool>& interruptM
     AssertLockNotHeld(m_tx_download_mutex);
     AssertLockHeld(g_msgproc_mutex);
 
+    // The activation thread holds cs_main and the mempool lock while it
+    // connects blocks. Don't contend for them: wait until it is done.
+    if (IsActivatingBlock()) return false;
+
     PeerRef maybe_peer{GetPeerRef(node.GetId())};
     if (maybe_peer == nullptr) return false;
     Peer& peer{*maybe_peer};
@@ -5500,6 +5635,10 @@ bool PeerManagerImpl::ProcessMessages(CNode& node, std::atomic<bool>& interruptM
     } catch (...) {
         LogDebug(BCLog::NET, "%s(%s, %u bytes): Unknown exception caught\n", __func__, SanitizeString(msg.m_type), msg.m_message_size);
     }
+
+    // Connect a block stored by this message only now, so that the message
+    // handler does not contend with the activation thread for cs_main.
+    MaybeStartBlockActivation();
 
     return fMoreWork;
 }
@@ -6103,6 +6242,10 @@ bool PeerManagerImpl::SendMessages(CNode& node)
     MaybeSendPing(node, peer, now);
 
     MaybeSendAddr(node, peer, current_time);
+
+    // Everything below needs cs_main or the mempool lock, which the
+    // activation thread holds while it connects blocks.
+    if (IsActivatingBlock()) return true;
 
     MaybeSendSendHeaders(node, peer);
 
