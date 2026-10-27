@@ -1093,6 +1093,15 @@ private:
     /** Housekeeping once m_block_activating has been connected. */
     void FinishBlockActivation() EXCLUSIVE_LOCKS_REQUIRED(NetEventsInterface::g_msgproc_mutex);
 
+    /**
+     * Whether processing `msg` needs neither cs_main nor the mempool lock, so
+     * that it can be processed while the activation thread connects a block.
+     *
+     * Called with the peer's receive queue locked: it must be cheap, and take
+     * no lock other than m_most_recent_block_mutex.
+     */
+    bool IsLockFreeMessage(const CNetMessage& msg) EXCLUSIVE_LOCKS_REQUIRED(!m_most_recent_block_mutex);
+
     void ThreadBlockActivation() EXCLUSIVE_LOCKS_REQUIRED(!m_activation_mutex);
 
     Mutex m_activation_mutex;
@@ -5553,14 +5562,33 @@ bool PeerManagerImpl::MaybeDisconnectForTxRelayCapacity(CNode& node, const std::
     return true;
 }
 
+bool PeerManagerImpl::IsLockFreeMessage(const CNetMessage& msg)
+{
+    // Keep peers responsive to pings while a block is being connected.
+    if (msg.m_type == NetMsgType::PING || msg.m_type == NetMsgType::PONG) return true;
+
+    // Let peers that received a compact block we relayed before connecting it
+    // fetch its missing transactions. Only the most recent block is served
+    // without cs_main. The request starts with the block hash.
+    if (msg.m_type == NetMsgType::GETBLOCKTXN) {
+        const auto payload{MakeUCharSpan(msg.m_recv)};
+        if (payload.size() < uint256::size()) return false;
+        const uint256 hash{payload.first(uint256::size())};
+        LOCK(m_most_recent_block_mutex);
+        return m_most_recent_block && m_most_recent_block_hash == hash;
+    }
+
+    // Everything else may need cs_main or the mempool lock. Returning false
+    // is always safe: the message waits until the block is connected.
+    return false;
+}
+
 bool PeerManagerImpl::ProcessMessages(CNode& node, std::atomic<bool>& interruptMsgProc)
 {
     AssertLockNotHeld(m_tx_download_mutex);
     AssertLockHeld(g_msgproc_mutex);
 
-    // The activation thread holds cs_main and the mempool lock while it
-    // connects blocks. Don't contend for them: wait until it is done.
-    if (IsActivatingBlock()) return false;
+    const bool activating{IsActivatingBlock()};
 
     PeerRef maybe_peer{GetPeerRef(node.GetId())};
     if (maybe_peer == nullptr) return false;
@@ -5570,6 +5598,17 @@ bool PeerManagerImpl::ProcessMessages(CNode& node, std::atomic<bool>& interruptM
     // has been sent first before processing any incoming messages
     if (!node.IsInboundConn() && !peer.m_outbound_version_message_sent) return false;
 
+    if (activating) {
+        // The activation thread holds cs_main and the mempool lock while it
+        // connects blocks. Don't contend for them: only process messages that
+        // need neither. Keep messages from the peer that sent the block in
+        // order, and don't let other peers' messages overtake their pending
+        // getdata or orphan work.
+        if (m_block_activating->peer == node.GetId()) return false;
+        if (WITH_LOCK(peer.m_getdata_requests_mutex, return !peer.m_getdata_requests.empty())) return false;
+        if (WITH_LOCK(m_tx_download_mutex, return m_txdownloadman.HaveMoreWork(peer.m_id))) return false;
+    }
+
     {
         LOCK(peer.m_getdata_requests_mutex);
         if (!peer.m_getdata_requests.empty()) {
@@ -5577,7 +5616,7 @@ bool PeerManagerImpl::ProcessMessages(CNode& node, std::atomic<bool>& interruptM
         }
     }
 
-    const bool processed_orphan = ProcessOrphanTx(peer);
+    const bool processed_orphan = !activating && ProcessOrphanTx(peer);
 
     if (node.fDisconnect)
         return false;
@@ -5594,9 +5633,12 @@ bool PeerManagerImpl::ProcessMessages(CNode& node, std::atomic<bool>& interruptM
     // Don't bother if send buffer is too full to respond anyway
     if (node.fPauseSend) return false;
 
-    auto poll_result{node.PollMessage()};
+    auto poll_result{activating ? node.PollMessage([this](const CNetMessage& msg) EXCLUSIVE_LOCKS_REQUIRED(!m_most_recent_block_mutex) {
+                                      return IsLockFreeMessage(msg);
+                                  }) :
+                                  node.PollMessage()};
     if (!poll_result) {
-        // No message to process
+        // No message to process, or none that can be processed now
         return false;
     }
 

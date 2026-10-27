@@ -4185,10 +4185,11 @@ void CNode::MarkReceivedMsgsForProcessing()
     fPauseRecv = m_msg_process_queue_size > m_recv_flood_size;
 }
 
-std::optional<std::pair<CNetMessage, bool>> CNode::PollMessage()
+std::optional<std::pair<CNetMessage, bool>> CNode::PollMessage(const std::function<bool(const CNetMessage&)>& filter)
 {
     LOCK(m_msg_process_queue_mutex);
     if (m_msg_process_queue.empty()) return std::nullopt;
+    if (filter && !filter(m_msg_process_queue.front())) return std::nullopt;
 
     std::list<CNetMessage> msgs;
     // Just take one message
