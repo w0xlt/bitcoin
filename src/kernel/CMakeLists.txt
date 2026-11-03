@@ -77,10 +77,6 @@ add_library(bitcoinkernel
   ../validation.cpp
   ../validationinterface.cpp
   ../versionbits.cpp
-  $<TARGET_OBJECTS:bitcoin_clientversion>
-  $<TARGET_OBJECTS:bitcoin_crypto>
-  $<TARGET_OBJECTS:leveldb>
-  $<TARGET_OBJECTS:crc32c>
 )
 
 # Compiler warnings that apply only to the kernel and its dependencies.
@@ -91,11 +87,14 @@ if(NOT MSVC)
   try_append_cxx_flags("-Wunique-object-duplication" TARGET kernel_warn_interface SKIP_LINK)
 endif()
 
-# Also manually apply the warnings to the kernel's internal dependencies
-target_link_libraries(bitcoin_clientversion PRIVATE kernel_warn_interface)
-target_link_libraries(bitcoin_crypto PRIVATE kernel_warn_interface)
-target_link_libraries(leveldb PRIVATE kernel_warn_interface)
-target_link_libraries(crc32c PRIVATE kernel_warn_interface)
+# The kernel's internal dependencies, whose objects are embedded into the
+# library. They are compiled as separate targets, so the settings that only
+# apply to the kernel have to be applied to them as well.
+set(kernel_embedded_libs bitcoin_clientversion bitcoin_crypto leveldb crc32c)
+foreach(lib IN LISTS kernel_embedded_libs)
+  target_sources(bitcoinkernel PRIVATE $<TARGET_OBJECTS:${lib}>)
+  target_link_libraries(${lib} PRIVATE kernel_warn_interface)
+endforeach()
 
 target_link_libraries(bitcoinkernel
   PRIVATE
