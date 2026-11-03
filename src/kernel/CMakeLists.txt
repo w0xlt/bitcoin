@@ -96,6 +96,15 @@ foreach(lib IN LISTS kernel_embedded_libs)
   target_link_libraries(${lib} PRIVATE kernel_warn_interface)
 endforeach()
 
+# Only the C API, whose functions are marked with BITCOINKERNEL_API, is meant
+# to be used from outside the library. Hide all other symbols, independently
+# of REDUCE_EXPORTS.
+set_target_properties(bitcoinkernel ${kernel_embedded_libs} PROPERTIES
+  C_VISIBILITY_PRESET hidden
+  CXX_VISIBILITY_PRESET hidden
+  VISIBILITY_INLINES_HIDDEN ON
+)
+
 target_link_libraries(bitcoinkernel
   PRIVATE
     core_interface
