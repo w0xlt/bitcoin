@@ -1,0 +1,15 @@
+/* Copyright (c) 2026-present The Bitcoin Core developers
+ * Distributed under the MIT software license, see the accompanying
+ * file COPYING or https://opensource.org/license/mit/.
+ *
+ * Linker version script for the shared libbitcoinkernel library. Its only
+ * supported interface is the C API declared in bitcoinkernel.h, so everything
+ * else, including the symbols of embedded dependencies, is kept local.
+ */
+
+{
+  global:
+    btck_*;
+  local:
+    *;
+};

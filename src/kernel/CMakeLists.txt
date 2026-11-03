@@ -116,6 +116,20 @@ add_dependencies(libbitcoinkernel bitcoinkernel)
 get_target_property(bitcoinkernel_type bitcoinkernel TYPE)
 if(bitcoinkernel_type STREQUAL "STATIC_LIBRARY")
   target_compile_definitions(bitcoinkernel PUBLIC BITCOINKERNEL_STATIC)
+elseif(bitcoinkernel_type STREQUAL "SHARED_LIBRARY" AND NOT WIN32)
+  # Only export the C API from the shared library. Otherwise, unless
+  # REDUCE_EXPORTS is enabled, all internal symbols are exported, including
+  # those of embedded dependencies like LevelDB. On Windows, the DLL already
+  # only exports the functions marked with BITCOINKERNEL_API.
+  set(version_script ${CMAKE_CURRENT_SOURCE_DIR}/bitcoinkernel.map)
+  try_append_linker_flag("-Wl,--version-script=${version_script}"
+    RESULT_VAR linker_supports_version_script
+    NO_CACHE_IF_FAILED
+  )
+  if(linker_supports_version_script)
+    target_link_options(bitcoinkernel PRIVATE "-Wl,--version-script=${version_script}")
+    set_property(TARGET bitcoinkernel APPEND PROPERTY LINK_DEPENDS ${version_script})
+  endif()
 endif()
 
 configure_file(${PROJECT_SOURCE_DIR}/libbitcoinkernel.pc.in ${PROJECT_BINARY_DIR}/libbitcoinkernel.pc @ONLY)
