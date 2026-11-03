@@ -124,6 +124,12 @@ add_dependencies(libbitcoinkernel bitcoinkernel)
 get_target_property(bitcoinkernel_type bitcoinkernel TYPE)
 if(bitcoinkernel_type STREQUAL "STATIC_LIBRARY")
   target_compile_definitions(bitcoinkernel PUBLIC BITCOINKERNEL_STATIC)
+elseif(bitcoinkernel_type STREQUAL "SHARED_LIBRARY" AND NOT WIN32 AND NOT APPLE)
+  # Keep the library loaded after dlclose(). LevelDB's background thread
+  # never exits, so unloading the library would leave that thread behind in
+  # unmapped code. glibc only keeps GCC builds loaded on its own, because of
+  # their STB_GNU_UNIQUE symbols.
+  target_link_options(bitcoinkernel PRIVATE "-Wl,-z,nodelete")
 endif()
 
 configure_file(${PROJECT_SOURCE_DIR}/libbitcoinkernel.pc.in ${PROJECT_BINARY_DIR}/libbitcoinkernel.pc @ONLY)
