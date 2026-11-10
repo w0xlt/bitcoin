@@ -739,14 +739,16 @@ class CompactBlocksTest(BitcoinTestFramework):
             assert_equal(test_node.last_message["block"].block.hash_hex, block_hash)
             assert "blocktxn" not in test_node.last_message
 
-        # Request with out-of-bounds tx index results in disconnect
-        bad_peer = self.nodes[0].add_p2p_connection(TestP2PConn())
-        block_hash = node.getblockhash(chain_height)
-        block = from_hex(CBlock(), node.getblock(block_hash, False))
-        msg.block_txn_request = BlockTransactionsRequest(int(block_hash, 16), [len(block.vtx)])
-        with node.assert_debug_log(['getblocktxn with out-of-bounds tx indices']):
-            bad_peer.send_without_ping(msg)
-            bad_peer.wait_for_disconnect()
+        # Request with out-of-bounds tx index results in disconnect, both for
+        # the tip and for an older block within the allowed depth.
+        for height in [chain_height, chain_height - 1]:
+            bad_peer = self.nodes[0].add_p2p_connection(TestP2PConn())
+            block_hash = node.getblockhash(height)
+            block = from_hex(CBlock(), node.getblock(block_hash, False))
+            msg.block_txn_request = BlockTransactionsRequest(int(block_hash, 16), [len(block.vtx)])
+            with node.assert_debug_log(['getblocktxn with out-of-bounds tx indices']):
+                bad_peer.send_without_ping(msg)
+                bad_peer.wait_for_disconnect()
 
     def test_low_work_compactblocks(self, test_node):
         # A compactblock with insufficient work won't get its header included

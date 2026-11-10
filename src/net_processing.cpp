@@ -4585,6 +4585,7 @@ void PeerManagerImpl::ProcessMessage(Peer& peer, CNode& pfrom, const std::string
         }
 
         FlatFilePos block_pos{};
+        unsigned int block_tx_count{0};
         {
             LOCK(cs_main);
 
@@ -4596,10 +4597,19 @@ void PeerManagerImpl::ProcessMessage(Peer& peer, CNode& pfrom, const std::string
 
             if (pindex->nHeight >= m_chainman.ActiveChain().Height() - MAX_BLOCKTXN_DEPTH) {
                 block_pos = pindex->GetBlockPos();
+                block_tx_count = pindex->nTx;
             }
         }
 
         if (!block_pos.IsNull()) {
+            // The indexes are strictly increasing, so checking the last one is
+            // enough to reject an out-of-bounds request without reading the
+            // block from disk.
+            if (req.indexes.back() >= block_tx_count) {
+                Misbehaving(peer, "getblocktxn with out-of-bounds tx indices");
+                return;
+            }
+
             CBlock block;
             const bool ret{m_chainman.m_blockman.ReadBlock(block, block_pos, req.blockhash)};
             // If height is above MAX_BLOCKTXN_DEPTH then this block cannot get
